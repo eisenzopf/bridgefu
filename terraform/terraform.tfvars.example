@@ -9,9 +9,12 @@ public_key = "ssh-ed25519 AAAA... you@host"
 # Lock SSH + metrics (port 9090) to your own IP. Find it with: curl ifconfig.me
 admin_cidr = "203.0.113.4/32"
 
-# SIP/RTP exposure. Default 0.0.0.0/0 (open) for the POC; lock to Vapi/carrier
-# CIDRs once known.
-# sip_cidr = "0.0.0.0/0"
+# SIP signaling allowlist. Defaults to Vapi US signaling IPs (sip.vapi.ai).
+# Override if your carrier differs.
+# sip_cidrs = ["44.229.228.186/32", "44.238.177.138/32"]
+#
+# RTP media stays open (Vapi media IPs are dynamic; SGs can't filter source port).
+# rtp_cidr = "0.0.0.0/0"
 
 # Build host size. t4g.2xlarge (8 vCPU/32 GB) for fast first build.
 # instance_type = "t4g.2xlarge"

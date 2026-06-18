@@ -37,11 +37,23 @@ variable "admin_cidr" {
   type        = string
 }
 
-variable "sip_cidr" {
+variable "sip_cidrs" {
   description = <<-EOT
-    CIDR allowed to reach SIP (5060 udp/tcp) and RTP (16384-32767 udp).
-    Defaults open (0.0.0.0/0) for the POC test. TODO: lock to Vapi/carrier CIDRs
-    once known (see PRD §6 / §10).
+    CIDRs allowed to reach SIP signaling (5060 udp/tcp). Lock to the carrier's
+    signaling IPs — this is what stops abuse (no INVITE = no Connect contact).
+    Default: Vapi US signaling IPs (sip.vapi.ai).
+  EOT
+  type        = list(string)
+  default     = ["44.229.228.186/32", "44.238.177.138/32"]
+}
+
+variable "rtp_cidr" {
+  description = <<-EOT
+    CIDR allowed to reach RTP media (16384-32767 udp). Vapi uses DYNAMIC media
+    source IPs (only source ports 40000-60000 are known, and security groups
+    can't filter on source port), so this stays open. Media to these ports is
+    only consumed for an already-established SIP session, so the exposure is low
+    once SIP signaling is locked via sip_cidrs.
   EOT
   type        = string
   default     = "0.0.0.0/0"

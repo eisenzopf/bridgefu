@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- bridgefu gateway test: a UAC that stands in for Vapi.
+
+     Sends an INVITE carrying the custom X- headers bridgefu maps to Amazon
+     Connect contact attributes, negotiates G.711 (PCMA) media, streams a
+     canned audio clip so the bridge has real RTP, holds the call, then BYEs.
+
+     This exercises the whole gateway path EXCEPT the carrier-preservation
+     question (FR6) — that is inherently Vapi-specific. Here WE set the headers,
+     so a clean run proves bridgefu maps them correctly and lands them in
+     Connect with a screen pop + two-way audio.
+
+     The X- header VALUES below are samples — edit them freely. -->
+
+<scenario name="bridgefu - INVITE with X- headers">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Subject: bridgefu sipp test
+      X-Vapi-Customer-Id: CUST-12345
+      X-Vapi-Call-Id: VAPI-CALL-67890
+      X-Account-Tier: gold
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=vapi [call_number] [call_number] IN IP[local_ip_type] [local_ip]
+      s=bridgefu-sipp-test
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 8 101
+      a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="183" optional="true" />
+
+  <!-- bridgefu auto-answers; rtd measures INVITE->200 round-trip. -->
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Stream G.711 A-law RTP from the SIPp-bundled sample so the bridge has
+       real audio to transcode to Opus toward the Connect/agent leg. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="pcap/g711a.pcap" />
+    </action>
+  </nop>
+
+  <!-- Hold the call up long enough for the agent to answer + audio to flow.
+       Tune with: -d 30000 on the CLI, or edit this value. -->
+  <pause milliseconds="30000" />
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <!-- One call per run by default (-m 1). Stats for the response-time chart. -->
+  <ResponseTimeRepartition value="100, 250, 500, 1000, 2000" />
+  <CallLengthRepartition value="30000, 31000, 32000" />
+
+</scenario>

@@ -72,13 +72,14 @@ resource "aws_security_group" "this" {
     cidr_blocks = [var.admin_cidr]
   }
 
-  # SIP signaling (UDP + TCP) — from sip_cidr (default open for POC).
+  # SIP signaling (UDP + TCP) — locked to the carrier's signaling IPs (sip_cidrs).
+  # This is the rule that stops abuse: no INVITE from an allowed IP = no contact.
   ingress {
     description = "SIP UDP"
     from_port   = 5060
     to_port     = 5060
     protocol    = "udp"
-    cidr_blocks = [var.sip_cidr]
+    cidr_blocks = var.sip_cidrs
   }
 
   ingress {
@@ -86,16 +87,17 @@ resource "aws_security_group" "this" {
     from_port   = 5060
     to_port     = 5060
     protocol    = "tcp"
-    cidr_blocks = [var.sip_cidr]
+    cidr_blocks = var.sip_cidrs
   }
 
-  # RTP media (UDP) — from sip_cidr (default open for POC).
+  # RTP media (UDP) — open by source IP (rtp_cidr): Vapi media IPs are dynamic
+  # and SGs can't filter on source port. Low risk once SIP signaling is locked.
   ingress {
     description = "RTP media"
     from_port   = 16384
     to_port     = 32767
     protocol    = "udp"
-    cidr_blocks = [var.sip_cidr]
+    cidr_blocks = [var.rtp_cidr]
   }
 
   egress {
