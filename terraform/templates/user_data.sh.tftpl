@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# bridgefu instance bootstrap (Amazon Linux 2023, arm64/Graviton).
+#
+# Prepares the box so deploy.sh can sync the bridgefu source and build the image:
+#   - install docker + git
+#   - clone the rvoip workspace (origin/main is current; some crates are NOT on
+#     crates.io, so we build against this local checkout via path deps)
+#   - create the build + config directories
+#
+# The actual `docker build` + systemd install is driven by deploy.sh, because the
+# bridgefu source lives on the operator's laptop, not in a public repo.
+set -euxo pipefail
+
+dnf update -y
+dnf install -y docker git
+
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+mkdir -p /opt/build /etc/bridgefu
+chown -R ec2-user:ec2-user /opt/build
+
+# Clone the rvoip workspace next to where deploy.sh will rsync bridgefu, so the
+# `../rvoip` path dependency resolves inside the Docker build context (/opt/build).
+if [ ! -d /opt/build/rvoip/.git ]; then
+  sudo -u ec2-user git clone --depth 1 https://github.com/eisenzopf/rvoip /opt/build/rvoip
+fi

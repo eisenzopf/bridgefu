@@ -1,0 +1,22 @@
+# Rust
+/target
+
+# Logs
+*.log
+
+# Operator's filled-in config (contains your instance/flow IDs). Commit only
+# config/bridgefu.example.yaml, not the real one.
+/bridgefu.yaml
+
+# Terraform — never commit local state (may contain sensitive values), the
+# provider plugin cache (huge), crash logs, or your real tfvars.
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform/terraform.tfvars
+# Keep .terraform.lock.hcl tracked (provider pinning) and tfvars.example tracked.
+
+# NOTE: Cargo.lock IS committed — bridgefu is a binary and we want reproducible
+# builds (deploy.sh ships it; the Dockerfile relies on it for the MSRV-pinned tree).

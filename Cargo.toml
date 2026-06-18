@@ -1,0 +1,35 @@
+[package]
+name = "bridgefu"
+version = "0.1.0"
+edition = "2021"
+description = "Deployable SIP → Amazon Connect screen-pop gateway (Vapi transfer bridge)"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Path dep — built against a local rvoip checkout in ALL environments (some rvoip
+# crates are not published to crates.io, so the registry tree won't resolve). The
+# Docker build (deploy/Dockerfile) clones github.com/eisenzopf/rvoip next to this
+# repo so the same `../rvoip` path resolves inside the image.
+rvoip-amazon-connect = { path = "../rvoip/crates/webrtc/rvoip-amazon-connect", features = ["server", "aws-control"] }
+
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.7"
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+
+# bridgefu is the build root, so this profile governs the WHOLE dependency tree
+# (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are
+# memory- and time-hungry across the full SIP/WebRTC/AWS tree). `thin` LTO + many
+# codegen units keeps the on-instance build fast and within RAM, while opt-level 2
+# is plenty for a POC gateway whose hot path is a single audio bridge.
+[profile.release]
+lto = "thin"
+codegen-units = 16
+opt-level = 2

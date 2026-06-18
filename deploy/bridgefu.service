@@ -1,0 +1,26 @@
+[Unit]
+Description=bridgefu — SIP -> Amazon Connect screen-pop gateway
+Documentation=https://github.com/eisenzopf/rvoip
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+# Run the container in the FOREGROUND (no -d) so systemd owns the process and
+# drives restarts — we do NOT use docker's own --restart to avoid two
+# supervisors fighting. --network host is required so SIP (5060) + RTP
+# (16384-32767) and the IMDSv2 public-ip lookup work without port mapping.
+ExecStartPre=-/usr/bin/docker rm -f bridgefu
+ExecStart=/usr/bin/docker run --rm --name bridgefu \
+    --network host \
+    -v /etc/bridgefu:/etc/bridgefu:ro \
+    bridgefu:latest --config /etc/bridgefu/bridgefu.yaml
+ExecStop=/usr/bin/docker stop bridgefu
+
+Restart=always
+RestartSec=2
+# Give the daemon time to drain the SIP/Chime legs on SIGTERM.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

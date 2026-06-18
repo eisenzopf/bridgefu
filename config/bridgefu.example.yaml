@@ -1,0 +1,34 @@
+# bridgefu configuration. Copy to /etc/bridgefu/bridgefu.yaml and edit.
+# AWS credentials are NOT here — they come from the EC2 instance role / default
+# AWS credential chain. Restart the service to apply changes.
+
+aws:
+  region: us-west-2
+  instance_id: 83a72e61-0000-0000-0000-000000000000        # your Connect instance id
+  contact_flow_id: 2a3b3059-0000-0000-0000-000000000000     # the agent/screen-pop flow
+
+sip:
+  bind_ip: 0.0.0.0
+  port: 5060
+  advertised_ip: auto        # "auto" → IMDSv2 public-ipv4 (the Elastic IP); or a literal IP
+  media_public_ip: auto      # SDP c=/m= public IP (EC2 1:1 NAT); "auto" or a literal IP
+
+contact:
+  default_display_name: "Vapi caller"
+  signaling_timeout_secs: 15
+  media_connect_timeout_secs: 30
+  keepalive_interval_secs: 10
+  session_idle_ttl_secs: 120
+
+mapping:
+  unmapped: drop             # drop | pass_prefixed
+  passthrough_prefix: "X-"
+  rename:                     # inbound SIP header  ->  Connect attribute key
+    X-Vapi-Customer-Id: HostedWidget-customerId
+    X-Vapi-Call-Id: HostedWidget-vapiCallId
+    X-Account-Tier: HostedWidget-accountTier
+
+observability:
+  log_level: "info,rvoip_amazon_connect=debug"
+  log_format: json           # json | pretty
+  http_bind: 0.0.0.0:9090    # serves /healthz and /metrics

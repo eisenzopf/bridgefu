@@ -1,0 +1,8 @@
+# Keep build artifacts and local cruft out of the Docker build context so the
+# `COPY bridgefu /src/bridgefu` layer stays small and cache-friendly. (Cargo.lock
+# IS shipped — we want reproducible builds.)
+target/
+.git/
+*.log
+/etc/
+deploy/*.tar.gz
