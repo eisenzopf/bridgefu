@@ -24,6 +24,7 @@ mapping:
   unmapped: drop             # drop | pass_prefixed
   passthrough_prefix: "X-"
   rename:                     # inbound SIP header  ->  Connect attribute key
+    X-Correlation-Id: correlation_id          # screen-pop key: Vapi sets this header; the Connect flow reads $.Attributes.correlation_id
     X-Vapi-Customer-Id: HostedWidget-customerId
     X-Vapi-Call-Id: HostedWidget-vapiCallId
     X-Account-Tier: HostedWidget-accountTier
