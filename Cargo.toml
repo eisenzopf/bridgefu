@@ -1,17 +1,17 @@
 [package]
 name = "bridgefu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Deployable SIP → Amazon Connect screen-pop gateway (Vapi transfer bridge)"
 license = "MIT"
 publish = false
 
 [dependencies]
-# Path dep — built against a local rvoip checkout in ALL environments (some rvoip
-# crates are not published to crates.io, so the registry tree won't resolve). The
-# Docker build (deploy/Dockerfile) clones github.com/eisenzopf/rvoip next to this
-# repo so the same `../rvoip` path resolves inside the image.
-rvoip-amazon-connect = { path = "../rvoip/crates/webrtc/rvoip-amazon-connect", features = ["server", "aws-control"] }
+# crates.io dep. The gateway crate `rvoip-amazon-connect` is independently
+# versioned (alpha train, 0.1.x); it depends on the rvoip `0.2.x` beta train
+# (rvoip-core / -sip / -media-core `^0.2.3`), so this resolves the 0.2.4 beta
+# train — including the G.711<->Opus transcode fix in rvoip-media-core 0.2.4.
+rvoip-amazon-connect = { version = "0.1.2", features = ["server", "aws-control"] }
 
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # deploy.sh — push the bridgefu source to the EC2 instance, build the Docker
-# image there (against the cloned rvoip workspace), and (re)start the systemd
-# service. Run from the bridgefu repo root.
+# image there (rvoip is fetched from crates.io during the build), and (re)start
+# the systemd service. Run from the bridgefu repo root.
 #
 # Required env vars:
 #   INSTANCE_IP   Public/Elastic IP of the instance (terraform output public_ip)
@@ -49,12 +49,10 @@ echo "==> [2/5] Installing config to /etc/bridgefu/bridgefu.yaml"
 scp "${SSH_OPTS[@]}" "$CONFIG" "${REMOTE}:/tmp/bridgefu.yaml"
 ssh_run "sudo install -D -m 0644 /tmp/bridgefu.yaml /etc/bridgefu/bridgefu.yaml && rm -f /tmp/bridgefu.yaml"
 
-echo "==> [3/5] Building image on instance (first cold build is slow; rvoip layers cache after)"
+echo "==> [3/5] Building image on instance (first cold build is slow; crates.io deps cache after)"
 ssh_run "set -e
-  cd '${REMOTE_DIR}'
-  if [ -d rvoip/.git ]; then git -C rvoip pull --ff-only || true; \
-  else git clone --depth 1 https://github.com/eisenzopf/rvoip rvoip; fi
-  docker build -t bridgefu:latest -f bridgefu/deploy/Dockerfile ."
+  cd '${REMOTE_DIR}/bridgefu'
+  docker build -t bridgefu:latest -f deploy/Dockerfile ."
 
 echo "==> [4/5] Installing + (re)starting systemd service"
 ssh_run "sudo install -D -m 0644 '${REMOTE_DIR}/bridgefu/deploy/bridgefu.service' /etc/systemd/system/bridgefu.service \

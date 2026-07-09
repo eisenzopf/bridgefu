@@ -1,26 +1,23 @@
 # bridgefu — multi-stage build.
 #
-# IMPORTANT: the build CONTEXT is the PARENT directory that holds *both* repos:
+# The build CONTEXT is the bridgefu repo root; the Dockerfile lives at
+# deploy/Dockerfile. Build from the repo root with:
 #
-#     /opt/build/rvoip      <- git clone https://github.com/eisenzopf/rvoip
-#     /opt/build/bridgefu   <- this repo (Dockerfile is bridgefu/deploy/Dockerfile)
+#     docker build -t bridgefu:latest -f deploy/Dockerfile .
 #
-# Build with:
-#     docker build -t bridgefu:latest -f bridgefu/deploy/Dockerfile /opt/build
-#
-# bridgefu/Cargo.toml depends on rvoip-amazon-connect by the relative path
-# `../rvoip/crates/webrtc/rvoip-amazon-connect`. We copy both trees so that the
-# same `../rvoip` path resolves inside the image — no Cargo.toml edits, and we
-# never touch crates.io (some rvoip crates are unpublished).
+# bridgefu depends on rvoip-amazon-connect from crates.io (Cargo.toml pins
+# `rvoip-amazon-connect = "0.1.2"`, which pulls rvoip-webrtc 0.1.2 + the 0.2.4
+# beta train). Cargo fetches the whole tree from the registry, so there is no
+# rvoip checkout to copy or clone — just this repo.
 
 # ---- builder ----------------------------------------------------------------
-# NOTE: the rvoip workspace declares rust-version = 1.88, but the resolved
-# dependency tree floor is higher — the AWS SDK crates (aws-smithy-*, aws-types)
-# in our Cargo.lock require rustc >= 1.91.1. Pin to 1.95 (matches the dev host).
-# bookworm → glibc, matched by the debian-slim runtime stage.
+# NOTE: the resolved dependency tree's rustc floor is set by the AWS SDK crates
+# (aws-smithy-*, aws-types) in our Cargo.lock, which require rustc >= 1.91.1.
+# Pin to 1.95 (matches the dev host). bookworm → glibc, matched by the
+# debian-slim runtime stage.
 FROM rust:1.95-bookworm AS builder
 
-# Build deps the rvoip tree needs:
+# Build deps the rvoip dependency tree needs (compiled from crates.io source):
 #  - protobuf-compiler: rvoip-amazon-connect build.rs (prost-build) needs protoc
 #  - cmake + clang + libclang-dev: media-core `opus` feature builds libopus
 #    (audiopus_sys) via cmake and generates bindings with bindgen/libclang
@@ -34,12 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-# Copy both trees. `.dockerignore` (bridgefu/.dockerignore) keeps target/ out.
-COPY rvoip /src/rvoip
-COPY bridgefu /src/bridgefu
-
 WORKDIR /src/bridgefu
+# Copy the repo. `.dockerignore` keeps target/, .git/, and logs out.
+COPY . /src/bridgefu
 # Release build uses bridgefu's own [profile.release] (thin LTO, opt-level 2),
 # which governs the whole dependency tree.
 RUN cargo build --release \
