@@ -48,6 +48,14 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
+# Cargo patches are resolved by the top-level build root, so Bridgefu repeats
+# rvoip's exact reviewed rtc fork pin. This ensures container and CI builds use
+# the late-DataChannel and DCEP reliability fixes rather than the unfixed alpha
+# from crates.io. Do not change this revision or submit it upstream without
+# project-owner review.
+[patch.crates-io]
+rtc = { git = "https://github.com/eisenzopf/rtc", rev = "1e5b7d4be6d94850694f2519f4c235d16c871d53" }
+
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are
 # memory- and time-hungry across the full SIP/WebRTC/AWS tree). `thin` LTO + many

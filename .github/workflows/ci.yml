@@ -22,7 +22,7 @@ jobs:
           # Coordinated Bridgefu 1.0 foundation revision. Update this only
           # after the matching rvoip change set is green and available on
           # the remote; never replace it with a floating branch.
-          ref: 59e569e374709fd6bd0db919ae05524268eb0b1f
+          ref: b8c1f25b5e797c00012cca1fe66d252ba3f8bd5d
           path: rvoip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -32,7 +32,10 @@ jobs:
             rvoip
       - run: cargo test --locked --all-targets
         working-directory: bridgefu
-      - run: cargo test --locked -p rvoip-auth-core -p rvoip-core -p rvoip-uctp -p rvoip-quic -p rvoip-moq
+      # rvoip is a library workspace and intentionally does not commit its
+      # Cargo.lock. Bridgefu's preceding locked build is the reproducible
+      # consumer graph; this second pass exercises rvoip-only package tests.
+      - run: cargo test -p rvoip-auth-core -p rvoip-core -p rvoip-uctp -p rvoip-quic -p rvoip-moq
         working-directory: rvoip
 
   image:
@@ -44,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: eisenzopf/rvoip
-          ref: 59e569e374709fd6bd0db919ae05524268eb0b1f
+          ref: b8c1f25b5e797c00012cca1fe66d252ba3f8bd5d
           path: rvoip
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6

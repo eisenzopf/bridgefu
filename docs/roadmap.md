@@ -13,6 +13,9 @@ Documentation, Terraform, or API scaffolding alone does not complete a gate.
 - rvoip branch: `codex/bridgefu-1.0-rvoip`
 - Production StandardCharter deployment and public artifact publication are not
   authorized by this roadmap.
+- Upstream pull requests, issues, or other maintainer outreach require explicit
+  user review and approval. Dependency fixes may be developed and pinned on the
+  `eisenzopf` forks before that review.
 
 Baseline evidence recorded on 2026-07-10:
 
@@ -35,6 +38,11 @@ MOQT is implemented in three layers:
 MOQT draft-19, MSF draft-01, and LOC draft-03. Incompatible peers are rejected
 explicitly. Draft changes are never adopted automatically; scheduled CI only
 reports changes in the IETF drafts or upstream implementation.
+
+The WebRTC alpha dependency follows the same reviewed-fork rule. rvoip pins an
+exact `eisenzopf/rtc` revision for post-handshake DataChannel creation and DCEP
+partial-reliability fixes. A port to the current upstream branch may be kept on
+the fork for review, but it is not submitted upstream without explicit approval.
 
 ### Transport roles
 
@@ -103,19 +111,37 @@ Exit: all existing work is accounted for and the baseline is reproducible.
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
 
-### Gate 2 — Complete rvoip foundations (`in progress`)
+### Gate 2 — Complete rvoip foundations (`complete`)
 
-- [ ] Move `AuthenticatedPrincipal` to core traits and preserve issuer, tenant,
+- [x] Move `AuthenticatedPrincipal` to core traits and preserve issuer, tenant,
   subject, scopes, expiry, method, and assurance through every validator/event.
-- [ ] Add transport-neutral DataMessage adapter, Orchestrator, and client APIs.
-- [ ] Complete MediaGraph IDs, snapshots, codec grouping, bounded fanout,
+- [x] Add transport-neutral DataMessage adapter, Orchestrator, and client APIs.
+- [x] Complete MediaGraph IDs, snapshots, codec grouping, bounded fanout,
   queue/transcoder diagnostics, and aggregate-safe metrics.
-- [ ] Preserve compatibility through re-exports and legacy wrappers.
+- [x] Preserve compatibility through re-exports and legacy wrappers.
+
+Gate 2 evidence recorded on 2026-07-10:
+
+- rvoip revision `b8c1f25b5e797c00012cca1fe66d252ba3f8bd5d` is pushed on
+  `codex/bridgefu-1.0-rvoip`; Bridgefu CI pins that exact revision.
+- The complete rvoip workspace passes `cargo check --workspace --all-targets`.
+- Focused foundation, identity, UCTP, client, WebRTC, and Amazon suites pass
+  441 tests with zero failures; QUIC, WebTransport, and WebSocket adapters
+  compile together.
+- The reviewed rtc alpha fork revision
+  `1e5b7d4be6d94850694f2519f4c235d16c871d53` passes 167 library tests and is
+  exact-pinned by both rvoip and the top-level Bridgefu build. Bridgefu's
+  locked consumer graph passes all 34 tests.
+- The current rtc-line port remains review-only on the `eisenzopf/rtc` fork at
+  revision `a26e9b080a68cdf4210d7f34e227006625c89668`; no upstream submission is
+  open.
+- Migration and compatibility guidance is recorded in rvoip's
+  `docs/BRIDGEFU_FOUNDATIONS_MIGRATION.md`.
 
 Exit: validator parity, ownership isolation, DataMessage round trips, and
 MediaGraph stress tests pass.
 
-### Gate 3 — Harden rvoip authentication and lifecycle (`pending`)
+### Gate 3 — Harden rvoip authentication and lifecycle (`in progress`)
 
 - [ ] Authenticate WS/WSS before upgrade and enforce full route ownership.
 - [ ] Enforce SIP Digest, Bearer, trusted-CIDR, and server-verified mTLS at the
@@ -149,7 +175,8 @@ wire suite passes.
   subscribers, embedded/external relays, mTLS, authorization, reconnect,
   health, and drain.
 - [ ] Interoperate with the patched moq-rs stack and an independent matching
-  implementation; upstream the moq-rs changes.
+  implementation; prepare the moq-rs patch for user review before any upstream
+  submission.
 
 Exit: both substrates traverse a relay and version, packet-capture, and
 interoperability suites pass.
