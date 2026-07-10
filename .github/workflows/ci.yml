@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bridgefu
+      - uses: actions/checkout@v4
+        with:
+          repository: eisenzopf/rvoip
+          # Coordinated Bridgefu 1.0 foundation revision. Update this only
+          # after the matching rvoip change set is green and available on
+          # the remote; never replace it with a floating branch.
+          ref: 8de84899560922190bcaac386ba8e7dc11e4e3c8
+          path: rvoip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bridgefu
+            rvoip
+      - run: cargo test --locked --all-targets
+        working-directory: bridgefu
+      - run: cargo test --locked -p rvoip-auth-core -p rvoip-core -p rvoip-uctp -p rvoip-quic -p rvoip-moq
+        working-directory: rvoip
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bridgefu
+      - uses: actions/checkout@v4
+        with:
+          repository: eisenzopf/rvoip
+          ref: 8de84899560922190bcaac386ba8e7dc11e4e3c8
+          path: rvoip
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: bridgefu
+          file: bridgefu/Dockerfile
+          build-contexts: rvoip=./rvoip
+          tags: bridgefu:ci
+          load: true
+      - uses: anchore/sbom-action@v0
+        with:
+          image: bridgefu:ci
+          format: spdx-json
+          output-file: bridgefu.spdx.json
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: bridgefu:ci
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif

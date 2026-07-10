@@ -84,8 +84,8 @@ Active calls remain pinned and are drained rather than migrated.
 - [x] Preserve the existing dirty worktrees on coordinated branches.
 - [x] Record exact starting revisions.
 - [x] Run and record the baseline test matrix.
-- [ ] Separate existing scaffolding from new functional changes.
-- [ ] Pin Bridgefu CI to an exact rvoip revision rather than floating `main`.
+- [x] Separate existing scaffolding from new functional changes.
+- [x] Pin Bridgefu CI to an exact rvoip revision rather than floating `main`.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
 
