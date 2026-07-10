@@ -81,6 +81,10 @@ async fn main() -> Result<()> {
     let server = ConnectScreenPopServer::build(server_cfg)
         .await
         .map_err(|e| anyhow::anyhow!("building gateway: {e}"))?;
+    // Subscribe before `serve()` can emit the first INVITE lifecycle event.
+    // The broadcast channel intentionally has no replay buffer for late
+    // subscribers.
+    let lifecycle_events = server.subscribe_lifecycle();
 
     observability::spawn_metrics_updater(server.clone(), tenants.clone());
 
@@ -92,10 +96,20 @@ async fn main() -> Result<()> {
 
     let api_state =
         api::ApiState::from_config(&cfg, server.clone(), prom, tenants, generic_runtime.clone())?;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut lifecycle_task = screen_pop_evidence::spawn_lifecycle_ingest(
+        lifecycle_events,
+        api_state.screen_pop_evidence_store(),
+        shutdown_tx.subscribe(),
+    );
     let app = api::router(api_state);
 
     // Control/health/metrics HTTP server, shut down on the same signal as the gateway.
-    let http = tokio::spawn(api::serve(http_bind, app, shutdown_signal()));
+    let mut http = tokio::spawn(api::serve(
+        http_bind,
+        app,
+        wait_for_shutdown(shutdown_tx.subscribe()),
+    ));
 
     // Run the SIP→Connect gateway until a shutdown signal.
     tokio::select! {
@@ -111,8 +125,27 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Give the HTTP server a moment to drain (its own shutdown future fires too).
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), http).await;
+    let _ = shutdown_tx.send(true);
+    // The lifecycle consumer must stop before its store and API state are
+    // dropped. Abort only as a bounded fallback for a runtime bug.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut lifecycle_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("screen-pop lifecycle consumer did not stop; aborting task");
+        lifecycle_task.abort();
+        let _ = lifecycle_task.await;
+    }
+
+    // Give the HTTP server a moment to drain from the shared shutdown signal.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut http)
+        .await
+        .is_err()
+    {
+        tracing::warn!("HTTP API did not drain; aborting task");
+        http.abort();
+        let _ = http.await;
+    }
     if let Some(runtime) = generic_runtime {
         runtime
             .shutdown(std::time::Duration::from_secs(
@@ -122,6 +155,17 @@ async fn main() -> Result<()> {
     }
     tracing::info!("bridgefu stopped");
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM (systemd/Docker stop).

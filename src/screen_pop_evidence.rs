@@ -11,8 +11,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use rvoip_amazon_connect::{ScreenPopLifecycleEvent, ScreenPopLifecycleStage};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::{broadcast, watch};
+use tokio::task::JoinHandle;
 
 pub const DEFAULT_SCREEN_POP_EVIDENCE_TTL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY: usize = 10_000;
@@ -375,6 +378,147 @@ impl ScreenPopEvidenceStore {
     }
 }
 
+/// Start the Bridgefu consumer for rvoip's sanitized lifecycle feed.
+///
+/// The caller must create `receiver` with `server.subscribe_lifecycle()` before
+/// starting `server.serve()`, otherwise the broadcast channel cannot replay
+/// setup events emitted before subscription.
+pub fn spawn_lifecycle_ingest(
+    mut receiver: broadcast::Receiver<ScreenPopLifecycleEvent>,
+    store: ScreenPopEvidenceStore,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                received = receiver.recv() => {
+                    match received {
+                        Ok(event) => {
+                            record_lifecycle_event(&store, event);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            metrics::counter!(
+                                "bridgefu_screen_pop_lifecycle_errors_total",
+                                "error" => "receiver_lagged"
+                            )
+                            .increment(skipped);
+                            tracing::warn!(skipped, "screen-pop lifecycle receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            metrics::counter!(
+                                "bridgefu_screen_pop_lifecycle_errors_total",
+                                "error" => "receiver_closed"
+                            )
+                            .increment(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Map and record one rvoip lifecycle event. This is also the deterministic
+/// seam used by the StandardCharter diagnostics contract test.
+pub fn record_lifecycle_event(
+    store: &ScreenPopEvidenceStore,
+    event: ScreenPopLifecycleEvent,
+) -> LifecycleRecordResult {
+    let stage_label = lifecycle_stage_label(event.stage);
+    let lag = Utc::now()
+        .signed_duration_since(event.occurred_at)
+        .to_std()
+        .unwrap_or_default()
+        .as_secs_f64();
+    metrics::histogram!(
+        "bridgefu_screen_pop_lifecycle_lag_seconds",
+        "stage" => stage_label
+    )
+    .record(lag);
+
+    let Some(correlation_id) = event.correlation_id.as_deref() else {
+        metrics::counter!(
+            "bridgefu_screen_pop_lifecycle_errors_total",
+            "error" => "missing_correlation"
+        )
+        .increment(1);
+        return LifecycleRecordResult::MissingCorrelation;
+    };
+    let (stage, terminal_reason) = map_lifecycle_stage(event.stage);
+    match store.record(correlation_id, stage, event.occurred_at, terminal_reason) {
+        Ok(_) => {
+            metrics::counter!(
+                "bridgefu_screen_pop_lifecycle_events_total",
+                "stage" => stage_label,
+                "result" => "recorded"
+            )
+            .increment(1);
+            LifecycleRecordResult::Recorded
+        }
+        Err(error) => {
+            metrics::counter!(
+                "bridgefu_screen_pop_lifecycle_events_total",
+                "stage" => stage_label,
+                "result" => "rejected"
+            )
+            .increment(1);
+            metrics::counter!(
+                "bridgefu_screen_pop_lifecycle_errors_total",
+                "error" => "store_rejected"
+            )
+            .increment(1);
+            tracing::warn!(stage = stage_label, error = %error, "screen-pop lifecycle evidence rejected");
+            LifecycleRecordResult::Rejected(error)
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum LifecycleRecordResult {
+    Recorded,
+    MissingCorrelation,
+    Rejected(ScreenPopEvidenceError),
+}
+
+fn map_lifecycle_stage(
+    stage: ScreenPopLifecycleStage,
+) -> (ScreenPopStage, Option<ScreenPopTerminalReason>) {
+    match stage {
+        ScreenPopLifecycleStage::SipInviteReceived => (ScreenPopStage::SipInviteReceived, None),
+        ScreenPopLifecycleStage::AttributesMapped => (ScreenPopStage::AttributesMapped, None),
+        ScreenPopLifecycleStage::ContactStarted => (ScreenPopStage::ContactStarted, None),
+        ScreenPopLifecycleStage::MediaConnected => (ScreenPopStage::MediaConnected, None),
+        ScreenPopLifecycleStage::TeardownStarted => (ScreenPopStage::TeardownStarted, None),
+        ScreenPopLifecycleStage::Terminated => (
+            ScreenPopStage::Terminated,
+            Some(ScreenPopTerminalReason::NormalHangup),
+        ),
+        ScreenPopLifecycleStage::Failed => (
+            ScreenPopStage::Failed,
+            Some(ScreenPopTerminalReason::InternalError),
+        ),
+    }
+}
+
+fn lifecycle_stage_label(stage: ScreenPopLifecycleStage) -> &'static str {
+    match stage {
+        ScreenPopLifecycleStage::SipInviteReceived => "sip_invite_received",
+        ScreenPopLifecycleStage::AttributesMapped => "attributes_mapped",
+        ScreenPopLifecycleStage::ContactStarted => "contact_started",
+        ScreenPopLifecycleStage::MediaConnected => "media_connected",
+        ScreenPopLifecycleStage::TeardownStarted => "teardown_started",
+        ScreenPopLifecycleStage::Terminated => "terminated",
+        ScreenPopLifecycleStage::Failed => "failed",
+    }
+}
+
 fn validate_correlation_id(correlation_id: &str) -> Result<(), ScreenPopEvidenceError> {
     if correlation_id.is_empty() || correlation_id.len() > MAX_CORRELATION_ID_BYTES {
         return Err(ScreenPopEvidenceError::InvalidCorrelationId);
@@ -628,5 +772,146 @@ mod tests {
         assert!(!metrics.contains(correlation));
         assert!(metrics.contains("stage=\"sip_invite_received\""));
         assert!(!metrics.contains("correlation_id="));
+    }
+
+    #[test]
+    fn rvoip_lifecycle_feed_matches_standardcharter_diagnostics_contract() {
+        let clock = ManualClock::new();
+        let store = store(clock, Duration::from_secs(60), 4);
+        let correlation = "+14155550199";
+        let base = DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            for (offset, stage) in [
+                ScreenPopLifecycleStage::SipInviteReceived,
+                ScreenPopLifecycleStage::AttributesMapped,
+                ScreenPopLifecycleStage::ContactStarted,
+                ScreenPopLifecycleStage::MediaConnected,
+                ScreenPopLifecycleStage::TeardownStarted,
+                ScreenPopLifecycleStage::Terminated,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    record_lifecycle_event(
+                        &store,
+                        ScreenPopLifecycleEvent {
+                            stage,
+                            correlation_id: Some(correlation.into()),
+                            occurred_at: base + TimeDelta::seconds(offset as i64),
+                        },
+                    ),
+                    LifecycleRecordResult::Recorded
+                );
+            }
+        });
+
+        let evidence = store.get(correlation).expect("correlated evidence");
+        let json = serde_json::to_value(&evidence).unwrap();
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains(correlation));
+        assert_eq!(json.as_object().unwrap().len(), 2);
+        assert_eq!(json["correlation_fingerprint"], "e8d461284346");
+        for stage in [
+            "sip_invite_received",
+            "attributes_mapped",
+            "contact_started",
+            "media_connected",
+            "teardown_started",
+            "terminated",
+        ] {
+            assert_eq!(json["stages"][stage]["observed"], true);
+            assert!(json["stages"][stage]["at"].is_string());
+        }
+        assert_eq!(
+            json["stages"]["terminated"]["terminal_reason"],
+            "normal_hangup"
+        );
+        assert!(json["stages"].get("failed").is_none());
+
+        let metrics = handle.render();
+        assert!(!metrics.contains(correlation));
+        assert!(!metrics.contains("correlation_id="));
+        assert!(metrics.contains("stage=\"media_connected\""));
+        assert!(metrics.contains("stage=\"terminated\""));
+
+        let failed_correlation = "failed-correlation";
+        assert_eq!(
+            record_lifecycle_event(
+                &store,
+                ScreenPopLifecycleEvent {
+                    stage: ScreenPopLifecycleStage::SipInviteReceived,
+                    correlation_id: Some(failed_correlation.into()),
+                    occurred_at: base,
+                },
+            ),
+            LifecycleRecordResult::Recorded
+        );
+        assert_eq!(
+            record_lifecycle_event(
+                &store,
+                ScreenPopLifecycleEvent {
+                    stage: ScreenPopLifecycleStage::Failed,
+                    correlation_id: Some(failed_correlation.into()),
+                    occurred_at: base + TimeDelta::seconds(1),
+                },
+            ),
+            LifecycleRecordResult::Recorded
+        );
+        assert_eq!(
+            store
+                .get(failed_correlation)
+                .unwrap()
+                .stages
+                .failed
+                .unwrap()
+                .terminal_reason,
+            Some(ScreenPopTerminalReason::InternalError)
+        );
+        assert_eq!(
+            record_lifecycle_event(
+                &store,
+                ScreenPopLifecycleEvent {
+                    stage: ScreenPopLifecycleStage::SipInviteReceived,
+                    correlation_id: None,
+                    occurred_at: base,
+                },
+            ),
+            LifecycleRecordResult::MissingCorrelation
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ingest_stops_on_shutdown() {
+        let clock = ManualClock::new();
+        let store = store(clock, Duration::from_secs(60), 4);
+        let (events_tx, events_rx) = broadcast::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_lifecycle_ingest(events_rx, store.clone(), shutdown_rx);
+        events_tx
+            .send(ScreenPopLifecycleEvent {
+                stage: ScreenPopLifecycleStage::SipInviteReceived,
+                correlation_id: Some("corr-shutdown".into()),
+                occurred_at: Utc::now(),
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.get("corr-shutdown").is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle event was consumed");
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("lifecycle task stopped")
+            .expect("lifecycle task did not panic");
     }
 }
