@@ -12,6 +12,7 @@ mod imds;
 mod observability;
 mod providers;
 mod runtime;
+mod screen_pop_evidence;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

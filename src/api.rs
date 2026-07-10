@@ -35,6 +35,10 @@ use crate::providers::{
     NormalizedProviderEvent, OriginateCommand, ProviderError, ProviderRegistry, WebhookRequest,
 };
 use crate::runtime::GenericBridgeRuntime;
+use crate::screen_pop_evidence::{
+    ScreenPopEvidence, ScreenPopEvidenceStore, DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY,
+    DEFAULT_SCREEN_POP_EVIDENCE_TTL,
+};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -55,6 +59,7 @@ pub struct ApiState {
     api_enabled: bool,
     context_policy: ContextPolicy,
     generic_runtime: Option<Arc<GenericBridgeRuntime>>,
+    screen_pop_evidence: ScreenPopEvidenceStore,
 }
 
 struct ActiveBroadcast {
@@ -93,6 +98,10 @@ impl ApiState {
                 "control API has no bearer token; configure api.bearer_token in production"
             );
         }
+        let screen_pop_evidence = ScreenPopEvidenceStore::new(
+            DEFAULT_SCREEN_POP_EVIDENCE_TTL,
+            DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY,
+        )?;
         Ok(Self {
             server,
             providers,
@@ -115,7 +124,13 @@ impl ApiState {
             api_enabled: config.api.enabled,
             context_policy: config.context.clone(),
             generic_runtime,
+            screen_pop_evidence,
         })
+    }
+
+    /// Clone the handle that the rvoip lifecycle-event bridge will feed.
+    pub fn screen_pop_evidence_store(&self) -> ScreenPopEvidenceStore {
+        self.screen_pop_evidence.clone()
     }
 }
 
@@ -141,6 +156,10 @@ pub fn router(state: ApiState) -> Router {
                 post(create_broadcast_token),
             )
             .route("/diagnostics", get(diagnostics))
+            .route(
+                "/v1/diagnostics/screen-pop/:correlation_id",
+                get(get_screen_pop_evidence),
+            )
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_api_auth,
@@ -756,6 +775,30 @@ async fn diagnostics(State(state): State<ApiState>) -> Json<Value> {
     }))
 }
 
+async fn get_screen_pop_evidence(
+    State(state): State<ApiState>,
+    Path(correlation_id): Path<String>,
+) -> Result<Json<ScreenPopEvidence>, ApiError> {
+    match state.screen_pop_evidence.get(&correlation_id) {
+        Some(evidence) => {
+            metrics::counter!(
+                "bridgefu_screen_pop_evidence_lookups_total",
+                "result" => "hit"
+            )
+            .increment(1);
+            Ok(Json(evidence))
+        }
+        None => {
+            metrics::counter!(
+                "bridgefu_screen_pop_evidence_lookups_total",
+                "result" => "miss"
+            )
+            .increment(1);
+            Err(ApiError::not_found("screen-pop evidence not found"))
+        }
+    }
+}
+
 fn broadcast_label(kind: BroadcastKind) -> &'static str {
     match kind {
         BroadcastKind::Moqt => "moqt",
@@ -826,5 +869,143 @@ impl From<ProviderError> for ApiError {
                 error.to_string(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use axum::body::{to_bytes, Body};
+    use rvoip_amazon_connect::{
+        ConnectContactStarter, ConnectError, ConnectionData, StartContactRequest,
+    };
+    use tower::ServiceExt;
+
+    use crate::screen_pop_evidence::ScreenPopStage;
+
+    struct UnusedStarter;
+
+    #[async_trait]
+    impl ConnectContactStarter for UnusedStarter {
+        async fn start_webrtc_contact(
+            &self,
+            _request: StartContactRequest,
+        ) -> rvoip_amazon_connect::Result<ConnectionData> {
+            Err(ConnectError::Control(
+                "diagnostics test never starts a contact".into(),
+            ))
+        }
+    }
+
+    fn available_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("reserve diagnostics test port")
+            .local_addr()
+            .expect("reserved diagnostics test address")
+            .port()
+    }
+
+    async fn diagnostics_test_state() -> ApiState {
+        let yaml = format!(
+            r#"
+aws:
+  region: us-west-2
+  instance_id: instance-test
+  contact_flow_id: flow-test
+sip:
+  bind_ip: 127.0.0.1
+  port: {}
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+api:
+  enabled: true
+  bearer_token: diagnostics-secret
+broadcast:
+  token_secret: test-broadcast-secret
+"#,
+            available_udp_port()
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("diagnostics config parses");
+        config.validate().expect("diagnostics config is valid");
+        let server_config = config
+            .into_server_config_with_starter(Arc::new(UnusedStarter))
+            .await
+            .expect("diagnostics server config builds");
+        let server = ConnectScreenPopServer::build(server_config)
+            .await
+            .expect("diagnostics SIP server builds");
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        ApiState::from_config(
+            &config,
+            server,
+            recorder.handle(),
+            config.tenant_names().unwrap(),
+            None,
+        )
+        .expect("diagnostics API state builds")
+    }
+
+    async fn get(app: &Router, uri: &str, bearer: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = bearer {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .expect("diagnostics request completes")
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("diagnostics response body");
+        serde_json::from_slice(&bytes).expect("diagnostics response JSON")
+    }
+
+    #[tokio::test]
+    async fn screen_pop_diagnostics_require_auth_and_redact_correlation() {
+        let state = diagnostics_test_state().await;
+        let correlation_id = "+14155550199";
+        let evidence = state.screen_pop_evidence_store();
+        evidence
+            .record_now(correlation_id, ScreenPopStage::SipInviteReceived, None)
+            .unwrap();
+        evidence
+            .record_now(correlation_id, ScreenPopStage::AttributesMapped, None)
+            .unwrap();
+        let app = router(state);
+        let path = "/v1/diagnostics/screen-pop/%2B14155550199";
+
+        assert_eq!(
+            get(&app, path, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(&app, path, Some("wrong-secret")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let missing = get(
+            &app,
+            "/v1/diagnostics/screen-pop/unknown-correlation",
+            Some("diagnostics-secret"),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_body = serde_json::to_string(&response_json(missing).await).unwrap();
+        assert!(!missing_body.contains("unknown-correlation"));
+
+        let response = get(&app, path, Some("diagnostics-secret")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains(correlation_id));
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        assert_eq!(body["correlation_fingerprint"], "e8d461284346");
+        assert_eq!(body["stages"]["sip_invite_received"]["observed"], true);
+        assert_eq!(body["stages"]["attributes_mapped"]["observed"], true);
+        assert!(body["stages"]["sip_invite_received"]["at"].is_string());
     }
 }

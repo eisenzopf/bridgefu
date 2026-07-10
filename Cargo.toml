@@ -45,6 +45,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are
 # memory- and time-hungry across the full SIP/WebRTC/AWS tree). `thin` LTO + many
