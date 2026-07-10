@@ -5,15 +5,19 @@
 //! StartWebRTCContact → Chime media bridge), and serves `/healthz` + `/metrics`,
 //! until SIGTERM/SIGINT triggers a graceful shutdown.
 
+mod api;
 mod config;
+mod context;
 mod imds;
 mod observability;
+mod providers;
+mod runtime;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rvoip_amazon_connect::ConnectScreenPopServer;
 
 #[derive(Parser, Debug)]
@@ -22,12 +26,36 @@ struct Args {
     /// Path to the YAML config file.
     #[arg(short, long, default_value = "/etc/bridgefu/bridgefu.yaml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum Command {
+    /// Run the configured Bridgefu process (the default).
+    Run,
+    /// Parse configuration, apply environment overrides, and exit.
+    Validate,
+    /// Print the effective configuration with all secrets redacted.
+    PrintEffectiveConfig,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = config::Config::load(&args.config)?;
+
+    match args.command.clone().unwrap_or(Command::Run) {
+        Command::Validate => {
+            println!("configuration is valid: {}", args.config.display());
+            return Ok(());
+        }
+        Command::PrintEffectiveConfig => {
+            print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
+            return Ok(());
+        }
+        Command::Run => {}
+    }
 
     observability::init_tracing(&cfg.observability.log_level, &cfg.observability.log_format)?;
     let prom = observability::install_metrics()?;
@@ -40,11 +68,12 @@ async fn main() -> Result<()> {
         "starting bridgefu"
     );
 
-    let http_bind: SocketAddr = cfg
-        .observability
-        .http_bind
-        .parse()
-        .with_context(|| format!("invalid observability.http_bind: {}", cfg.observability.http_bind))?;
+    let http_bind: SocketAddr = cfg.observability.http_bind.parse().with_context(|| {
+        format!(
+            "invalid observability.http_bind: {}",
+            cfg.observability.http_bind
+        )
+    })?;
 
     // Build the gateway from config (resolves AWS creds + any `auto` IPs).
     let server_cfg = cfg.into_server_config().await?;
@@ -54,13 +83,18 @@ async fn main() -> Result<()> {
 
     observability::spawn_metrics_updater(server.clone(), tenants.clone());
 
-    // Health/metrics HTTP server, shut down on the same signal as the gateway.
-    let http = tokio::spawn(observability::serve_http(
-        http_bind,
-        prom,
-        tenants,
-        shutdown_signal(),
-    ));
+    let generic_runtime = if cfg.generic_bridge.enabled {
+        Some(runtime::GenericBridgeRuntime::start(&cfg.generic_bridge, &cfg.runtime).await?)
+    } else {
+        None
+    };
+
+    let api_state =
+        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, generic_runtime.clone())?;
+    let app = api::router(api_state);
+
+    // Control/health/metrics HTTP server, shut down on the same signal as the gateway.
+    let http = tokio::spawn(api::serve(http_bind, app, shutdown_signal()));
 
     // Run the SIP→Connect gateway until a shutdown signal.
     tokio::select! {
@@ -78,6 +112,13 @@ async fn main() -> Result<()> {
 
     // Give the HTTP server a moment to drain (its own shutdown future fires too).
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), http).await;
+    if let Some(runtime) = generic_runtime {
+        runtime
+            .shutdown(std::time::Duration::from_secs(
+                cfg.runtime.drain_timeout_secs,
+            ))
+            .await;
+    }
     tracing::info!("bridgefu stopped");
     Ok(())
 }

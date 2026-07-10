@@ -1,19 +1,17 @@
-//! Logging (tracing) + a small HTTP server exposing `/healthz` and `/metrics`.
+//! Structured logging and process metrics.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, routing::get, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use rvoip_amazon_connect::ConnectScreenPopServer;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 /// Initialize tracing from the configured level + format (`json` | `pretty`).
 pub fn init_tracing(level: &str, format: &str) -> Result<()> {
-    let filter = EnvFilter::try_new(level)
-        .with_context(|| format!("invalid log_level filter: {level}"))?;
+    let filter =
+        EnvFilter::try_new(level).with_context(|| format!("invalid log_level filter: {level}"))?;
     let registry = tracing_subscriber::registry().with(filter);
     match format {
         "pretty" => registry
@@ -36,43 +34,6 @@ pub fn install_metrics() -> Result<PrometheusHandle> {
     PrometheusBuilder::new()
         .install_recorder()
         .context("installing Prometheus recorder")
-}
-
-/// Serve `/healthz` (liveness + loaded tenants, CONTRACTS.md B.4) and
-/// `/metrics` (Prometheus) until `shutdown`.
-pub async fn serve_http(
-    bind: SocketAddr,
-    handle: PrometheusHandle,
-    tenants: Vec<String>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Result<()> {
-    // The tenant set is fixed for the process lifetime (the reconciler
-    // restarts bridgefu on config change), so the body is pre-rendered.
-    let healthz = serde_json::json!({ "ok": true, "tenants": tenants }).to_string();
-    let app = Router::new()
-        .route(
-            "/healthz",
-            get(move || async move {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    healthz,
-                )
-            }),
-        )
-        .route(
-            "/metrics",
-            get(|State(h): State<PrometheusHandle>| async move { h.render() }),
-        )
-        .with_state(handle);
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding observability HTTP on {bind}"))?;
-    tracing::info!(%bind, "observability HTTP server listening (/healthz, /metrics)");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("observability HTTP server")
 }
 
 /// Periodically publish the per-tenant route counters as Prometheus gauges

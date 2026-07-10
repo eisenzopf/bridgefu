@@ -23,9 +23,14 @@ use rvoip_amazon_connect::{
     SipConfig, UnmappedPolicy,
 };
 
+use crate::context::ContextPolicy;
+use crate::providers::{ProviderConfigs, SecretRef};
+
 /// Top-level config (see `config/bridgefu.example.yaml`).
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
     pub aws: AwsCfg,
     pub sip: SipCfg,
     #[serde(default)]
@@ -44,6 +49,67 @@ pub struct Config {
     /// `sip:banking@<eip>`).
     #[serde(default)]
     pub tenants: BTreeMap<String, TenantCfg>,
+    #[serde(default)]
+    pub runtime: RuntimeCfg,
+    #[serde(default)]
+    pub api: ApiCfg,
+    #[serde(default)]
+    pub providers: ProviderConfigs,
+    #[serde(default)]
+    pub broadcast: BroadcastCfg,
+    #[serde(default)]
+    pub context: ContextPolicy,
+    #[serde(default)]
+    pub generic_bridge: GenericBridgeCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenericBridgeCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_generic_sip_bind")]
+    pub sip_bind: String,
+    #[serde(default = "default_webrtc_ws_bind")]
+    pub webrtc_ws_bind: String,
+    #[serde(default = "default_webrtc_whip_bind")]
+    pub webrtc_whip_bind: String,
+    #[serde(default)]
+    pub bearer_token: Option<SecretRef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeCfg {
+    #[serde(default = "default_runtime_mode")]
+    pub mode: String,
+    #[serde(default = "default_max_calls")]
+    pub max_concurrent_calls: usize,
+    #[serde(default = "default_setup_timeout")]
+    pub setup_timeout_secs: u64,
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApiCfg {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional shared Bearer API key. Use `env:VARIABLE` in production.
+    #[serde(default)]
+    pub bearer_token: Option<SecretRef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BroadcastCfg {
+    #[serde(default = "default_broadcast_transport")]
+    pub default_transport: String,
+    #[serde(default = "default_broadcast_ttl")]
+    pub token_ttl_secs: u64,
+    #[serde(default = "default_max_broadcasts")]
+    pub max_active: usize,
+    #[serde(default)]
+    pub public_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_secret: Option<SecretRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,13 +193,56 @@ pub struct ObsCfg {
 impl Config {
     /// Parse a YAML config file.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {}", path.display()))?;
+        let value = effective_value(path)?;
         let cfg: Self =
-            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            serde_yaml::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()?;
         cfg.resolved_tenants()
             .with_context(|| format!("validating {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Effective YAML after `BRIDGEFU__SECTION__KEY` environment overrides,
+    /// with credential-bearing values replaced by `[redacted]`.
+    pub fn redacted_effective_yaml(path: &std::path::Path) -> Result<String> {
+        let mut value = effective_value(path)?;
+        redact_secrets(&mut value);
+        serde_yaml::to_string(&value).context("serializing effective configuration")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.config_version != 1 {
+            return Err(anyhow!(
+                "unsupported config_version {}",
+                self.config_version
+            ));
+        }
+        if !matches!(
+            self.runtime.mode.as_str(),
+            "all-in-one" | "gateway" | "worker" | "moq-relay"
+        ) {
+            return Err(anyhow!(
+                "invalid runtime.mode {}; expected all-in-one|gateway|worker|moq-relay",
+                self.runtime.mode
+            ));
+        }
+        if self.runtime.max_concurrent_calls == 0 {
+            return Err(anyhow!(
+                "runtime.max_concurrent_calls must be greater than zero"
+            ));
+        }
+        if !matches!(
+            self.broadcast.default_transport.as_str(),
+            "moqt" | "uctp-quic"
+        ) {
+            return Err(anyhow!(
+                "broadcast.default_transport must be moqt or uctp-quic"
+            ));
+        }
+        if self.broadcast.max_active == 0 {
+            return Err(anyhow!("broadcast.max_active must be greater than zero"));
+        }
+        Ok(())
     }
 
     /// Resolve the effective routing table: `(user part → route, effective
@@ -215,6 +324,21 @@ impl Config {
     /// Build the `rvoip-amazon-connect` server config from this YAML. Async
     /// because it resolves AWS credentials and may query IMDS for `auto` IPs.
     pub async fn into_server_config(&self) -> Result<ScreenPopServerConfig> {
+        let starter: Arc<dyn ConnectContactStarter> =
+            Arc::new(AwsConnectStarter::from_env(Some(self.aws.region.clone())).await);
+        self.into_server_config_with_starter(starter).await
+    }
+
+    /// Build the server config with an explicit Amazon Connect control-plane
+    /// implementation.
+    ///
+    /// Production uses [`Self::into_server_config`]. This injection seam keeps
+    /// the Vapi SIP -> Connect request contract testable without AWS credentials
+    /// or a live Connect instance.
+    pub async fn into_server_config_with_starter(
+        &self,
+        starter: Arc<dyn ConnectContactStarter>,
+    ) -> Result<ScreenPopServerConfig> {
         let (table, default_tenant) = self.resolved_tenants()?;
 
         // --- connect defaults (every real call is routed, so the empty
@@ -227,7 +351,8 @@ impl Config {
         .with_attribute_mapping(attribute_mapping(&self.mapping)?);
         connect.default_display_name = self.contact.default_display_name.clone();
         connect.signaling_timeout = Duration::from_secs(self.contact.signaling_timeout_secs);
-        connect.media_connect_timeout = Duration::from_secs(self.contact.media_connect_timeout_secs);
+        connect.media_connect_timeout =
+            Duration::from_secs(self.contact.media_connect_timeout_secs);
         connect.keepalive_interval = Duration::from_secs(self.contact.keepalive_interval_secs);
         connect.session_idle_ttl = Duration::from_secs(self.contact.session_idle_ttl_secs);
 
@@ -249,10 +374,6 @@ impl Config {
             .context("resolving sip.media_public_ip")?;
         // Port 0 → keep the dynamically-allocated RTP port, swap in the public IP.
         sip.media_public_addr = Some(SocketAddr::new(media_ip, 0));
-
-        // --- control-plane starter (AWS creds via the default chain / instance role) ---
-        let starter: Arc<dyn ConnectContactStarter> =
-            Arc::new(AwsConnectStarter::from_env(Some(self.aws.region.clone())).await);
 
         // --- per-INVITE router (B.4 match order) ---
         let router = Arc::new(move |call: &IncomingCall| {
@@ -291,6 +412,83 @@ impl Config {
     }
 }
 
+fn effective_value(path: &std::path::Path) -> Result<serde_yaml::Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    for (name, raw) in std::env::vars() {
+        let Some(path) = name.strip_prefix("BRIDGEFU__") else {
+            continue;
+        };
+        let segments: Vec<String> = path
+            .split("__")
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| segment.to_ascii_lowercase())
+            .collect();
+        if segments.is_empty() {
+            continue;
+        }
+        let replacement =
+            serde_yaml::from_str(&raw).unwrap_or_else(|_| serde_yaml::Value::String(raw));
+        set_yaml_path(&mut value, &segments, replacement)?;
+    }
+    Ok(value)
+}
+
+fn set_yaml_path(
+    value: &mut serde_yaml::Value,
+    path: &[String],
+    replacement: serde_yaml::Value,
+) -> Result<()> {
+    if path.len() == 1 {
+        let mapping = value
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow!("environment override parent is not a mapping"))?;
+        mapping.insert(serde_yaml::Value::String(path[0].clone()), replacement);
+        return Ok(());
+    }
+    let mapping = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("environment override parent is not a mapping"))?;
+    let next = mapping
+        .entry(serde_yaml::Value::String(path[0].clone()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    set_yaml_path(next, &path[1..], replacement)
+}
+
+fn redact_secrets(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            for (key, value) in mapping.iter_mut() {
+                let sensitive = key.as_str().is_some_and(|key| {
+                    matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "auth_token"
+                            | "api_key"
+                            | "private_key"
+                            | "signature_secret"
+                            | "token_secret"
+                            | "bearer_token"
+                            | "password"
+                    )
+                });
+                if sensitive {
+                    *value = serde_yaml::Value::String("[redacted]".into());
+                } else {
+                    redact_secrets(value);
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(sequence) => {
+            for value in sequence {
+                redact_secrets(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Tenant name used for the legacy single-tenant schema.
 pub const LEGACY_TENANT: &str = "default";
 
@@ -313,7 +511,11 @@ fn attribute_mapping(cfg: &MappingCfg) -> Result<AttributeMapping> {
     let unmapped = match cfg.unmapped.as_str() {
         "drop" => UnmappedPolicy::Drop,
         "pass_prefixed" => UnmappedPolicy::PassPrefixed,
-        other => return Err(anyhow!("invalid mapping.unmapped: {other} (drop|pass_prefixed)")),
+        other => {
+            return Err(anyhow!(
+                "invalid mapping.unmapped: {other} (drop|pass_prefixed)"
+            ))
+        }
     };
     Ok(AttributeMapping {
         rename: cfg.rename.clone(),
@@ -337,19 +539,81 @@ async fn resolve_public_ip(value: &str) -> Result<IpAddr> {
     }
 }
 
-fn default_bind_ip() -> String { "0.0.0.0".into() }
-fn default_port() -> u16 { 5060 }
-fn default_auto() -> String { "auto".into() }
-fn default_display_name() -> String { "bridgefu".into() }
-fn default_signaling_timeout() -> u64 { 15 }
-fn default_media_timeout() -> u64 { 30 }
-fn default_keepalive() -> u64 { 10 }
-fn default_idle_ttl() -> u64 { 120 }
-fn default_unmapped() -> String { "drop".into() }
-fn default_prefix() -> String { "X-".into() }
-fn default_log_level() -> String { "info".into() }
-fn default_log_format() -> String { "json".into() }
-fn default_http_bind() -> String { "0.0.0.0:9090".into() }
+fn default_bind_ip() -> String {
+    "0.0.0.0".into()
+}
+fn default_port() -> u16 {
+    5060
+}
+fn default_auto() -> String {
+    "auto".into()
+}
+fn default_display_name() -> String {
+    "bridgefu".into()
+}
+fn default_signaling_timeout() -> u64 {
+    15
+}
+fn default_media_timeout() -> u64 {
+    30
+}
+fn default_keepalive() -> u64 {
+    10
+}
+fn default_idle_ttl() -> u64 {
+    120
+}
+fn default_unmapped() -> String {
+    "drop".into()
+}
+fn default_prefix() -> String {
+    "X-".into()
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_format() -> String {
+    "json".into()
+}
+fn default_http_bind() -> String {
+    "0.0.0.0:9090".into()
+}
+fn default_config_version() -> u32 {
+    1
+}
+fn default_runtime_mode() -> String {
+    "all-in-one".into()
+}
+fn default_max_calls() -> usize {
+    100
+}
+fn default_setup_timeout() -> u64 {
+    30
+}
+fn default_drain_timeout() -> u64 {
+    30
+}
+fn default_true() -> bool {
+    true
+}
+fn default_broadcast_transport() -> String {
+    "moqt".into()
+}
+fn default_broadcast_ttl() -> u64 {
+    300
+}
+fn default_max_broadcasts() -> usize {
+    100
+}
+fn default_generic_sip_bind() -> String {
+    "0.0.0.0:5070".into()
+}
+fn default_webrtc_ws_bind() -> String {
+    "0.0.0.0:8080".into()
+}
+fn default_webrtc_whip_bind() -> String {
+    "0.0.0.0:8081".into()
+}
 
 impl Default for ContactCfg {
     fn default() -> Self {
@@ -377,6 +641,46 @@ impl Default for ObsCfg {
             log_level: default_log_level(),
             log_format: default_log_format(),
             http_bind: default_http_bind(),
+        }
+    }
+}
+impl Default for RuntimeCfg {
+    fn default() -> Self {
+        Self {
+            mode: default_runtime_mode(),
+            max_concurrent_calls: default_max_calls(),
+            setup_timeout_secs: default_setup_timeout(),
+            drain_timeout_secs: default_drain_timeout(),
+        }
+    }
+}
+impl Default for ApiCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bearer_token: None,
+        }
+    }
+}
+impl Default for BroadcastCfg {
+    fn default() -> Self {
+        Self {
+            default_transport: default_broadcast_transport(),
+            token_ttl_secs: default_broadcast_ttl(),
+            max_active: default_max_broadcasts(),
+            public_endpoint: None,
+            token_secret: None,
+        }
+    }
+}
+impl Default for GenericBridgeCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sip_bind: default_generic_sip_bind(),
+            webrtc_ws_bind: default_webrtc_ws_bind(),
+            webrtc_whip_bind: default_webrtc_whip_bind(),
+            bearer_token: None,
         }
     }
 }
@@ -428,7 +732,10 @@ mapping:
         assert_eq!(banking.contact_flow_id.as_deref(), Some("flow-banking"));
         assert_eq!(banking.default_display_name.as_deref(), Some("Vapi caller"));
         let mapping = banking.attribute_mapping.as_ref().unwrap();
-        assert_eq!(mapping.rename.get("X-Correlation-Id").unwrap(), "correlation_id");
+        assert_eq!(
+            mapping.rename.get("X-Correlation-Id").unwrap(),
+            "correlation_id"
+        );
         assert_eq!(mapping.unmapped, UnmappedPolicy::Drop);
 
         // retail has no mapping block → inherits the (default) top-level one.
@@ -527,7 +834,10 @@ aws: {"region": "us-west-2", "instance_id": "inst-only"}
 sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
 "#;
         let err = parse(yaml).resolved_tenants().unwrap_err().to_string();
-        assert!(err.contains("must be set together"), "unexpected error: {err}");
+        assert!(
+            err.contains("must be set together"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

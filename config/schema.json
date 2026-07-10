@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/schema/config-v1.json",
+  "title": "Bridgefu configuration v1",
+  "type": "object",
+  "required": ["aws", "sip"],
+  "properties": {
+    "config_version": { "const": 1 },
+    "aws": {
+      "type": "object",
+      "required": ["region"],
+      "properties": {
+        "region": { "type": "string", "minLength": 1 },
+        "instance_id": { "type": "string" },
+        "contact_flow_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "sip": {
+      "type": "object",
+      "properties": {
+        "bind_ip": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "advertised_ip": { "type": "string" },
+        "media_public_ip": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["all-in-one", "gateway", "worker", "moq-relay"] },
+        "max_concurrent_calls": { "type": "integer", "minimum": 1 },
+        "setup_timeout_secs": { "type": "integer", "minimum": 1 },
+        "drain_timeout_secs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "bearer_token": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "broadcast": {
+      "type": "object",
+      "properties": {
+        "default_transport": { "enum": ["moqt", "uctp-quic"] },
+        "token_ttl_secs": { "type": "integer", "minimum": 1 },
+        "max_active": { "type": "integer", "minimum": 1 },
+        "public_endpoint": { "type": "string" },
+        "token_secret": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "generic_bridge": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "sip_bind": { "type": "string" },
+        "webrtc_ws_bind": { "type": "string" },
+        "webrtc_whip_bind": { "type": "string" },
+        "bearer_token": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "providers": { "type": "object" },
+    "context": { "type": "object" },
+    "tenants": { "type": "object" }
+  }
+}

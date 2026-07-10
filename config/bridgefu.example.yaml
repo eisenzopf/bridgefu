@@ -1,4 +1,5 @@
 # bridgefu configuration. Copy to /etc/bridgefu/bridgefu.yaml and edit.
+config_version: 1
 # AWS credentials are NOT here — they come from the EC2 instance role / default
 # AWS credential chain. Restart the service to apply changes.
 #
@@ -60,4 +61,50 @@ tenants:
 observability:
   log_level: "info,rvoip_amazon_connect=debug"
   log_format: json           # json | pretty
-  http_bind: 0.0.0.0:9090    # serves /healthz and /metrics
+  http_bind: 0.0.0.0:9090    # serves /v1, /livez, /readyz, /metrics
+
+runtime:
+  mode: all-in-one            # all-in-one | gateway | worker | moq-relay
+  max_concurrent_calls: 100
+  setup_timeout_secs: 30
+  drain_timeout_secs: 30
+
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_TOKEN
+
+context:
+  allow_headers:
+    X-Correlation-Id: correlation_id
+    X-Vapi-Call-Id: vapi_call_id
+    X-Account-Tier: account_tier
+
+broadcast:
+  default_transport: moqt     # moqt | uctp-quic
+  token_ttl_secs: 300
+  max_active: 100
+  public_endpoint: moqt://127.0.0.1:4443
+  token_secret: env:BRIDGEFU_BROADCAST_TOKEN_SECRET
+
+# Optional normal rvoip SIP↔WebRTC bridge, independent of the Amazon listener.
+# Incoming SIP and WebRTC legs are paired FIFO in this 1.0 runtime.
+generic_bridge:
+  enabled: false
+  sip_bind: 0.0.0.0:5070
+  webrtc_ws_bind: 0.0.0.0:8080
+  webrtc_whip_bind: 0.0.0.0:8081
+  # bearer_token: env:BRIDGEFU_WEBRTC_TOKEN
+
+# Configure any subset. Provider media is delivered through SIP/RTP.
+providers:
+  # twilio:
+  #   account_sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  #   auth_token: env:TWILIO_AUTH_TOKEN
+  # telnyx:
+  #   connection_id: "0000000000000000000"
+  #   api_key: env:TELNYX_API_KEY
+  #   webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
+  # vonage:
+  #   application_id: 00000000-0000-0000-0000-000000000000
+  #   private_key: env:VONAGE_PRIVATE_KEY_PEM
+  #   signature_secret: env:VONAGE_SIGNATURE_SECRET

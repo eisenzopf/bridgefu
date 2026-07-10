@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # deploy.sh — push the bridgefu source to the EC2 instance, build the Docker
-# image there (rvoip is fetched from crates.io during the build), and (re)start
+# image there (using the sibling rvoip checkout), and (re)start
 # the systemd service. Run from the bridgefu repo root.
 #
 # Required env vars:
@@ -52,7 +52,7 @@ ssh_run "sudo install -D -m 0644 /tmp/bridgefu.yaml /etc/bridgefu/bridgefu.yaml 
 echo "==> [3/5] Building image on instance (first cold build is slow; crates.io deps cache after)"
 ssh_run "set -e
   cd '${REMOTE_DIR}/bridgefu'
-  docker build -t bridgefu:latest -f deploy/Dockerfile ."
+  docker build --build-context rvoip=../rvoip -t bridgefu:latest -f Dockerfile ."
 
 echo "==> [4/5] Installing + (re)starting systemd service"
 ssh_run "sudo install -D -m 0644 '${REMOTE_DIR}/bridgefu/deploy/bridgefu.service' /etc/systemd/system/bridgefu.service \

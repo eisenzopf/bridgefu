@@ -1,9 +1,9 @@
 # bridgefu
 
-A small, always-on **SIP → Amazon Connect gateway**. Point a Vapi application at
-it and it will accept the inbound SIP transfer, carry the call's custom `X-`
-headers into Amazon Connect contact attributes (driving the agent screen pop),
-join the Chime WebRTC media leg, and bridge audio both ways.
+Bridgefu is a programmable Rust SIP/RTP ↔ WebRTC/RTP bridge and the reference
+application for rvoip. It preserves the Vapi → Amazon Connect screen-pop path,
+adds a normal rvoip SIP/WebRTC runtime, native Twilio/Telnyx/Vonage call control,
+safe SIP-header/DataChannel context envelopes, and UCTP or MOQT audio fanout.
 
 ```
 PSTN caller ─▶ Vapi app ─(SIP transfer/REFER with X- headers)─▶ bridgefu
@@ -11,8 +11,17 @@ PSTN caller ─▶ Vapi app ─(SIP transfer/REFER with X- headers)─▶ bridge
             ─▶ live agent (CCP rings, screen pop populated, two-way audio)
 ```
 
-`bridgefu` is a thin daemon over `rvoip-amazon-connect`'s `ConnectScreenPopServer`.
-See [PRD.md](PRD.md) for the full product spec.
+The core data plane is an rvoip `MediaGraph`, so a call peer and both broadcast
+types can observe one source without competing for its receiver. See
+[architecture](docs/architecture.md), [security](docs/security.md), and the
+[provider matrix](docs/provider-capabilities.md).
+
+This tree is an implementation branch toward 1.0, not a GA performance claim.
+The ordered implementation gates and their evidence are tracked in the
+[Bridgefu 1.0 roadmap](docs/roadmap.md). Protocol and load requirements are
+also documented in
+[protocol compatibility](docs/protocol-compatibility.md) and
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -33,7 +42,7 @@ See [PRD.md](PRD.md) for the full product spec.
 On the instance:
   /opt/build/rvoip      <- git clone of github.com/eisenzopf/rvoip
   /opt/build/bridgefu   <- rsync of this repo (deploy.sh)
-  docker build -f bridgefu/deploy/Dockerfile /opt/build   # ../rvoip path dep resolves
+  docker build --build-context rvoip=../rvoip -f Dockerfile .
 ```
 
 ---
@@ -112,7 +121,22 @@ $EDITOR bridgefu.yaml          # set aws.region + instance_id + contact_flow_id
 Leave `sip.advertised_ip` and `sip.media_public_ip` as `auto` — on EC2 the daemon
 resolves the public (Elastic) IP via IMDSv2. AWS credentials are **never** in this
 file. See [config/bridgefu.example.yaml](config/bridgefu.example.yaml) for every
-field. Restart the service to apply config changes (no hot reload).
+field. Every scalar can be overridden with a double-underscore environment key,
+for example `BRIDGEFU__RUNTIME__MAX_CONCURRENT_CALLS=200`.
+
+```bash
+bridgefu --config bridgefu.yaml validate
+bridgefu --config bridgefu.yaml print-effective-config  # secrets redacted
+```
+
+The versioned API is served with health and Prometheus on the configured HTTP
+bind. Provider webhooks authenticate with provider signatures; all other `/v1`
+routes use `api.bearer_token` when configured.
+
+```bash
+curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \
+  http://127.0.0.1:9090/v1/providers/twilio/capabilities
+```
 
 ---
 
@@ -204,16 +228,18 @@ To redeploy after a code or config change, just re-run `deploy.sh`.
 
 ---
 
-## Security (POC posture)
+## Security
 
-This is a proof-of-concept and is **not hardened for untrusted public exposure**:
+Do not expose signaling until the configured carrier and identity policies are
+in place:
 
 - **SIP/RTP are open by default** (`sip_cidr = 0.0.0.0/0`). **TODO:** set `sip_cidr`
   to the Vapi/carrier CIDRs once known and `terraform apply`.
 - SSH (22) and metrics (9090) are restricted to `admin_cidr` — set this to your IP.
 - The IAM policy uses `Resource = "*"` for the two Connect actions. **TODO:** scope
   to the specific instance + contact-flow ARNs.
-- Plain UDP/RTP (no SIPS/SRTP) for the POC.
+- Use SIPS/SRTP or private carrier networks where required. See the complete
+  [security model](docs/security.md).
 
 ---
 
@@ -237,15 +263,21 @@ This is a proof-of-concept and is **not hardened for untrusted public exposure**
 # Builds against ../rvoip (path dep). Requires the rvoip workspace checked out
 # as a sibling of this repo.
 cargo build
-cargo run -- --config config/bridgefu.example.yaml   # fails fast on placeholder IDs
+export BRIDGEFU_API_TOKEN=dev-api-token
+export BRIDGEFU_BROADCAST_TOKEN_SECRET=dev-broadcast-secret
+cargo run -- --config config/bridgefu.example.yaml validate
+
+# Build/run the non-root, read-only-capable image (BuildKit required).
+docker compose up --build
 ```
 
 ## Layout
 
 ```
-src/                      daemon (main, config, observability, imds)
+src/                      API, provider adapters, runtimes, config, observability
 config/bridgefu.example.yaml
-deploy/Dockerfile         multi-stage arm64 image (context = parent of rvoip + bridgefu)
+Dockerfile                reproducible multi-stage non-root image
+compose.yaml              local all-in-one deployment
 deploy/bridgefu.service   systemd unit (docker run --network host, Restart=always)
 deploy.sh                 sync -> build-on-instance -> restart -> healthcheck
 terraform/                VPC, EIP, security group, IAM role, AL2023 arm64 instance

@@ -1,0 +1,34 @@
+services:
+  bridgefu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        rvoip: ../rvoip
+    image: bridgefu:local
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - ./config/bridgefu.example.yaml:/etc/bridgefu/bridgefu.yaml:ro
+    environment:
+      BRIDGEFU__SIP__ADVERTISED_IP: "127.0.0.1"
+      BRIDGEFU__SIP__MEDIA_PUBLIC_IP: "127.0.0.1"
+      BRIDGEFU_API_TOKEN: change-me
+      BRIDGEFU_BROADCAST_TOKEN_SECRET: change-me-too
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5070:5070/udp"
+      - "5070:5070/tcp"
+      - "8080:8080/tcp"
+      - "8081:8081/tcp"
+      - "9090:9090/tcp"
+      - "4433:4433/udp"
+      - "4443:4443/udp"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
