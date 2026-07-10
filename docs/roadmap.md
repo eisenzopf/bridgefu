@@ -78,7 +78,7 @@ Active calls remain pinned and are drained rather than migrated.
 
 ## Gates
 
-### Gate 0 — Plan and baseline (`in progress`)
+### Gate 0 — Plan and baseline (`complete`)
 
 - [x] Record the canonical roadmap before implementation edits.
 - [x] Preserve the existing dirty worktrees on coordinated branches.
@@ -89,21 +89,21 @@ Active calls remain pinned and are drained rather than migrated.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
 
-### Gate 1 — Freeze StandardCharter (`pending`)
+### Gate 1 — Freeze StandardCharter (`complete`)
 
-- [ ] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
-- [ ] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
+- [x] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
+- [x] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
   StartWebRTCContact attributes.
-- [ ] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
+- [x] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
   teardown.
-- [ ] Add a protected non-production Vapi-to-Connect smoke workflow and a
+- [x] Add a protected non-production Vapi-to-Connect smoke workflow and a
   drain/rollback runbook.
-- [ ] Keep the existing production path isolated.
+- [x] Keep the existing production path isolated.
 
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
 
-### Gate 2 — Complete rvoip foundations (`pending`)
+### Gate 2 — Complete rvoip foundations (`in progress`)
 
 - [ ] Move `AuthenticatedPrincipal` to core traits and preserve issuer, tenant,
   subject, scopes, expiry, method, and assurance through every validator/event.
