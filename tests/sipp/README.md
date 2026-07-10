@@ -19,6 +19,42 @@ samples; edit them freely.
 
 ---
 
+## Multi-tenant routing scenarios (no media, no AWS needed)
+
+Three signaling-only scenarios validate the CONTRACTS B.4 routing semantics
+(R-URI user part → `To:` user part → `default_tenant` → 404). They run anywhere
+(laptop included — no RTP round-trip needed) against a config with two tenants,
+e.g. `banking` and `retail` on distinct contact flows:
+
+```bash
+# Routed by R-URI user part → expect 200; gateway log shows route="banking".
+sipp -sf bridgefu_route.xml 127.0.0.1:5060 -s banking -m 1 -d 2000
+
+# Second tenant, distinct flow → route="retail".
+sipp -sf bridgefu_route.xml 127.0.0.1:5060 -s retail -m 1 -d 2000
+
+# R-URI user is unknown, To: user matches → still routed (To fallback).
+sipp -sf bridgefu_to_fallback.xml 127.0.0.1:5060 -s retail -m 1
+
+# No tenant matches, default_tenant: null → 404 Not Found.
+sipp -sf bridgefu_unknown_tenant.xml 127.0.0.1:5060 -s ghost -m 1
+```
+
+Then check:
+
+- `curl -s localhost:9090/healthz` → `{"ok":true,"tenants":["banking","retail"]}`
+- `curl -s localhost:9090/metrics | grep bridgefu` → per-tenant labels:
+  `bridgefu_calls_routed_total{tenant="banking"}`,
+  `bridgefu_unknown_tenant_total`, plus `bridgefu_active_sessions` /
+  `bridgefu_contacts_started_total` / `bridgefu_failures_total` per tenant.
+
+Without real AWS credentials the routed calls still answer (200) and then fail
+at `StartWebRTCContact` — that failure is *expected* off-EC2 and shows up in
+`bridgefu_failures_total{tenant=…}`, which is itself part of what the test
+validates. On the real bridge host the same runs place real contacts.
+
+---
+
 ## Where to run it: ON the EC2 instance (not your laptop)
 
 Run SIPp **on the gateway instance itself**. From your laptop (behind home NAT)

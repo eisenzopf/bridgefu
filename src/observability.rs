@@ -38,14 +38,27 @@ pub fn install_metrics() -> Result<PrometheusHandle> {
         .context("installing Prometheus recorder")
 }
 
-/// Serve `/healthz` (liveness) and `/metrics` (Prometheus) until `shutdown`.
+/// Serve `/healthz` (liveness + loaded tenants, CONTRACTS.md B.4) and
+/// `/metrics` (Prometheus) until `shutdown`.
 pub async fn serve_http(
     bind: SocketAddr,
     handle: PrometheusHandle,
+    tenants: Vec<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    // The tenant set is fixed for the process lifetime (the reconciler
+    // restarts bridgefu on config change), so the body is pre-rendered.
+    let healthz = serde_json::json!({ "ok": true, "tenants": tenants }).to_string();
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/healthz",
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    healthz,
+                )
+            }),
+        )
         .route(
             "/metrics",
             get(|State(h): State<PrometheusHandle>| async move { h.render() }),
@@ -62,16 +75,24 @@ pub async fn serve_http(
         .context("observability HTTP server")
 }
 
-/// Periodically publish the adapter's counters as Prometheus gauges.
-pub fn spawn_metrics_updater(server: Arc<ConnectScreenPopServer>) {
+/// Periodically publish the per-tenant route counters as Prometheus gauges
+/// (`tenant` label, CONTRACTS.md B.4). Every configured tenant is pre-seeded
+/// so its series exist from startup.
+pub fn spawn_metrics_updater(server: Arc<ConnectScreenPopServer>, tenants: Vec<String>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         loop {
             tick.tick().await;
-            let m = server.adapter().metrics();
-            metrics::gauge!("bridgefu_active_sessions").set(m.active_sessions as f64);
-            metrics::gauge!("bridgefu_contacts_started_total").set(m.contacts_started as f64);
-            metrics::gauge!("bridgefu_failures_total").set(m.failures as f64);
+            let stats = server.route_metrics();
+            for tenant in &tenants {
+                let m = stats.get(tenant).cloned().unwrap_or_default();
+                metrics::gauge!("bridgefu_active_sessions", "tenant" => tenant.clone())
+                    .set(m.active_sessions as f64);
+                metrics::gauge!("bridgefu_contacts_started_total", "tenant" => tenant.clone())
+                    .set(m.contacts_started as f64);
+                metrics::gauge!("bridgefu_failures_total", "tenant" => tenant.clone())
+                    .set(m.failures as f64);
+            }
         }
     });
 }

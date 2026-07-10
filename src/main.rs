@@ -32,11 +32,11 @@ async fn main() -> Result<()> {
     observability::init_tracing(&cfg.observability.log_level, &cfg.observability.log_format)?;
     let prom = observability::install_metrics()?;
 
+    let tenants = cfg.tenant_names()?;
     tracing::info!(
         config = %args.config.display(),
-        instance = %cfg.aws.instance_id,
-        flow = %cfg.aws.contact_flow_id,
         region = %cfg.aws.region,
+        tenants = ?tenants,
         "starting bridgefu"
     );
 
@@ -52,10 +52,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("building gateway: {e}"))?;
 
-    observability::spawn_metrics_updater(server.clone());
+    observability::spawn_metrics_updater(server.clone(), tenants.clone());
 
     // Health/metrics HTTP server, shut down on the same signal as the gateway.
-    let http = tokio::spawn(observability::serve_http(http_bind, prom, shutdown_signal()));
+    let http = tokio::spawn(observability::serve_http(
+        http_bind,
+        prom,
+        tenants,
+        shutdown_signal(),
+    ));
 
     // Run the SIP→Connect gateway until a shutdown signal.
     tokio::select! {

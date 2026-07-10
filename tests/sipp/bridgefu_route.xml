@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- bridgefu multi-tenant routing test (signaling only, no media playback).
+
+     Sends an INVITE whose Request-URI/To user part is the tenant key
+     (-s <tenant>), expects bridgefu to answer 200 (i.e. the router matched a
+     tenant), holds briefly, then BYEs. Verify the chosen tenant in the
+     gateway log (`route = <tenant>` on the "inbound SIP call" line) and in
+     /metrics (bridgefu_calls_routed_total{tenant="<tenant>"}).
+
+     Run:  sipp -sf bridgefu_route.xml <host>:5060 -s banking -m 1 -d 2000 -->
+
+<scenario name="bridgefu - route INVITE to tenant by SIP user part">
+
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Subject: bridgefu routing test
+      X-Correlation-Id: CORR-[call_number]
+      X-Vapi-Call-Id: VAPI-CALL-67890
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=vapi [call_number] [call_number] IN IP[local_ip_type] [local_ip]
+      s=bridgefu-sipp-routing-test
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 8 101
+      a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="183" optional="true" />
+
+  <!-- A 200 means the router matched a tenant (unknown tenants get 404). -->
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Brief hold; tune with -d <ms>. -->
+  <pause milliseconds="2000" />
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: "Vapi caller" <sip:vapi@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: <sip:vapi@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <ResponseTimeRepartition value="100, 250, 500, 1000, 2000" />
+  <CallLengthRepartition value="2000, 3000, 4000" />
+
+</scenario>

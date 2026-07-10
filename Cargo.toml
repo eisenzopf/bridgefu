@@ -9,9 +9,9 @@ publish = false
 [dependencies]
 # crates.io dep. The gateway crate `rvoip-amazon-connect` is independently
 # versioned (alpha train, 0.1.x); it depends on the rvoip `0.2.x` beta train
-# (rvoip-core / -sip / -media-core `^0.2.3`), so this resolves the 0.2.4 beta
-# train — including the G.711<->Opus transcode fix in rvoip-media-core 0.2.4.
-rvoip-amazon-connect = { version = "0.1.2", features = ["server", "aws-control"] }
+# (rvoip-core / -sip / -media-core), currently the 0.2.5 beta train.
+# 0.1.3 adds the per-call router hook (multi-tenant SIP-URI routing, §8.1).
+rvoip-amazon-connect = { version = "0.1.3", features = ["server", "aws-control"] }
 
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
@@ -21,8 +21,17 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = "0.7"
+serde_json = "1"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+
+# TEMPORARY until rvoip-amazon-connect 0.1.3 is published to crates.io: build
+# against the local rvoip checkout carrying the router hook (branch
+# feat/amazon-connect-multitenant-routing). Remove this whole section (and
+# regenerate Cargo.lock) once 0.1.3 is on crates.io — the Docker/CodeBuild
+# image build cannot see this path and will fail while it is present.
+[patch.crates-io]
+rvoip-amazon-connect = { path = "/Users/jonathan/Developer/rvoip/crates/webrtc/rvoip-amazon-connect" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are
