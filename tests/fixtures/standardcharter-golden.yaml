@@ -1,0 +1,44 @@
+config_version: 1
+
+aws:
+  region: us-west-2
+
+sip:
+  bind_ip: 127.0.0.1
+  port: __SIP_PORT__
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+
+contact:
+  default_display_name: Vapi caller
+  signaling_timeout_secs: 1
+  media_connect_timeout_secs: 1
+  keepalive_interval_secs: 1
+  session_idle_ttl_secs: 2
+
+mapping:
+  unmapped: drop
+  passthrough_prefix: X-
+  rename:
+    X-Correlation-Id: correlation_id
+    X-Vapi-Customer-Id: HostedWidget-customerId
+    X-Vapi-Call-Id: HostedWidget-vapiCallId
+    X-Account-Tier: HostedWidget-accountTier
+
+default_tenant: null
+tenants:
+  banking:
+    instance_id: instance-standardcharter-test
+    contact_flow_id: flow-standardcharter-test
+    default_display_name: Vapi caller
+
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: 8
+  setup_timeout_secs: 2
+  drain_timeout_secs: 1
+
+observability:
+  log_level: warn
+  log_format: pretty
+  http_bind: 127.0.0.1:0
