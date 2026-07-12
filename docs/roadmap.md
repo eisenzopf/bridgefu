@@ -870,10 +870,16 @@ not hide an earlier adapter side effect behind a nominally staged API.
      point and at every public typed transport `send_message` boundary; the
      explicitly raw transport escape hatch remains the only verbatim bypass.
      Typed sends also validate every extension header name as an exact SIP
-     token and every raw field value as one line, so whitespace-before-colon,
-     embedded-colon, CR/LF, and malformed `Other` spellings cannot reconstitute
-     an Authorization header downstream. Response reason phrases are bounded
-     and reject line/control injection before any typed transport performs I/O.
+     token and the final serialized value of every header variant as a bounded,
+     single-line field. This includes structured values and non-`Other` typed
+     headers, not only `HeaderValue::Raw`, so whitespace-before-colon,
+     embedded-colon, CR/LF, malicious nested parameters, and malformed `Other`
+     spellings cannot create a new header downstream. Response reason phrases
+     are bounded and reject line/control injection before any typed transport
+     performs I/O. Request methods must be exact SIP tokens, and every rendered
+     Request-URI/version start-line component is bounded and single-line before
+     route lookup or I/O. Outer diagnostics classify extension methods without
+     formatting their caller-controlled spelling.
      Authorization-bearing raw values, their enclosing typed headers, and
      complete requests must also redact secrets from diagnostics regardless of
      whether the header name uses a canonical variant or a case-insensitive
