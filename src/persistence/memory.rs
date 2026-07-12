@@ -6,7 +6,7 @@
 //! rollback semantics over throughput; clustered deployments use the SQL
 //! implementations added by the next roadmap item.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -27,7 +27,8 @@ use crate::call_engine::{
     ProviderAccountKey, ProviderCallId, ProviderEventCommit, ProviderEventCommitOutcome,
     ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput, ProviderEventOutcome,
     ProviderEventState, ProviderEventTarget, ProviderReceiptSequence, RegisterWorker,
-    RepositoryError, RestartClaim, StoredCall, StoredCommand, TenantId, WorkerAssignment,
+    RepositoryError, RestartClaim, StoredCall, StoredCommand, TenantId,
+    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerAssignment,
     WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 
@@ -87,6 +88,17 @@ struct ProviderReferenceRow {
     bound_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+enum ProviderCompletionRow {
+    Command {
+        request: Box<ProviderEventCommit>,
+        view: Box<CommandCommitView>,
+    },
+    TerminalAcknowledgement {
+        request: TerminalProviderEventAcknowledge,
+    },
+}
+
 #[derive(Clone, Default)]
 struct MemoryState {
     workers: HashMap<WorkerId, WorkerSnapshot>,
@@ -99,9 +111,11 @@ struct MemoryState {
     attachment_ids: HashMap<AttachmentId, AttachmentTokenDigest>,
     active_attachments: HashMap<BindingKey, AttachmentTokenDigest>,
     connection_owners: HashMap<ConnectionId, BindingKey>,
+    used_connection_ids: HashSet<ConnectionId>,
     principal_bindings: HashMap<PrincipalBindingKey, ConnectionId>,
     provider_events: HashMap<ProviderEventKey, ProviderEventEnvelope>,
     provider_references: HashMap<ProviderReferenceKey, ProviderReferenceRow>,
+    provider_completions: HashMap<ProviderEventKey, ProviderCompletionRow>,
     provider_receipt_sequence: Option<ProviderReceiptSequence>,
     outbox: HashMap<EffectId, OutboxRecord>,
     deadlines: HashMap<DeadlineKey, DeadlineRecord>,
@@ -511,7 +525,7 @@ impl CallRepository for MemoryRepository {
                 request.candidate.binding_generation,
             );
             let principal_binding_key = (request.principal_fingerprint, binding_key);
-            if state.connection_owners.contains_key(&request.connection_id)
+            if state.used_connection_ids.contains(&request.connection_id)
                 || state
                     .principal_bindings
                     .contains_key(&principal_binding_key)
@@ -539,6 +553,9 @@ impl CallRepository for MemoryRepository {
             state
                 .connection_owners
                 .insert(request.connection_id.clone(), binding_key);
+            state
+                .used_connection_ids
+                .insert(request.connection_id.clone());
             state
                 .principal_bindings
                 .insert(principal_binding_key, request.connection_id.clone());
@@ -715,6 +732,7 @@ impl CallRepository for MemoryRepository {
                 event.state = ProviderEventState::Claimed {
                     worker,
                     generation,
+                    claimed_at: at,
                     expires_at,
                 };
                 claimed.push(ClaimedProviderEvent {
@@ -744,7 +762,20 @@ impl CallRepository for MemoryRepository {
             let event = state
                 .provider_events
                 .get(&key)
+                .cloned()
                 .ok_or(RepositoryError::NotFound)?;
+            if event.state == ProviderEventState::Applied {
+                return match state.provider_completions.get(&key) {
+                    Some(ProviderCompletionRow::Command {
+                        request: recorded,
+                        view,
+                    }) if recorded.as_ref() == &request => Ok(ProviderEventCommitOutcome {
+                        event,
+                        command: CommandCommitOutcome::Replayed(view.as_ref().clone()),
+                    }),
+                    _ => Err(RepositoryError::StaleClaim),
+                };
+            }
             let target = event
                 .target
                 .clone()
@@ -753,9 +784,12 @@ impl CallRepository for MemoryRepository {
                 ProviderEventState::Claimed {
                     worker,
                     generation,
+                    claimed_at,
                     expires_at,
                 } if *worker == request.worker
                     && *generation == request.claim_generation
+                    && event.received_at <= request.at
+                    && *claimed_at <= request.at
                     && *expires_at > request.at => {}
                 _ => return Err(RepositoryError::StaleClaim),
             }
@@ -764,18 +798,86 @@ impl CallRepository for MemoryRepository {
             {
                 return Err(RepositoryError::ProviderReferenceConflict);
             }
+            validate_provider_command_target(&target, &request.command.command)?;
 
+            let recorded_request = request.clone();
             let command = commit_command_in_state(state, request.command)?;
+            let view = match &command {
+                CommandCommitOutcome::Committed(view) | CommandCommitOutcome::Replayed(view) => {
+                    view.clone()
+                }
+            };
             let event = state
                 .provider_events
                 .get_mut(&key)
                 .ok_or(RepositoryError::NotFound)?;
             event.state = ProviderEventState::Applied;
             event.applied_at = Some(request.at);
-            Ok(ProviderEventCommitOutcome {
-                event: event.clone(),
-                command,
-            })
+            let event = event.clone();
+            state.provider_completions.insert(
+                key,
+                ProviderCompletionRow::Command {
+                    request: Box::new(recorded_request),
+                    view: Box::new(view),
+                },
+            );
+            Ok(ProviderEventCommitOutcome { event, command })
+        })
+    }
+
+    async fn acknowledge_terminal_provider_event(
+        &self,
+        request: TerminalProviderEventAcknowledge,
+    ) -> Result<TerminalProviderEventAcknowledgeOutcome, RepositoryError> {
+        self.transaction(|state| {
+            ensure_worker(state, request.worker, true)?;
+            let key = (request.account.clone(), request.event_digest);
+            let event = state
+                .provider_events
+                .get(&key)
+                .cloned()
+                .ok_or(RepositoryError::NotFound)?;
+            if event.state == ProviderEventState::Applied {
+                return match state.provider_completions.get(&key) {
+                    Some(ProviderCompletionRow::TerminalAcknowledgement { request: recorded })
+                        if recorded == &request =>
+                    {
+                        Ok(TerminalProviderEventAcknowledgeOutcome::Replayed(event))
+                    }
+                    _ => Err(RepositoryError::StaleClaim),
+                };
+            }
+            if event.target.as_ref() != Some(&request.target) {
+                return Err(RepositoryError::ProviderReferenceConflict);
+            }
+            ensure_terminal_call_worker(state, &request.target, request.worker)?;
+            match &event.state {
+                ProviderEventState::Claimed {
+                    worker,
+                    generation,
+                    claimed_at,
+                    expires_at,
+                } if *worker == request.worker
+                    && *generation == request.claim_generation
+                    && event.received_at <= request.at
+                    && *claimed_at <= request.at
+                    && *expires_at > request.at => {}
+                _ => return Err(RepositoryError::StaleClaim),
+            }
+            let event = state
+                .provider_events
+                .get_mut(&key)
+                .ok_or(RepositoryError::NotFound)?;
+            event.state = ProviderEventState::Applied;
+            event.applied_at = Some(request.at);
+            let event = event.clone();
+            state.provider_completions.insert(
+                key,
+                ProviderCompletionRow::TerminalAcknowledgement {
+                    request: request.clone(),
+                },
+            );
+            Ok(TerminalProviderEventAcknowledgeOutcome::Acknowledged(event))
         })
     }
 
@@ -960,7 +1062,8 @@ impl CallRepository for MemoryRepository {
                         && call.assignment.lease.fence < worker.fence
                         && (call.assignment.released_at.is_none()
                             || (call.aggregate.state().is_terminal()
-                                && has_unfinished_outbox(state, call.aggregate.id())))
+                                && (has_unfinished_outbox(state, call.aggregate.id())
+                                    || has_unfinished_provider_events(state, call.aggregate.id()))))
                 })
                 .map(|(call_id, _)| *call_id)
                 .collect::<Vec<_>>();
@@ -1051,6 +1154,31 @@ fn ensure_call_worker(
         .ok_or(RepositoryError::NotFound)?;
     if call.assignment.released_at.is_some() || call.assignment.lease != worker {
         return Err(RepositoryError::StaleWorkerFence);
+    }
+    Ok(())
+}
+
+fn ensure_terminal_call_worker(
+    state: &MemoryState,
+    target: &ProviderEventTarget,
+    worker: WorkerLease,
+) -> Result<(), RepositoryError> {
+    ensure_worker(state, worker, true)?;
+    let call = state
+        .calls
+        .get(&target.call_id)
+        .filter(|call| call.aggregate.tenant_id() == &target.tenant_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if call.assignment.lease != worker {
+        return Err(RepositoryError::StaleWorkerFence);
+    }
+    if call.assignment.released_at.is_none() || !call.aggregate.state().is_terminal() {
+        return Err(RepositoryError::InvalidInput(
+            "terminal provider acknowledgement requires a released terminal call",
+        ));
+    }
+    if call.aggregate.leg(target.leg_id).is_none() {
+        return Err(RepositoryError::ProviderReferenceConflict);
     }
     Ok(())
 }
@@ -1296,7 +1424,7 @@ fn provider_event_claimable(
         ProviderEventState::Claimed { expires_at, .. } => *expires_at <= at,
         ProviderEventState::PendingReference | ProviderEventState::Applied => false,
     };
-    if !lifecycle_is_claimable {
+    if !lifecycle_is_claimable || event.received_at > at {
         return false;
     }
     let Some(target) = event.target.as_ref() else {
@@ -1312,6 +1440,36 @@ fn provider_event_claimable(
             && predecessor.provider_call_id == event.provider_call_id
             && predecessor.receipt_sequence < event.receipt_sequence
             && !matches!(predecessor.state, ProviderEventState::Applied)
+    })
+}
+
+fn validate_provider_command_target(
+    target: &ProviderEventTarget,
+    command: &CallCommand,
+) -> Result<(), RepositoryError> {
+    let leg_id = match command {
+        CallCommand::SetLegState { leg_id, .. } | CallCommand::RotateLegBinding { leg_id, .. } => {
+            Some(*leg_id)
+        }
+        _ => None,
+    };
+    if leg_id.is_some_and(|leg_id| leg_id != target.leg_id) {
+        Err(RepositoryError::ProviderReferenceConflict)
+    } else {
+        Ok(())
+    }
+}
+
+fn has_unfinished_provider_events(state: &MemoryState, call_id: CallId) -> bool {
+    state.provider_events.values().any(|event| {
+        event
+            .target
+            .as_ref()
+            .is_some_and(|target| target.call_id == call_id)
+            && matches!(
+                event.state,
+                ProviderEventState::Ready | ProviderEventState::Claimed { .. }
+            )
     })
 }
 
@@ -1793,6 +1951,27 @@ mod tests {
         .call;
         current = move_leg(repo, owner, worker, &current, 0, LegState::Ended, 8).await;
         move_leg(repo, owner, worker, &current, 1, LegState::Ended, 9).await
+    }
+
+    async fn drain_outbox(repo: &MemoryRepository, worker: WorkerLease, now: DateTime<Utc>) {
+        loop {
+            let claimed = repo
+                .claim_outbox(worker, now, Duration::from_secs(5), 1)
+                .await
+                .unwrap();
+            let Some(claimed) = claimed.into_iter().next() else {
+                break;
+            };
+            repo.complete_outbox(
+                claimed.record.effect_id,
+                worker,
+                claimed.claim_generation,
+                OutboxCompletion::Succeeded,
+                now,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2743,6 +2922,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(candidate.binding_generation(), generation_two);
+        assert_eq!(
+            repo.consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(7),
+                    leg_id,
+                    binding_generation: generation_two,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate: candidate.clone(),
+                connection_id: old_connection,
+                principal_fingerprint: service_principal(),
+                at: at(7),
+            })
+            .await,
+            Err(RepositoryError::AttachmentConflict)
+        );
+        assert!(repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: new_token,
+                tenant_id: owner.clone(),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(7),
+            })
+            .await
+            .is_ok());
         let new_connection = ConnectionId::new();
         let current = repo
             .consume_attachment(AttachmentConsume {
@@ -3144,6 +3352,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_completion_is_time_leg_and_exact_replay_bound_with_rollback() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                164,
+                165,
+            ))
+            .await
+            .unwrap(),
+        );
+        let account = ProviderAccountKey::parse("telnyx-replay-account").unwrap();
+        let provider_call_id = ProviderCallId::parse("provider-call-replay").unwrap();
+        let event_digest = ProviderEventDigest::new(digest(166));
+        let target_leg = call.aggregate.legs()[1].id();
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest,
+            payload_digest: crate::call_engine::ProviderPayloadDigest::new(digest(167)),
+            provider_call_id: provider_call_id.clone(),
+            kind: "answered".into(),
+            payload: json!({"state": "answered"}),
+            occurred_at: None,
+            received_at: at(8),
+        })
+        .await
+        .unwrap();
+        repo.bind_provider_reference(BindProviderReference {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            leg_id: target_leg,
+            account: account.clone(),
+            provider_call_id,
+            worker: worker.lease,
+            at: at(8),
+        })
+        .await
+        .unwrap();
+        let claim = repo
+            .claim_provider_events(worker.lease, at(9), Duration::from_secs(5), 1)
+            .await
+            .unwrap()
+            .remove(0);
+
+        let backdated_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(7),
+                leg_id: target_leg,
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(7),
+        };
+        assert_eq!(
+            repo.complete_provider_event(ProviderEventCommit {
+                account: account.clone(),
+                event_digest,
+                claim_generation: claim.claim_generation,
+                worker: worker.lease,
+                command: backdated_command,
+                at: at(7),
+            })
+            .await,
+            Err(RepositoryError::StaleClaim)
+        );
+        assert_eq!(
+            repo.load_call(&owner, call.aggregate.id()).await.unwrap(),
+            call
+        );
+
+        let wrong_leg_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(10),
+                leg_id: call.aggregate.legs()[0].id(),
+                binding_generation: call.aggregate.legs()[0].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(10),
+        };
+        assert_eq!(
+            repo.complete_provider_event(ProviderEventCommit {
+                account: account.clone(),
+                event_digest,
+                claim_generation: claim.claim_generation,
+                worker: worker.lease,
+                command: wrong_leg_command,
+                at: at(10),
+            })
+            .await,
+            Err(RepositoryError::ProviderReferenceConflict)
+        );
+        assert_eq!(
+            repo.load_call(&owner, call.aggregate.id()).await.unwrap(),
+            call
+        );
+
+        let command_id = CommandId::new();
+        let command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id,
+            command: CallCommand::SetLegState {
+                at: at(10),
+                leg_id: target_leg,
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(10),
+        };
+        let completion = ProviderEventCommit {
+            account: account.clone(),
+            event_digest,
+            claim_generation: claim.claim_generation,
+            worker: worker.lease,
+            command,
+            at: at(10),
+        };
+        let first = repo
+            .complete_provider_event(completion.clone())
+            .await
+            .unwrap();
+        assert!(matches!(first.command, CommandCommitOutcome::Committed(_)));
+        let replay = repo
+            .complete_provider_event(completion.clone())
+            .await
+            .unwrap();
+        assert!(matches!(replay.command, CommandCommitOutcome::Replayed(_)));
+        assert_eq!(replay.event, first.event);
+
+        let mut mismatched = completion;
+        mismatched.at = at(11);
+        mismatched.command.at = at(11);
+        mismatched.command.command = CallCommand::SetLegState {
+            at: at(11),
+            leg_id: target_leg,
+            binding_generation: call.aggregate.legs()[1].binding_generation(),
+            state: LegState::Signaling,
+            failure: None,
+        };
+        assert_eq!(
+            repo.complete_provider_event(mismatched).await,
+            Err(RepositoryError::StaleClaim)
+        );
+    }
+
+    #[tokio::test]
     async fn provider_claims_recover_on_worker_restart_and_reject_stale_fences() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 2).await;
@@ -3269,6 +3647,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed.event.state, ProviderEventState::Applied);
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_acknowledgement_recovers_without_outbox_or_capacity() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-a");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                168,
+                169,
+            ))
+            .await
+            .unwrap(),
+        );
+        let account = ProviderAccountKey::parse("vonage-terminal-account").unwrap();
+        let provider_call_id = ProviderCallId::parse("provider-call-terminal").unwrap();
+        let target = ProviderEventTarget {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            leg_id: call.aggregate.legs()[1].id(),
+        };
+        repo.bind_provider_reference(BindProviderReference {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            leg_id: target.leg_id,
+            account: account.clone(),
+            provider_call_id: provider_call_id.clone(),
+            worker: worker.lease,
+            at: at(2),
+        })
+        .await
+        .unwrap();
+        let terminal = end_call(&repo, &owner, worker.lease, call).await;
+        assert!(terminal.aggregate.state().is_terminal());
+        assert!(terminal.assignment.released_at.is_some());
+        drain_outbox(&repo, worker.lease, at(10)).await;
+        assert!(!repo
+            .read(|state| Ok(has_unfinished_outbox(state, terminal.aggregate.id())))
+            .unwrap());
+
+        let event_digest = ProviderEventDigest::new(digest(170));
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest,
+            payload_digest: crate::call_engine::ProviderPayloadDigest::new(digest(171)),
+            provider_call_id,
+            kind: "hangup".into(),
+            payload: json!({"state": "completed"}),
+            occurred_at: Some(at(10)),
+            received_at: at(11),
+        })
+        .await
+        .unwrap();
+
+        let newer = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: 1,
+                capabilities: BTreeSet::from(["sip".into()]),
+                at: at(12),
+            })
+            .await
+            .unwrap();
+        let recovered = repo
+            .claim_restart_calls(newer.lease, at(13), 1)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].call.assignment.released_at.is_some());
+        assert_eq!(
+            repo.worker_snapshot(newer.lease.worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+        let claim = repo
+            .claim_provider_events(newer.lease, at(14), Duration::from_secs(5), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let acknowledgement = TerminalProviderEventAcknowledge {
+            account,
+            event_digest,
+            claim_generation: claim.claim_generation,
+            worker: newer.lease,
+            target,
+            at: at(15),
+        };
+        let first = repo
+            .acknowledge_terminal_provider_event(acknowledgement.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            TerminalProviderEventAcknowledgeOutcome::Acknowledged(_)
+        ));
+        let replay = repo
+            .acknowledge_terminal_provider_event(acknowledgement.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay,
+            TerminalProviderEventAcknowledgeOutcome::Replayed(_)
+        ));
+        let mut mismatch = acknowledgement;
+        mismatch.at = at(16);
+        assert_eq!(
+            repo.acknowledge_terminal_provider_event(mismatch).await,
+            Err(RepositoryError::StaleClaim)
+        );
     }
 
     #[tokio::test]

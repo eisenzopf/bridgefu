@@ -334,7 +334,7 @@ pub struct DeadlineClaimGuard {
 }
 
 /// Optimistic, fenced pure-command transaction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandCommit {
     /// Authenticated tenant scope.
     pub tenant_id: TenantId,
@@ -598,6 +598,8 @@ pub enum ProviderEventState {
         worker: WorkerLease,
         /// Claim incarnation.
         generation: ClaimGeneration,
+        /// Time at which this claim incarnation began.
+        claimed_at: DateTime<Utc>,
         /// Claim expiry.
         expires_at: DateTime<Utc>,
     },
@@ -740,7 +742,7 @@ pub struct ClaimedProviderEvent {
 }
 
 /// Atomically applies a claimed provider event with its call command.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderEventCommit {
     /// Provider namespace.
     pub account: ProviderAccountKey,
@@ -763,6 +765,33 @@ pub struct ProviderEventCommitOutcome {
     pub event: ProviderEventEnvelope,
     /// Associated call command result.
     pub command: CommandCommitOutcome,
+}
+
+/// Fenced terminal-call acknowledgement for a provider event that requires no
+/// further aggregate transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalProviderEventAcknowledge {
+    /// Provider namespace.
+    pub account: ProviderAccountKey,
+    /// Exact provider event ID digest.
+    pub event_digest: ProviderEventDigest,
+    /// Exact claim incarnation.
+    pub claim_generation: ClaimGeneration,
+    /// Current call worker.
+    pub worker: WorkerLease,
+    /// Exact tenant/call/leg target retained on the event.
+    pub target: ProviderEventTarget,
+    /// Acknowledgement time.
+    pub at: DateTime<Utc>,
+}
+
+/// Idempotent terminal provider-event acknowledgement outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalProviderEventAcknowledgeOutcome {
+    /// This transaction acknowledged the event.
+    Acknowledged(ProviderEventEnvelope),
+    /// The exact acknowledgement had already committed.
+    Replayed(ProviderEventEnvelope),
 }
 
 /// Outbox execution lifecycle.
@@ -1047,6 +1076,12 @@ pub trait CallRepository: Send + Sync {
         &self,
         request: ProviderEventCommit,
     ) -> Result<ProviderEventCommitOutcome, RepositoryError>;
+
+    /// Acknowledges a claimed provider event for an already-terminal call.
+    async fn acknowledge_terminal_provider_event(
+        &self,
+        request: TerminalProviderEventAcknowledge,
+    ) -> Result<TerminalProviderEventAcknowledgeOutcome, RepositoryError>;
 
     /// Claims ordered effects for the current assigned worker.
     async fn claim_outbox(
