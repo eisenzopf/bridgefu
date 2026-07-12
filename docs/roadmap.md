@@ -838,24 +838,48 @@ not hide an earlier adapter side effect behind a nominally staged API.
    exposing transport types through Bridgefu's durable domain. Context secrets
    must never appear in logs, diagnostics, equality output, or metrics.
 2. [ ] Make SIP origination genuinely dormant. `prepare_outbound` may reserve
-   identifiers, routes, sockets, and capacity, but it must emit no INVITE or
-   other peer-visible signaling. Only a single successful `activate` may send
-   the INVITE, after Bridgefu has durably bound the exact Connection ID and
-   installed its operational-event owner. Cancellation before activation must
-   release every reservation without a network side effect.
+   bounded in-process identifiers, routes, and capacity, but it must perform no
+   coordinator call, DNS lookup, socket connection, RTP allocation, timer
+   creation, INVITE, or other peer-visible signaling. A retained single-flight
+   activation driver must send at most one INVITE only after Bridgefu has
+   durably bound the exact Connection ID and installed its operational-event
+   owner. Concurrent or cancelled activation waiters must observe the same
+   result without retransmitting. Cancellation before activation must release
+   every reservation without a network side effect; cancellation after a
+   possible send must boundedly compensate with CANCEL/BYE and forced local
+   cleanup. Activation must return the actual SIP Call-ID only after staged
+   events have been flushed without losing a fast terminal response.
+   `SipOriginateContext` must provide redacted typed authentication and
+   ordered, bounded initial headers; reject controls, CR/LF, stack-managed or
+   internal headers, and untyped authorization before any packet. Add
+   byte-preserving in-dialog SIP MESSAGE mapping for reliable ordered
+   `DataMessage`, typed asynchronous REFER progress/completion/failure, and
+   validated RFC 4733 duration and inter-digit spacing.
 3. [ ] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
    WHEP, while retaining the corresponding authenticated server roles. Local
-   SDP offer construction is not an outbound client. For attachable WHEP,
-   authenticate and validate the resource tag, allocate a provisional
-   connection, bind its exact Connection ID transactionally, and install its
-   owner before returning `201` and emitting the operational event. Rejection,
-   expiry, replay, disconnect, or abandonment must close the provisional
-   connection and erase its context.
+   SDP offer construction is not an outbound client. Pin WHIP to
+   [RFC 9725](https://datatracker.ietf.org/doc/rfc9725/) and WHEP to
+   [draft-ietf-wish-whep-04](https://datatracker.ietf.org/doc/html/draft-ietf-wish-whep-04)
+   (published 2026-06-22, expiring 2026-12-24). Implement canonical WHEP-04
+   offer/answer and `406` counter-offer handling; any prior empty-POST/server-
+   offer behavior is legacy-only behind explicit configuration. HTTP clients
+   must retain `Location`/`ETag`, use conditional PATCH/DELETE, constrain
+   redirects and credential forwarding, and buffer trickle candidates until a
+   resource exists. Persistent WS/WSS sessions must carry signaling,
+   candidates, and BYE over one authenticated `rvoip.webrtc.v1` connection.
+   For attachable WHEP, authenticate and validate the resource tag, allocate a
+   provisional connection, bind its exact Connection ID transactionally, and
+   install its owner before returning `201` and emitting the operational event.
+   Rejection, expiry, replay, disconnect, or abandonment must close the
+   provisional connection and erase its context.
 4. [ ] Persist signaling role independently from media direction using
    `SignalingInitiator` and `MediaFlow` (`send_only`, `receive_only`, or
    `send_recv`). Derive offerer/answerer behavior from the protocol and
    signaling role, never from media direction, and construct directional
-   MediaGraph routes so one-way legs do not accidentally transmit.
+   MediaGraph routes so one-way legs do not accidentally transmit. Make source
+   and sink halves independently optional, negotiate Opus/PCMU/PCMA from the
+   actual SDP/transceiver rather than configuration guesses, and validate the
+   complete directional bridge plan before consuming any one-shot receiver.
 5. [ ] Give the Amazon adapter the same prepare/bind/activate/terminal/drain
    lifecycle. Its typed per-call context must contain the actual Connect
    target, attributes, display name, and a stable client token reused during
@@ -873,7 +897,12 @@ not hide an earlier adapter side effect behind a nominally staged API.
    engine using the staged interfaces above. Support G.711, Opus, RFC 4733
    DTMF, arbitrary DataChannels, context translation, transfer, remote hangup,
    timeout, and teardown in both directions without bypassing the actor or
-   MediaGraph ownership model.
+   MediaGraph ownership model. Each SIP and WebRTC route must have one owned
+   supervisor for negotiation, candidate, media-pump, disconnect-grace, and
+   terminal tasks; teardown must cancel and join them, remove exact mappings,
+   close transport resources, and emit exactly one authoritative terminal
+   event. Transfer completion is established by typed protocol outcome, not by
+   successful command dispatch alone.
 8. [ ] Preserve the frozen StandardCharter path while adding a protected
    canary compatibility route for its trusted Vapi contract: `sip:<tenant>`
    plus `X-Correlation-Id`, without a public attachment token. The canary may
@@ -883,12 +912,23 @@ not hide an earlier adapter side effect behind a nominally staged API.
    the default until this path passes every frozen regression and the
    non-production canary workflow.
 9. [ ] Add configurable STUN/TURN, symmetric RTP, advertised addresses, SIP
-   `rport`, ICE/DTLS timeout handling, and NAT-aware media-port allocation.
+   `rport`, ICE/DTLS timeout handling, and NAT-aware media-port allocation. ICE
+   candidate policy is per exchange: HTTP answers full-gather as required by
+   WHIP/WHEP, while trickle-capable clients buffer until `Location`/`ETag` and
+   WS/WSS exchanges negotiate trickle independently. Do not use one global
+   trickle setting across these substrates.
    Prove real PCMU and PCMA SIP/RTP to Opus WebRTC media in both directions,
    real RFC 4733 DTMF, WS/WSS and WHIP/WHEP signaling, initial and subsequent
    context translation, terminal cleanup, and no media after teardown across
    representative NAT topologies. Mock-adapter bridge tests alone do not
    satisfy this prerequisite or the gate.
+
+The current exact-revision `rtc` alpha fork remains pinned while these adapter
+and lifecycle defects are fixed in rvoip. A further private fork is justified
+only by a minimal failing engine conformance test (directional RTP,
+rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
+such patch remains on an exact reviewed revision; no upstream issue or pull
+request is created before owner review.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
