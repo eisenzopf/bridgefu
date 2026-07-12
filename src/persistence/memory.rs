@@ -4570,6 +4570,19 @@ fn validate_effect_follow_up(
             },
         ) => leg_id == command_leg && binding_generation == command_generation,
         (
+            EffectIntent::BridgeMedia {
+                left_leg_id,
+                right_leg_id,
+            },
+            ServiceEffectResult::Failed(expected),
+            CallCommand::SetLegState {
+                leg_id,
+                state: LegState::Failed,
+                failure: Some(actual),
+                ..
+            },
+        ) => (leg_id == left_leg_id || leg_id == right_leg_id) && expected == actual,
+        (
             EffectIntent::ExecuteTransfer {
                 deadline_generation,
             },

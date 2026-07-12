@@ -289,6 +289,7 @@ pub struct CallServiceRuntime {
     repository: Arc<dyn CallRepository>,
     service_repository: Arc<dyn CallServiceRepository>,
     service: Arc<CallService>,
+    timeouts: CallTimeoutPolicy,
     worker: WorkerSnapshot,
     clock: Arc<dyn CallServiceClock>,
     work_wakeups: watch::Sender<Option<RuntimeWorkWakeup>>,
@@ -414,6 +415,20 @@ impl CallServiceRuntime {
     #[must_use]
     pub fn worker(&self) -> &WorkerSnapshot {
         &self.worker
+    }
+
+    /// Current injected UTC observation time used by execution claims and
+    /// lifecycle reconciliation.
+    #[must_use]
+    pub fn observation_time(&self) -> chrono::DateTime<chrono::Utc> {
+        self.clock.now()
+    }
+
+    /// Validated lifecycle timeout policy shared with the transactional
+    /// service and execution supervisor.
+    #[must_use]
+    pub const fn timeouts(&self) -> CallTimeoutPolicy {
+        self.timeouts
     }
 
     /// Subscribes to coalesced worker wakeups. Every update means the caller
@@ -1073,6 +1088,7 @@ where
         repository: core_repository,
         service_repository,
         service,
+        timeouts: config.timeouts,
         worker,
         clock,
         work_wakeups,

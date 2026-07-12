@@ -4,6 +4,7 @@
 //! the immutable execution plan and transactional records needed by a worker
 //! without changing the existing call-engine public API.
 
+mod execution;
 mod idempotency;
 mod model;
 mod repository;
@@ -11,6 +12,7 @@ mod runtime;
 mod service;
 mod view;
 
+pub use execution::*;
 pub use idempotency::*;
 pub use model::*;
 pub use repository::*;
