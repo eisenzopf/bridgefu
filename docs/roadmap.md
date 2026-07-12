@@ -343,7 +343,7 @@ hint for SIP and WebRTC connections.
    commit, attachment consumption, provider-event deduplication, deadlines,
    and restart claims. Use one lock across all memory indexes so tests exercise
    real atomic semantics.
-4. [ ] Add SQLite and PostgreSQL migrations and implementations for calls,
+4. [x] Add SQLite and PostgreSQL migrations and implementations for calls,
    legs, commands, 24-hour idempotency, attachments, provider events, outbox,
    worker capacity, and assignments. Run one repository conformance suite
    against all three backends; use cancellation-safe `BEGIN IMMEDIATE` or
@@ -425,6 +425,25 @@ Gate 6 progress evidence recorded on 2026-07-12:
   ID tombstones, and capacity-safe terminal cleanup. The complete locked suite
   passes 49 library, 20 binary, and 14 StandardCharter tests; strict library
   Clippy and warning-free library rustdoc pass.
+- Bridgefu revision `5b746cf12bd50c645492d05213167a1c6283950b`
+  adds authoritative SQLite and PostgreSQL implementations with one versioned
+  initial schema per backend. SQLite uses cancellation-safe `BEGIN IMMEDIATE`;
+  PostgreSQL serializes mutation decisions with a fenced epoch row. Read-only
+  snapshots do not advance the epoch, and mutations write targeted row deltas
+  rather than rewriting unchanged history.
+- Database constraints enforce composite call/leg ownership, provider
+  completion replay, and permanent connection-ID tombstones. Both loaders
+  compare every normalized worker, call, leg, assignment, binding, command,
+  idempotency, attachment, provider, outbox, and deadline column against its
+  serialized body and fail closed on drift. Unsafe automatic history deletion
+  is absent; only fully settled terminal histories can be reported as retention
+  candidates.
+- The digest-pinned PostgreSQL 17.5 Docker runner passes all 10 shared schema,
+  migration reconnect/checksum, row-delta, rollback/cancellation, 13-row-family
+  drift, lifecycle, and two-independent-instance race tests. The main locked
+  suite passes 49 library, 20 binary, 10 repository, and 14 StandardCharter
+  tests; strict library/repository Clippy and warning-free rustdoc pass. CI
+  provisions PostgreSQL and cannot silently use the local skip path.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
