@@ -920,6 +920,10 @@ not hide an earlier adapter side effect behind a nominally staged API.
      SIP option materialization errors expose only field presence/length and
      validation class; they never include P-Asserted-Identity, proxy URI, From,
      target, credential, or application-header values.
+     The same boundary covers every initial, extra-header, structured-options,
+     and authenticated-retry INVITE wrapper: no wrapper may relay a lower
+     builder/parser error string, and pre-dispatch CreateDialog actions expose
+     only endpoint presence/length before calling the lower dialog manager.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
@@ -1100,6 +1104,13 @@ Gate 7 progress evidence recorded on 2026-07-12:
   warning-free rustdoc, formatting, and diff checks. Item 2a remains open only
   for the separately enumerated transaction/parser/option diagnostic closure
   and its final independent audit.
+- An independent audit of rvoip revision
+  `fa173e7c9bd875ea143a0894415c5826448c09c0` confirms the new PAI/proxy option
+  errors and structured-options wrapper are value-free and preserve absent-From
+  and header-order behavior, but keeps 2a open. The earlier CreateDialog action
+  and lower dialog manager still log raw endpoints, while legacy, extra-header,
+  and authenticated-retry adapter wrappers still relay lower builder/parser
+  source text. Those two P1 paths are part of the active diagnostic closure.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
