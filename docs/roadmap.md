@@ -390,6 +390,26 @@ hint for SIP and WebRTC connections.
    and capacity-aware selection, reservations, routing, replay markers, drain,
    and Redis Streams notification. PostgreSQL remains authoritative and a
    transactional outbox avoids PostgreSQL/Redis dual writes.
+   - Reuse authoritative `workers.reserved_calls` and `worker_assignments`;
+     select and reserve an active, non-draining, capability-compatible worker
+     inside the same call-creation transaction after idempotency replay lookup.
+     Do not create a second Redis or lease-table capacity authority.
+   - Add expiring, non-resurrectable worker leases, exact-fence renewal, and a
+     one-way drain transition. PostgreSQL lease decisions use database time;
+     standalone backends use an injected clock for deterministic parity tests.
+   - Persist a separate, ordered coordination outbox for worker snapshots, call
+     routes, and work-available notifications. A projector applies each event
+     idempotently to memory or Redis, then acknowledges PostgreSQL; it never
+     writes PostgreSQL and Redis as one request-path operation.
+   - Treat Redis route/replay entries and per-worker Streams as short-lived
+     sequence-checked hints only. Consumers still claim authoritative database
+     work before external I/O, use bounded database fallback polling, and
+     tolerate duplicate, missing, trimmed, stale, flushed, or reordered Redis
+     messages.
+   - Run Redis Stream consumers with dedicated blocking connections,
+     `XREADGROUP`/`XACK`/`XAUTOCLAIM`, bounded streams, deployment-prefixed keys,
+     `rediss://` in clustered modes, and no raw tokens, secrets, provider
+     payloads, or tenant authorization decisions in Redis.
 7. [ ] Replace global FIFO pairing with at least 256-bit, two-minute,
    single-use attachment tokens. Persist only a digest bound to tenant, call,
    leg, expected transport, and worker fence; atomically bind the exact rvoip
