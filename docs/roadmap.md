@@ -245,15 +245,50 @@ Gate 4 evidence recorded on 2026-07-11:
 
 ### Gate 5 — Finish rvoip-moq draft-19 (`in progress`)
 
-- [ ] Patch and exact-pin moq-rs for MOQT-19/MSF-01/LOC-03.
-- [ ] Replace the current runtime/target mismatch with `MoqProtocolVersion` and
-  `MoqCompatibility`.
-- [ ] Implement LOC Opus objects, MSF catalogs, raw QUIC, WebTransport, origins,
-  subscribers, embedded/external relays, mTLS, authorization, reconnect,
-  health, and drain.
-- [ ] Interoperate with the patched moq-rs stack and an independent matching
-  implementation; prepare the moq-rs patch for user review before any upstream
-  submission.
+The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
+
+1. [x] Fork `cloudflare/moq-rs` under `eisenzopf` and record upstream main
+   `5295993480c3d19f6057d0bb3c8b0b394ad1df62` plus the draft-18 port base.
+   Keep every patch private to the fork until user review; do not open upstream
+   issues or pull requests.
+2. [ ] Add serializable `MoqProtocolVersion` and `MoqCompatibility` types and
+   make the published MOQT-19/MSF-01/LOC-03 tuple authoritative across ALPN,
+   negotiation, descriptors, diagnostics, logs, and metrics. Reject mismatches
+   explicitly and remove the current runtime/target split.
+3. [ ] Base the port on Cloudflare's draft-18 work at exact revision
+   `c7e80e49f4189efd1e55e2533eab36adf0e8f4b4`, reconcile it with the current
+   upstream mainline, and port the resulting wire engine to draft-19. Add
+   golden control/data vectors plus raw-QUIC and WebTransport coverage.
+4. [ ] Pin `moq-transport`, `moq-native-ietf`, and `moq-relay-ietf` to the same
+   reviewed 40-character fork revision. Permit that exact Git source in supply
+   chain policy without allowing branches or floating revisions, and prove no
+   moq-rs type appears in the public `rvoip-moq` API.
+5. [ ] Implement the rvoip-owned LOC Opus object and MSF catalog model,
+   including canonical 48 kHz mono 20 ms audio, collision-free namespace tuple
+   validation, catalog authorization, Joining FETCH retention, and an optional
+   sanitized events track. Production MSF-01 uses one new MOQT stream per
+   Object as required by MSF-01 section 6; LOC datagrams remain an explicitly
+   experimental non-MSF profile and are not enabled by Bridgefu 1.0.
+6. [ ] Implement managed origin, publication, subscriber, embedded-relay, and
+   external-relay lifecycles with mTLS, scoped authorization, reconnect,
+   health, graceful drain, exact cleanup, and bounded task/queue behavior.
+7. [ ] Prove publication and subscription through a relay over raw QUIC and
+   WebTransport, then test against one independent implementation at the exact
+   same draft. Record packet captures, negotiated versions, and relay paths.
+8. [x] Add scheduled CI that compares the pinned tuple and fork base with IETF
+   Datatracker and moq-rs upstream, emits a report or tracking issue, and never
+   edits dependencies or contacts upstream automatically.
+9. [ ] Prepare the fork delta, interoperability report, and proposed upstream
+   patch for user review. Submission remains a separately authorized action.
+
+Gate 5 external evidence note: draft-19 and LOC-03 were published on
+2026-07-06. At the 2026-07-11 audit, Meta moxygen and the other catalogued
+independent implementations supported draft-18 or earlier. The fork and rvoip
+work proceeds now, but Gate 5 cannot be marked complete and Bridgefu cannot
+claim draft-19 GA interoperability until an independently maintained draft-19
+implementation is available and passes the recorded matrix. An internal
+moxygen patch is useful for development but does not satisfy that independent
+evidence requirement.
 
 Exit: both substrates traverse a relay and version, packet-capture, and
 interoperability suites pass.

@@ -1,0 +1,22 @@
+name: moq-upstream-watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 11 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare pinned MOQT inputs with authoritative upstreams
+        run: bash scripts/check-moq-upstream.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moq-upstream-report
+          path: moq-upstream-report.json
+          if-no-files-found: error

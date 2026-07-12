@@ -10,9 +10,18 @@
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
 MOQT draft churn is isolated in `rvoip-moq`. The diagnostics endpoint reports
-both the linked wire draft and the target. Bridgefu must not be called GA for
-draft-19 until the pinned moq-rs commit passes independent interop; the current
-crate makes this gap explicit rather than misreporting compatibility.
+the negotiated transport draft and the configured MSF/LOC profile separately.
+Bridgefu must not be called GA for draft-19 until the pinned moq-rs commit
+passes independent interop; the current crate makes this gap explicit rather
+than misreporting compatibility.
+
+The reviewed inputs are recorded in `docs/moq-compatibility.json`. A scheduled,
+report-only CI workflow compares those pins with IETF Datatracker and moq-rs
+upstream. It never updates a dependency or contacts an upstream maintainer.
+
+Bridgefu's production MSF-01 profile maps each audio Object to a new MOQT
+stream, as required by MSF-01 section 6. LOC datagrams are retained only as an
+explicit experimental non-MSF profile.
 
 RoQ remains an adapter seam. It is point-to-point RTP/RTCP carriage and is not
 used as a broadcast fanout protocol.

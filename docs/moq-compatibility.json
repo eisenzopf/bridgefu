@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "auditedAt": "2026-07-11",
+  "standards": {
+    "transport": {
+      "name": "draft-ietf-moq-transport",
+      "revision": "19",
+      "archiveSha256": "bc15c8143b5dac3f6db8282b2fcf1dc86d6e8bc70a38c8aa09c54e8f4a045743"
+    },
+    "streamingFormat": {
+      "name": "draft-ietf-moq-msf",
+      "revision": "01",
+      "archiveSha256": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+    },
+    "container": {
+      "name": "draft-ietf-moq-loc",
+      "revision": "03",
+      "archiveSha256": "cbcab1e0bb205831c96ca871436a93c372dc892352c2b0a214f4334c36642bd9"
+    }
+  },
+  "wireLibrary": {
+    "upstream": "cloudflare/moq-rs",
+    "fork": "eisenzopf/moq-rs",
+    "portBaseRevision": "c7e80e49f4189efd1e55e2533eab36adf0e8f4b4",
+    "reviewedForkRevision": null,
+    "status": "draft-19-port-in-progress"
+  },
+  "independentInterop": {
+    "implementation": "facebookexperimental/moxygen",
+    "auditedRevision": "bdf5ac341f152d69e25eec753ef4fc77ba603b6a",
+    "maximumTransportRevision": "18",
+    "status": "awaiting-independent-draft-19-support"
+  }
+}
