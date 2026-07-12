@@ -879,6 +879,34 @@ not hide an earlier adapter side effect behind a nominally staged API.
      validated append path so allowed duplicate headers preserve exact order
      and multiplicity while singleton duplicates fail. Validate generated
      auth values, including AKA-provider output, before wire serialization.
+     Implement this as one per-connection `SipOutboundRoute`, not independent
+     context and event maps. Its retained driver owns `Dormant`, `Activating`,
+     `Flushing`, `Activated`, `Terminating`, and `Terminal` phases, a bounded
+     operational FIFO, a separately reserved first-terminal slot, a cloneable
+     redacted result, cancellation, and exact task/route reclamation. The first
+     activation spawns the driver; caller-future cancellation must not cancel
+     or re-enter the initializer, and every concurrent waiter observes the
+     same receipt or failure. Split protocol-map retirement from route
+     reclamation so a fast terminal is delivered once but can never resurrect
+     a tombstoned Session ID or retain a permanent stage.
+
+     `SipMediaStream` gains a local-only dormant constructor plus single-flight
+     bind/close states. Prepare may allocate its bounded channels and stable
+     stream ID, but no coordinator subscription, media session, pump, timer,
+     socket, DNS, or packet exists until activation. Existing inbound/new
+     construction remains a compatibility wrapper over dormant-plus-bind.
+     Non-terminal controls fail with a typed pre-activation state error; end is
+     always allowed. Once a session may have been created, a bounded
+     coordinator compensation helper sends the one legal CANCEL or BYE and
+     then forces idempotent local cleanup if the peer never completes teardown.
+
+     Land 2b in independently green slices: shared initial/retry append and
+     singleton policy; dormant-bind media; retained route supervisor; zero-wire
+     prepare plus context/receipt; cancellation compensation; then the complete
+     capture-UAS, concurrency, backpressure, leak, and migration suite. Existing
+     core receipt and prepared-commit interfaces are sufficient; do not make a
+     breaking core API change. A generic adapter drain hook remains optional,
+     while SIP exposes a concrete drain method for Bridgefu worker shutdown.
    - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
      both directions, with validated internal label/message-ID headers and
      explicit reliability capability errors.
