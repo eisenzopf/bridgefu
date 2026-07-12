@@ -457,12 +457,12 @@ hint for SIP and WebRTC connections.
      Keep the WebSocket authentication bearer in its existing independent
      subprotocol/header path; do not put attachment tokens in query strings.
      rvoip's auth hook retains only a redacted, single-take session hint.
-   - Model WHIP and WHEP according to their direction instead of forcing both
-     through the unsolicited-inbound event shape. WHIP publication enters the
-     reliable inbound-admission path. WHEP resource creation must validate and
-     consume the durable resource tag before originating its subscriber leg,
-     retaining the same principal, worker-fence, once-only, and cleanup
-     guarantees.
+   - Model WHIP and WHEP according to their signaling role instead of forcing
+     both through the unsolicited-inbound event shape. WHIP publication enters
+     the reliable inbound-admission path. Current WHEP resource creation is a
+     server-offer/outbound rvoip operation and is completed in Gate 7 through
+     the explicit attachable-outbound path below; it must not emit a synthetic
+     `ConnectionInbound` event.
    - On every inbound connection, obtain the complete authenticated principal,
      consume its owner-bound rvoip inbound context once, hash the routing hint,
      inspect and consume the durable attachment atomically, and reject/close
@@ -553,6 +553,12 @@ cross-connect.
 ### Gate 7 — Complete SIP/WebRTC and Amazon paths (`pending`)
 
 - [ ] Support inbound and outbound SIP and WebRTC through one call engine.
+- [ ] Separate logical media direction from signaling initiation/attachment
+  role. Add an authenticated attachable-outbound connection seam for WHEP:
+  authenticate and validate its resource tag, allocate the connection, bind
+  the exact Connection ID transactionally before returning `201`, then emit
+  the outbound event. A rejected, expired, replayed, or abandoned request must
+  close the provisional connection and erase its context.
 - [ ] Support G.711, Opus, DTMF, arbitrary DataChannels, context translation,
   transfer, and teardown in both directions.
 - [ ] Integrate Amazon through reusable rvoip interfaces while preserving the
