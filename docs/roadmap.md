@@ -259,7 +259,7 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
    `c7e80e49f4189efd1e55e2533eab36adf0e8f4b4`, reconcile it with the current
    upstream mainline, and port the resulting wire engine to draft-19. Add
    golden control/data vectors plus raw-QUIC and WebTransport coverage.
-4. [ ] Pin `moq-transport`, `moq-native-ietf`, and `moq-relay-ietf` to the same
+4. [x] Pin `moq-transport`, `moq-native-ietf`, and `moq-relay-ietf` to the same
    reviewed 40-character fork revision. Permit that exact Git source in supply
    chain policy without allowing branches or floating revisions, and prove no
    moq-rs type appears in the public `rvoip-moq` API.
@@ -284,21 +284,28 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
 Gate 5 implementation checkpoint recorded on 2026-07-11:
 
 - The private `eisenzopf/moq-rs` fork is pinned at
-  `f3c29d319766061b013ed683552a26ff8b7e5a2f`. It implements draft-19-only
-  ALPN/version negotiation, the changed discovery/request messages,
-  stream-owned request updates with receiver credit enforcement, redirect and
-  Track Property encoding, session-fatal protocol errors, and golden vectors.
-  The fork workspace passes 219 transport tests plus 42 relay tests. No
-  upstream issue, pull request, or maintainer message was created.
-- rvoip revision `a258af2e6e9d1fd185cd48f6157c8417eaecce6a`
-  exact-pins that fork and adds rvoip-owned compatibility, namespace,
-  authorization, replay, MSF catalog, monotonic LOC timestamp, and typed
-  broadcast lifecycle models without exposing moq-rs types. The combined
-  core/QUIC/MOQT suite and strict scoped clippy/doc checks pass.
-- This is an integration checkpoint, not Gate 5 completion. Production MSF
-  stream-per-object delivery, complete PUBLISH/FETCH, network authorization,
-  mTLS relay admission, reconnect/drain, and two-substrate relay traversal are
-  still required by items 3, 5, 6, and 7.
+  `f6159d2daf4e7aa6caccefbaf225070ff55bd869`. It implements draft-19-only
+  ALPN/version negotiation, control and data codecs, PUBLISH request/update and
+  cancellation flow, same-alias filtered fanout, bounded per-publication and
+  per-session admission, deterministic task cleanup, session draining, and
+  golden vectors. The reviewed matrix passes 264 transport tests, 42 relay
+  library tests, two relay binary tests, strict clippy, and a workspace check.
+- rvoip revision `6492ec1d4638323aeb52cfc66fa7feea0b180e0f`
+  exact-pins that fork and provides rvoip-owned protocol compatibility,
+  authorization/replay, namespace validation, MSF catalog, monotonic LOC Opus
+  packaging, health, and managed publication/relay lifecycle APIs without
+  exposing moq-rs types. Production paths require mTLS and implement bounded
+  reconnect, graceful drain, task-failure propagation, and deterministic
+  cleanup. The scoped `rvoip-moq` matrix passes 53 default unit tests plus its
+  public API test, 54 `insecure-development` unit tests plus its public API
+  test, and strict clippy/rustdoc in both configurations.
+- This is an integration checkpoint, not Gate 5 completion. Remaining work is
+  control-stream request confinement; subgroup `END_OF_GROUP` and one stream
+  per MSF Object; Joining FETCH and its bounded cache; URI handling,
+  WebTransport, and end-to-end relay traversal; and interoperability with an
+  independently maintained draft-19 implementation.
+- No upstream issue, pull request, or maintainer message has been created. The
+  fork remains private pending project-owner review of any proposed submission.
 
 Gate 5 external evidence note: draft-19 and LOC-03 were published on
 2026-07-06. At the 2026-07-11 audit, Meta moxygen and the other catalogued

@@ -22,7 +22,7 @@ jobs:
           # Coordinated Bridgefu 1.0 foundation revision. Update this only
           # after the matching rvoip change set is green and available on
           # the remote; never replace it with a floating branch.
-          ref: ef74512967e26f994c4593ed2187517e2c0307b4
+          ref: 6492ec1d4638323aeb52cfc66fa7feea0b180e0f
           path: rvoip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: eisenzopf/rvoip
-          ref: ef74512967e26f994c4593ed2187517e2c0307b4
+          ref: 6492ec1d4638323aeb52cfc66fa7feea0b180e0f
           path: rvoip
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
