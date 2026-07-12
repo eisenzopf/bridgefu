@@ -350,8 +350,9 @@ impl CallService {
         key: &IdempotencyKey,
         input: CreateCallInput,
     ) -> Result<CallOperationResult<CreateCallView>, CallServiceError> {
-        let at = self.clock.now();
-        let tenant = principal.resolve_tenant(input.tenant_id.as_deref(), CallScope::Create, at)?;
+        let request_at = self.clock.now();
+        let tenant =
+            principal.resolve_tenant(input.tenant_id.as_deref(), CallScope::Create, request_at)?;
         let owner_fingerprint = self.crypto.principal_fingerprint(principal);
         let transcript = create_transcript(&input.legs);
         let operation = self.crypto.operation_idempotency(
@@ -364,18 +365,39 @@ impl CallService {
         );
         if let Some(stored) = self
             .repository
-            .load_create_replay(&tenant, operation.key_digest, operation.request_digest, at)
+            .load_create_replay(
+                &tenant,
+                operation.key_digest,
+                operation.request_digest,
+                request_at,
+            )
             .await?
         {
             return self.create_view(stored, true);
         }
+        let setup_deadline = checked_deadline(request_at, self.timeouts.setup)?;
+        let creation_deadline = if input
+            .legs
+            .iter()
+            .any(|leg| leg.direction == LegDirection::Inbound)
+        {
+            setup_deadline.min(checked_deadline(
+                request_at,
+                Duration::from_secs(
+                    u64::try_from(super::ATTACHMENT_TOKEN_TTL_SECONDS)
+                        .expect("positive attachment TTL fits u64"),
+                ),
+            )?)
+        } else {
+            setup_deadline
+        };
         let aggregate = CallAggregate::new(
             tenant.clone(),
             input.legs.clone().map(|leg| LegSpec {
                 direction: leg.direction,
                 kind: leg.endpoint.kind(),
             }),
-            at,
+            request_at,
         );
         let plan = CallExecutionPlan::new(
             &aggregate,
@@ -391,42 +413,82 @@ impl CallService {
             ],
         )?;
 
-        let resolved_principals = match self
-            .resolve_attachment_principals(&tenant, &aggregate, &plan, owner_fingerprint)
-            .await
-        {
-            Ok(principals) => principals,
+        let resolver_budget = match remaining_budget(self.clock.now(), creation_deadline) {
+            Ok(remaining) => remaining,
             Err(error) => {
+                return self
+                    .replay_create_or_error(&tenant, &operation, error)
+                    .await;
+            }
+        };
+        let resolved_principals = match tokio::time::timeout(
+            resolver_budget,
+            self.resolve_attachment_principals(&tenant, &aggregate, &plan, owner_fingerprint),
+        )
+        .await
+        {
+            Ok(Ok(principals)) => principals,
+            Ok(Err(error)) => {
                 // A concurrent request may commit while profile resolution is
                 // blocked or failing. Its durable receipt outranks dependency
                 // health and contains the original attachment descriptors.
-                if let Some(stored) = self
-                    .repository
-                    .load_create_replay(&tenant, operation.key_digest, operation.request_digest, at)
-                    .await?
-                {
-                    return self.create_view(stored, true);
-                }
-                return Err(error);
+                return self
+                    .replay_create_or_error(&tenant, &operation, error)
+                    .await;
+            }
+            Err(_) => {
+                return self
+                    .replay_create_or_error(
+                        &tenant,
+                        &operation,
+                        CallServiceError::DependencyUnavailable,
+                    )
+                    .await;
             }
         };
-        let worker = match self.placement.select_worker(&tenant, &plan, at).await {
-            Ok(worker) => worker,
+        let placement_at = self.clock.now();
+        let placement_budget = match remaining_budget(placement_at, creation_deadline) {
+            Ok(remaining) => remaining,
             Err(error) => {
+                return self
+                    .replay_create_or_error(&tenant, &operation, error)
+                    .await;
+            }
+        };
+        let worker = match tokio::time::timeout(
+            placement_budget,
+            self.placement.select_worker(&tenant, &plan, placement_at),
+        )
+        .await
+        {
+            Ok(Ok(worker)) => worker,
+            Ok(Err(error)) => {
                 // A concurrent request may have won after the preflight. Exact
                 // retained results outrank current placement health/capacity.
-                if let Some(stored) = self
-                    .repository
-                    .load_create_replay(&tenant, operation.key_digest, operation.request_digest, at)
-                    .await?
-                {
-                    return self.create_view(stored, true);
-                }
-                return Err(map_placement_error(error));
+                return self
+                    .replay_create_or_error(&tenant, &operation, map_placement_error(error))
+                    .await;
+            }
+            Err(_) => {
+                return self
+                    .replay_create_or_error(
+                        &tenant,
+                        &operation,
+                        CallServiceError::DependencyUnavailable,
+                    )
+                    .await;
             }
         };
-        let setup_deadline = checked_deadline(at, self.timeouts.setup)?;
-        let command = CallCommand::StartConnecting { at, setup_deadline };
+        let commit_at = self.clock.now();
+        if let Err(error) = remaining_budget(commit_at, creation_deadline) {
+            return self
+                .replay_create_or_error(&tenant, &operation, error)
+                .await;
+        }
+        let command = CallCommand::StartConnecting {
+            at: commit_at,
+            setup_deadline,
+        };
         let decided = aggregate
             .decide(command.clone())
             .map_err(|_| CallServiceError::InvalidTransition)?;
@@ -435,7 +497,7 @@ impl CallService {
             decided.aggregate(),
             &resolved_principals,
             worker,
-            at,
+            request_at,
         )?;
         let outcome = self
             .repository
@@ -448,7 +510,7 @@ impl CallService {
                     idempotency_key: operation.key_digest,
                     request_digest: operation.request_digest,
                     attachments,
-                    at,
+                    at: commit_at,
                 },
                 plan,
             })
@@ -458,6 +520,29 @@ impl CallService {
             ServiceCreateOutcome::Replayed(stored) => (stored, true),
         };
         self.create_view(stored, replayed)
+    }
+
+    async fn replay_create_or_error(
+        &self,
+        tenant: &TenantId,
+        operation: &OperationIdempotency,
+        error: CallServiceError,
+    ) -> Result<CallOperationResult<CreateCallView>, CallServiceError> {
+        let observed_at = self.clock.now();
+        if let Some(stored) = self
+            .repository
+            .load_create_replay(
+                tenant,
+                operation.key_digest,
+                operation.request_digest,
+                observed_at,
+            )
+            .await?
+        {
+            self.create_view(stored, true)
+        } else {
+            Err(error)
+        }
     }
 
     /// Loads only a call owned by the authenticated tenant.
@@ -809,6 +894,21 @@ fn checked_deadline(
         ))
 }
 
+fn remaining_budget(
+    observed_at: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+) -> Result<Duration, CallServiceError> {
+    let remaining = deadline
+        .signed_duration_since(observed_at)
+        .to_std()
+        .map_err(|_| CallServiceError::DependencyUnavailable)?;
+    if remaining.is_zero() {
+        Err(CallServiceError::DependencyUnavailable)
+    } else {
+        Ok(remaining)
+    }
+}
+
 fn attachment_transport(kind: crate::call_engine::LegKind) -> AttachmentTransport {
     match kind {
         crate::call_engine::LegKind::Sip
@@ -1017,6 +1117,61 @@ mod tests {
             self.entered.wait().await;
             self.release.wait().await;
             Err(AttachmentPrincipalResolverError::Unavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierSuccessfulResolver {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl AttachmentPrincipalResolver for BarrierSuccessfulResolver {
+        async fn resolve_principal(
+            &self,
+            request: AttachmentPrincipalRequest<'_>,
+        ) -> Result<Option<PrincipalFingerprint>, AttachmentPrincipalResolverError> {
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(Some(request.api_principal))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierPendingResolver {
+        entered: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl AttachmentPrincipalResolver for BarrierPendingResolver {
+        async fn resolve_principal(
+            &self,
+            _request: AttachmentPrincipalRequest<'_>,
+        ) -> Result<Option<PrincipalFingerprint>, AttachmentPrincipalResolverError> {
+            self.entered.wait().await;
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierSuccessfulPlacement {
+        worker: WorkerLease,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl WorkerPlacement for BarrierSuccessfulPlacement {
+        async fn select_worker(
+            &self,
+            _tenant: &TenantId,
+            _plan: &CallExecutionPlan,
+            _at: DateTime<Utc>,
+        ) -> Result<WorkerLease, PlacementError> {
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(self.worker)
         }
     }
 
@@ -1321,6 +1476,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_resolver_crossing_setup_deadline_leaks_no_state_or_capacity() {
+        let repository = Arc::new(MemoryRepository::new());
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 1,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let clock = Arc::new(TestClock::new(at(0)));
+        let service = Arc::new(CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(BarrierSuccessfulResolver {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            CallServiceCrypto::new(vec![0x65; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy {
+                setup: Duration::from_secs(30),
+                ..CallTimeoutPolicy::default()
+            },
+        ));
+        let task = tokio::spawn(async move {
+            service
+                .create_call(
+                    &principal("tenant-a"),
+                    &IdempotencyKey::parse("stalled-resolver").unwrap(),
+                    generic_input(),
+                )
+                .await
+        });
+        entered.wait().await;
+        clock.set(at(31));
+        release.wait().await;
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            CallServiceError::DependencyUnavailable
+        );
+        assert_eq!(repository.counts().unwrap().calls, 0);
+
+        let recovery = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x65; 32]).unwrap(),
+            clock,
+            CallTimeoutPolicy::default(),
+        );
+        recovery
+            .create_call(
+                &principal("tenant-a"),
+                &IdempotencyKey::parse("resolver-recovery").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.counts().unwrap().calls, 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_placement_crossing_token_window_leaks_no_state_or_capacity() {
+        let repository = Arc::new(MemoryRepository::new());
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 1,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let clock = Arc::new(TestClock::new(at(0)));
+        let service = Arc::new(CallService::new(
+            repository.clone(),
+            Arc::new(BarrierSuccessfulPlacement {
+                worker,
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x66; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy {
+                setup: Duration::from_secs(300),
+                ..CallTimeoutPolicy::default()
+            },
+        ));
+        let task = tokio::spawn(async move {
+            service
+                .create_call(
+                    &principal("tenant-a"),
+                    &IdempotencyKey::parse("stalled-placement").unwrap(),
+                    generic_input(),
+                )
+                .await
+        });
+        entered.wait().await;
+        clock.set(at(121));
+        release.wait().await;
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            CallServiceError::DependencyUnavailable
+        );
+        assert_eq!(repository.counts().unwrap().calls, 0);
+
+        let recovery = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x66; 32]).unwrap(),
+            clock,
+            CallTimeoutPolicy::default(),
+        );
+        recovery
+            .create_call(
+                &principal("tenant-a"),
+                &IdempotencyKey::parse("placement-recovery").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.counts().unwrap().calls, 1);
+    }
+
+    #[tokio::test]
     async fn consumed_expired_attachment_replays_exactly_without_live_dependencies() {
         let repository = Arc::new(MemoryRepository::new());
         let worker = repository
@@ -1464,6 +1754,66 @@ mod tests {
             .await
             .unwrap();
         release.wait().await;
+        let raced = loser_task.await.unwrap().unwrap();
+        assert!(raced.replayed);
+        assert_eq!(raced.value, committed.value);
+        assert_eq!(repository.counts().unwrap().calls, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_winner_outranks_resolver_timeout() {
+        let repository = Arc::new(MemoryRepository::new());
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let clock = Arc::new(TestClock::new(at(0)));
+        let loser = Arc::new(CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(BarrierPendingResolver {
+                entered: entered.clone(),
+            }),
+            CallServiceCrypto::new(vec![0x67; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy {
+                setup: Duration::from_secs(1),
+                ..CallTimeoutPolicy::default()
+            },
+        ));
+        let winner = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x67; 32]).unwrap(),
+            clock,
+            CallTimeoutPolicy::default(),
+        );
+        let loser_task = tokio::spawn(async move {
+            loser
+                .create_call(
+                    &principal("tenant-a"),
+                    &IdempotencyKey::parse("resolver-timeout-race").unwrap(),
+                    generic_input(),
+                )
+                .await
+        });
+        entered.wait().await;
+        let committed = winner
+            .create_call(
+                &principal("tenant-a"),
+                &IdempotencyKey::parse("resolver-timeout-race").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
         let raced = loser_task.await.unwrap().unwrap();
         assert!(raced.replayed);
         assert_eq!(raced.value, committed.value);

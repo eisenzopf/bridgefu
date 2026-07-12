@@ -148,6 +148,11 @@ least 32 bytes). With the compatibility shared API key, set
 requests require exactly one visible-ASCII `Idempotency-Key` header; receipts
 are tenant-bound and retained for 24 hours. `POST /v1/calls` accepts exactly two
 typed SIP, WebRTC, WHIP/WHEP, Amazon Connect, or provider-controlled legs.
+Startup validation resolves the control-key reference, verifies its byte
+length without rendering it, and rejects a static tenant that is not present
+in the configured routing table. Attachment-principal resolution and worker
+placement share the original setup budget; Bridgefu commits no call or worker
+capacity after that budget or the two-minute attachment window is exhausted.
 Missing API authentication makes every protected route fail closed with `503`;
 missing call-control key material makes the call routes fail with `503`. The
 existing StandardCharter listener and public health/metrics endpoints continue

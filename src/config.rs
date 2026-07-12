@@ -16,6 +16,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use zeroize::Zeroize;
+
+use bridgefu::call_engine::TenantId;
+use bridgefu::call_service::{MAX_CONTROL_KEY_BYTES, MIN_CONTROL_KEY_BYTES};
 
 use rvoip_amazon_connect::{
     request_uri_user, to_uri_user, AttributeMapping, AwsConnectStarter, ConnectConfig,
@@ -249,6 +253,30 @@ impl Config {
         }
         if self.broadcast.max_active == 0 {
             return Err(anyhow!("broadcast.max_active must be greater than zero"));
+        }
+        if let Some(static_tenant) = &self.api.static_tenant {
+            let static_tenant = TenantId::parse(static_tenant)
+                .map_err(|_| anyhow!("api.static_tenant is not a valid tenant identifier"))?;
+            let (tenants, _) = self
+                .resolved_tenants()
+                .context("validating api.static_tenant against configured tenants")?;
+            if !tenants.contains_key(static_tenant.as_str()) {
+                return Err(anyhow!(
+                    "api.static_tenant must name one configured routing tenant"
+                ));
+            }
+        }
+        if let Some(control_key) = &self.api.control_hmac_key {
+            let mut resolved = control_key
+                .resolve()
+                .map_err(|error| anyhow!("resolving api.control_hmac_key: {error}"))?;
+            let valid = (MIN_CONTROL_KEY_BYTES..=MAX_CONTROL_KEY_BYTES).contains(&resolved.len());
+            resolved.zeroize();
+            if !valid {
+                return Err(anyhow!(
+                    "api.control_hmac_key must resolve to 32 to 4096 bytes"
+                ));
+            }
         }
         Ok(())
     }
@@ -874,5 +902,51 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
         assert!(!rendered.contains("bearer-private"));
         assert!(!rendered.contains("hmac-private"));
         assert_eq!(rendered.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn api_static_tenant_must_be_valid_and_configured() {
+        let valid = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  static_tenant: banking\n"
+        ));
+        valid.validate().unwrap();
+
+        let missing = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  static_tenant: wholesale\n"
+        ));
+        let error = missing.validate().unwrap_err().to_string();
+        assert!(error.contains("must name one configured routing tenant"));
+
+        let invalid = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  static_tenant: 'invalid tenant'\n"
+        ));
+        let error = invalid.validate().unwrap_err().to_string();
+        assert!(error.contains("not a valid tenant identifier"));
+    }
+
+    #[test]
+    fn control_hmac_key_preflight_resolves_bounds_and_redacts_secret() {
+        let valid_secret = "v".repeat(MIN_CONTROL_KEY_BYTES);
+        let valid = parse(&format!(
+            "{LEGACY}\napi:\n  control_hmac_key: '{valid_secret}'\n"
+        ));
+        valid.validate().unwrap();
+
+        let private_short_secret = "private-short-control-secret";
+        let short = parse(&format!(
+            "{LEGACY}\napi:\n  control_hmac_key: '{private_short_secret}'\n"
+        ));
+        let error = short.validate().unwrap_err().to_string();
+        assert!(error.contains("must resolve to 32 to 4096 bytes"));
+        assert!(!error.contains(private_short_secret));
+
+        const MISSING_ENV: &str = "BRIDGEFU_TEST_MISSING_CONTROL_HMAC_KEY";
+        std::env::remove_var(MISSING_ENV);
+        let missing = parse(&format!(
+            "{LEGACY}\napi:\n  control_hmac_key: 'env:{MISSING_ENV}'\n"
+        ));
+        let error = missing.validate().unwrap_err().to_string();
+        assert!(error.contains(MISSING_ENV));
+        assert!(!error.contains(&valid_secret));
     }
 }
