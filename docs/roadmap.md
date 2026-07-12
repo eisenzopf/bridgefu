@@ -365,6 +365,21 @@ hint for SIP and WebRTC connections.
      outbox claim, records provider/rvoip references, releases callback-before-
      reference events, commits the follow-up state transition, completes the
      effect, and retains an exact replay result.
+   - Keep service-managed mutations behind the service repository boundary.
+     Raw compatibility methods must not create state transitions or complete
+     effects for a service-managed call in a way that bypasses execution-plan,
+     payload, reference, or reconciliation invariants.
+   - Bind every returned provider reference to the exact provider endpoint and
+     account profile in the persisted execution plan before releasing queued
+     callbacks. Validate effect follow-ups against the claimed intent, leg,
+     binding generation, and success/failure result.
+   - Give control effects a database-safe per-binding sequence, claim only the
+     oldest unfinished command, and invalidate claimed DTMF as soon as its leg
+     leaves `connected` or `held`, including teardown races.
+   - Return the original creation snapshot on an idempotent replay, enforce one
+     Command ID namespace across core and service operations, and redact endpoint
+     URIs, transfer destinations, phone numbers, and credential-bearing URL
+     components from durable-model diagnostics.
    - Inject rvoip `AuthenticatedPrincipal` validation into Axum, inherit tenant
      from the principal, require operation scopes, and allow tenant override
      only with `calls:tenant-override`.
