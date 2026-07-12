@@ -141,16 +141,38 @@ Gate 2 evidence recorded on 2026-07-10:
 Exit: validator parity, ownership isolation, DataMessage round trips, and
 MediaGraph stress tests pass.
 
-### Gate 3 — Harden rvoip authentication and lifecycle (`in progress`)
+### Gate 3 — Harden rvoip authentication and lifecycle (`complete`)
 
-- [ ] Authenticate WS/WSS before upgrade and enforce full route ownership.
-- [ ] Enforce SIP Digest, Bearer, trusted-CIDR, and server-verified mTLS at the
+- [x] Authenticate WS/WSS before upgrade and enforce full route ownership.
+- [x] Enforce SIP Digest, Bearer, trusted-CIDR, and server-verified mTLS at the
   listener before application events.
-- [ ] Verify UCTP version, replay, signature, principal, scopes, and ownership
+- [x] Verify UCTP version, replay, signature, principal, scopes, and ownership
   before delivering replies or commands.
-- [ ] Enforce caps and deterministic peer cleanup on QUIC, WebTransport, and
+- [x] Enforce caps and deterministic peer cleanup on QUIC, WebTransport, and
   WebSocket substrates.
-- [ ] Route multi-session datagrams by session and stream.
+
+Gate 3 evidence recorded on 2026-07-11:
+
+- rvoip revision `a0335daf81ba5e18bddf960c61d4f5bc01c6079e` is pushed on
+  `codex/bridgefu-1.0-rvoip`; Bridgefu CI pins that exact revision.
+- Auth-core passes 89 tests; rvoip-core passes 163 tests, including saturated
+  lifecycle fallback, idempotent terminal delivery, stale-event rejection,
+  subscription cleanup, and MediaGraph lifecycle stress.
+- SIP dialog passes 325 tests, rvoip-sip passes 198 library tests, and SIP
+  transport passes all 115 all-feature tests, including 12 TLS/WSS mTLS modes
+  plus negative listener-auth, source-binding, CANCEL, ACK, and replay cases.
+- UCTP passes 115 tests; QUIC, WebTransport, and all-feature WebSocket suites
+  pass 8, 3, and 11 tests respectively. A real WebSocket saturation test with
+  capacity one proves terminal fallback releases the first peer and admits an
+  authenticated second peer.
+- The feature-correct WHIP/WS/WSS ownership and pre-upgrade authentication
+  matrix passes 18 tests. The full WebRTC suite passes 96 tests; its two known
+  baseline media-stat assertions remain isolated from signaling auth and are
+  tracked as rtc/media test-environment debt rather than Gate 3 regressions.
+- Strict clippy is clean for core/auth/UCTP and every substrate across all
+  targets/features, for SIP transport/dialog/proxy, and for the focused WebRTC
+  signaling library/tests. Migration guidance is in rvoip's
+  `docs/BRIDGEFU_FOUNDATIONS_MIGRATION.md`.
 
 Exit: auth-negative, cross-tenant, replay, expiry, cap, and leak tests pass on
 every supported substrate.
@@ -160,6 +182,13 @@ every supported substrate.
 - [ ] Finalize the eight-byte UCTP header followed by a complete RTP packet.
 - [ ] Add golden byte vectors and packet-capture conformance tests.
 - [ ] Version UCTP, QUIC, and WebTransport crates as 0.2.
+- [ ] Route simultaneous sessions on one QUIC/WebTransport peer by an
+  authenticated core-session mapping and peer-global stream-local-ID
+  allocation; remove the first-session reader context and first-route lookup.
+- [ ] Replace random-only subscription namespaces with authorized wire-to-core
+  Session/Connection bindings so legitimate peers can share a Session without
+  cross-tenant collisions; add real-wire subscribe/fanout and concurrent-
+  session packet tests.
 - [ ] Register MediaGraph virtual publishers through the existing Orchestrator
   publisher/subscriber path and authorize real network listeners.
 

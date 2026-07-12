@@ -4574,6 +4574,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -4626,6 +4627,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hound",
+ "ipnet",
  "lazy_static",
  "rand 0.8.6",
  "roxmltree",
@@ -4680,6 +4682,7 @@ dependencies = [
  "futures",
  "http 1.4.2",
  "rand 0.8.6",
+ "rvoip-core-traits",
  "rvoip-infra-common",
  "rvoip-sip-core",
  "rvoip-sip-transport",
@@ -4742,6 +4745,7 @@ dependencies = [
  "rustls-pemfile",
  "rvoip-infra-common",
  "rvoip-sip-core",
+ "sha2 0.10.9",
  "socket2 0.5.10",
  "thiserror 1.0.69",
  "tokio",

@@ -22,7 +22,7 @@ jobs:
           # Coordinated Bridgefu 1.0 foundation revision. Update this only
           # after the matching rvoip change set is green and available on
           # the remote; never replace it with a floating branch.
-          ref: b8c1f25b5e797c00012cca1fe66d252ba3f8bd5d
+          ref: a0335daf81ba5e18bddf960c61d4f5bc01c6079e
           path: rvoip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -35,7 +35,35 @@ jobs:
       # rvoip is a library workspace and intentionally does not commit its
       # Cargo.lock. Bridgefu's preceding locked build is the reproducible
       # consumer graph; this second pass exercises rvoip-only package tests.
-      - run: cargo test -p rvoip-auth-core -p rvoip-core -p rvoip-uctp -p rvoip-quic -p rvoip-moq
+      - name: rvoip foundation and QUIC tests
+        run: >-
+          cargo test
+          -p rvoip-auth-core
+          -p rvoip-core
+          -p rvoip-uctp
+          -p rvoip-quic
+          -p rvoip-webtransport
+          -p rvoip-moq
+          --no-fail-fast
+        working-directory: rvoip
+      - name: rvoip peer lifecycle saturation test
+        run: cargo test -p rvoip-websocket --test lifecycle_capacity
+        working-directory: rvoip
+      - name: rvoip SIP authentication tests
+        run: |
+          cargo test -p rvoip-sip-transport --all-features --no-fail-fast
+          cargo test -p rvoip-sip-dialog --lib --no-fail-fast
+          cargo test -p rvoip-sip --lib --no-fail-fast
+        working-directory: rvoip
+      - name: rvoip WebRTC signaling authentication tests
+        run: >-
+          cargo test -p rvoip-webrtc
+          --features signaling-whip,signaling-ws,tls-rustls
+          --test whip_auth
+          --test ws_auth
+          --test signaling_ownership
+          --test tls_termination
+          --no-fail-fast
         working-directory: rvoip
 
   image:
@@ -47,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: eisenzopf/rvoip
-          ref: b8c1f25b5e797c00012cca1fe66d252ba3f8bd5d
+          ref: a0335daf81ba5e18bddf960c61d4f5bc01c6079e
           path: rvoip
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
