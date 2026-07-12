@@ -507,6 +507,10 @@ hint for SIP and WebRTC connections.
      per-connection attachment state. Duplicate notices must not close an
      already admitted winner, and no protocol acceptance, media work, or other
      external I/O may occur before the durable bind commits.
+   - Register the exact durable connection-to-tenant/call/leg/generation index
+     before calling `InboundAdmission::accept()`. The unresolved admission is
+     handed to the owning call actor only after that index is visible, so an
+     immediate `Connected` or terminal event cannot outrun durable ownership.
    - In clustered topology, a public gateway resolves only a token digest to
      the authoritative pinned worker through PostgreSQL or a sequence-checked
      coordination projection, then forwards over private authenticated UCTP.
@@ -520,6 +524,11 @@ hint for SIP and WebRTC connections.
      for connected, terminal, DTMF, and `DataMessage` events. The existing
      broadcast event bus remains observability-only; lag on it must never lose
      a durable state transition or cleanup decision.
+   - Make every rvoip correctness task owned and drainable before Bridgefu
+     relies on the stream. `Orchestrator::register` must retain and join adapter
+     normalizer tasks, authoritative mode must not use detached DTMF forwarding,
+     and prepared-outbound plus terminal publication must remain lossless across
+     cancellation, activation failure, receiver loss, and drain races.
    - Add an opaque two-phase `PreparedOutboundConnection` seam in rvoip. The
      adapter creates an event-dormant route, Bridgefu transactionally binds its
      exact Connection ID, and only then may core activate signaling/events.
@@ -529,11 +538,35 @@ hint for SIP and WebRTC connections.
      and before opening public signaling listeners. It owns bounded claim loops
      for call effects, controls, deadlines, provider events, and restart work,
      plus capacity-bounded per-call actors and all adapter/bridge child tasks.
+   - Add a service-managed provider-event reconciliation transaction before the
+     supervisor claims provider callbacks. The raw compatibility completion
+     path intentionally rejects service-managed calls and must never be used as
+     a bypass.
+   - Persist every input needed to recover external work before enabling the
+     corresponding claim: the call/outbound authorization fingerprint, the
+     explicit transfer target leg, and a media-idle timeout/activity generation.
+     `DeadlineKind::Media` is not operational evidence until rvoip supplies an
+     authoritative activity signal that can refresh it.
+   - Treat lease validity as a monotonic local safety deadline as well as a
+     repository state. A store outage may report `Degraded` only until the last
+     confirmed lease TTL expires; at that instant the runtime becomes
+     `LeaseLost`, stops admission/claims, and ends local media without attempting
+     stale-fence durable writes.
    - Each call actor serializes attachment, originate, connect, media-bridge,
      DTMF, transfer, terminal, and compensation work against the exact worker
      fence and connection binding generation. It owns the conversation,
      session, connections, managed media-graph routes, cancellation, and child
      `JoinSet`; no correctness task is detached.
+   - Give operational events a reserved bounded mailbox and prioritize them over
+     ordinary work so an external operation cannot deadlock waiting for the
+     event it emitted. Retry ambiguous repository failures with the identical
+     command request; reload and reclassify only after an explicit version
+     conflict. Retain completed external-I/O results until reconciliation is
+     durable so an outage never repeats a non-idempotent operation.
+   - Run fenced restart recovery before public listeners become usable. Old
+     process-local routes cannot migrate: fail their nonterminal bindings with
+     `worker_restarted`, fail unbound legs through the internal service command
+     path, and execute the resulting teardown work before admitting new calls.
    - Drain in dependency order: stop admission/listeners, stop new claims,
      drain or end call actors, close graphs/connections/adapters, join core
      lifecycle tasks, then stop coordination and lease renewal.
