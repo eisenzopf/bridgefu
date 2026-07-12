@@ -328,7 +328,7 @@ Gate 5 completion evidence recorded on 2026-07-12:
 Exit: both substrates traverse a relay and version, packet-capture, and
 interoperability suites pass.
 
-### Gate 6 — Build Bridgefu's durable call engine (`in progress`)
+### Gate 6 — Build Bridgefu's durable call engine (`complete`)
 
 The implementation order is deliberate. In particular, FIFO pairing cannot be
 removed safely until rvoip preserves a single-take, redacted inbound routing
@@ -461,7 +461,7 @@ hint for SIP and WebRTC connections.
      mandatory in CI and local backend scripts, including delayed recovery,
      commit reordering, restart/flush/group recreation, v3-to-v4 migration, and
      values above `2^53`; ignored external tests alone are not evidence.
-7. [ ] Replace global FIFO pairing with at least 256-bit, two-minute,
+7. [x] Replace global FIFO pairing with at least 256-bit, two-minute,
    single-use attachment tokens. Persist only a digest bound to tenant, call,
    leg, expected transport, and worker fence; atomically bind the exact rvoip
    Connection ID and reject expiry, replay, wrong transport, and cross-call or
@@ -520,7 +520,7 @@ hint for SIP and WebRTC connections.
      the authoritative pinned worker through PostgreSQL or a sequence-checked
      coordination projection, then forwards over private authenticated UCTP.
      It never guesses a worker or consumes a worker-owned attachment locally.
-8. [ ] Add a bounded lifecycle supervisor for setup/media/transfer/cleanup
+8. [x] Add a bounded lifecycle supervisor for setup/media/transfer/cleanup
    deadlines, cancellation and compensation, hangup-versus-transfer glare,
    peer teardown, stale generation rejection, worker drain, and fenced restart
    recovery. Active media is ended and cleaned after worker loss, never
@@ -724,9 +724,9 @@ Gate 6 progress evidence recorded on 2026-07-12:
   consumes owner-bound SIP Request-URI or WHIP/WS routing hints once; commits
   the exact durable connection binding before accepting; and uses a bounded,
   supervisor-owned `JoinSet`. Crossed-call and duplicate-leg tests prove that
-  arrival order cannot cross-connect calls. Gate 6 item 7 remains open until
-  the WebRTC listener consumes protocol confirmation and terminal compensation
-  is driven by the strong lifecycle supervisor.
+  arrival order cannot cross-connect calls. At that revision, Gate 6 item 7
+  remained open until the WebRTC listener consumed protocol confirmation and
+  terminal compensation was driven by the strong lifecycle supervisor.
 - Bridgefu revision `c72bed3` adds exact, fenced connection-lifecycle commits
   across the memory, SQLite, and PostgreSQL repositories. Durable connection
   ownership, binding generation, worker fence, state mutation, replay, and
@@ -774,11 +774,53 @@ Gate 6 progress evidence recorded on 2026-07-12:
   rvoip revision until the remaining local rvoip work is qualified and its
   exact final revision is reviewed.
 
-Gate 6 qualification must include interleaved unrelated attachments, repository
+- rvoip revisions `7d8eb259`, `2df927f6`, and `b25785c0` complete the
+  remaining correctness signals used by the supervisor. MediaGraph activity
+  is coalesced into consecutive, monotonic per-connection generations, and a
+  task-free sticky health subscription reports receiver loss, cancelled
+  delivery, sequence exhaustion, or send failure without delaying core
+  lifecycle drain. The full core and orchestrator qualification passes 153
+  tests with strict Clippy, rustdoc, formatting, and no upstream contact.
+- Bridgefu revisions `9f46120`, `4ba929e`, and `e680146` move verified
+  Twilio, Telnyx, and Vonage callbacks into the shared durable repository,
+  bind them to exact provider/account profiles, reject ambiguous identities,
+  and make duplicate/conflicting delivery deterministic before the execution
+  supervisor claims provider work.
+- Bridgefu revisions `8216d13` through `8b3e1be` complete Gate 6 items 7 and
+  8. One process-owned `CallExecutionSupervisor` installs admission and the
+  authoritative operational stream before listeners, runs fenced recovery,
+  owns bounded proof/claim/actor tasks, and serializes each call's signaling,
+  media, control, provider, deadline, compensation, and cleanup work. Exact
+  durable connection ownership is installed before protocol acceptance;
+  simultaneous same-call legs and interleaved unrelated calls cannot race or
+  cross-connect. Immediate `Connected` then terminal events are reconciled in
+  order, remote termination boundedly tears down its peer, and retiring actors
+  release active capacity without making total task count unbounded.
+- Lease or operational-stream authority loss is a hard local boundary. The
+  supervisor cancels proof, claim, actor, and external-operation work, retains
+  every indexed or not-yet-joined proof Connection ID, performs no stale-fence
+  durable compensation, and boundedly ends all local routes. Startup recovery
+  has an explicit old-fence bound-leg fixture. Process shutdown applies one
+  absolute deadline across HTTP, signaling/media, the worker drain write, and
+  coordination tasks; stalled writes time out and stalled tasks are aborted.
+- Final Gate 6 qualification passes 280 executable tests: 133 library, 53
+  binary, 6 real fake-adapter supervisor integrations, 20 memory-service, 5
+  service-repository, 8 runtime, 1 standalone SQL coordination, 21 repository
+  conformance, and 33 unchanged StandardCharter tests. Three credentialed
+  Redis/PostgreSQL cases remain intentionally environment-gated in the normal
+  suite. The digest-pinned disposable PostgreSQL run passes 21 repository, 5
+  service-repository, 8 runtime, and 2 coordination tests; the companion
+  PostgreSQL/Redis runner passes both SQL ordering tests and the Redis 7.2
+  Streams/fallback conformance test. Strict changed-surface Clippy, warning-
+  free rustdoc, rustfmt, and diff checks pass; an independent P0/P1 audit found
+  no release blocker.
+
+Gate 6 qualification covers interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
 outbox crash points, token replay/expiry/isolation, remote teardown, transfer
-glare, restart, and drain. The existing `ConnectScreenPopServer` remains the
-default StandardCharter path until Gate 7 moves Amazon behind the common engine.
+glare, restart, authority loss, and bounded drain. The existing
+`ConnectScreenPopServer` remains the default StandardCharter path until Gate 7
+moves Amazon behind the common engine.
 
 Exit: state/repository tests pass and unrelated concurrent calls cannot
 cross-connect.
