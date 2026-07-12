@@ -12,8 +12,8 @@ use crate::call_engine::{
     AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit,
     CommandCommitView, CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId,
     FailureDetails, IdempotencyKeyDigest, LegId, LegState, OutboxRecord, OutboxState,
-    PrincipalFingerprint, ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall,
-    TenantId, WorkerLease,
+    PrincipalFingerprint, ProviderAccountKey, ProviderEventDigest, ProviderEventEnvelope,
+    ProviderEventTarget, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
 };
 
 use super::{CallExecutionPlan, ControlIntent, ExternalReferenceValue, ServiceEffectPayload};
@@ -543,6 +543,56 @@ pub enum EffectResultOutcome {
     Replayed(EffectResultView),
 }
 
+/// Atomic service-managed provider callback reconciliation.
+///
+/// The target is repeated deliberately as an immutable ownership guard. The
+/// repository requires it to match both the retained event target and the
+/// provider reference released by the original start-leg reconciliation.
+/// `follow_up` may be omitted only after the target call is durably terminal;
+/// otherwise a callback must advance the aggregate through a validated service
+/// command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderEventReconciliationTransaction {
+    /// Provider credential/account namespace.
+    pub account: ProviderAccountKey,
+    /// Exact normalized provider event identity.
+    pub event_digest: ProviderEventDigest,
+    /// Exact claim incarnation held by the worker.
+    pub claim_generation: ClaimGeneration,
+    /// Current fenced worker.
+    pub worker: WorkerLease,
+    /// Exact tenant, call, and provider-leg target.
+    pub target: ProviderEventTarget,
+    /// Optional service command committed with callback completion.
+    pub follow_up: Option<ServiceCommandTransaction>,
+    /// Reconciliation time. A follow-up command must use this exact time.
+    pub at: DateTime<Utc>,
+}
+
+/// Exact durable result of applying or acknowledging a provider callback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderEventReconciliationView {
+    /// Applied provider event.
+    pub event: ProviderEventEnvelope,
+    /// Target independently retained with the completion receipt.
+    pub target: ProviderEventTarget,
+    /// Worker fence independently retained with the completion receipt.
+    pub worker: WorkerLease,
+    /// Claim generation independently retained with the completion receipt.
+    pub claim_generation: ClaimGeneration,
+    /// Optional state-machine result committed atomically.
+    pub follow_up: Option<ServiceCommandView>,
+}
+
+/// First service reconciliation or an exact lost-response replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderEventReconciliationOutcome {
+    /// Callback and optional follow-up were committed in this transaction.
+    Reconciled(ProviderEventReconciliationView),
+    /// The exact request returned its original durable result.
+    Replayed(ProviderEventReconciliationView),
+}
+
 /// Durable service companion. Implementations perform no provider or rvoip I/O.
 #[async_trait]
 pub trait CallServiceRepository: Send + Sync {
@@ -643,4 +693,15 @@ pub trait CallServiceRepository: Send + Sync {
         &self,
         request: EffectResultReconciliation,
     ) -> Result<EffectResultOutcome, RepositoryError>;
+
+    /// Atomically applies one claimed provider callback to a service-managed
+    /// call, or acknowledges it after terminal completion.
+    async fn reconcile_provider_event(
+        &self,
+        _request: ProviderEventReconciliationTransaction,
+    ) -> Result<ProviderEventReconciliationOutcome, RepositoryError> {
+        Err(RepositoryError::InvalidInput(
+            "service-managed provider reconciliation is unsupported",
+        ))
+    }
 }

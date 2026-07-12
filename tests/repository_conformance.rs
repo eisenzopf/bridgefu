@@ -724,7 +724,7 @@ async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() 
 }
 
 #[tokio::test]
-async fn sqlite_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
+async fn sqlite_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
     let (url, path) = sqlite_database("direct-v3-v4-worker");
     let migration_dir = std::env::temp_dir().join(format!(
         "bridgefu-v3-sqlite-migration-{}",
@@ -787,7 +787,7 @@ async fn sqlite_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 4);
+    assert_eq!(schema_version, 5);
     let persisted_body: String = sqlx::query_scalar("SELECT body FROM workers WHERE worker_id = ?")
         .bind(worker_id.to_string())
         .fetch_one(upgraded.pool())
@@ -894,7 +894,7 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
 }
 
 #[tokio::test]
-async fn postgres_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
+async fn postgres_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
     let Some(url) = postgres_test_url() else {
         eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v3 upgrade test skipped");
         return;
@@ -963,7 +963,7 @@ async fn postgres_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 4);
+    assert_eq!(schema_version, 5);
     let has_expiry: bool =
         sqlx::query_scalar("SELECT body ? 'lease_expires_at' FROM workers WHERE worker_id = $1")
             .bind(worker_id.as_uuid())
@@ -2103,8 +2103,8 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 4);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=4) {
+    assert_eq!(migrations.len(), 5);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=5) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2114,7 +2114,7 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        4
+        5
     );
 }
 
@@ -2141,8 +2141,8 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 4);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=4) {
+    assert_eq!(migrations.len(), 5);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=5) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2152,7 +2152,7 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        4
+        5
     );
 }
 

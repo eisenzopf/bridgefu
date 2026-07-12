@@ -28,7 +28,8 @@ use super::{
     CallServiceCrypto, CallServiceRepository, CallView, CanonicalRequestTranscript,
     ControlCommandOutcome, ControlCommandTransaction, ControlIntent, CreateCallView,
     DtmfAcceptedView, DtmfSequence, IdempotencyKey, LegEndpointConfig, LegExecutionSpec,
-    OperationIdempotency, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
+    OperationIdempotency, ProviderEndpointConfig, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ProviderKind, ServiceCommandOutcome,
     ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput,
     ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
@@ -670,6 +671,16 @@ impl CallService {
             .repository
             .commit_bound_connection_state(request)
             .await?)
+    }
+
+    /// Reconciles one claimed provider callback through the service-managed
+    /// transaction boundary. The execution supervisor supplies the exact
+    /// retained request on every ambiguous retry.
+    pub async fn reconcile_provider_event(
+        &self,
+        request: ProviderEventReconciliationTransaction,
+    ) -> Result<ProviderEventReconciliationOutcome, CallServiceError> {
+        Ok(self.repository.reconcile_provider_event(request).await?)
     }
 
     /// Authenticates ownership, reserves a worker, and creates both legs atomically.
@@ -1740,6 +1751,13 @@ mod tests {
             &self,
             _request: EffectResultReconciliation,
         ) -> Result<EffectResultOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn reconcile_provider_event(
+            &self,
+            _request: ProviderEventReconciliationTransaction,
+        ) -> Result<ProviderEventReconciliationOutcome, RepositoryError> {
             Err(RepositoryError::Unavailable)
         }
     }

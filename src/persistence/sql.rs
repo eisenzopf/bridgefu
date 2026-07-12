@@ -44,7 +44,8 @@ use crate::call_service::{
     CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
     ControlOutboxRecord, EffectResultOutcome, EffectResultReconciliation, ExternalReferenceValue,
     LegEndpointConfig, OperationIdempotencyReceipt, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
+    OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ServiceCommandOutcome, ServiceCommandTransaction,
     ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult,
     ServiceOperationKind, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
@@ -1255,6 +1256,7 @@ fn provider_completion_kind(row: &ProviderCompletionRow) -> &'static str {
     match row {
         ProviderCompletionRow::Command { .. } => "command",
         ProviderCompletionRow::TerminalAcknowledgement { .. } => "terminal_acknowledgement",
+        ProviderCompletionRow::ServiceReconciliation { .. } => "service_reconciliation",
     }
 }
 
@@ -2905,6 +2907,7 @@ async fn upsert_sqlite_rows(
         let completion_kind = match &completion.row {
             ProviderCompletionRow::Command { .. } => "command",
             ProviderCompletionRow::TerminalAcknowledgement { .. } => "terminal_acknowledgement",
+            ProviderCompletionRow::ServiceReconciliation { .. } => "service_reconciliation",
         };
         sqlx::query(
             "INSERT INTO provider_completions(account_key, event_digest, completion_kind, body) VALUES (?, ?, ?, ?) ON CONFLICT(account_key, event_digest) DO UPDATE SET completion_kind=excluded.completion_kind, body=excluded.body",
@@ -3345,6 +3348,7 @@ async fn upsert_postgres_rows(
         let completion_kind = match &completion.row {
             ProviderCompletionRow::Command { .. } => "command",
             ProviderCompletionRow::TerminalAcknowledgement { .. } => "terminal_acknowledgement",
+            ProviderCompletionRow::ServiceReconciliation { .. } => "service_reconciliation",
         };
         sqlx::query(
             "INSERT INTO provider_completions(account_key, event_digest, completion_kind, body) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT(account_key, event_digest) DO UPDATE SET completion_kind=EXCLUDED.completion_kind, body=EXCLUDED.body",
@@ -4074,6 +4078,17 @@ macro_rules! impl_call_service_repository {
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move { repository.reconcile_effect_result(request).await })
+                    })
+                    .await
+            }
+
+            async fn reconcile_provider_event(
+                &self,
+                request: ProviderEventReconciliationTransaction,
+            ) -> Result<ProviderEventReconciliationOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move { repository.reconcile_provider_event(request).await })
                     })
                     .await
             }

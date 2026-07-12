@@ -6,19 +6,22 @@ use bridgefu::call_engine::{
     AttachmentTransport, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
     CommandCommit, CommandId, ConnectionBinding, CreateCall, EffectIntent, IdempotencyKeyDigest,
     LegDirection, LegId, LegKind, LegSpec, LegState, PrincipalFingerprint, ProviderAccountKey,
-    ProviderCallId, RegisterWorker, RepositoryError, RequestDigest, StopLegReason, StoredCall,
-    TenantId, WorkerLease,
+    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
+    ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderPayloadDigest,
+    RegisterWorker, RepositoryError, RequestDigest, StopLegReason, StoredCall, TenantId,
+    WorkerLease,
 };
 use bridgefu::call_service::{
     BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository, ControlCommandOutcome,
     ControlCommandTransaction, ControlIntent, DtmfSequence, EffectResultOutcome,
     EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
     LegEndpointConfig, LegExecutionSpec, OperationIdempotency, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction,
-    ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind,
-    SipEndpointConfig, StoredServiceCall, StoredServiceEffectPayload, TransferTarget,
-    WebRtcEndpointConfig,
+    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ProviderEventReconciliationView, ProviderKind,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
+    ServiceOperationKind, SipEndpointConfig, StoredServiceCall, StoredServiceEffectPayload,
+    TransferTarget, WebRtcEndpointConfig,
 };
 use bridgefu::persistence::{MemoryRepository, PostgresRepository, SqliteRepository};
 use chrono::{DateTime, TimeZone, Utc};
@@ -416,9 +419,12 @@ struct ConformanceEvidence {
     provider_owner: TenantId,
     provider_call_id: CallId,
     provider_leg_id: LegId,
+    provider_peer_leg_id: LegId,
     cross_call_connection_id: ConnectionId,
     provider_reconciliation: EffectResultReconciliation,
     provider_reconciliation_view: EffectResultView,
+    provider_event_reconciliation: ProviderEventReconciliationTransaction,
+    provider_event_reconciliation_view: ProviderEventReconciliationView,
 }
 
 async fn assert_service_conformance<R>(repository: &R) -> ConformanceEvidence
@@ -710,6 +716,36 @@ where
             .unwrap(),
     );
     let provider_leg_id = provider.call.aggregate.legs()[0].id();
+    let provider_peer_leg_id = provider.call.aggregate.legs()[1].id();
+    let provider_account = ProviderAccountKey::parse("twilio-sandbox").unwrap();
+    let provider_external_call_id = ProviderCallId::parse("CA-conformance").unwrap();
+    let provider_event_digest = ProviderEventDigest::new(digest(70));
+    let provider_event = ProviderEventInput {
+        account: provider_account.clone(),
+        event_digest: provider_event_digest,
+        payload_digest: ProviderPayloadDigest::new(digest(71)),
+        provider_call_id: provider_external_call_id.clone(),
+        kind: "ringing".to_owned(),
+        payload: serde_json::json!({"state": "ringing"}),
+        occurred_at: Some(at(21)),
+        received_at: at(22),
+    };
+    assert!(matches!(
+        repository
+            .ingest_provider_event(provider_event.clone())
+            .await
+            .unwrap(),
+        ProviderEventOutcome::Accepted(ref event)
+            if event.state == ProviderEventState::PendingReference
+    ));
+    assert!(matches!(
+        repository
+            .ingest_provider_event(provider_event.clone())
+            .await
+            .unwrap(),
+        ProviderEventOutcome::Duplicate(ref event)
+            if event.state == ProviderEventState::PendingReference
+    ));
     let cross_call_connection_id = ConnectionId::from_string("provider-cross-call");
     let OutboundConnectionBindOutcome::Bound(_) = repository
         .bind_outbound_connection(OutboundConnectionBind {
@@ -780,8 +816,8 @@ where
             leg_id: provider_leg_id,
             binding_generation: BindingGeneration::INITIAL,
             value: ExternalReferenceValue::ProviderCall {
-                account: ProviderAccountKey::parse("twilio-sandbox").unwrap(),
-                provider_call_id: ProviderCallId::parse("CA-conformance").unwrap(),
+                account: provider_account.clone(),
+                provider_call_id: provider_external_call_id.clone(),
             },
         }),
         follow_up: None,
@@ -795,6 +831,14 @@ where
         panic!("fresh provider reconciliation replayed")
     };
     assert_eq!(
+        provider_reconciliation_view.released_provider_events.len(),
+        1
+    );
+    assert_eq!(
+        provider_reconciliation_view.released_provider_events[0].state,
+        ProviderEventState::Ready
+    );
+    assert_eq!(
         repository
             .load_external_reference(
                 &provider_owner,
@@ -805,6 +849,195 @@ where
             .unwrap(),
         provider_reconciliation_view.external_reference
     );
+
+    let claimed_provider_event = repository
+        .claim_provider_events(worker, at(24), Duration::from_secs(30), 8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| claimed.event.event_digest == provider_event_digest)
+        .expect("released provider event was not claimable");
+    let provider_target = ProviderEventTarget {
+        tenant_id: provider_owner.clone(),
+        call_id: provider.call.aggregate.id(),
+        leg_id: provider_leg_id,
+    };
+    let current_provider = repository
+        .load_service_call(&provider_owner, provider.call.aggregate.id())
+        .await
+        .unwrap();
+    let provider_follow_up = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: provider_owner.clone(),
+            call_id: provider.call.aggregate.id(),
+            expected_version: current_provider.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(25),
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(25),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+    };
+    let provider_event_reconciliation = ProviderEventReconciliationTransaction {
+        account: provider_account.clone(),
+        event_digest: provider_event_digest,
+        claim_generation: claimed_provider_event.claim_generation,
+        worker,
+        target: provider_target.clone(),
+        follow_up: Some(provider_follow_up.clone()),
+        at: at(25),
+    };
+
+    let raw_completion = ProviderEventCommit {
+        account: provider_account.clone(),
+        event_digest: provider_event_digest,
+        claim_generation: claimed_provider_event.claim_generation,
+        worker,
+        command: provider_follow_up.command.clone(),
+        at: at(25),
+    };
+    assert_eq!(
+        repository.complete_provider_event(raw_completion).await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed provider event requires service reconciliation"
+        ))
+    );
+
+    let mut stale_claim = provider_event_reconciliation.clone();
+    stale_claim.claim_generation = Default::default();
+    assert_eq!(
+        repository.reconcile_provider_event(stale_claim).await,
+        Err(RepositoryError::StaleClaim)
+    );
+
+    let mut cross_tenant = provider_event_reconciliation.clone();
+    cross_tenant.target.tenant_id = tenant("provider-event-other-owner");
+    assert_eq!(
+        repository.reconcile_provider_event(cross_tenant).await,
+        Err(RepositoryError::ProviderReferenceConflict)
+    );
+
+    let mut cross_tenant_follow_up = provider_event_reconciliation.clone();
+    cross_tenant_follow_up
+        .follow_up
+        .as_mut()
+        .unwrap()
+        .command
+        .tenant_id = tenant("provider-event-other-owner");
+    assert_eq!(
+        repository
+            .reconcile_provider_event(cross_tenant_follow_up)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "provider follow-up ownership or timestamp differs"
+        ))
+    );
+
+    let mut wrong_account = provider_event_reconciliation.clone();
+    wrong_account.account = ProviderAccountKey::parse("other-provider-account").unwrap();
+    assert_eq!(
+        repository.reconcile_provider_event(wrong_account).await,
+        Err(RepositoryError::NotFound)
+    );
+
+    let mut wrong_leg = provider_event_reconciliation.clone();
+    wrong_leg.target.leg_id = provider_peer_leg_id;
+    assert_eq!(
+        repository.reconcile_provider_event(wrong_leg).await,
+        Err(RepositoryError::ProviderReferenceConflict)
+    );
+
+    let mut wrong_follow_up_leg = provider_event_reconciliation.clone();
+    let CallCommand::SetLegState { leg_id, .. } = &mut wrong_follow_up_leg
+        .follow_up
+        .as_mut()
+        .unwrap()
+        .command
+        .command
+    else {
+        panic!("expected provider leg-state follow-up")
+    };
+    *leg_id = provider_peer_leg_id;
+    assert_eq!(
+        repository
+            .reconcile_provider_event(wrong_follow_up_leg)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "provider follow-up does not match the referenced provider leg"
+        ))
+    );
+
+    let mut wrong_command = provider_event_reconciliation.clone();
+    wrong_command.follow_up.as_mut().unwrap().command.command = CallCommand::StartConnecting {
+        at: at(25),
+        setup_deadline: at(55),
+    };
+    assert_eq!(
+        repository.reconcile_provider_event(wrong_command).await,
+        Err(RepositoryError::InvalidInput(
+            "provider follow-up does not match the referenced provider leg"
+        ))
+    );
+
+    let mut reused_cross_call_command = provider_event_reconciliation.clone();
+    reused_cross_call_command
+        .follow_up
+        .as_mut()
+        .unwrap()
+        .command
+        .command_id = transfer_request.command.command_id;
+    assert_eq!(
+        repository
+            .reconcile_provider_event(reused_cross_call_command)
+            .await,
+        Err(RepositoryError::CommandConflict)
+    );
+
+    let ProviderEventReconciliationOutcome::Reconciled(provider_event_reconciliation_view) =
+        repository
+            .reconcile_provider_event(provider_event_reconciliation.clone())
+            .await
+            .unwrap()
+    else {
+        panic!("fresh provider event reconciliation replayed")
+    };
+    assert_eq!(
+        provider_event_reconciliation_view.event.state,
+        ProviderEventState::Applied
+    );
+    assert!(provider_event_reconciliation_view.follow_up.is_some());
+    assert_eq!(
+        repository
+            .reconcile_provider_event(provider_event_reconciliation.clone())
+            .await
+            .unwrap(),
+        ProviderEventReconciliationOutcome::Replayed(provider_event_reconciliation_view.clone())
+    );
+    let mut mismatched_replay = provider_event_reconciliation.clone();
+    mismatched_replay
+        .follow_up
+        .as_mut()
+        .unwrap()
+        .command
+        .command_id = CommandId::new();
+    assert_eq!(
+        repository.reconcile_provider_event(mismatched_replay).await,
+        Err(RepositoryError::StaleClaim)
+    );
+    assert!(matches!(
+        repository.ingest_provider_event(provider_event).await.unwrap(),
+        ProviderEventOutcome::Duplicate(ref event) if event.state == ProviderEventState::Applied
+    ));
 
     ConformanceEvidence {
         owner,
@@ -831,9 +1064,12 @@ where
         provider_owner,
         provider_call_id: provider.call.aggregate.id(),
         provider_leg_id,
+        provider_peer_leg_id,
         cross_call_connection_id,
         provider_reconciliation,
         provider_reconciliation_view,
+        provider_event_reconciliation,
+        provider_event_reconciliation_view,
     }
 }
 
@@ -937,6 +1173,15 @@ where
             .await
             .unwrap(),
         EffectResultOutcome::Replayed(evidence.provider_reconciliation_view.clone())
+    );
+    assert_eq!(
+        repository
+            .reconcile_provider_event(evidence.provider_event_reconciliation.clone())
+            .await
+            .unwrap(),
+        ProviderEventReconciliationOutcome::Replayed(
+            evidence.provider_event_reconciliation_view.clone()
+        )
     );
     assert_eq!(
         repository
@@ -1387,6 +1632,82 @@ async fn assert_postgres_bound_guard_tamper_fails_closed(
         .unwrap();
 }
 
+async fn assert_sqlite_provider_completion_tamper_fails_closed(
+    repository: &SqliteRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let original: String = sqlx::query_scalar(
+        "SELECT body FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    let changed = sqlx::query(
+        "UPDATE provider_completions SET body = json_set(body, '$.row.ServiceReconciliation.request.target.leg_id', ?) WHERE completion_kind = 'service_reconciliation'",
+    )
+    .bind(evidence.provider_peer_leg_id.to_string())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.provider_owner, evidence.provider_call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "SQLite accepted a provider completion with a forged target leg"
+    );
+    sqlx::query(
+        "UPDATE provider_completions SET body = ? WHERE completion_kind = 'service_reconciliation'",
+    )
+    .bind(original)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    repository
+        .load_service_call(&evidence.provider_owner, evidence.provider_call_id)
+        .await
+        .unwrap();
+}
+
+async fn assert_postgres_provider_completion_tamper_fails_closed(
+    repository: &PostgresRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let original: String = sqlx::query_scalar(
+        "SELECT body::text FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    let changed = sqlx::query(
+        "UPDATE provider_completions SET body = jsonb_set(body, '{row,ServiceReconciliation,request,target,leg_id}', to_jsonb($1::text), false) WHERE completion_kind = 'service_reconciliation'",
+    )
+    .bind(evidence.provider_peer_leg_id.to_string())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.provider_owner, evidence.provider_call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "PostgreSQL accepted a provider completion with a forged target leg"
+    );
+    sqlx::query(
+        "UPDATE provider_completions SET body = $1::jsonb WHERE completion_kind = 'service_reconciliation'",
+    )
+    .bind(original)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    repository
+        .load_service_call(&evidence.provider_owner, evidence.provider_call_id)
+        .await
+        .unwrap();
+}
+
 async fn assert_sqlite_deletion_fails_closed(
     repository: &SqliteRepository,
     owner: &TenantId,
@@ -1582,6 +1903,7 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
     assert_sqlite_bound_guard_tamper_fails_closed(&second, &evidence).await;
+    assert_sqlite_provider_completion_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
     let third = SqliteRepository::connect(&url).await.unwrap();
@@ -1647,6 +1969,14 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
             "effect_id = '{}'",
             evidence.provider_reconciliation.effect_id
         ),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.provider_owner,
+        evidence.provider_call_id,
+        "provider_completions",
+        "completion_kind = 'service_reconciliation'",
     )
     .await;
     assert_sqlite_deletion_fails_closed(
@@ -1778,6 +2108,7 @@ async fn postgres_service_repository_conformance_restart_and_races() {
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
     assert_postgres_bound_guard_tamper_fails_closed(&second, &evidence).await;
+    assert_postgres_provider_completion_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
     let third = PostgresRepository::connect(&scoped).await.unwrap();
@@ -1846,6 +2177,14 @@ async fn postgres_service_repository_conformance_restart_and_races() {
             "effect_id = '{}'::uuid",
             evidence.provider_reconciliation.effect_id
         ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.provider_owner,
+        evidence.provider_call_id,
+        "provider_completions",
+        "completion_kind = 'service_reconciliation'",
     )
     .await;
     assert_postgres_deletion_fails_closed(

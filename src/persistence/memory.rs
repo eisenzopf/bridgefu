@@ -39,10 +39,11 @@ use crate::call_service::{
     ControlCommandView, ControlOutboxRecord, ControlSequence, EffectResultOutcome,
     EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
     OperationIdempotency, OperationIdempotencyReceipt, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
-    ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, StoredControlCommand,
-    StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ProviderEventReconciliationView, ServiceCommandOutcome,
+    ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction,
+    ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind,
+    StoredControlCommand, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -286,6 +287,10 @@ pub(super) enum ProviderCompletionRow {
     },
     TerminalAcknowledgement {
         request: TerminalProviderEventAcknowledge,
+    },
+    ServiceReconciliation {
+        request: Box<ProviderEventReconciliationTransaction>,
+        view: Box<ProviderEventReconciliationView>,
     },
 }
 
@@ -1135,6 +1140,14 @@ impl MemoryRepository {
                         || result.request.at != reference.bound_at
                 })
         }) {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        if state
+            .provider_completions
+            .iter()
+            .any(|(key, completion)| !provider_completion_crosslinks(&state, key, completion))
+        {
             return Err(RepositoryError::Unavailable);
         }
 
@@ -2974,6 +2987,14 @@ impl CallServiceRepository for MemoryRepository {
         let request = normalize_reconciliation(request)?;
         self.transaction(|state| reconcile_effect_result_in_state(state, request))
     }
+
+    async fn reconcile_provider_event(
+        &self,
+        request: ProviderEventReconciliationTransaction,
+    ) -> Result<ProviderEventReconciliationOutcome, RepositoryError> {
+        let request = normalize_provider_event_reconciliation(request)?;
+        self.transaction(|state| reconcile_provider_event_in_state(state, request))
+    }
 }
 
 fn original_create_snapshot(
@@ -3835,6 +3856,375 @@ fn reconcile_effect_result_in_state(
         },
     );
     Ok(EffectResultOutcome::Reconciled(view))
+}
+
+fn normalize_provider_event_reconciliation(
+    mut request: ProviderEventReconciliationTransaction,
+) -> Result<ProviderEventReconciliationTransaction, RepositoryError> {
+    if let Some(follow_up) = request.follow_up.take() {
+        let follow_up = normalize_service_command(follow_up)?;
+        if follow_up.operation_idempotency.is_some() || follow_up.bound_connection.is_some() {
+            return Err(RepositoryError::InvalidInput(
+                "provider follow-up cannot carry public or transport idempotency",
+            ));
+        }
+        request.follow_up = Some(follow_up);
+    }
+    Ok(request)
+}
+
+fn reconcile_provider_event_in_state(
+    state: &mut MemoryState,
+    request: ProviderEventReconciliationTransaction,
+) -> Result<ProviderEventReconciliationOutcome, RepositoryError> {
+    let key = (request.account.clone(), request.event_digest);
+    let event = state
+        .provider_events
+        .get(&key)
+        .cloned()
+        .ok_or(RepositoryError::NotFound)?;
+
+    // Exact completion replay is independent of the current claim, worker
+    // lease, aggregate version, and target lifecycle. This is the durable
+    // lost-response path.
+    if event.state == ProviderEventState::Applied {
+        return match state.provider_completions.get(&key) {
+            Some(ProviderCompletionRow::ServiceReconciliation {
+                request: recorded,
+                view,
+            }) if recorded.as_ref() == &request && view.event == event => Ok(
+                ProviderEventReconciliationOutcome::Replayed(view.as_ref().clone()),
+            ),
+            _ => Err(RepositoryError::StaleClaim),
+        };
+    }
+
+    if event.target.as_ref() != Some(&request.target) {
+        return Err(RepositoryError::ProviderReferenceConflict);
+    }
+    ensure_provider_event_service_reference(state, &event, &request, request.follow_up.is_some())?;
+    match &event.state {
+        ProviderEventState::Claimed {
+            worker,
+            generation,
+            claimed_at,
+            expires_at,
+        } if *worker == request.worker
+            && *generation == request.claim_generation
+            && event.received_at <= request.at
+            && *claimed_at <= request.at
+            && *expires_at > request.at
+            && *expires_at > authoritative_time(state, request.at) => {}
+        _ => return Err(RepositoryError::StaleClaim),
+    }
+
+    let follow_up = match request.follow_up.clone() {
+        Some(follow_up) => {
+            ensure_call_worker(
+                state,
+                &request.target.tenant_id,
+                request.target.call_id,
+                request.worker,
+                request.at,
+            )?;
+            if follow_up.command.tenant_id != request.target.tenant_id
+                || follow_up.command.call_id != request.target.call_id
+                || follow_up.command.worker != request.worker
+                || follow_up.command.at != request.at
+                || follow_up.command.command.at() != request.at
+            {
+                return Err(RepositoryError::InvalidInput(
+                    "provider follow-up ownership or timestamp differs",
+                ));
+            }
+            let reference = provider_external_reference(state, &event, &request.target)?;
+            validate_provider_service_follow_up(
+                &request.target,
+                reference.binding_generation,
+                &follow_up.command.command,
+            )?;
+            match commit_service_command_in_state(state, follow_up)? {
+                ServiceCommandOutcome::Committed(view) => Some(view),
+                ServiceCommandOutcome::Replayed(_) => {
+                    return Err(RepositoryError::CommandConflict);
+                }
+            }
+        }
+        None => {
+            ensure_terminal_call_worker(state, &request.target, request.worker, request.at)?;
+            None
+        }
+    };
+
+    let event = state
+        .provider_events
+        .get_mut(&key)
+        .ok_or(RepositoryError::NotFound)?;
+    event.state = ProviderEventState::Applied;
+    event.applied_at = Some(request.at);
+    let event = event.clone();
+    let view = ProviderEventReconciliationView {
+        event,
+        target: request.target.clone(),
+        worker: request.worker,
+        claim_generation: request.claim_generation,
+        follow_up,
+    };
+    if state
+        .provider_completions
+        .insert(
+            key,
+            ProviderCompletionRow::ServiceReconciliation {
+                request: Box::new(request),
+                view: Box::new(view.clone()),
+            },
+        )
+        .is_some()
+    {
+        return Err(RepositoryError::Unavailable);
+    }
+    Ok(ProviderEventReconciliationOutcome::Reconciled(view))
+}
+
+fn ensure_provider_event_service_reference(
+    state: &MemoryState,
+    event: &ProviderEventEnvelope,
+    request: &ProviderEventReconciliationTransaction,
+    require_current_generation: bool,
+) -> Result<(), RepositoryError> {
+    let target = &request.target;
+    let call = state
+        .calls
+        .get(&target.call_id)
+        .filter(|call| call.aggregate.tenant_id() == &target.tenant_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if !state.service_managed_calls.contains(&target.call_id) {
+        return Err(RepositoryError::NotFound);
+    }
+    let plan = state
+        .execution_plans
+        .get(&target.call_id)
+        .ok_or(RepositoryError::Unavailable)?;
+    let spec = plan
+        .legs
+        .iter()
+        .find(|spec| spec.leg_id == target.leg_id)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    if !matches!(
+        &spec.endpoint,
+        crate::call_service::LegEndpointConfig::Provider(config)
+            if config.account_profile == request.account.as_str()
+    ) {
+        return Err(RepositoryError::ProviderReferenceConflict);
+    }
+    let reference = provider_external_reference(state, event, target)?;
+    let leg = call
+        .aggregate
+        .leg(target.leg_id)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    if require_current_generation && leg.binding_generation() != reference.binding_generation {
+        return Err(RepositoryError::StaleClaim);
+    }
+    let provider_reference = state
+        .provider_references
+        .get(&(request.account.clone(), event.provider_call_id.clone()))
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    if provider_reference.target != *target || provider_reference.bound_at != reference.bound_at {
+        return Err(RepositoryError::ProviderReferenceConflict);
+    }
+    Ok(())
+}
+
+fn provider_external_reference<'a>(
+    state: &'a MemoryState,
+    event: &ProviderEventEnvelope,
+    target: &ProviderEventTarget,
+) -> Result<&'a StoredExternalReference, RepositoryError> {
+    let key = ExternalReferenceKey::Provider(event.account.clone(), event.provider_call_id.clone());
+    let reference = state
+        .external_references
+        .get(&key)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    if reference.tenant_id != target.tenant_id
+        || reference.call_id != target.call_id
+        || reference.leg_id != target.leg_id
+        || reference.value
+            != (ExternalReferenceValue::ProviderCall {
+                account: event.account.clone(),
+                provider_call_id: event.provider_call_id.clone(),
+            })
+        || state.external_reference_bindings.get(&(
+            target.call_id,
+            target.leg_id,
+            reference.binding_generation,
+        )) != Some(&key)
+    {
+        return Err(RepositoryError::ProviderReferenceConflict);
+    }
+    Ok(reference)
+}
+
+fn validate_provider_service_follow_up(
+    target: &ProviderEventTarget,
+    reference_generation: BindingGeneration,
+    command: &CallCommand,
+) -> Result<(), RepositoryError> {
+    let valid = match command {
+        CallCommand::SetLegState {
+            leg_id,
+            binding_generation,
+            state,
+            ..
+        } => {
+            *leg_id == target.leg_id
+                && *binding_generation == reference_generation
+                && !matches!(state, LegState::Pending | LegState::AwaitingAttach)
+        }
+        CallCommand::RotateLegBinding {
+            leg_id,
+            binding_generation,
+            ..
+        } => *leg_id == target.leg_id && *binding_generation == reference_generation,
+        CallCommand::FinishTransfer { .. } | CallCommand::BeginEnding { .. } => true,
+        CallCommand::StartConnecting { .. }
+        | CallCommand::ArmDeadline { .. }
+        | CallCommand::BeginTransfer { .. }
+        | CallCommand::DeadlineElapsed { .. } => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RepositoryError::InvalidInput(
+            "provider follow-up does not match the referenced provider leg",
+        ))
+    }
+}
+
+fn provider_completion_crosslinks(
+    state: &MemoryState,
+    key: &ProviderEventKey,
+    completion: &ProviderCompletionRow,
+) -> bool {
+    let Some(event) = state.provider_events.get(key) else {
+        return false;
+    };
+    if event.state != ProviderEventState::Applied {
+        return false;
+    }
+    let Some(applied_at) = event.applied_at else {
+        return false;
+    };
+    match completion {
+        ProviderCompletionRow::Command { request, view } => {
+            request.account == key.0
+                && request.event_digest == key.1
+                && request.at == applied_at
+                && event.target.as_ref().is_some_and(|target| {
+                    target.tenant_id == request.command.tenant_id
+                        && target.call_id == request.command.call_id
+                        && validate_provider_command_target(target, &request.command.command)
+                            .is_ok()
+                        && !state.service_managed_calls.contains(&target.call_id)
+                })
+                && state.command_results.get(&request.command.command_id) == Some(view.as_ref())
+        }
+        ProviderCompletionRow::TerminalAcknowledgement { request } => {
+            request.account == key.0
+                && request.event_digest == key.1
+                && request.at == applied_at
+                && event.target.as_ref() == Some(&request.target)
+                && state
+                    .calls
+                    .get(&request.target.call_id)
+                    .is_some_and(|call| {
+                        call.aggregate.tenant_id() == &request.target.tenant_id
+                            && call.aggregate.state().is_terminal()
+                            && call.assignment.released_at.is_some()
+                            && call.aggregate.leg(request.target.leg_id).is_some()
+                    })
+        }
+        ProviderCompletionRow::ServiceReconciliation { request, view } => {
+            let request = request.as_ref();
+            let view = view.as_ref();
+            if request.account != key.0
+                || request.event_digest != key.1
+                || request.at != applied_at
+                || event.target.as_ref() != Some(&request.target)
+                || view.event != *event
+                || view.target != request.target
+                || view.worker != request.worker
+                || view.claim_generation != request.claim_generation
+                || normalize_provider_event_reconciliation(request.clone())
+                    .ok()
+                    .as_ref()
+                    != Some(request)
+            {
+                return false;
+            }
+            let Some(call) = state.calls.get(&request.target.call_id) else {
+                return false;
+            };
+            let plan_matches = state
+                .service_managed_calls
+                .contains(&request.target.call_id)
+                && call.aggregate.tenant_id() == &request.target.tenant_id
+                && state
+                    .execution_plans
+                    .get(&request.target.call_id)
+                    .and_then(|plan| {
+                        plan.legs
+                            .iter()
+                            .find(|spec| spec.leg_id == request.target.leg_id)
+                    })
+                    .is_some_and(|spec| {
+                        matches!(
+                            &spec.endpoint,
+                            crate::call_service::LegEndpointConfig::Provider(config)
+                                if config.account_profile == request.account.as_str()
+                        )
+                    });
+            if !plan_matches {
+                return false;
+            }
+            let Ok(reference) = provider_external_reference(state, event, &request.target) else {
+                return false;
+            };
+            let provider_reference_matches = state
+                .provider_references
+                .get(&(request.account.clone(), event.provider_call_id.clone()))
+                .is_some_and(|provider| {
+                    provider.target == request.target && provider.bound_at == reference.bound_at
+                });
+            if !provider_reference_matches {
+                return false;
+            }
+            match (&request.follow_up, &view.follow_up) {
+                (Some(follow_up), Some(follow_up_view)) => {
+                    follow_up.command.tenant_id == request.target.tenant_id
+                        && follow_up.command.call_id == request.target.call_id
+                        && follow_up.command.worker == request.worker
+                        && follow_up.command.at == request.at
+                        && follow_up.command.command.at() == request.at
+                        && validate_provider_service_follow_up(
+                            &request.target,
+                            reference.binding_generation,
+                            &follow_up.command.command,
+                        )
+                        .is_ok()
+                        && state
+                            .service_command_results
+                            .get(&follow_up.command.command_id)
+                            .is_some_and(|stored| {
+                                stored.request == *follow_up && stored.view == *follow_up_view
+                            })
+                }
+                (None, None) => {
+                    call.aggregate.state().is_terminal() && call.assignment.released_at.is_some()
+                }
+                _ => false,
+            }
+        }
+    }
 }
 
 fn validate_effect_follow_up(
@@ -5092,11 +5482,12 @@ mod tests {
 
     use super::*;
     use crate::call_engine::{
-        CallAggregate, CallState, LegDirection, LegKind, LegSpec, StopLegReason,
+        CallAggregate, CallState, LegDirection, LegKind, LegSpec, ProviderPayloadDigest,
+        RequestDigest, StopLegReason,
     };
     use crate::call_service::{
-        ControlIntent, DtmfSequence, LegEndpointConfig, LegExecutionSpec, ServiceOperationKind,
-        SipEndpointConfig, WebRtcEndpointConfig,
+        ControlIntent, DtmfSequence, LegEndpointConfig, LegExecutionSpec, ProviderEndpointConfig,
+        ProviderKind, ServiceOperationKind, SipEndpointConfig, WebRtcEndpointConfig,
     };
 
     fn at(second: i64) -> DateTime<Utc> {
@@ -5224,6 +5615,40 @@ mod tests {
         match outcome {
             CommandCommitOutcome::Committed(view) => view,
             CommandCommitOutcome::Replayed(_) => panic!("fresh command unexpectedly replayed"),
+        }
+    }
+
+    async fn apply_service_command(
+        repo: &MemoryRepository,
+        owner: &TenantId,
+        worker: WorkerLease,
+        current: &StoredCall,
+        command: CallCommand,
+    ) -> ServiceCommandView {
+        let outcome = repo
+            .commit_with_effect_payloads(ServiceCommandTransaction {
+                command: CommandCommit {
+                    tenant_id: owner.clone(),
+                    call_id: current.aggregate.id(),
+                    expected_version: current.aggregate.version(),
+                    command_id: CommandId::new(),
+                    at: command.at(),
+                    command,
+                    worker,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                },
+                effect_payloads: Vec::new(),
+                operation_idempotency: None,
+                bound_connection: None,
+            })
+            .await
+            .unwrap();
+        match outcome {
+            ServiceCommandOutcome::Committed(view) => view,
+            ServiceCommandOutcome::Replayed(_) => {
+                panic!("fresh service command unexpectedly replayed")
+            }
         }
     }
 
@@ -5404,6 +5829,321 @@ mod tests {
         assert_eq!(
             recovered.snapshot().unwrap().service_command_results.len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn service_provider_reconciliation_crosslinks_follow_up_and_terminal_ack() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-provider-reconciliation");
+        let aggregate = CallAggregate::new(
+            owner.clone(),
+            [
+                LegSpec {
+                    direction: LegDirection::Outbound,
+                    kind: LegKind::Twilio,
+                },
+                LegSpec {
+                    direction: LegDirection::Inbound,
+                    kind: LegKind::Sip,
+                },
+            ],
+            at(1),
+        );
+        let provider_leg = aggregate.legs()[0].id();
+        let peer_leg = aggregate.legs()[1].id();
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: provider_leg,
+                    endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                        provider: ProviderKind::Twilio,
+                        account_profile: "twilio-sandbox".into(),
+                        destination: Some("+12065550100".into()),
+                    }),
+                },
+                LegExecutionSpec {
+                    leg_id: peer_leg,
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                },
+            ],
+        )
+        .unwrap();
+        let created = repo
+            .create_with_plan(ServiceCreateTransaction {
+                create: CreateCall {
+                    initial: aggregate,
+                    command_id: CommandId::new(),
+                    command: CallCommand::StartConnecting {
+                        at: at(2),
+                        setup_deadline: at(32),
+                    },
+                    worker: worker.lease,
+                    idempotency_key: IdempotencyKeyDigest::new(digest(51)),
+                    request_digest: RequestDigest::new(digest(52)),
+                    attachments: Vec::new(),
+                    at: at(2),
+                },
+                plan,
+                alternatives: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let stored = match created {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh provider call replayed"),
+        };
+        let account = ProviderAccountKey::parse("twilio-sandbox").unwrap();
+        let provider_call_id = ProviderCallId::parse("CA-provider-reconciliation").unwrap();
+        let first_digest = ProviderEventDigest::new(digest(53));
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest: first_digest,
+            payload_digest: ProviderPayloadDigest::new(digest(54)),
+            provider_call_id: provider_call_id.clone(),
+            kind: "ringing".into(),
+            payload: json!({"state": "ringing"}),
+            occurred_at: Some(at(2)),
+            received_at: at(3),
+        })
+        .await
+        .unwrap();
+        let start = repo
+            .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|claim| {
+                matches!(
+                    claim.record.intent,
+                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg
+                )
+            })
+            .expect("provider start effect");
+        let effect_result = repo
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: owner.clone(),
+                call_id: stored.call.aggregate.id(),
+                effect_id: start.record.effect_id,
+                worker: worker.lease,
+                claim_generation: start.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: Some(ExternalReferenceBinding {
+                    leg_id: provider_leg,
+                    binding_generation: BindingGeneration::INITIAL,
+                    value: ExternalReferenceValue::ProviderCall {
+                        account: account.clone(),
+                        provider_call_id: provider_call_id.clone(),
+                    },
+                }),
+                follow_up: None,
+                at: at(4),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(effect_result, EffectResultOutcome::Reconciled(_)));
+
+        let target = ProviderEventTarget {
+            tenant_id: owner.clone(),
+            call_id: stored.call.aggregate.id(),
+            leg_id: provider_leg,
+        };
+        let first_claim = repo
+            .claim_provider_events(worker.lease, at(5), Duration::from_secs(30), 8)
+            .await
+            .unwrap()
+            .remove(0);
+        let first_request = ProviderEventReconciliationTransaction {
+            account: account.clone(),
+            event_digest: first_digest,
+            claim_generation: first_claim.claim_generation,
+            worker: worker.lease,
+            target: target.clone(),
+            follow_up: Some(ServiceCommandTransaction {
+                command: CommandCommit {
+                    tenant_id: owner.clone(),
+                    call_id: stored.call.aggregate.id(),
+                    expected_version: stored.call.aggregate.version(),
+                    command_id: CommandId::new(),
+                    command: CallCommand::SetLegState {
+                        at: at(6),
+                        leg_id: provider_leg,
+                        binding_generation: BindingGeneration::INITIAL,
+                        state: LegState::Signaling,
+                        failure: None,
+                    },
+                    worker: worker.lease,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                    at: at(6),
+                },
+                effect_payloads: Vec::new(),
+                operation_idempotency: None,
+                bound_connection: None,
+            }),
+            at: at(6),
+        };
+        let first_view = match repo
+            .reconcile_provider_event(first_request.clone())
+            .await
+            .unwrap()
+        {
+            ProviderEventReconciliationOutcome::Reconciled(view) => view,
+            ProviderEventReconciliationOutcome::Replayed(_) => panic!("fresh callback replayed"),
+        };
+        let mut call = first_view.follow_up.as_ref().unwrap().command.call.clone();
+
+        let second_digest = ProviderEventDigest::new(digest(55));
+        assert!(matches!(
+            repo.ingest_provider_event(ProviderEventInput {
+                account: account.clone(),
+                event_digest: second_digest,
+                payload_digest: ProviderPayloadDigest::new(digest(56)),
+                provider_call_id,
+                kind: "completed".into(),
+                payload: json!({"state": "completed"}),
+                occurred_at: Some(at(7)),
+                received_at: at(7),
+            })
+            .await
+            .unwrap(),
+            ProviderEventOutcome::Accepted(ref event) if event.state == ProviderEventState::Ready
+        ));
+
+        for (second, leg_id, state) in [
+            (7, peer_leg, LegState::Signaling),
+            (8, provider_leg, LegState::Connected),
+            (9, peer_leg, LegState::Connected),
+        ] {
+            call = apply_service_command(
+                &repo,
+                &owner,
+                worker.lease,
+                &call,
+                CallCommand::SetLegState {
+                    at: at(second),
+                    leg_id,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state,
+                    failure: None,
+                },
+            )
+            .await
+            .command
+            .call;
+        }
+        call = apply_service_command(
+            &repo,
+            &owner,
+            worker.lease,
+            &call,
+            CallCommand::BeginEnding {
+                at: at(10),
+                ending_deadline: Some(at(20)),
+                reason: StopLegReason::Requested,
+            },
+        )
+        .await
+        .command
+        .call;
+        for (second, leg_id) in [(11, provider_leg), (12, peer_leg)] {
+            call = apply_service_command(
+                &repo,
+                &owner,
+                worker.lease,
+                &call,
+                CallCommand::SetLegState {
+                    at: at(second),
+                    leg_id,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state: LegState::Ended,
+                    failure: None,
+                },
+            )
+            .await
+            .command
+            .call;
+        }
+        assert!(call.aggregate.state().is_terminal());
+        assert!(call.assignment.released_at.is_some());
+
+        let second_claim = repo
+            .claim_provider_events(worker.lease, at(13), Duration::from_secs(30), 8)
+            .await
+            .unwrap()
+            .remove(0);
+        let terminal_request = ProviderEventReconciliationTransaction {
+            account,
+            event_digest: second_digest,
+            claim_generation: second_claim.claim_generation,
+            worker: worker.lease,
+            target,
+            follow_up: None,
+            at: at(14),
+        };
+        let terminal_view = match repo
+            .reconcile_provider_event(terminal_request.clone())
+            .await
+            .unwrap()
+        {
+            ProviderEventReconciliationOutcome::Reconciled(view) => view,
+            ProviderEventReconciliationOutcome::Replayed(_) => {
+                panic!("fresh terminal callback replayed")
+            }
+        };
+        assert!(terminal_view.follow_up.is_none());
+        assert_eq!(
+            repo.reconcile_provider_event(terminal_request.clone())
+                .await
+                .unwrap(),
+            ProviderEventReconciliationOutcome::Replayed(terminal_view.clone())
+        );
+
+        let snapshot = repo.snapshot().unwrap();
+        MemoryRepository::from_snapshot(snapshot.clone()).unwrap();
+        let mut forged = snapshot.clone();
+        let completion = forged
+            .provider_completions
+            .iter_mut()
+            .find(|completion| {
+                matches!(
+                    completion.row,
+                    ProviderCompletionRow::ServiceReconciliation { ref view, .. }
+                        if view.follow_up.is_some()
+                )
+            })
+            .unwrap();
+        let ProviderCompletionRow::ServiceReconciliation { request, .. } = &mut completion.row
+        else {
+            unreachable!()
+        };
+        request.target.leg_id = peer_leg;
+        assert!(matches!(
+            MemoryRepository::from_snapshot(forged),
+            Err(RepositoryError::Unavailable)
+        ));
+        let mut missing = snapshot.clone();
+        missing.provider_completions.pop();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing),
+            Err(RepositoryError::Unavailable)
+        ));
+        let recovered = MemoryRepository::from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            recovered
+                .reconcile_provider_event(first_request)
+                .await
+                .unwrap(),
+            ProviderEventReconciliationOutcome::Replayed(first_view)
+        );
+        assert_eq!(
+            recovered
+                .reconcile_provider_event(terminal_request)
+                .await
+                .unwrap(),
+            ProviderEventReconciliationOutcome::Replayed(terminal_view)
         );
     }
 

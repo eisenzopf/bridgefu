@@ -16,6 +16,13 @@ work claims safe across independent pools and processes. Read-only
 consistent read transactions; they do not take the epoch write lock, rewrite
 tables, or advance the epoch.
 
+Schema version 5 widens `provider_completions` with a distinct
+`service_reconciliation` receipt. Existing command and terminal-acknowledgement
+rows are copied unchanged by the SQLite table rebuild and remain in place under
+PostgreSQL's widened constraint. The service receipt cross-links the claimed
+event, provider account/reference, execution-plan leg, worker fence, and exact
+service follow-up so restart replay cannot bypass the service-owned transaction.
+
 Gate 6 deliberately chooses correctness before maximum write concurrency. A
 mutation loads a consistent normalized snapshot, applies one transition through
 the shared evaluator, diffs the snapshots, and writes only inserted, changed,
