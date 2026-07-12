@@ -207,8 +207,6 @@ pub struct ControlOutboxRecord {
     pub intent: ControlIntent,
     /// Earliest claim time.
     pub available_at: DateTime<Utc>,
-    /// Start time of the current claim, when claimed.
-    pub claimed_at: Option<DateTime<Utc>>,
     /// Durable claim/completion state.
     pub state: OutboxState,
 }

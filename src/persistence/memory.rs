@@ -1119,6 +1119,7 @@ impl CallRepository for MemoryRepository {
                 record.state = OutboxState::Claimed {
                     worker,
                     generation,
+                    claimed_at: at,
                     expires_at,
                 };
                 claimed.push(ClaimedOutbox {
@@ -1157,8 +1158,12 @@ impl CallRepository for MemoryRepository {
                 OutboxState::Claimed {
                     worker: owner,
                     generation,
+                    claimed_at,
                     expires_at,
-                } if owner == worker && generation == claim_generation && expires_at > at => {}
+                } if owner == worker
+                    && generation == claim_generation
+                    && claimed_at <= at
+                    && expires_at > at => {}
                 _ => return Err(RepositoryError::StaleClaim),
             }
             record.state = match completion {
@@ -1298,7 +1303,6 @@ impl CallRepository for MemoryRepository {
                     record.worker = worker;
                     if matches!(record.state, OutboxState::Claimed { .. }) {
                         record.state = OutboxState::Ready;
-                        record.claimed_at = None;
                     }
                 }
                 for record in state
@@ -1482,9 +1486,9 @@ impl CallServiceRepository for MemoryRepository {
                 record.state = OutboxState::Claimed {
                     worker,
                     generation,
+                    claimed_at: at,
                     expires_at,
                 };
-                record.claimed_at = Some(at);
                 claimed.push(ClaimedControlEffect {
                     record: record.clone(),
                     claim_generation: generation,
@@ -1755,7 +1759,6 @@ fn enqueue_control_in_state(
         sequence,
         intent: request.intent.clone(),
         available_at: request.at,
-        claimed_at: None,
         state: OutboxState::Ready,
     };
     let view = ControlCommandView {
@@ -1973,14 +1976,6 @@ fn reconcile_effect_result_in_state(
             "effect completion predates effect availability",
         ));
     }
-    if let ServiceEffectSnapshot::Control(record) = &effect {
-        if record
-            .claimed_at
-            .is_none_or(|claimed_at| claimed_at > request.at)
-        {
-            return Err(RepositoryError::StaleClaim);
-        }
-    }
     let call = state
         .calls
         .get(&request.call_id)
@@ -2064,7 +2059,6 @@ fn reconcile_effect_result_in_state(
                 .get_mut(&request.effect_id)
                 .ok_or(RepositoryError::NotFound)?;
             record.state = completed_state;
-            record.claimed_at = None;
             CompletedServiceEffect::Control(record.clone())
         }
     };
@@ -2210,8 +2204,15 @@ fn validate_effect_claim(
         OutboxState::Claimed {
             worker: owner,
             generation,
+            claimed_at,
             expires_at,
-        } if *owner == worker && *generation == claim_generation && *expires_at > at => Ok(()),
+        } if *owner == worker
+            && *generation == claim_generation
+            && *claimed_at <= at
+            && *expires_at > at =>
+        {
+            Ok(())
+        }
         _ => Err(RepositoryError::StaleClaim),
     }
 }
@@ -2830,7 +2831,6 @@ fn retire_inactive_bindings(
                 false,
             ),
         };
-        record.claimed_at = None;
     }
 
     let retired = state
@@ -2996,10 +2996,12 @@ fn control_outbox_claimable(
     let individually_claimable = record.worker == worker
         && record.available_at <= at
         && match &record.state {
-            OutboxState::Ready => record.claimed_at.is_none(),
-            OutboxState::Claimed { expires_at, .. } => {
-                record.claimed_at.is_some_and(|claimed_at| claimed_at <= at) && *expires_at <= at
-            }
+            OutboxState::Ready => true,
+            OutboxState::Claimed {
+                claimed_at,
+                expires_at,
+                ..
+            } => *claimed_at <= at && *expires_at <= at,
             OutboxState::Succeeded { .. } | OutboxState::Failed { .. } => false,
         }
         && state.calls.get(&record.call_id).is_some_and(|call| {
@@ -3030,7 +3032,11 @@ fn outbox_claimable(
         || record.available_at > at
         || !match &record.state {
             OutboxState::Ready => true,
-            OutboxState::Claimed { expires_at, .. } => *expires_at <= at,
+            OutboxState::Claimed {
+                claimed_at,
+                expires_at,
+                ..
+            } => *claimed_at <= at && *expires_at <= at,
             OutboxState::Succeeded { .. } | OutboxState::Failed { .. } => false,
         }
         || !state
@@ -5304,6 +5310,17 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].record.call_id, call.aggregate.id());
+        assert_eq!(
+            repo.complete_outbox(
+                first[0].record.effect_id,
+                worker.lease,
+                first[0].claim_generation,
+                OutboxCompletion::Succeeded,
+                at(2),
+            )
+            .await,
+            Err(RepositoryError::StaleClaim)
+        );
         assert_eq!(
             repo.complete_outbox(
                 first[0].record.effect_id,

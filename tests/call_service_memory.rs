@@ -647,9 +647,7 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
     before_available.at = at(9);
     assert_eq!(
         repository.reconcile_effect_result(before_available).await,
-        Err(RepositoryError::InvalidInput(
-            "effect completion predates effect availability"
-        ))
+        Err(RepositoryError::StaleClaim)
     );
     let mut before_claim = success.clone();
     before_claim.at = at(10);

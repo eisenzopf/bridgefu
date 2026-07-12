@@ -806,6 +806,8 @@ pub enum OutboxState {
         worker: WorkerLease,
         /// Claim incarnation.
         generation: ClaimGeneration,
+        /// Time at which this claim incarnation was acquired.
+        claimed_at: DateTime<Utc>,
         /// Claim expiry.
         expires_at: DateTime<Utc>,
     },
