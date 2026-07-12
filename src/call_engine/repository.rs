@@ -101,6 +101,45 @@ impl<'de> Deserialize<'de> for ClaimGeneration {
     }
 }
 
+/// Monotonic repository-assigned ordering for verified provider events.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ProviderReceiptSequence(u64);
+
+impl ProviderReceiptSequence {
+    /// First durable provider receipt.
+    pub const INITIAL: Self = Self(1);
+
+    /// Returns the database-safe signed value.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+
+    pub(crate) fn next(self) -> Result<Self, RepositoryError> {
+        if self.0 >= i64::MAX as u64 {
+            Err(RepositoryError::CounterExhausted)
+        } else {
+            Ok(Self(self.0 + 1))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderReceiptSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 || value > i64::MAX as u64 {
+            return Err(serde::de::Error::custom(
+                "provider receipt sequence must fit a positive signed database integer",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
 /// Current fenced worker identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct WorkerLease {
@@ -216,6 +255,8 @@ pub struct AttachmentIssue {
     pub binding_generation: BindingGeneration,
     /// Expected signaling/media transport.
     pub transport: AttachmentTransport,
+    /// Exact authenticated principal allowed to consume this token.
+    pub expected_principal: PrincipalFingerprint,
     /// Absolute two-minute-style expiry supplied by policy.
     pub expires_at: DateTime<Utc>,
 }
@@ -347,8 +388,8 @@ pub struct AttachmentCandidate {
     pub(crate) transport: AttachmentTransport,
     pub(crate) worker: WorkerLease,
     pub(crate) expires_at: DateTime<Utc>,
-    /// Snapshot used to construct the consume command.
-    pub call: StoredCall,
+    pub(crate) expected_principal: PrincipalFingerprint,
+    pub(crate) expected_version: AggregateVersion,
 }
 
 impl AttachmentCandidate {
@@ -356,6 +397,12 @@ impl AttachmentCandidate {
     #[must_use]
     pub const fn leg_id(&self) -> LegId {
         self.leg_id
+    }
+
+    /// Call selected by the token.
+    #[must_use]
+    pub const fn call_id(&self) -> CallId {
+        self.call_id
     }
 
     /// Exact leg generation selected by the token.
@@ -375,6 +422,10 @@ impl AttachmentCandidate {
     pub const fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }
+
+    pub(crate) const fn expected_version(&self) -> AggregateVersion {
+        self.expected_version
+    }
 }
 
 impl fmt::Debug for AttachmentCandidate {
@@ -390,6 +441,8 @@ impl fmt::Debug for AttachmentCandidate {
             .field("transport", &self.transport)
             .field("worker", &self.worker)
             .field("expires_at", &self.expires_at)
+            .field("expected_principal", &"[redacted]")
+            .field("expected_version", &self.expected_version)
             .finish()
     }
 }
@@ -403,6 +456,8 @@ pub struct AttachmentLookup {
     pub tenant_id: TenantId,
     /// Actual inbound transport.
     pub transport: AttachmentTransport,
+    /// Authenticated issuer/tenant/subject fingerprint.
+    pub principal_fingerprint: PrincipalFingerprint,
     /// Worker expected to own this call.
     pub worker: WorkerLease,
     /// Lookup time.
@@ -530,13 +585,22 @@ impl<'de> Deserialize<'de> for ProviderCallId {
 }
 
 /// Provider event lifecycle in durable storage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum ProviderEventState {
     /// No provider-call reference existed at receipt time.
     PendingReference,
     /// A call/leg target is known and the event awaits application.
     Ready,
+    /// Exclusively claimed by a fenced worker until expiry.
+    Claimed {
+        /// Claim owner.
+        worker: WorkerLease,
+        /// Claim incarnation.
+        generation: ClaimGeneration,
+        /// Claim expiry.
+        expires_at: DateTime<Utc>,
+    },
     /// The event was applied by a later transactional service step.
     Applied,
 }
@@ -571,6 +635,8 @@ pub struct ProviderEventEnvelope {
     pub occurred_at: Option<DateTime<Utc>>,
     /// Bridgefu receipt time.
     pub received_at: DateTime<Utc>,
+    /// Monotonic repository insertion order.
+    pub receipt_sequence: ProviderReceiptSequence,
     /// Current matching target.
     pub target: Option<ProviderEventTarget>,
     /// Durable lifecycle state.
@@ -591,6 +657,7 @@ impl fmt::Debug for ProviderEventEnvelope {
             .field("payload", &"[redacted]")
             .field("occurred_at", &self.occurred_at)
             .field("received_at", &self.received_at)
+            .field("receipt_sequence", &self.receipt_sequence)
             .field("target", &self.target)
             .field("state", &self.state)
             .field("applied_at", &self.applied_at)
@@ -661,6 +728,41 @@ pub struct BindProviderReference {
     pub worker: WorkerLease,
     /// Binding time.
     pub at: DateTime<Utc>,
+}
+
+/// Claimed provider event and its exact completion guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedProviderEvent {
+    /// Claimed event snapshot.
+    pub event: ProviderEventEnvelope,
+    /// Claim incarnation.
+    pub claim_generation: ClaimGeneration,
+}
+
+/// Atomically applies a claimed provider event with its call command.
+#[derive(Clone, Debug)]
+pub struct ProviderEventCommit {
+    /// Provider namespace.
+    pub account: ProviderAccountKey,
+    /// Exact provider event ID digest.
+    pub event_digest: ProviderEventDigest,
+    /// Exact claim incarnation.
+    pub claim_generation: ClaimGeneration,
+    /// Current call worker.
+    pub worker: WorkerLease,
+    /// Associated pure call command transaction.
+    pub command: CommandCommit,
+    /// Completion time; must equal the command time.
+    pub at: DateTime<Utc>,
+}
+
+/// Atomic provider event and call-command result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderEventCommitOutcome {
+    /// Applied provider event.
+    pub event: ProviderEventEnvelope,
+    /// Associated call command result.
+    pub command: CommandCommitOutcome,
 }
 
 /// Outbox execution lifecycle.
@@ -931,14 +1033,20 @@ pub trait CallRepository: Send + Sync {
         request: BindProviderReference,
     ) -> Result<Vec<ProviderEventEnvelope>, RepositoryError>;
 
-    /// Marks an exact ready provider event applied.
-    async fn mark_provider_event_applied(
+    /// Claims provider events in monotonic repository receipt order.
+    async fn claim_provider_events(
         &self,
-        account: &ProviderAccountKey,
-        event_digest: ProviderEventDigest,
-        target: &ProviderEventTarget,
+        worker: WorkerLease,
         at: DateTime<Utc>,
-    ) -> Result<ProviderEventEnvelope, RepositoryError>;
+        claim_ttl: Duration,
+        limit: usize,
+    ) -> Result<Vec<ClaimedProviderEvent>, RepositoryError>;
+
+    /// Atomically applies a claimed provider event and its call command.
+    async fn complete_provider_event(
+        &self,
+        request: ProviderEventCommit,
+    ) -> Result<ProviderEventCommitOutcome, RepositoryError>;
 
     /// Claims ordered effects for the current assigned worker.
     async fn claim_outbox(

@@ -18,18 +18,21 @@ use crate::call_engine::{
     chrono_ttl, idempotency_expiry, validate_attachment_issue, validate_provider_event,
     validate_register_worker, AggregateVersion, AttachmentCandidate, AttachmentConsume,
     AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTokenDigest, AttachmentTransport,
-    BindProviderReference, BindingGeneration, CallCommand, CallId, CallRepository, ClaimGeneration,
-    ClaimedDeadline, ClaimedOutbox, CommandCommit, CommandCommitOutcome, CommandCommitView,
-    CommandDisposition, CommandId, ConnectionBinding, ConsumedAttachment, CreateCall,
-    CreateCallOutcome, DeadlineClaimGuard, DeadlineGeneration, DeadlineKind, DeadlineRecord,
-    DeadlineState, EffectId, EffectIntent, IdempotencyKeyDigest, LegId, LegState, OutboxCompletion,
-    OutboxRecord, OutboxState, ProviderAccountKey, ProviderCallId, ProviderEventDigest,
-    ProviderEventEnvelope, ProviderEventInput, ProviderEventOutcome, ProviderEventState,
-    ProviderEventTarget, RegisterWorker, RepositoryError, RestartClaim, StoredCall, StoredCommand,
-    TenantId, WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
+    BindProviderReference, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
+    ClaimGeneration, ClaimedDeadline, ClaimedOutbox, ClaimedProviderEvent, CommandCommit,
+    CommandCommitOutcome, CommandCommitView, CommandDisposition, CommandId, ConnectionBinding,
+    ConsumedAttachment, CreateCall, CreateCallOutcome, DeadlineClaimGuard, DeadlineGeneration,
+    DeadlineKind, DeadlineRecord, DeadlineState, EffectId, EffectIntent, IdempotencyKeyDigest,
+    LegId, LegState, OutboxCompletion, OutboxRecord, OutboxState, PrincipalFingerprint,
+    ProviderAccountKey, ProviderCallId, ProviderEventCommit, ProviderEventCommitOutcome,
+    ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput, ProviderEventOutcome,
+    ProviderEventState, ProviderEventTarget, ProviderReceiptSequence, RegisterWorker,
+    RepositoryError, RestartClaim, StoredCall, StoredCommand, TenantId, WorkerAssignment,
+    WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
+type PrincipalBindingKey = (PrincipalFingerprint, BindingKey);
 type DeadlineKey = (CallId, DeadlineKind, DeadlineGeneration);
 type ProviderEventKey = (ProviderAccountKey, ProviderEventDigest);
 type ProviderReferenceKey = (ProviderAccountKey, ProviderCallId);
@@ -69,6 +72,7 @@ struct AttachmentRow {
     leg_id: LegId,
     binding_generation: BindingGeneration,
     transport: AttachmentTransport,
+    expected_principal: PrincipalFingerprint,
     worker: WorkerLease,
     expires_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
@@ -89,14 +93,16 @@ struct MemoryState {
     calls: HashMap<CallId, StoredCall>,
     leg_owners: HashMap<LegId, CallId>,
     commands: HashMap<CommandId, StoredCommand>,
-    command_outbox: HashMap<CommandId, Vec<EffectId>>,
+    command_results: HashMap<CommandId, CommandCommitView>,
     idempotency: HashMap<(TenantId, IdempotencyKeyDigest), IdempotencyRow>,
     attachments: HashMap<AttachmentTokenDigest, AttachmentRow>,
     attachment_ids: HashMap<AttachmentId, AttachmentTokenDigest>,
     active_attachments: HashMap<BindingKey, AttachmentTokenDigest>,
     connection_owners: HashMap<ConnectionId, BindingKey>,
+    principal_bindings: HashMap<PrincipalBindingKey, ConnectionId>,
     provider_events: HashMap<ProviderEventKey, ProviderEventEnvelope>,
     provider_references: HashMap<ProviderReferenceKey, ProviderReferenceRow>,
+    provider_receipt_sequence: Option<ProviderReceiptSequence>,
     outbox: HashMap<EffectId, OutboxRecord>,
     deadlines: HashMap<DeadlineKey, DeadlineRecord>,
 }
@@ -249,6 +255,7 @@ impl CallRepository for MemoryRepository {
     }
 
     async fn create_call(&self, request: CreateCall) -> Result<CreateCallOutcome, RepositoryError> {
+        validate_command_timestamp(&request.command, request.at)?;
         request
             .initial
             .validate()
@@ -353,7 +360,7 @@ impl CallRepository for MemoryRepository {
                 disposition,
                 recorded_at: request.at,
             };
-            state.commands.insert(request.command_id, command);
+            state.commands.insert(request.command_id, command.clone());
             insert_attachments(
                 state,
                 &tenant_id,
@@ -374,16 +381,20 @@ impl CallRepository for MemoryRepository {
                     effects,
                 },
             )?;
-            state.command_outbox.insert(
-                request.command_id,
-                outbox.iter().map(|record| record.effect_id).collect(),
-            );
             state.idempotency.insert(
                 idempotency_key,
                 IdempotencyRow {
                     request_digest: request.request_digest,
                     call_id,
                     expires_at,
+                },
+            );
+            state.command_results.insert(
+                request.command_id,
+                CommandCommitView {
+                    command,
+                    call: stored.clone(),
+                    outbox: outbox.clone(),
                 },
             );
             Ok(CreateCallOutcome::Created(stored))
@@ -429,6 +440,7 @@ impl CallRepository for MemoryRepository {
             if row.token_digest != request.token_digest
                 || row.tenant_id != request.tenant_id
                 || row.transport != request.transport
+                || row.expected_principal != request.principal_fingerprint
                 || row.worker != request.worker
                 || row.expires_at <= request.at
                 || row.consumed_at.is_some()
@@ -457,7 +469,8 @@ impl CallRepository for MemoryRepository {
                 transport: row.transport,
                 worker: row.worker,
                 expires_at: row.expires_at,
-                call,
+                expected_principal: row.expected_principal,
+                expected_version: call.aggregate.version(),
             })
         })
     }
@@ -483,6 +496,8 @@ impl CallRepository for MemoryRepository {
                 || row.leg_id != request.candidate.leg_id
                 || row.binding_generation != request.candidate.binding_generation
                 || row.transport != request.candidate.transport
+                || row.expected_principal != request.candidate.expected_principal
+                || row.expected_principal != request.principal_fingerprint
                 || row.worker != request.candidate.worker
                 || row.expires_at <= request.at
                 || row.consumed_at.is_some()
@@ -490,15 +505,19 @@ impl CallRepository for MemoryRepository {
             {
                 return Err(RepositoryError::AttachmentRejected);
             }
-            if state.connection_owners.contains_key(&request.connection_id) {
-                return Err(RepositoryError::AttachmentConflict);
-            }
-
             let binding_key = (
                 request.candidate.call_id,
                 request.candidate.leg_id,
                 request.candidate.binding_generation,
             );
+            let principal_binding_key = (request.principal_fingerprint, binding_key);
+            if state.connection_owners.contains_key(&request.connection_id)
+                || state
+                    .principal_bindings
+                    .contains_key(&principal_binding_key)
+            {
+                return Err(RepositoryError::AttachmentConflict);
+            }
             let binding = ConnectionBinding {
                 connection_id: request.connection_id.clone(),
                 leg_id: request.candidate.leg_id,
@@ -520,6 +539,9 @@ impl CallRepository for MemoryRepository {
             state
                 .connection_owners
                 .insert(request.connection_id.clone(), binding_key);
+            state
+                .principal_bindings
+                .insert(principal_binding_key, request.connection_id.clone());
             let row = state
                 .attachments
                 .get_mut(&request.candidate.token_digest)
@@ -532,7 +554,7 @@ impl CallRepository for MemoryRepository {
                 CommandCommit {
                     tenant_id: request.candidate.tenant_id.clone(),
                     call_id: request.candidate.call_id,
-                    expected_version: request.candidate.call.aggregate.version(),
+                    expected_version: request.candidate.expected_version(),
                     command_id: request.command_id,
                     command: request.command.clone(),
                     worker: request.candidate.worker,
@@ -575,6 +597,11 @@ impl CallRepository for MemoryRepository {
             } else {
                 ProviderEventState::PendingReference
             };
+            let receipt_sequence = match state.provider_receipt_sequence {
+                Some(last) => last.next()?,
+                None => ProviderReceiptSequence::INITIAL,
+            };
+            state.provider_receipt_sequence = Some(receipt_sequence);
             let event = ProviderEventEnvelope {
                 account: request.account,
                 event_digest: request.event_digest,
@@ -584,6 +611,7 @@ impl CallRepository for MemoryRepository {
                 payload: request.payload,
                 occurred_at: request.occurred_at,
                 received_at: request.received_at,
+                receipt_sequence,
                 target,
                 state: state_kind,
                 applied_at: None,
@@ -627,54 +655,127 @@ impl CallRepository for MemoryRepository {
             for event in state.provider_events.values_mut() {
                 if event.account == request.account
                     && event.provider_call_id == request.provider_call_id
-                    && event.state != ProviderEventState::Applied
+                    && !matches!(event.state, ProviderEventState::Applied)
                 {
-                    event.target = Some(target.clone());
-                    event.state = ProviderEventState::Ready;
+                    if matches!(event.state, ProviderEventState::PendingReference) {
+                        event.target = Some(target.clone());
+                        event.state = ProviderEventState::Ready;
+                    }
                     ready.push(event.clone());
                 }
             }
-            ready.sort_by(|left, right| {
-                left.received_at.cmp(&right.received_at).then_with(|| {
-                    left.event_digest
-                        .expose_bytes()
-                        .cmp(right.event_digest.expose_bytes())
-                })
-            });
+            ready.sort_by_key(|event| event.receipt_sequence);
             Ok(ready)
         })
     }
 
-    async fn mark_provider_event_applied(
+    async fn claim_provider_events(
         &self,
-        account: &ProviderAccountKey,
-        event_digest: ProviderEventDigest,
-        target: &ProviderEventTarget,
+        worker: WorkerLease,
         at: DateTime<Utc>,
-    ) -> Result<ProviderEventEnvelope, RepositoryError> {
+        claim_ttl: Duration,
+        limit: usize,
+    ) -> Result<Vec<ClaimedProviderEvent>, RepositoryError> {
+        let expires_at = chrono_ttl(at, claim_ttl)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         self.transaction(|state| {
+            ensure_worker(state, worker, true)?;
+            let mut eligible = state
+                .provider_events
+                .iter()
+                .filter(|(_, event)| provider_event_claimable(state, event, worker, at))
+                .map(|(key, event)| (event.receipt_sequence, key.clone()))
+                .collect::<Vec<_>>();
+            eligible.sort_by_key(|(sequence, _)| *sequence);
+
+            let mut claimed = Vec::new();
+            for (_, key) in eligible {
+                if claimed.len() >= limit {
+                    break;
+                }
+                let event = state
+                    .provider_events
+                    .get(&key)
+                    .ok_or(RepositoryError::NotFound)?;
+                if !provider_event_claimable(state, event, worker, at) {
+                    continue;
+                }
+                let previous = match &event.state {
+                    ProviderEventState::Ready => ClaimGeneration::default(),
+                    ProviderEventState::Claimed { generation, .. } => *generation,
+                    ProviderEventState::PendingReference | ProviderEventState::Applied => continue,
+                };
+                let generation = previous.next()?;
+                let event = state
+                    .provider_events
+                    .get_mut(&key)
+                    .ok_or(RepositoryError::NotFound)?;
+                event.state = ProviderEventState::Claimed {
+                    worker,
+                    generation,
+                    expires_at,
+                };
+                claimed.push(ClaimedProviderEvent {
+                    event: event.clone(),
+                    claim_generation: generation,
+                });
+            }
+            Ok(claimed)
+        })
+    }
+
+    async fn complete_provider_event(
+        &self,
+        request: ProviderEventCommit,
+    ) -> Result<ProviderEventCommitOutcome, RepositoryError> {
+        self.transaction(|state| {
+            if request.at != request.command.at
+                || request.worker != request.command.worker
+                || request.command.command.at() != request.at
+            {
+                return Err(RepositoryError::InvalidInput(
+                    "provider completion and command times or workers differ",
+                ));
+            }
+            ensure_worker(state, request.worker, true)?;
+            let key = (request.account.clone(), request.event_digest);
             let event = state
                 .provider_events
-                .get_mut(&(account.clone(), event_digest))
+                .get(&key)
                 .ok_or(RepositoryError::NotFound)?;
-            if event.target.as_ref() != Some(target)
-                || !matches!(
-                    event.state,
-                    ProviderEventState::Ready | ProviderEventState::Applied
-                )
+            let target = event
+                .target
+                .clone()
+                .ok_or(RepositoryError::ProviderReferenceConflict)?;
+            match &event.state {
+                ProviderEventState::Claimed {
+                    worker,
+                    generation,
+                    expires_at,
+                } if *worker == request.worker
+                    && *generation == request.claim_generation
+                    && *expires_at > request.at => {}
+                _ => return Err(RepositoryError::StaleClaim),
+            }
+            if target.tenant_id != request.command.tenant_id
+                || target.call_id != request.command.call_id
             {
                 return Err(RepositoryError::ProviderReferenceConflict);
             }
-            if event.state == ProviderEventState::Ready {
-                if at < event.received_at {
-                    return Err(RepositoryError::InvalidInput(
-                        "provider event application predates receipt",
-                    ));
-                }
-                event.state = ProviderEventState::Applied;
-                event.applied_at = Some(at);
-            }
-            Ok(event.clone())
+
+            let command = commit_command_in_state(state, request.command)?;
+            let event = state
+                .provider_events
+                .get_mut(&key)
+                .ok_or(RepositoryError::NotFound)?;
+            event.state = ProviderEventState::Applied;
+            event.applied_at = Some(request.at);
+            Ok(ProviderEventCommitOutcome {
+                event: event.clone(),
+                command,
+            })
         })
     }
 
@@ -694,34 +795,23 @@ impl CallRepository for MemoryRepository {
             let mut eligible = state
                 .outbox
                 .values()
-                .filter(|record| {
-                    record.worker == worker
-                        && record.available_at <= at
-                        && match &record.state {
-                            OutboxState::Ready => true,
-                            OutboxState::Claimed { expires_at, .. } => *expires_at <= at,
-                            OutboxState::Succeeded { .. } | OutboxState::Failed { .. } => false,
-                        }
-                        && state
-                            .calls
-                            .get(&record.call_id)
-                            .is_some_and(|call| call.assignment.lease == worker)
-                })
-                .map(|record| {
-                    (
-                        record.available_at,
-                        record.call_id,
-                        record.aggregate_version,
-                        record.ordinal,
-                        record.effect_id,
-                    )
-                })
+                .filter(|record| outbox_claimable(state, record, worker, at))
+                .map(|record| (outbox_order_key(record), record.effect_id))
                 .collect::<Vec<_>>();
-            eligible.sort();
-            eligible.truncate(limit);
+            eligible.sort_by_key(|(key, _)| *key);
 
-            let mut claimed = Vec::with_capacity(eligible.len());
-            for (_, _, _, _, effect_id) in eligible {
+            let mut claimed = Vec::new();
+            for (_, effect_id) in eligible {
+                if claimed.len() >= limit {
+                    break;
+                }
+                let record = state
+                    .outbox
+                    .get(&effect_id)
+                    .ok_or(RepositoryError::NotFound)?;
+                if !outbox_claimable(state, record, worker, at) {
+                    continue;
+                }
                 let record = state
                     .outbox
                     .get_mut(&effect_id)
@@ -866,9 +956,11 @@ impl CallRepository for MemoryRepository {
                 .calls
                 .iter()
                 .filter(|(_, call)| {
-                    call.assignment.released_at.is_none()
-                        && call.assignment.lease.worker_id == worker.worker_id
+                    call.assignment.lease.worker_id == worker.worker_id
                         && call.assignment.lease.fence < worker.fence
+                        && (call.assignment.released_at.is_none()
+                            || (call.aggregate.state().is_terminal()
+                                && has_unfinished_outbox(state, call.aggregate.id())))
                 })
                 .map(|(call_id, _)| *call_id)
                 .collect::<Vec<_>>();
@@ -886,7 +978,7 @@ impl CallRepository for MemoryRepository {
                 for record in state
                     .outbox
                     .values_mut()
-                    .filter(|row| row.call_id == call_id)
+                    .filter(|row| row.call_id == call_id && outbox_is_unfinished(row))
                 {
                     record.worker = worker;
                     if matches!(record.state, OutboxState::Claimed { .. }) {
@@ -900,6 +992,16 @@ impl CallRepository for MemoryRepository {
                 {
                     if matches!(record.state, DeadlineState::Claimed { .. }) {
                         record.state = DeadlineState::Pending;
+                    }
+                }
+                for event in state.provider_events.values_mut().filter(|event| {
+                    event
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.call_id == call_id)
+                }) {
+                    if matches!(event.state, ProviderEventState::Claimed { .. }) {
+                        event.state = ProviderEventState::Ready;
                     }
                 }
                 for attachment in state
@@ -1004,6 +1106,7 @@ fn insert_attachments(
             leg_id: issue.leg_id,
             binding_generation: issue.binding_generation,
             transport: issue.transport,
+            expected_principal: issue.expected_principal,
             worker,
             expires_at: issue.expires_at,
             consumed_at: None,
@@ -1026,6 +1129,7 @@ fn commit_command_in_state(
     state: &mut MemoryState,
     request: CommandCommit,
 ) -> Result<CommandCommitOutcome, RepositoryError> {
+    validate_command_timestamp(&request.command, request.at)?;
     if let Some(existing) = state.commands.get(&request.command_id) {
         ensure_worker(state, request.worker, true)?;
         let call = tenant_call(state, &request.tenant_id, request.call_id)?;
@@ -1067,6 +1171,9 @@ fn commit_command_in_state(
 
     let observed_version = current.aggregate.version();
     let (aggregate, effects, disposition) = decision.into_parts();
+    if disposition == CommandDisposition::Applied {
+        retire_inactive_bindings(state, request.call_id, &aggregate)?;
+    }
     let call = state
         .calls
         .get_mut(&request.call_id)
@@ -1106,10 +1213,6 @@ fn commit_command_in_state(
             effects,
         },
     )?;
-    state.command_outbox.insert(
-        request.command_id,
-        outbox.iter().map(|record| record.effect_id).collect(),
-    );
     if let Some(claim) = request.deadline_claim {
         let record = state
             .deadlines
@@ -1127,36 +1230,168 @@ fn commit_command_in_state(
         )?;
     }
     let call = tenant_call(state, &request.tenant_id, request.call_id)?;
-    Ok(CommandCommitOutcome::Committed(CommandCommitView {
+    let view = CommandCommitView {
         command,
         call,
         outbox,
-    }))
+    };
+    state
+        .command_results
+        .insert(request.command_id, view.clone());
+    Ok(CommandCommitOutcome::Committed(view))
+}
+
+fn retire_inactive_bindings(
+    state: &mut MemoryState,
+    call_id: CallId,
+    next: &CallAggregate,
+) -> Result<(), RepositoryError> {
+    let retired = state
+        .calls
+        .get(&call_id)
+        .ok_or(RepositoryError::NotFound)?
+        .bindings
+        .iter()
+        .filter(|(leg_id, binding)| {
+            next.leg(**leg_id).is_none_or(|leg| {
+                leg.binding_generation() != binding.binding_generation
+                    || !matches!(
+                        leg.state(),
+                        LegState::Signaling
+                            | LegState::Connected
+                            | LegState::Held
+                            | LegState::Ending
+                    )
+            })
+        })
+        .map(|(leg_id, binding)| (*leg_id, binding.clone()))
+        .collect::<Vec<_>>();
+
+    for (leg_id, binding) in retired {
+        let binding_key = (call_id, leg_id, binding.binding_generation);
+        let call = state
+            .calls
+            .get_mut(&call_id)
+            .ok_or(RepositoryError::NotFound)?;
+        call.bindings.remove(&leg_id);
+        if state.connection_owners.get(&binding.connection_id) == Some(&binding_key) {
+            state.connection_owners.remove(&binding.connection_id);
+        }
+        let principal_binding_key = (binding.principal_fingerprint, binding_key);
+        if state.principal_bindings.get(&principal_binding_key) == Some(&binding.connection_id) {
+            state.principal_bindings.remove(&principal_binding_key);
+        }
+    }
+    Ok(())
+}
+
+fn provider_event_claimable(
+    state: &MemoryState,
+    event: &ProviderEventEnvelope,
+    worker: WorkerLease,
+    at: DateTime<Utc>,
+) -> bool {
+    let lifecycle_is_claimable = match &event.state {
+        ProviderEventState::Ready => true,
+        ProviderEventState::Claimed { expires_at, .. } => *expires_at <= at,
+        ProviderEventState::PendingReference | ProviderEventState::Applied => false,
+    };
+    if !lifecycle_is_claimable {
+        return false;
+    }
+    let Some(target) = event.target.as_ref() else {
+        return false;
+    };
+    if !state.calls.get(&target.call_id).is_some_and(|call| {
+        call.aggregate.tenant_id() == &target.tenant_id && call.assignment.lease == worker
+    }) {
+        return false;
+    }
+    !state.provider_events.values().any(|predecessor| {
+        predecessor.account == event.account
+            && predecessor.provider_call_id == event.provider_call_id
+            && predecessor.receipt_sequence < event.receipt_sequence
+            && !matches!(predecessor.state, ProviderEventState::Applied)
+    })
+}
+
+type OutboxOrderKey = (CallId, AggregateVersion, CommandId, u32, EffectId);
+
+fn outbox_order_key(record: &OutboxRecord) -> OutboxOrderKey {
+    (
+        record.call_id,
+        record.aggregate_version,
+        record.command_id,
+        record.ordinal,
+        record.effect_id,
+    )
+}
+
+fn outbox_is_unfinished(record: &OutboxRecord) -> bool {
+    matches!(
+        record.state,
+        OutboxState::Ready | OutboxState::Claimed { .. }
+    )
+}
+
+fn has_unfinished_outbox(state: &MemoryState, call_id: CallId) -> bool {
+    state
+        .outbox
+        .values()
+        .any(|record| record.call_id == call_id && outbox_is_unfinished(record))
+}
+
+fn outbox_claimable(
+    state: &MemoryState,
+    record: &OutboxRecord,
+    worker: WorkerLease,
+    at: DateTime<Utc>,
+) -> bool {
+    if record.worker != worker
+        || record.available_at > at
+        || !match &record.state {
+            OutboxState::Ready => true,
+            OutboxState::Claimed { expires_at, .. } => *expires_at <= at,
+            OutboxState::Succeeded { .. } | OutboxState::Failed { .. } => false,
+        }
+        || !state
+            .calls
+            .get(&record.call_id)
+            .is_some_and(|call| call.assignment.lease == worker)
+    {
+        return false;
+    }
+    let key = outbox_order_key(record);
+    !state.outbox.values().any(|predecessor| {
+        predecessor.call_id == record.call_id
+            && outbox_order_key(predecessor) < key
+            && outbox_is_unfinished(predecessor)
+    })
+}
+
+fn validate_command_timestamp(
+    command: &CallCommand,
+    at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    if command.at() == at {
+        Ok(())
+    } else {
+        Err(RepositoryError::InvalidInput(
+            "command time must equal repository transaction time",
+        ))
+    }
 }
 
 fn command_view(
     state: &MemoryState,
     command: StoredCommand,
 ) -> Result<CommandCommitView, RepositoryError> {
-    let call = tenant_call(state, &command.tenant_id, command.call_id)?;
-    let outbox = state
-        .command_outbox
+    state
+        .command_results
         .get(&command.command_id)
-        .into_iter()
-        .flatten()
-        .map(|effect_id| {
-            state
-                .outbox
-                .get(effect_id)
-                .cloned()
-                .ok_or(RepositoryError::Unavailable)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(CommandCommitView {
-        command,
-        call,
-        outbox,
-    })
+        .filter(|result| result.command == command)
+        .cloned()
+        .ok_or(RepositoryError::Unavailable)
 }
 
 struct EffectBatch<'a> {
@@ -1339,6 +1574,7 @@ fn release_assignment_in_state(
 }
 
 fn validate_attachment_consume_command(request: &AttachmentConsume) -> Result<(), RepositoryError> {
+    validate_command_timestamp(&request.command, request.at)?;
     match &request.command {
         CallCommand::SetLegState {
             leg_id,
@@ -1391,6 +1627,10 @@ mod tests {
         [byte; 32]
     }
 
+    fn service_principal() -> PrincipalFingerprint {
+        PrincipalFingerprint::new(digest(0xa5))
+    }
+
     async fn worker(repo: &MemoryRepository, max_calls: usize) -> WorkerSnapshot {
         repo.register_worker(RegisterWorker {
             worker_id: WorkerId::new(),
@@ -1427,6 +1667,7 @@ mod tests {
             leg_id: leg.id(),
             binding_generation: leg.binding_generation(),
             transport: AttachmentTransport::Sip,
+            expected_principal: service_principal(),
             expires_at: at(121),
         }
     }
@@ -1472,6 +1713,86 @@ mod tests {
             CreateCallOutcome::Created(call) => call,
             CreateCallOutcome::Replayed(_) => panic!("expected created call"),
         }
+    }
+
+    async fn apply_command(
+        repo: &MemoryRepository,
+        owner: &TenantId,
+        worker: WorkerLease,
+        current: &StoredCall,
+        command: CallCommand,
+    ) -> CommandCommitView {
+        let outcome = repo
+            .commit_command(CommandCommit {
+                tenant_id: owner.clone(),
+                call_id: current.aggregate.id(),
+                expected_version: current.aggregate.version(),
+                command_id: CommandId::new(),
+                at: command.at(),
+                command,
+                worker,
+                attachments: Vec::new(),
+                deadline_claim: None,
+            })
+            .await
+            .unwrap();
+        match outcome {
+            CommandCommitOutcome::Committed(view) => view,
+            CommandCommitOutcome::Replayed(_) => panic!("fresh command unexpectedly replayed"),
+        }
+    }
+
+    async fn move_leg(
+        repo: &MemoryRepository,
+        owner: &TenantId,
+        worker: WorkerLease,
+        current: &StoredCall,
+        leg_index: usize,
+        state: LegState,
+        second: i64,
+    ) -> StoredCall {
+        apply_command(
+            repo,
+            owner,
+            worker,
+            current,
+            CallCommand::SetLegState {
+                at: at(second),
+                leg_id: current.aggregate.legs()[leg_index].id(),
+                binding_generation: current.aggregate.legs()[leg_index].binding_generation(),
+                state,
+                failure: None,
+            },
+        )
+        .await
+        .call
+    }
+
+    async fn end_call(
+        repo: &MemoryRepository,
+        owner: &TenantId,
+        worker: WorkerLease,
+        mut current: StoredCall,
+    ) -> StoredCall {
+        current = move_leg(repo, owner, worker, &current, 0, LegState::Signaling, 3).await;
+        current = move_leg(repo, owner, worker, &current, 1, LegState::Signaling, 4).await;
+        current = move_leg(repo, owner, worker, &current, 0, LegState::Connected, 5).await;
+        current = move_leg(repo, owner, worker, &current, 1, LegState::Connected, 6).await;
+        current = apply_command(
+            repo,
+            owner,
+            worker,
+            &current,
+            CallCommand::BeginEnding {
+                at: at(7),
+                ending_deadline: Some(at(17)),
+                reason: StopLegReason::Requested,
+            },
+        )
+        .await
+        .call;
+        current = move_leg(repo, owner, worker, &current, 0, LegState::Ended, 8).await;
+        move_leg(repo, owner, worker, &current, 1, LegState::Ended, 9).await
     }
 
     #[tokio::test]
@@ -1770,6 +2091,7 @@ mod tests {
             leg_id: current.aggregate.legs()[1].id(),
             binding_generation: current.aggregate.legs()[1].binding_generation(),
             transport: AttachmentTransport::WebRtc,
+            expected_principal: service_principal(),
             expires_at: at(120),
         };
         let counts = repo.counts().unwrap();
@@ -1887,6 +2209,7 @@ mod tests {
             leg_id: rotated_leg.id(),
             binding_generation: rotated_leg.binding_generation(),
             transport: AttachmentTransport::Sip,
+            expected_principal: service_principal(),
             expires_at: at(123),
         };
         let request = CommandCommit {
@@ -1932,6 +2255,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_replay_returns_its_original_result_after_later_commands() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let created = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                140,
+                141,
+            ))
+            .await
+            .unwrap(),
+        );
+        let command_a = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: created.aggregate.id(),
+            expected_version: created.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(3),
+                leg_id: created.aggregate.legs()[0].id(),
+                binding_generation: created.aggregate.legs()[0].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(3),
+        };
+        let CommandCommitOutcome::Committed(result_a) =
+            repo.commit_command(command_a.clone()).await.unwrap()
+        else {
+            unreachable!()
+        };
+        let result_b = move_leg(
+            &repo,
+            &owner,
+            worker.lease,
+            &result_a.call,
+            1,
+            LegState::Signaling,
+            4,
+        )
+        .await;
+        assert!(result_b.aggregate.version() > result_a.call.aggregate.version());
+
+        let CommandCommitOutcome::Replayed(replayed_a) =
+            repo.commit_command(command_a).await.unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(replayed_a, result_a);
+        assert!(replayed_a.call.aggregate.version() < result_b.aggregate.version());
+    }
+
+    #[tokio::test]
+    async fn repository_rejects_create_command_and_attachment_time_skew_atomically() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let mut skewed_create = create_request(new_call(owner.clone()), worker.lease, 142, 143);
+        skewed_create.at = at(3);
+        assert_eq!(
+            repo.create_call(skewed_create).await,
+            Err(RepositoryError::InvalidInput(
+                "command time must equal repository transaction time"
+            ))
+        );
+        assert_eq!(repo.counts().unwrap().calls, 0);
+        assert_eq!(
+            repo.worker_snapshot(worker.lease.worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+
+        let request = create_request(new_call(owner.clone()), worker.lease, 144, 145);
+        let token = request.attachments[0].token_digest;
+        let call = created(repo.create_call(request).await.unwrap());
+        let skewed_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(4),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(3),
+        };
+        assert_eq!(
+            repo.commit_command(skewed_command).await,
+            Err(RepositoryError::InvalidInput(
+                "command time must equal repository transaction time"
+            ))
+        );
+        assert_eq!(
+            repo.load_call(&owner, call.aggregate.id()).await.unwrap(),
+            call
+        );
+
+        let lookup = AttachmentLookup {
+            token_digest: token,
+            tenant_id: owner,
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: service_principal(),
+            worker: worker.lease,
+            at: at(3),
+        };
+        let candidate = repo.inspect_attachment(lookup.clone()).await.unwrap();
+        assert_eq!(
+            repo.consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(4),
+                    leg_id: call.aggregate.legs()[0].id(),
+                    binding_generation: call.aggregate.legs()[0].binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: ConnectionId::new(),
+                principal_fingerprint: service_principal(),
+                at: at(5),
+            })
+            .await,
+            Err(RepositoryError::InvalidInput(
+                "command time must equal repository transaction time"
+            ))
+        );
+        assert!(repo
+            .inspect_attachment(AttachmentLookup {
+                at: at(6),
+                ..lookup
+            })
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn attachment_is_single_use_and_fully_isolated() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 3).await;
@@ -1943,6 +2415,7 @@ mod tests {
             token_digest: token,
             tenant_id: owner.clone(),
             transport: AttachmentTransport::Sip,
+            principal_fingerprint: service_principal(),
             worker: worker.lease,
             at: at(3),
         };
@@ -1962,6 +2435,14 @@ mod tests {
             .await,
             Err(RepositoryError::AttachmentRejected)
         ));
+        assert!(matches!(
+            repo.inspect_attachment(AttachmentLookup {
+                principal_fingerprint: PrincipalFingerprint::new(digest(72)),
+                ..lookup.clone()
+            })
+            .await,
+            Err(RepositoryError::AttachmentRejected)
+        ));
         let candidate = repo.inspect_attachment(lookup.clone()).await.unwrap();
         let connection_id = ConnectionId::new();
         let consumed = repo
@@ -1976,7 +2457,7 @@ mod tests {
                     failure: None,
                 },
                 connection_id: connection_id.clone(),
-                principal_fingerprint: crate::call_engine::PrincipalFingerprint::new(digest(72)),
+                principal_fingerprint: service_principal(),
                 at: at(4),
             })
             .await
@@ -2016,6 +2497,298 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_attachment_candidate_cannot_overwrite_a_newer_call_version() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let request = create_request(new_call(owner.clone()), worker.lease, 146, 147);
+        let token = request.attachments[0].token_digest;
+        let call = created(repo.create_call(request).await.unwrap());
+        let lookup = AttachmentLookup {
+            token_digest: token,
+            tenant_id: owner.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: service_principal(),
+            worker: worker.lease,
+            at: at(3),
+        };
+        let candidate = repo.inspect_attachment(lookup.clone()).await.unwrap();
+        let newer = move_leg(
+            &repo,
+            &owner,
+            worker.lease,
+            &call,
+            1,
+            LegState::Signaling,
+            4,
+        )
+        .await;
+
+        assert_eq!(
+            repo.consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(5),
+                    leg_id: candidate.leg_id(),
+                    binding_generation: candidate.binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate,
+                connection_id: ConnectionId::new(),
+                principal_fingerprint: service_principal(),
+                at: at(5),
+            })
+            .await,
+            Err(RepositoryError::VersionConflict)
+        );
+        assert_eq!(
+            repo.load_call(&owner, call.aggregate.id()).await.unwrap(),
+            newer
+        );
+        assert!(repo
+            .inspect_attachment(AttachmentLookup {
+                at: at(6),
+                ..lookup
+            })
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_ids_are_unique_while_service_principals_span_calls() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let mut candidates = Vec::new();
+        let mut lookups = Vec::new();
+        for (key, request_digest) in [(148, 149), (150, 151)] {
+            let request =
+                create_request(new_call(owner.clone()), worker.lease, key, request_digest);
+            let lookup = AttachmentLookup {
+                token_digest: request.attachments[0].token_digest,
+                tenant_id: owner.clone(),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(3),
+            };
+            repo.create_call(request).await.unwrap();
+            candidates.push(repo.inspect_attachment(lookup.clone()).await.unwrap());
+            lookups.push(lookup);
+        }
+        let shared_connection = ConnectionId::new();
+        let first = candidates.remove(0);
+        repo.consume_attachment(AttachmentConsume {
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(4),
+                leg_id: first.leg_id(),
+                binding_generation: first.binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            candidate: first,
+            connection_id: shared_connection.clone(),
+            principal_fingerprint: service_principal(),
+            at: at(4),
+        })
+        .await
+        .unwrap();
+
+        let second = candidates.remove(0);
+        assert_eq!(
+            repo.consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(4),
+                    leg_id: second.leg_id(),
+                    binding_generation: second.binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate: second.clone(),
+                connection_id: shared_connection,
+                principal_fingerprint: service_principal(),
+                at: at(4),
+            })
+            .await,
+            Err(RepositoryError::AttachmentConflict)
+        );
+        assert!(repo
+            .inspect_attachment(AttachmentLookup {
+                at: at(5),
+                ..lookups.remove(1)
+            })
+            .await
+            .is_ok());
+        assert!(repo
+            .consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(5),
+                    leg_id: second.leg_id(),
+                    binding_generation: second.binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate: second,
+                connection_id: ConnectionId::new(),
+                principal_fingerprint: service_principal(),
+                at: at(5),
+            })
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn rotating_a_binding_retires_old_ownership_and_accepts_generation_two() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let request = create_request(new_call(owner.clone()), worker.lease, 152, 153);
+        let initial_token = request.attachments[0].token_digest;
+        let created = created(repo.create_call(request).await.unwrap());
+        let candidate = repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: initial_token,
+                tenant_id: owner.clone(),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        let old_generation = candidate.binding_generation();
+        let old_connection = ConnectionId::new();
+        let connected = repo
+            .consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(4),
+                    leg_id: candidate.leg_id(),
+                    binding_generation: old_generation,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate,
+                connection_id: old_connection.clone(),
+                principal_fingerprint: service_principal(),
+                at: at(4),
+            })
+            .await
+            .unwrap()
+            .commit
+            .call;
+        let leg_id = created.aggregate.legs()[0].id();
+        let rotate = CallCommand::RotateLegBinding {
+            at: at(5),
+            leg_id,
+            binding_generation: old_generation,
+        };
+        let decision = connected.aggregate.decide(rotate.clone()).unwrap();
+        let generation_two = decision
+            .aggregate()
+            .leg(leg_id)
+            .unwrap()
+            .binding_generation();
+        let new_token = AttachmentTokenDigest::new(digest(254));
+        let CommandCommitOutcome::Committed(rotated) = repo
+            .commit_command(CommandCommit {
+                tenant_id: owner.clone(),
+                call_id: connected.aggregate.id(),
+                expected_version: connected.aggregate.version(),
+                command_id: CommandId::new(),
+                command: rotate,
+                worker: worker.lease,
+                attachments: vec![AttachmentIssue {
+                    attachment_id: AttachmentId::new(),
+                    token_digest: new_token,
+                    leg_id,
+                    binding_generation: generation_two,
+                    transport: AttachmentTransport::Sip,
+                    expected_principal: service_principal(),
+                    expires_at: at(125),
+                }],
+                deadline_claim: None,
+                at: at(5),
+            })
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(!rotated.call.bindings.contains_key(&leg_id));
+        repo.read(|state| {
+            assert!(!state.connection_owners.contains_key(&old_connection));
+            assert!(!state.principal_bindings.contains_key(&(
+                service_principal(),
+                (created.aggregate.id(), leg_id, old_generation)
+            )));
+            Ok(())
+        })
+        .unwrap();
+
+        let candidate = repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: new_token,
+                tenant_id: owner.clone(),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(6),
+            })
+            .await
+            .unwrap();
+        assert_eq!(candidate.binding_generation(), generation_two);
+        let new_connection = ConnectionId::new();
+        let current = repo
+            .consume_attachment(AttachmentConsume {
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(7),
+                    leg_id,
+                    binding_generation: generation_two,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate,
+                connection_id: new_connection.clone(),
+                principal_fingerprint: service_principal(),
+                at: at(7),
+            })
+            .await
+            .unwrap()
+            .commit
+            .call;
+        assert_eq!(
+            current.bindings.get(&leg_id).unwrap().connection_id,
+            new_connection
+        );
+
+        let stale = apply_command(
+            &repo,
+            &owner,
+            worker.lease,
+            &current,
+            CallCommand::SetLegState {
+                at: at(8),
+                leg_id,
+                binding_generation: old_generation,
+                state: LegState::Connected,
+                failure: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            stale.command.disposition,
+            CommandDisposition::IgnoredStaleGeneration
+        );
+        assert_eq!(stale.call, current);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn interleaved_attachments_never_cross_connect_calls() {
         let repo = Arc::new(MemoryRepository::new());
@@ -2032,6 +2805,7 @@ mod tests {
                     token_digest: token,
                     tenant_id: owner.clone(),
                     transport: AttachmentTransport::Sip,
+                    principal_fingerprint: service_principal(),
                     worker: worker.lease,
                     at: at(3),
                 })
@@ -2042,7 +2816,7 @@ mod tests {
         }
         candidates.reverse();
         let mut tasks = Vec::new();
-        for (index, candidate) in candidates.into_iter().enumerate() {
+        for candidate in candidates {
             let repo = Arc::clone(&repo);
             tasks.push(tokio::spawn(async move {
                 let connection_id = ConnectionId::new();
@@ -2058,9 +2832,7 @@ mod tests {
                         },
                         candidate,
                         connection_id: connection_id.clone(),
-                        principal_fingerprint: crate::call_engine::PrincipalFingerprint::new(
-                            digest(150 + u8::try_from(index).unwrap()),
-                        ),
+                        principal_fingerprint: service_principal(),
                         at: at(4),
                     })
                     .await
@@ -2091,6 +2863,7 @@ mod tests {
                     token_digest: token,
                     tenant_id: owner.clone(),
                     transport: AttachmentTransport::Sip,
+                    principal_fingerprint: service_principal(),
                     worker: worker.lease,
                     at: at(5),
                 })
@@ -2117,7 +2890,7 @@ mod tests {
         );
         let account = ProviderAccountKey::parse("twilio-account").unwrap();
         let provider_call_id = ProviderCallId::parse("provider-call-1").unwrap();
-        for (event, received) in [(1u8, 6i64), (2, 5)] {
+        for (event, received) in [(1u8, 6i64), (2, 5), (3, 5)] {
             let outcome = repo
                 .ingest_provider_event(ProviderEventInput {
                     account: account.clone(),
@@ -2179,12 +2952,323 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(ready.len(), 2);
-        assert_eq!(ready[0].received_at, at(5));
-        assert_eq!(ready[1].received_at, at(6));
+        assert_eq!(ready.len(), 3);
+        assert_eq!(ready[0].receipt_sequence, ProviderReceiptSequence::INITIAL);
+        assert_eq!(ready[0].received_at, at(6));
+        assert_eq!(ready[1].received_at, at(5));
+        assert_eq!(ready[2].received_at, at(5));
+        assert_eq!(ready[0].event_digest, ProviderEventDigest::new(digest(1)));
+        assert_eq!(ready[1].event_digest, ProviderEventDigest::new(digest(2)));
+        assert_eq!(ready[2].event_digest, ProviderEventDigest::new(digest(3)));
+        assert!(ready
+            .windows(2)
+            .all(|events| events[0].receipt_sequence < events[1].receipt_sequence));
         assert!(ready
             .iter()
             .all(|event| event.state == ProviderEventState::Ready));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_claims_are_exclusive_expiring_and_atomically_applied() {
+        let repo = Arc::new(MemoryRepository::new());
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                154,
+                155,
+            ))
+            .await
+            .unwrap(),
+        );
+        let account = ProviderAccountKey::parse("telnyx-account").unwrap();
+        let provider_call_id = ProviderCallId::parse("provider-call-claims").unwrap();
+        let event_digest = ProviderEventDigest::new(digest(156));
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest,
+            payload_digest: crate::call_engine::ProviderPayloadDigest::new(digest(157)),
+            provider_call_id: provider_call_id.clone(),
+            kind: "answered".into(),
+            payload: json!({"state": "answered"}),
+            occurred_at: Some(at(7)),
+            received_at: at(8),
+        })
+        .await
+        .unwrap();
+        repo.bind_provider_reference(BindProviderReference {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            leg_id: call.aggregate.legs()[1].id(),
+            account: account.clone(),
+            provider_call_id,
+            worker: worker.lease,
+            at: at(8),
+        })
+        .await
+        .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.claim_provider_events(worker.lease, at(9), Duration::from_secs(5), 1)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut claims = Vec::new();
+        for task in tasks {
+            claims.extend(task.await.unwrap());
+        }
+        assert_eq!(claims.len(), 1);
+        let first_claim = claims.remove(0);
+
+        let invalid_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: AggregateVersion::default(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(10),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(10),
+        };
+        assert_eq!(
+            repo.complete_provider_event(ProviderEventCommit {
+                account: account.clone(),
+                event_digest,
+                claim_generation: first_claim.claim_generation,
+                worker: worker.lease,
+                command: invalid_command,
+                at: at(10),
+            })
+            .await,
+            Err(RepositoryError::VersionConflict)
+        );
+        assert!(repo
+            .claim_provider_events(worker.lease, at(13), Duration::from_secs(5), 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let reclaimed = repo
+            .claim_provider_events(worker.lease, at(14), Duration::from_secs(5), 1)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert!(reclaimed[0].claim_generation > first_claim.claim_generation);
+
+        let stale_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(15),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(15),
+        };
+        assert_eq!(
+            repo.complete_provider_event(ProviderEventCommit {
+                account: account.clone(),
+                event_digest,
+                claim_generation: first_claim.claim_generation,
+                worker: worker.lease,
+                command: stale_command,
+                at: at(15),
+            })
+            .await,
+            Err(RepositoryError::StaleClaim)
+        );
+
+        let command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(16),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(16),
+        };
+        let completed = repo
+            .complete_provider_event(ProviderEventCommit {
+                account,
+                event_digest,
+                claim_generation: reclaimed[0].claim_generation,
+                worker: worker.lease,
+                command,
+                at: at(16),
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.event.state, ProviderEventState::Applied);
+        assert_eq!(completed.event.applied_at, Some(at(16)));
+        assert!(matches!(
+            completed.command,
+            CommandCommitOutcome::Committed(_)
+        ));
+        assert_eq!(
+            repo.load_call(&owner, call.aggregate.id())
+                .await
+                .unwrap()
+                .aggregate
+                .leg(call.aggregate.legs()[1].id())
+                .unwrap()
+                .state(),
+            LegState::Signaling
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_claims_recover_on_worker_restart_and_reject_stale_fences() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-a");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                158,
+                159,
+            ))
+            .await
+            .unwrap(),
+        );
+        let account = ProviderAccountKey::parse("vonage-account").unwrap();
+        let provider_call_id = ProviderCallId::parse("provider-call-restart").unwrap();
+        let event_digest = ProviderEventDigest::new(digest(160));
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest,
+            payload_digest: crate::call_engine::ProviderPayloadDigest::new(digest(161)),
+            provider_call_id: provider_call_id.clone(),
+            kind: "answered".into(),
+            payload: json!({"state": "answered"}),
+            occurred_at: None,
+            received_at: at(8),
+        })
+        .await
+        .unwrap();
+        repo.bind_provider_reference(BindProviderReference {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            leg_id: call.aggregate.legs()[1].id(),
+            account: account.clone(),
+            provider_call_id,
+            worker: worker.lease,
+            at: at(8),
+        })
+        .await
+        .unwrap();
+        let old_claim = repo
+            .claim_provider_events(worker.lease, at(9), Duration::from_secs(30), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let newer = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::from(["sip".into()]),
+                at: at(10),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.claim_restart_calls(newer.lease, at(11), 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let stale_command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(12),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(12),
+        };
+        assert_eq!(
+            repo.complete_provider_event(ProviderEventCommit {
+                account: account.clone(),
+                event_digest,
+                claim_generation: old_claim.claim_generation,
+                worker: worker.lease,
+                command: stale_command,
+                at: at(12),
+            })
+            .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+
+        let recovered = repo
+            .claim_provider_events(newer.lease, at(12), Duration::from_secs(5), 1)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        let command = CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(13),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: call.aggregate.legs()[1].binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker: newer.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(13),
+        };
+        let completed = repo
+            .complete_provider_event(ProviderEventCommit {
+                account,
+                event_digest,
+                claim_generation: recovered[0].claim_generation,
+                worker: newer.lease,
+                command,
+                at: at(13),
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.event.state, ProviderEventState::Applied);
     }
 
     #[tokio::test]
@@ -2238,7 +3322,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_outbox_claimers_never_share_an_effect() {
+    async fn concurrent_outbox_claimers_preserve_predecessor_order() {
         let repo = Arc::new(MemoryRepository::new());
         let worker = worker(&repo, 2).await;
         repo.create_call(create_request(
@@ -2253,20 +3337,36 @@ mod tests {
         for _ in 0..2 {
             let repo = Arc::clone(&repo);
             tasks.push(tokio::spawn(async move {
-                repo.claim_outbox(worker.lease, at(3), Duration::from_secs(10), 2)
+                repo.claim_outbox(worker.lease, at(3), Duration::from_secs(10), 1)
                     .await
                     .unwrap()
             }));
         }
         let mut effect_ids = BTreeSet::new();
-        let mut count = 0;
+        let mut claims = Vec::new();
         for task in tasks {
             for claim in task.await.unwrap() {
-                count += 1;
                 assert!(effect_ids.insert(claim.record.effect_id));
+                claims.push(claim);
             }
         }
-        assert_eq!(count, 3);
+        assert_eq!(claims.len(), 1);
+        let first = claims.remove(0);
+        repo.complete_outbox(
+            first.record.effect_id,
+            worker.lease,
+            first.claim_generation,
+            OutboxCompletion::Succeeded,
+            at(4),
+        )
+        .await
+        .unwrap();
+        let next = repo
+            .claim_outbox(worker.lease, at(5), Duration::from_secs(10), 1)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(outbox_order_key(&first.record) < outbox_order_key(&next[0].record));
     }
 
     #[tokio::test]
@@ -2409,6 +3509,72 @@ mod tests {
         assert_eq!(restart.len(), 1);
         assert_eq!(restart[0].previous_fence, worker.lease.fence);
         assert_eq!(restart[0].call.assignment.lease, newer.lease);
+    }
+
+    #[tokio::test]
+    async fn restart_migrates_terminal_cleanup_without_reserving_capacity_again() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-a");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                162,
+                163,
+            ))
+            .await
+            .unwrap(),
+        );
+        let terminal = end_call(&repo, &owner, worker.lease, call).await;
+        assert_eq!(terminal.aggregate.state(), CallState::Ended);
+        assert!(terminal.assignment.released_at.is_some());
+        assert_eq!(
+            repo.worker_snapshot(worker.lease.worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+        assert!(repo
+            .read(|state| Ok(has_unfinished_outbox(state, terminal.aggregate.id())))
+            .unwrap());
+
+        let newer = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: 1,
+                capabilities: BTreeSet::from(["sip".into()]),
+                at: at(10),
+            })
+            .await
+            .unwrap();
+        let recovered = repo
+            .claim_restart_calls(newer.lease, at(11), 1)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].call.aggregate.state(), CallState::Ended);
+        assert!(recovered[0].call.assignment.released_at.is_some());
+        assert_eq!(recovered[0].call.assignment.lease, newer.lease);
+        assert_eq!(
+            repo.worker_snapshot(newer.lease.worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+        assert_eq!(
+            repo.claim_outbox(worker.lease, at(12), Duration::from_secs(5), 1)
+                .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+        let cleanup = repo
+            .claim_outbox(newer.lease, at(12), Duration::from_secs(5), 1)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].record.worker, newer.lease);
     }
 
     #[tokio::test]

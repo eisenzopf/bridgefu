@@ -1099,6 +1099,27 @@ pub enum CallCommand {
     },
 }
 
+impl CallCommand {
+    /// UTC observation time carried by this command.
+    ///
+    /// Repositories require this value to equal their transaction timestamp
+    /// exactly so a caller cannot persist one ordering while asking the pure
+    /// aggregate to evaluate another.
+    #[must_use]
+    pub fn at(&self) -> DateTime<Utc> {
+        match self {
+            Self::StartConnecting { at, .. }
+            | Self::SetLegState { at, .. }
+            | Self::RotateLegBinding { at, .. }
+            | Self::ArmDeadline { at, .. }
+            | Self::BeginTransfer { at, .. }
+            | Self::FinishTransfer { at, .. }
+            | Self::BeginEnding { at, .. }
+            | Self::DeadlineElapsed { at, .. } => *at,
+        }
+    }
+}
+
 /// Outcome of a provider/signaling transfer command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", content = "failure", rename_all = "snake_case")]
