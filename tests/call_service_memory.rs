@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use bridgefu::call_engine::{
     AggregateVersion, AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup,
-    AttachmentTokenDigest, AttachmentTransport, BindingGeneration, CallAggregate, CallCommand,
-    CallRepository, CallState, CommandCommit, CommandId, CreateCall, EffectIntent, FailureDetails,
-    IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState, PrincipalFingerprint,
-    ProviderAccountKey, ProviderCallId, ProviderEventDigest, ProviderEventInput,
-    ProviderEventOutcome, ProviderEventState, ProviderPayloadDigest, RegisterWorker,
-    RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
+    AttachmentTokenDigest, AttachmentTransport, BindProviderReference, BindingGeneration,
+    CallAggregate, CallCommand, CallRepository, CallState, CommandCommit, CommandId, CreateCall,
+    EffectIntent, FailureDetails, IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState,
+    OutboxCompletion, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
+    ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
+    ProviderEventState, ProviderPayloadDigest, RegisterWorker, RepositoryError, RequestDigest,
+    StopLegReason, StoredCall, TenantId, WorkerLease,
 };
 use bridgefu::call_service::{
     AmazonConnectEndpointConfig, CallExecutionPlan, CallServiceRepository, CompletedServiceEffect,
@@ -370,14 +371,33 @@ async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
 
     let created = created(repository.create_with_plan(request.clone()).await.unwrap());
     assert_eq!(created.plan, original_plan);
+    let outbound_leg = created.call.aggregate.legs()[1].id();
+    let advanced = service_command(
+        &repository,
+        &created.call,
+        worker,
+        CallCommand::SetLegState {
+            at: at(3),
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            state: LegState::Signaling,
+            failure: None,
+        },
+        at(3),
+    )
+    .await;
+    assert!(advanced.aggregate.version() > created.call.aggregate.version());
     let mut alternate = request;
     alternate.plan.legs[1].endpoint = LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
         signaling_uri: Some("wss://alternate.example.test/session".to_owned()),
     });
-    assert!(matches!(
-        repository.create_with_plan(alternate).await.unwrap(),
-        ServiceCreateOutcome::Replayed(ref replayed) if replayed.plan == original_plan
-    ));
+    let ServiceCreateOutcome::Replayed(replayed) =
+        repository.create_with_plan(alternate).await.unwrap()
+    else {
+        panic!("expected replayed create")
+    };
+    assert_eq!(replayed.plan, original_plan);
+    assert_eq!(replayed.call, created.call);
     assert_eq!(
         repository
             .load_service_call(&owner, created.call.aggregate.id())
@@ -471,6 +491,94 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
 }
 
 #[tokio::test]
+async fn service_managed_calls_reject_raw_mutation_completion_and_reference_bypasses() {
+    let (repository, fixture) = active_fixture(25).await;
+    let call = &fixture.service_call.call;
+    assert_eq!(
+        repository
+            .commit_command(CommandCommit {
+                tenant_id: fixture.owner.clone(),
+                call_id: call.aggregate.id(),
+                expected_version: call.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::BeginTransfer {
+                    at: at(10),
+                    transfer_deadline: at(40),
+                },
+                worker: fixture.worker,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(10),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed call requires service repository transaction"
+        ))
+    );
+
+    let claim = repository
+        .claim_outbox(fixture.worker, at(10), Duration::from_secs(10), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        repository
+            .complete_outbox(
+                claim.record.effect_id,
+                fixture.worker,
+                claim.claim_generation,
+                OutboxCompletion::Succeeded,
+                at(11),
+            )
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed effect requires service reconciliation"
+        ))
+    );
+
+    assert_eq!(
+        repository
+            .bind_provider_reference(BindProviderReference {
+                tenant_id: fixture.owner.clone(),
+                call_id: call.aggregate.id(),
+                leg_id: call.aggregate.legs()[1].id(),
+                account: ProviderAccountKey::parse("unexpected-account").unwrap(),
+                provider_call_id: ProviderCallId::parse("unexpected-call").unwrap(),
+                worker: fixture.worker,
+                at: at(11),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed call requires service repository transaction"
+        ))
+    );
+
+    assert_eq!(
+        repository
+            .enqueue_control(ControlCommandTransaction {
+                command_id: CommandId::new(),
+                tenant_id: fixture.owner.clone(),
+                call_id: call.aggregate.id(),
+                leg_id: call.aggregate.legs()[1].id(),
+                binding_generation: BindingGeneration::INITIAL,
+                worker: fixture.worker,
+                intent: ControlIntent::Dtmf {
+                    sequence: DtmfSequence {
+                        digits: "1".to_owned(),
+                        duration_ms: 100,
+                        gap_ms: 50,
+                    },
+                },
+                at: at(6),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "control time predates its current binding"
+        ))
+    );
+}
+
+#[tokio::test]
 async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
     let (repository, fixture) = active_fixture(30).await;
     let leg = fixture.service_call.call.aggregate.legs()[1].id();
@@ -535,6 +643,20 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
         follow_up: None,
         at: at(12),
     };
+    let mut before_available = success.clone();
+    before_available.at = at(9);
+    assert_eq!(
+        repository.reconcile_effect_result(before_available).await,
+        Err(RepositoryError::InvalidInput(
+            "effect completion predates effect availability"
+        ))
+    );
+    let mut before_claim = success.clone();
+    before_claim.at = at(10);
+    assert_eq!(
+        repository.reconcile_effect_result(before_claim).await,
+        Err(RepositoryError::StaleClaim)
+    );
     let mut wrong_tenant = success.clone();
     wrong_tenant.tenant_id = tenant("other-tenant");
     assert_eq!(
@@ -628,6 +750,140 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
                     if matches!(record.state, bridgefu::call_engine::OutboxState::Failed { .. })
             )
     ));
+}
+
+#[tokio::test]
+async fn controls_are_fifo_per_binding_and_block_later_claims() {
+    let (repository, fixture) = active_fixture(32).await;
+    let leg_id = fixture.service_call.call.aggregate.legs()[1].id();
+    let request = |digit: &str, at_time| ControlCommandTransaction {
+        command_id: CommandId::new(),
+        tenant_id: fixture.owner.clone(),
+        call_id: fixture.service_call.call.aggregate.id(),
+        leg_id,
+        binding_generation: BindingGeneration::INITIAL,
+        worker: fixture.worker,
+        intent: ControlIntent::Dtmf {
+            sequence: DtmfSequence {
+                digits: digit.to_owned(),
+                duration_ms: 100,
+                gap_ms: 50,
+            },
+        },
+        at: at_time,
+    };
+    let ControlCommandOutcome::Enqueued(first) = repository
+        .enqueue_control(request("1", at(10)))
+        .await
+        .unwrap()
+    else {
+        panic!("expected first control")
+    };
+    let ControlCommandOutcome::Enqueued(second) = repository
+        .enqueue_control(request("2", at(11)))
+        .await
+        .unwrap()
+    else {
+        panic!("expected second control")
+    };
+    assert!(first.effect.sequence < second.effect.sequence);
+
+    let claims = repository
+        .claim_control_effects(fixture.worker, at(12), Duration::from_secs(10), 8)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].record.effect_id, first.effect.effect_id);
+    assert!(repository
+        .claim_control_effects(fixture.worker, at(12), Duration::from_secs(10), 8)
+        .await
+        .unwrap()
+        .is_empty());
+
+    repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            effect_id: claims[0].record.effect_id,
+            worker: fixture.worker,
+            claim_generation: claims[0].claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: None,
+            follow_up: None,
+            at: at(13),
+        })
+        .await
+        .unwrap();
+    let next = repository
+        .claim_control_effects(fixture.worker, at(14), Duration::from_secs(10), 8)
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].record.effect_id, second.effect.effect_id);
+}
+
+#[tokio::test]
+async fn claimed_control_is_invalidated_when_teardown_begins() {
+    let (repository, fixture) = active_fixture(34).await;
+    let leg_id = fixture.service_call.call.aggregate.legs()[1].id();
+    let ControlCommandOutcome::Enqueued(view) = repository
+        .enqueue_control(ControlCommandTransaction {
+            command_id: CommandId::new(),
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            leg_id,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: fixture.worker,
+            intent: ControlIntent::Dtmf {
+                sequence: DtmfSequence {
+                    digits: "3".to_owned(),
+                    duration_ms: 100,
+                    gap_ms: 50,
+                },
+            },
+            at: at(10),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected control")
+    };
+    let claim = repository
+        .claim_control_effects(fixture.worker, at(11), Duration::from_secs(10), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(claim.record.effect_id, view.effect.effect_id);
+
+    let ending = service_command(
+        &repository,
+        &fixture.service_call.call,
+        fixture.worker,
+        CallCommand::BeginEnding {
+            at: at(12),
+            ending_deadline: Some(at(30)),
+            reason: StopLegReason::Requested,
+        },
+        at(12),
+    )
+    .await;
+    assert_eq!(ending.aggregate.state(), CallState::Ending);
+    assert_eq!(
+        repository
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: fixture.owner,
+                call_id: ending.aggregate.id(),
+                effect_id: claim.record.effect_id,
+                worker: fixture.worker,
+                claim_generation: claim.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                follow_up: None,
+                at: at(13),
+            })
+            .await,
+        Err(RepositoryError::StaleClaim)
+    );
 }
 
 fn view_to_request(view: &bridgefu::call_service::ControlCommandView) -> ControlCommandTransaction {
@@ -818,6 +1074,177 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
 }
 
 #[tokio::test]
+async fn command_ids_conflict_across_control_core_and_attachment_paths() {
+    let (repository, fixture) = active_fixture(45).await;
+    let collision_id = CommandId::new();
+    let outbound_leg = fixture.service_call.call.aggregate.legs()[1].id();
+    repository
+        .enqueue_control(ControlCommandTransaction {
+            command_id: collision_id,
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: fixture.worker,
+            intent: ControlIntent::Dtmf {
+                sequence: DtmfSequence {
+                    digits: "4".to_owned(),
+                    duration_ms: 100,
+                    gap_ms: 50,
+                },
+            },
+            at: at(10),
+        })
+        .await
+        .unwrap();
+
+    let (mut raw_create, _) = sip_webrtc_create(tenant("collision-owner"), fixture.worker, 46);
+    raw_create.create.command_id = collision_id;
+    assert_eq!(
+        repository.create_call(raw_create.create).await,
+        Err(RepositoryError::CommandConflict)
+    );
+
+    let second_owner = tenant("attachment-collision-owner");
+    let (managed_create, token_digest) =
+        sip_webrtc_create(second_owner.clone(), fixture.worker, 47);
+    let second = created(repository.create_with_plan(managed_create).await.unwrap());
+    let inbound_leg = second.call.aggregate.legs()[0].id();
+    let candidate = repository
+        .inspect_attachment(AttachmentLookup {
+            token_digest,
+            tenant_id: second_owner.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(1),
+            worker: fixture.worker,
+            at: at(3),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .consume_attachment(AttachmentConsume {
+                command_id: collision_id,
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: inbound_leg,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                candidate,
+                connection_id: ConnectionId::from_string("collision-connection"),
+                principal_fingerprint: principal(1),
+                at: at(3),
+            })
+            .await,
+        Err(RepositoryError::AttachmentRejected)
+    );
+    assert!(repository
+        .inspect_attachment(AttachmentLookup {
+            token_digest,
+            tenant_id: second_owner,
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(1),
+            worker: fixture.worker,
+            at: at(3),
+        })
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn non_provider_leg_cannot_claim_provider_callbacks() {
+    let repository = MemoryRepository::new();
+    let worker = register(&repository, 1).await;
+    let owner = tenant("non-provider-reference-owner");
+    let (create, _) = sip_webrtc_create(owner.clone(), worker, 48);
+    let service_call = created(repository.create_with_plan(create).await.unwrap());
+    let account = ProviderAccountKey::parse("unrelated-provider-account").unwrap();
+    let provider_call_id = ProviderCallId::parse("unrelated-provider-call").unwrap();
+    let event = ProviderEventInput {
+        account: account.clone(),
+        event_digest: ProviderEventDigest::new(digest(248)),
+        payload_digest: ProviderPayloadDigest::new(digest(249)),
+        provider_call_id: provider_call_id.clone(),
+        kind: "ringing".to_owned(),
+        payload: serde_json::json!({"state": "ringing"}),
+        occurred_at: Some(at(2)),
+        received_at: at(3),
+    };
+    repository
+        .ingest_provider_event(event.clone())
+        .await
+        .unwrap();
+
+    let first = repository
+        .claim_outbox(worker, at(3), Duration::from_secs(10), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(matches!(
+        first.record.intent,
+        EffectIntent::AwaitLegAttachment { .. }
+    ));
+    repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id: service_call.call.aggregate.id(),
+            effect_id: first.record.effect_id,
+            worker,
+            claim_generation: first.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: None,
+            follow_up: None,
+            at: at(4),
+        })
+        .await
+        .unwrap();
+
+    let start = repository
+        .claim_outbox(worker, at(5), Duration::from_secs(10), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let (leg_id, binding_generation) = match start.record.intent {
+        EffectIntent::StartLeg {
+            leg_id,
+            binding_generation,
+            ..
+        } => (leg_id, binding_generation),
+        ref other => panic!("expected start-leg effect, got {other:?}"),
+    };
+    assert_eq!(
+        repository
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: owner,
+                call_id: service_call.call.aggregate.id(),
+                effect_id: start.record.effect_id,
+                worker,
+                claim_generation: start.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: Some(ExternalReferenceBinding {
+                    leg_id,
+                    binding_generation,
+                    value: ExternalReferenceValue::ProviderCall {
+                        account,
+                        provider_call_id,
+                    },
+                }),
+                follow_up: None,
+                at: at(6),
+            })
+            .await,
+        Err(RepositoryError::ProviderReferenceConflict)
+    );
+    assert!(matches!(
+        repository.ingest_provider_event(event).await.unwrap(),
+        ProviderEventOutcome::Duplicate(ref event)
+            if event.state == ProviderEventState::PendingReference
+    ));
+}
+
+#[tokio::test]
 async fn reconciliation_atomically_releases_callback_binds_reference_and_commits_follow_up() {
     let repository = MemoryRepository::new();
     let worker = register(&repository, 2).await;
@@ -897,6 +1324,93 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
         follow_up: Some(correct_follow_up.clone()),
         at: at(8),
     };
+
+    assert_eq!(
+        repository
+            .bind_provider_reference(BindProviderReference {
+                tenant_id: owner.clone(),
+                call_id: service_call.call.aggregate.id(),
+                leg_id: provider_leg,
+                account: account.clone(),
+                provider_call_id: provider_call_id.clone(),
+                worker,
+                at: at(8),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed call requires service repository transaction"
+        ))
+    );
+
+    let mut wrong_account = base.clone();
+    let Some(ExternalReferenceBinding {
+        value:
+            ExternalReferenceValue::ProviderCall {
+                account: wrong_account_key,
+                ..
+            },
+        ..
+    }) = wrong_account.external_reference.as_mut()
+    else {
+        panic!("expected provider reference")
+    };
+    *wrong_account_key = ProviderAccountKey::parse("other-twilio-account").unwrap();
+    assert_eq!(
+        repository.reconcile_effect_result(wrong_account).await,
+        Err(RepositoryError::ProviderReferenceConflict)
+    );
+
+    let mut wrong_reference_kind = base.clone();
+    wrong_reference_kind
+        .external_reference
+        .as_mut()
+        .unwrap()
+        .value = ExternalReferenceValue::Signaling {
+        namespace: "webrtc-session".to_owned(),
+        value: "wrong-kind".to_owned(),
+    };
+    assert_eq!(
+        repository
+            .reconcile_effect_result(wrong_reference_kind)
+            .await,
+        Err(RepositoryError::ProviderReferenceConflict)
+    );
+
+    let mut wrong_follow_up_leg = base.clone();
+    let CallCommand::SetLegState { leg_id, .. } = &mut wrong_follow_up_leg
+        .follow_up
+        .as_mut()
+        .unwrap()
+        .command
+        .command
+    else {
+        panic!("expected state follow-up")
+    };
+    *leg_id = service_call.call.aggregate.legs()[1].id();
+    assert_eq!(
+        repository
+            .reconcile_effect_result(wrong_follow_up_leg)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "effect follow-up does not match claimed intent or result"
+        ))
+    );
+
+    let mut wrong_follow_up_result = base.clone();
+    wrong_follow_up_result.external_reference = None;
+    wrong_follow_up_result.result = ServiceEffectResult::Failed(FailureDetails::sanitized(
+        "provider_start_failed",
+        "provider start failed",
+        true,
+    ));
+    assert_eq!(
+        repository
+            .reconcile_effect_result(wrong_follow_up_result)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "effect follow-up does not match claimed intent or result"
+        ))
+    );
 
     let mut wrong_tenant = base.clone();
     wrong_tenant.tenant_id = tenant("not-owner");
@@ -1003,5 +1517,37 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
             claimed_at: at(9),
             expires_at: at(14),
         }
+    );
+    let current = &view.follow_up.as_ref().unwrap().command.call;
+    assert_eq!(
+        repository
+            .complete_provider_event(ProviderEventCommit {
+                account,
+                event_digest: event_input.event_digest,
+                claim_generation: ready[0].claim_generation,
+                worker,
+                command: CommandCommit {
+                    tenant_id: owner,
+                    call_id: current.aggregate.id(),
+                    expected_version: current.aggregate.version(),
+                    command_id: CommandId::new(),
+                    command: CallCommand::SetLegState {
+                        at: at(10),
+                        leg_id: provider_leg,
+                        binding_generation: BindingGeneration::INITIAL,
+                        state: LegState::Connected,
+                        failure: None,
+                    },
+                    worker,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                    at: at(10),
+                },
+                at: at(10),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "service-managed provider event requires service reconciliation"
+        ))
     );
 }

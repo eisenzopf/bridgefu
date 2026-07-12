@@ -29,17 +29,18 @@ use crate::call_engine::{
     ProviderEventCommitOutcome, ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput,
     ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderReceiptSequence,
     RegisterWorker, RepositoryError, RestartClaim, StoredCall, StoredCommand, TenantId,
-    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerAssignment,
-    WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
+    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, TransferResult,
+    WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
     CallExecutionPlan, CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect,
     ControlCommandOutcome, ControlCommandTransaction, ControlCommandView, ControlOutboxRecord,
-    EffectResultOutcome, EffectResultReconciliation, EffectResultView, ExternalReferenceBinding,
-    ExternalReferenceValue, OutboundConnectionBind, OutboundConnectionBindOutcome,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
-    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
-    StoredControlCommand, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    ControlSequence, EffectResultOutcome, EffectResultReconciliation, EffectResultView,
+    ExternalReferenceBinding, ExternalReferenceValue, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectPayloadInput, ServiceEffectResult, StoredControlCommand, StoredExternalReference,
+    StoredServiceCall, StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -217,6 +218,7 @@ struct MemoryState {
     control_commands: HashMap<CommandId, StoredControlCommand>,
     control_command_results: HashMap<CommandId, StoredControlCommandResult>,
     control_outbox: HashMap<EffectId, ControlOutboxRecord>,
+    control_sequences: HashMap<ExternalBindingKey, ControlSequence>,
     outbound_binding_results: HashMap<CommandId, StoredOutboundBindingResult>,
     external_references: HashMap<ExternalReferenceKey, StoredExternalReference>,
     external_reference_bindings: HashMap<ExternalBindingKey, ExternalReferenceKey>,
@@ -628,7 +630,15 @@ impl CallRepository for MemoryRepository {
         &self,
         request: CommandCommit,
     ) -> Result<CommandCommitOutcome, RepositoryError> {
-        self.transaction(|state| commit_command_in_state(state, request))
+        self.transaction(|state| {
+            reject_service_managed_call(
+                state,
+                &request.tenant_id,
+                request.call_id,
+                request.worker,
+            )?;
+            commit_command_in_state(state, request)
+        })
     }
 
     async fn release_assignment(
@@ -698,7 +708,9 @@ impl CallRepository for MemoryRepository {
             ensure_worker(state, request.candidate.worker, true)
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
             validate_attachment_consume_command(&request)?;
-            if state.commands.contains_key(&request.command_id) {
+            if state.commands.contains_key(&request.command_id)
+                || command_id_conflicts_with_service_namespace(state, request.command_id)
+            {
                 return Err(RepositoryError::AttachmentRejected);
             }
             let row = state
@@ -843,7 +855,15 @@ impl CallRepository for MemoryRepository {
         &self,
         request: BindProviderReference,
     ) -> Result<Vec<ProviderEventEnvelope>, RepositoryError> {
-        self.transaction(|state| bind_provider_reference_in_state(state, request))
+        self.transaction(|state| {
+            reject_service_managed_call(
+                state,
+                &request.tenant_id,
+                request.call_id,
+                request.worker,
+            )?;
+            bind_provider_reference_in_state(state, request)
+        })
     }
 
     async fn claim_provider_events(
@@ -924,6 +944,18 @@ impl CallRepository for MemoryRepository {
                 .get(&key)
                 .cloned()
                 .ok_or(RepositoryError::NotFound)?;
+            if let Some(target) = event.target.as_ref() {
+                if target.tenant_id != request.command.tenant_id
+                    || target.call_id != request.command.call_id
+                {
+                    return Err(RepositoryError::ProviderReferenceConflict);
+                }
+                if state.execution_plans.contains_key(&target.call_id) {
+                    return Err(RepositoryError::InvalidInput(
+                        "service-managed provider event requires service reconciliation",
+                    ));
+                }
+            }
             if event.state == ProviderEventState::Applied {
                 return match state.provider_completions.get(&key) {
                     Some(ProviderCompletionRow::Command {
@@ -1108,6 +1140,15 @@ impl CallRepository for MemoryRepository {
     ) -> Result<OutboxRecord, RepositoryError> {
         self.transaction(|state| {
             ensure_worker(state, worker, true)?;
+            if state
+                .outbox
+                .get(&effect_id)
+                .is_some_and(|record| state.execution_plans.contains_key(&record.call_id))
+            {
+                return Err(RepositoryError::InvalidInput(
+                    "service-managed effect requires service reconciliation",
+                ));
+            }
             let record = state
                 .outbox
                 .get_mut(&effect_id)
@@ -1257,6 +1298,7 @@ impl CallRepository for MemoryRepository {
                     record.worker = worker;
                     if matches!(record.state, OutboxState::Claimed { .. }) {
                         record.state = OutboxState::Ready;
+                        record.claimed_at = None;
                     }
                 }
                 for record in state
@@ -1319,13 +1361,14 @@ impl CallServiceRepository for MemoryRepository {
                     }))
                 }
                 CreateCallOutcome::Replayed(call) => {
+                    let call_id = call.aggregate.id();
                     let original = state
                         .execution_plans
-                        .get(&call.aggregate.id())
+                        .get(&call_id)
                         .cloned()
                         .ok_or(RepositoryError::Unavailable)?;
                     Ok(ServiceCreateOutcome::Replayed(StoredServiceCall {
-                        call,
+                        call: original_create_snapshot(state, call_id)?,
                         plan: original,
                     }))
                 }
@@ -1404,13 +1447,21 @@ impl CallServiceRepository for MemoryRepository {
                 .control_outbox
                 .values()
                 .filter(|record| control_outbox_claimable(state, record, worker, at))
-                .map(|record| (record.available_at, record.command_id, record.effect_id))
+                .map(|record| {
+                    (
+                        record.call_id,
+                        record.leg_id,
+                        record.binding_generation,
+                        record.sequence,
+                        record.effect_id,
+                    )
+                })
                 .collect::<Vec<_>>();
             eligible.sort();
             eligible.truncate(limit);
 
             let mut claimed = Vec::with_capacity(eligible.len());
-            for (_, _, effect_id) in eligible {
+            for (_, _, _, _, effect_id) in eligible {
                 let record = state
                     .control_outbox
                     .get(&effect_id)
@@ -1433,6 +1484,7 @@ impl CallServiceRepository for MemoryRepository {
                     generation,
                     expires_at,
                 };
+                record.claimed_at = Some(at);
                 claimed.push(ClaimedControlEffect {
                     record: record.clone(),
                     claim_generation: generation,
@@ -1484,6 +1536,23 @@ impl CallServiceRepository for MemoryRepository {
         let request = normalize_reconciliation(request)?;
         self.transaction(|state| reconcile_effect_result_in_state(state, request))
     }
+}
+
+fn original_create_snapshot(
+    state: &MemoryState,
+    call_id: CallId,
+) -> Result<StoredCall, RepositoryError> {
+    let mut matching = state.command_results.values().filter(|result| {
+        result.command.call_id == call_id && result.command.observed_version.value() == 0
+    });
+    let call = matching
+        .next()
+        .map(|result| result.call.clone())
+        .ok_or(RepositoryError::Unavailable)?;
+    if matching.next().is_some() {
+        return Err(RepositoryError::Unavailable);
+    }
+    Ok(call)
 }
 
 fn normalize_service_command(
@@ -1649,6 +1718,17 @@ fn enqueue_control_in_state(
     if binding.leg_id != request.leg_id {
         return Err(RepositoryError::Unavailable);
     }
+    if request.at < call.aggregate.updated_at() || request.at < binding.bound_at {
+        return Err(RepositoryError::InvalidInput(
+            "control time predates its current binding",
+        ));
+    }
+
+    let binding_key = (request.call_id, request.leg_id, request.binding_generation);
+    let sequence = match state.control_sequences.get(&binding_key) {
+        Some(previous) => previous.next()?,
+        None => ControlSequence::INITIAL,
+    };
 
     let effect_id = EffectId::new();
     if state.outbox.contains_key(&effect_id) || state.control_outbox.contains_key(&effect_id) {
@@ -1672,8 +1752,10 @@ fn enqueue_control_in_state(
         leg_id: request.leg_id,
         binding_generation: request.binding_generation,
         worker: request.worker,
+        sequence,
         intent: request.intent.clone(),
         available_at: request.at,
+        claimed_at: None,
         state: OutboxState::Ready,
     };
     let view = ControlCommandView {
@@ -1682,6 +1764,7 @@ fn enqueue_control_in_state(
     };
     state.control_commands.insert(request.command_id, command);
     state.control_outbox.insert(effect_id, effect);
+    state.control_sequences.insert(binding_key, sequence);
     state.control_command_results.insert(
         request.command_id,
         StoredControlCommandResult {
@@ -1740,6 +1823,11 @@ fn bind_outbound_connection_in_state(
     }
     if leg.binding_generation() != request.binding_generation {
         return Err(RepositoryError::StaleClaim);
+    }
+    if request.at < call.aggregate.updated_at() {
+        return Err(RepositoryError::InvalidInput(
+            "outbound binding time predates call state",
+        ));
     }
     if leg.state().is_terminal() || call.bindings.contains_key(&request.leg_id) {
         return Err(RepositoryError::AttachmentConflict);
@@ -1876,6 +1964,23 @@ fn reconcile_effect_result_in_state(
         request.claim_generation,
         request.at,
     )?;
+    let available_at = match &effect {
+        ServiceEffectSnapshot::Call(record) => record.available_at,
+        ServiceEffectSnapshot::Control(record) => record.available_at,
+    };
+    if request.at < available_at {
+        return Err(RepositoryError::InvalidInput(
+            "effect completion predates effect availability",
+        ));
+    }
+    if let ServiceEffectSnapshot::Control(record) = &effect {
+        if record
+            .claimed_at
+            .is_none_or(|claimed_at| claimed_at > request.at)
+        {
+            return Err(RepositoryError::StaleClaim);
+        }
+    }
     let call = state
         .calls
         .get(&request.call_id)
@@ -1883,6 +1988,9 @@ fn reconcile_effect_result_in_state(
         .ok_or(RepositoryError::NotFound)?;
     if call.assignment.lease != request.worker {
         return Err(RepositoryError::StaleWorkerFence);
+    }
+    if let ServiceEffectSnapshot::Control(record) = &effect {
+        validate_control_effect_target(call, record)?;
     }
     if !state.execution_plans.contains_key(&request.call_id) {
         return Err(RepositoryError::NotFound);
@@ -1913,7 +2021,7 @@ fn reconcile_effect_result_in_state(
             ));
         }
         (_, None) => None,
-        (ServiceEffectSnapshot::Call(_), Some(follow_up)) => {
+        (ServiceEffectSnapshot::Call(record), Some(follow_up)) => {
             if follow_up.command.tenant_id != request.tenant_id
                 || follow_up.command.call_id != request.call_id
                 || follow_up.command.worker != request.worker
@@ -1924,6 +2032,7 @@ fn reconcile_effect_result_in_state(
                     "effect follow-up ownership or timestamp differs",
                 ));
             }
+            validate_effect_follow_up(&record.intent, &request.result, &follow_up.command.command)?;
             match commit_service_command_in_state(state, follow_up)? {
                 ServiceCommandOutcome::Committed(view) => Some(view),
                 ServiceCommandOutcome::Replayed(_) => {
@@ -1955,6 +2064,7 @@ fn reconcile_effect_result_in_state(
                 .get_mut(&request.effect_id)
                 .ok_or(RepositoryError::NotFound)?;
             record.state = completed_state;
+            record.claimed_at = None;
             CompletedServiceEffect::Control(record.clone())
         }
     };
@@ -1972,6 +2082,122 @@ fn reconcile_effect_result_in_state(
         },
     );
     Ok(EffectResultOutcome::Reconciled(view))
+}
+
+fn validate_effect_follow_up(
+    intent: &EffectIntent,
+    result: &ServiceEffectResult,
+    command: &CallCommand,
+) -> Result<(), RepositoryError> {
+    let valid = match (intent, result, command) {
+        (
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                ..
+            },
+            ServiceEffectResult::Succeeded,
+            CallCommand::SetLegState {
+                leg_id: command_leg,
+                binding_generation: command_generation,
+                state: LegState::Signaling | LegState::Connected,
+                failure: None,
+                ..
+            },
+        ) => leg_id == command_leg && binding_generation == command_generation,
+        (
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                ..
+            }
+            | EffectIntent::StopLeg {
+                leg_id,
+                binding_generation,
+                ..
+            },
+            ServiceEffectResult::Failed(expected),
+            CallCommand::SetLegState {
+                leg_id: command_leg,
+                binding_generation: command_generation,
+                state: LegState::Failed,
+                failure: Some(actual),
+                ..
+            },
+        ) => {
+            leg_id == command_leg && binding_generation == command_generation && expected == actual
+        }
+        (
+            EffectIntent::StopLeg {
+                leg_id,
+                binding_generation,
+                ..
+            },
+            ServiceEffectResult::Succeeded,
+            CallCommand::SetLegState {
+                leg_id: command_leg,
+                binding_generation: command_generation,
+                state: LegState::Ended,
+                failure: None,
+                ..
+            },
+        ) => leg_id == command_leg && binding_generation == command_generation,
+        (
+            EffectIntent::ExecuteTransfer {
+                deadline_generation,
+            },
+            ServiceEffectResult::Succeeded,
+            CallCommand::FinishTransfer {
+                deadline_generation: command_generation,
+                result: TransferResult::Completed,
+                ..
+            },
+        ) => deadline_generation == command_generation,
+        (
+            EffectIntent::ExecuteTransfer {
+                deadline_generation,
+            },
+            ServiceEffectResult::Failed(expected),
+            CallCommand::FinishTransfer {
+                deadline_generation: command_generation,
+                result: TransferResult::Rejected(actual),
+                ..
+            },
+        ) => deadline_generation == command_generation && expected == actual,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RepositoryError::InvalidInput(
+            "effect follow-up does not match claimed intent or result",
+        ))
+    }
+}
+
+fn validate_control_effect_target(
+    call: &StoredCall,
+    record: &ControlOutboxRecord,
+) -> Result<(), RepositoryError> {
+    let leg = call
+        .aggregate
+        .leg(record.leg_id)
+        .filter(|leg| {
+            leg.binding_generation() == record.binding_generation
+                && matches!(leg.state(), LegState::Connected | LegState::Held)
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    let binding = call
+        .bindings
+        .get(&record.leg_id)
+        .filter(|binding| {
+            binding.leg_id == leg.id() && binding.binding_generation == record.binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    if record.available_at < binding.bound_at || call.assignment.released_at.is_some() {
+        return Err(RepositoryError::StaleClaim);
+    }
+    Ok(())
 }
 
 fn validate_effect_claim(
@@ -2011,6 +2237,7 @@ fn store_external_reference_in_state(
     request: &EffectResultReconciliation,
     binding: ExternalReferenceBinding,
 ) -> Result<(StoredExternalReference, Vec<ProviderEventEnvelope>), RepositoryError> {
+    validate_external_reference_plan(state, request.call_id, binding.leg_id, &binding.value)?;
     let call = state
         .calls
         .get(&request.call_id)
@@ -2067,6 +2294,41 @@ fn store_external_reference_in_state(
     Ok((stored, released))
 }
 
+fn validate_external_reference_plan(
+    state: &MemoryState,
+    call_id: CallId,
+    leg_id: LegId,
+    value: &ExternalReferenceValue,
+) -> Result<(), RepositoryError> {
+    let plan = state
+        .execution_plans
+        .get(&call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let spec = plan
+        .legs
+        .iter()
+        .find(|spec| spec.leg_id == leg_id)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    match (&spec.endpoint, value) {
+        (
+            crate::call_service::LegEndpointConfig::Provider(config),
+            ExternalReferenceValue::ProviderCall { account, .. },
+        ) if account.as_str() == config.account_profile => Ok(()),
+        (
+            crate::call_service::LegEndpointConfig::Provider(_),
+            ExternalReferenceValue::ProviderCall { .. },
+        )
+        | (
+            crate::call_service::LegEndpointConfig::Provider(_),
+            ExternalReferenceValue::Signaling { .. },
+        )
+        | (_, ExternalReferenceValue::ProviderCall { .. }) => {
+            Err(RepositoryError::ProviderReferenceConflict)
+        }
+        (_, ExternalReferenceValue::Signaling { .. }) => Ok(()),
+    }
+}
+
 fn external_reference_key(value: &ExternalReferenceValue) -> ExternalReferenceKey {
     match value {
         ExternalReferenceValue::ProviderCall {
@@ -2093,6 +2355,22 @@ fn ensure_worker(
         return Err(RepositoryError::StaleWorkerFence);
     }
     Ok(())
+}
+
+fn reject_service_managed_call(
+    state: &MemoryState,
+    tenant_id: &TenantId,
+    call_id: CallId,
+    worker: WorkerLease,
+) -> Result<(), RepositoryError> {
+    if state.execution_plans.contains_key(&call_id) {
+        ensure_call_worker(state, tenant_id, call_id, worker)?;
+        Err(RepositoryError::InvalidInput(
+            "service-managed call requires service repository transaction",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_call_worker(
@@ -2412,6 +2690,9 @@ fn commit_command_in_state(
     request: CommandCommit,
 ) -> Result<CommandCommitOutcome, RepositoryError> {
     validate_command_timestamp(&request.command, request.at)?;
+    if command_id_conflicts_with_service_namespace(state, request.command_id) {
+        return Err(RepositoryError::CommandConflict);
+    }
     if let Some(existing) = state.commands.get(&request.command_id) {
         ensure_worker(state, request.worker, true)?;
         let call = tenant_call(state, &request.tenant_id, request.call_id)?;
@@ -2523,11 +2804,35 @@ fn commit_command_in_state(
     Ok(CommandCommitOutcome::Committed(view))
 }
 
+fn command_id_conflicts_with_service_namespace(state: &MemoryState, command_id: CommandId) -> bool {
+    state.control_commands.contains_key(&command_id)
+        || state.outbound_binding_results.contains_key(&command_id)
+}
+
 fn retire_inactive_bindings(
     state: &mut MemoryState,
     call_id: CallId,
     next: &CallAggregate,
 ) -> Result<(), RepositoryError> {
+    for record in state.control_outbox.values_mut().filter(|record| {
+        record.call_id == call_id
+            && control_outbox_is_unfinished(record)
+            && next.leg(record.leg_id).is_none_or(|leg| {
+                leg.binding_generation() != record.binding_generation
+                    || !matches!(leg.state(), LegState::Connected | LegState::Held)
+            })
+    }) {
+        record.state = OutboxState::Failed {
+            at: next.updated_at(),
+            failure: FailureDetails::sanitized(
+                "binding_retired",
+                "control target binding retired",
+                false,
+            ),
+        };
+        record.claimed_at = None;
+    }
+
     let retired = state
         .calls
         .get(&call_id)
@@ -2688,11 +2993,13 @@ fn control_outbox_claimable(
     worker: WorkerLease,
     at: DateTime<Utc>,
 ) -> bool {
-    record.worker == worker
+    let individually_claimable = record.worker == worker
         && record.available_at <= at
         && match &record.state {
-            OutboxState::Ready => true,
-            OutboxState::Claimed { expires_at, .. } => *expires_at <= at,
+            OutboxState::Ready => record.claimed_at.is_none(),
+            OutboxState::Claimed { expires_at, .. } => {
+                record.claimed_at.is_some_and(|claimed_at| claimed_at <= at) && *expires_at <= at
+            }
             OutboxState::Succeeded { .. } | OutboxState::Failed { .. } => false,
         }
         && state.calls.get(&record.call_id).is_some_and(|call| {
@@ -2702,6 +3009,14 @@ fn control_outbox_claimable(
                     leg.binding_generation() == record.binding_generation
                         && matches!(leg.state(), LegState::Connected | LegState::Held)
                 })
+        });
+    individually_claimable
+        && !state.control_outbox.values().any(|predecessor| {
+            predecessor.call_id == record.call_id
+                && predecessor.leg_id == record.leg_id
+                && predecessor.binding_generation == record.binding_generation
+                && predecessor.sequence < record.sequence
+                && control_outbox_is_unfinished(predecessor)
         })
 }
 

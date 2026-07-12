@@ -30,35 +30,71 @@ pub enum ProviderKind {
 }
 
 /// SIP signaling endpoint. Inbound legs may omit the URI and attach later.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SipEndpointConfig {
     /// Remote SIP or SIPS URI. Required for outbound legs.
     pub uri: Option<String>,
 }
 
+impl fmt::Debug for SipEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SipEndpointConfig")
+            .field("uri", &redacted_optional(&self.uri))
+            .finish()
+    }
+}
+
 /// Interactive WebRTC signaling endpoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcEndpointConfig {
     /// Remote HTTP(S) or WS(S) signaling URI. Inbound attachments may omit it.
     pub signaling_uri: Option<String>,
 }
 
+impl fmt::Debug for WebRtcEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebRtcEndpointConfig")
+            .field("signaling_uri", &redacted_optional(&self.signaling_uri))
+            .finish()
+    }
+}
+
 /// WHIP endpoint configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WhipEndpointConfig {
     /// Remote HTTP(S) endpoint. Inbound server legs may omit it.
     pub endpoint_uri: Option<String>,
 }
 
+impl fmt::Debug for WhipEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WhipEndpointConfig")
+            .field("endpoint_uri", &redacted_optional(&self.endpoint_uri))
+            .finish()
+    }
+}
+
 /// WHEP endpoint configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WhepEndpointConfig {
     /// Remote HTTP(S) endpoint. Inbound server legs may omit it.
     pub endpoint_uri: Option<String>,
 }
 
+impl fmt::Debug for WhepEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WhepEndpointConfig")
+            .field("endpoint_uri", &redacted_optional(&self.endpoint_uri))
+            .finish()
+    }
+}
+
 /// Amazon Connect WebRTC endpoint identifiers.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AmazonConnectEndpointConfig {
     /// Configured Connect instance identifier, never an AWS credential.
     pub instance_id: String,
@@ -66,8 +102,18 @@ pub struct AmazonConnectEndpointConfig {
     pub contact_flow_id: String,
 }
 
+impl fmt::Debug for AmazonConnectEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AmazonConnectEndpointConfig")
+            .field("instance_id", &"[redacted]")
+            .field("contact_flow_id", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Provider-controlled call endpoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderEndpointConfig {
     /// Native provider family.
     pub provider: ProviderKind,
@@ -75,6 +121,17 @@ pub struct ProviderEndpointConfig {
     pub account_profile: String,
     /// Provider destination. Inbound provider legs may omit it.
     pub destination: Option<String>,
+}
+
+impl fmt::Debug for ProviderEndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderEndpointConfig")
+            .field("provider", &self.provider)
+            .field("account_profile", &"[redacted]")
+            .field("destination", &redacted_optional(&self.destination))
+            .finish()
+    }
 }
 
 /// Typed, credential-free endpoint configuration for one logical leg.
@@ -233,7 +290,7 @@ impl CallExecutionPlan {
 }
 
 /// Transfer destination stored beside an `ExecuteTransfer` effect.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransferTarget {
     /// SIP or SIPS transfer target.
@@ -256,6 +313,32 @@ pub enum TransferTarget {
         /// Provider destination.
         destination: String,
     },
+}
+
+impl fmt::Debug for TransferTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sip { .. } => formatter
+                .debug_struct("Sip")
+                .field("uri", &"[redacted]")
+                .finish(),
+            Self::WebRtc { .. } => formatter
+                .debug_struct("WebRtc")
+                .field("uri", &"[redacted]")
+                .finish(),
+            Self::AmazonConnect { .. } => formatter
+                .debug_struct("AmazonConnect")
+                .field("instance_id", &"[redacted]")
+                .field("contact_flow_id", &"[redacted]")
+                .finish(),
+            Self::Provider { provider, .. } => formatter
+                .debug_struct("Provider")
+                .field("provider", provider)
+                .field("account_profile", &"[redacted]")
+                .field("destination", &"[redacted]")
+                .finish(),
+        }
+    }
 }
 
 impl TransferTarget {
@@ -428,10 +511,36 @@ fn validate_uri(value: &str, schemes: &[&str]) -> Result<(), RepositoryError> {
     validate_bounded_value(value, MAX_ENDPOINT_BYTES, "invalid endpoint URI")?;
     let parsed =
         Url::parse(value).map_err(|_| RepositoryError::InvalidInput("invalid endpoint URI"))?;
-    if !schemes.contains(&parsed.scheme()) || parsed.password().is_some() {
+    let sip_destination = matches!(parsed.scheme(), "sip" | "sips");
+    if !schemes.contains(&parsed.scheme())
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || (!sip_destination && has_authority_userinfo(value))
+        || (sip_destination && sip_path_has_password(&parsed))
+    {
         return Err(RepositoryError::InvalidInput("invalid endpoint URI"));
     }
     Ok(())
+}
+
+fn has_authority_userinfo(value: &str) -> bool {
+    value
+        .split_once(':')
+        .and_then(|(_, remainder)| remainder.strip_prefix("//"))
+        .and_then(|remainder| remainder.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn sip_path_has_password(parsed: &Url) -> bool {
+    parsed
+        .path()
+        .rsplit_once('@')
+        .is_some_and(|(user, _)| user.contains(':'))
+}
+
+fn redacted_optional<T>(value: &Option<T>) -> Option<&'static str> {
+    value.as_ref().map(|_| "[redacted]")
 }
 
 fn validate_identifier(value: &str, message: &'static str) -> Result<(), RepositoryError> {
@@ -461,5 +570,181 @@ fn validate_bounded_value(
         Err(RepositoryError::InvalidInput(message))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_debug_redacts_uris_destinations_and_profiles() {
+        let rendered = [
+            format!(
+                "{:?}",
+                SipEndpointConfig {
+                    uri: Some("sip:+15551234567@sip.example.test".into()),
+                }
+            ),
+            format!(
+                "{:?}",
+                WebRtcEndpointConfig {
+                    signaling_uri: Some("wss://private-session.example.test".into()),
+                }
+            ),
+            format!(
+                "{:?}",
+                WhipEndpointConfig {
+                    endpoint_uri: Some("https://media.example.test/whip/private-token".into()),
+                }
+            ),
+            format!(
+                "{:?}",
+                WhepEndpointConfig {
+                    endpoint_uri: Some("https://media.example.test/whep/private-token".into()),
+                }
+            ),
+            format!(
+                "{:?}",
+                AmazonConnectEndpointConfig {
+                    instance_id: "connect-instance-private".into(),
+                    contact_flow_id: "contact-flow-private".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                ProviderEndpointConfig {
+                    provider: ProviderKind::Twilio,
+                    account_profile: "twilio-account-private".into(),
+                    destination: Some("+15557654321".into()),
+                }
+            ),
+        ];
+
+        for debug in rendered {
+            assert!(debug.contains("[redacted]"));
+            for sensitive in [
+                "+15551234567",
+                "private-session",
+                "private-token",
+                "connect-instance-private",
+                "contact-flow-private",
+                "twilio-account-private",
+                "+15557654321",
+            ] {
+                assert!(
+                    !debug.contains(sensitive),
+                    "debug output leaked {sensitive}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_debug_redacts_every_sensitive_target_value() {
+        let targets = [
+            TransferTarget::Sip {
+                uri: "sip:+15551234567@sip.example.test".into(),
+            },
+            TransferTarget::WebRtc {
+                uri: "wss://signal.example.test/private-session".into(),
+            },
+            TransferTarget::AmazonConnect {
+                instance_id: "connect-instance-private".into(),
+                contact_flow_id: "contact-flow-private".into(),
+            },
+            TransferTarget::Provider {
+                provider: ProviderKind::Telnyx,
+                account_profile: "telnyx-account-private".into(),
+                destination: "+15557654321".into(),
+            },
+        ];
+
+        for target in targets {
+            let debug = format!("{:?}", ServiceEffectPayload::Transfer { target });
+            assert!(debug.contains("[redacted]"));
+            for sensitive in [
+                "+15551234567",
+                "private-session",
+                "connect-instance-private",
+                "contact-flow-private",
+                "telnyx-account-private",
+                "+15557654321",
+            ] {
+                assert!(
+                    !debug.contains(sensitive),
+                    "debug output leaked {sensitive}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uri_validation_rejects_credentials_queries_and_fragments() {
+        let web_schemes = &["http", "https", "ws", "wss"];
+        let sip_schemes = &["sip", "sips"];
+
+        for uri in [
+            "https://api-user@signal.example.test/session",
+            "https://api-user:password@signal.example.test/session",
+            "wss://signal.example.test/session?access_token=private",
+            "https://signal.example.test/session#private",
+        ] {
+            assert!(validate_uri(uri, web_schemes).is_err(), "accepted {uri}");
+        }
+        for uri in [
+            "sip:alice:password@sip.example.test",
+            "sips://alice:password@sip.example.test",
+            "sip:alice@sip.example.test?token=private",
+            "sip:alice@sip.example.test#private",
+        ] {
+            assert!(validate_uri(uri, sip_schemes).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn uri_validation_allows_sip_destinations_but_not_web_userinfo() {
+        let sip_schemes = &["sip", "sips"];
+
+        assert!(validate_uri("sip:alice@sip.example.test", sip_schemes).is_ok());
+        assert!(validate_uri("sip:+15551234567@sip.example.test", sip_schemes).is_ok());
+        assert!(validate_uri("sips://alice@sip.example.test", sip_schemes).is_ok());
+        assert!(validate_uri(
+            "https://signal.example.test/session",
+            &["http", "https", "ws", "wss"]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn redacted_debug_does_not_change_serialization() {
+        let endpoint = ProviderEndpointConfig {
+            provider: ProviderKind::Vonage,
+            account_profile: "provider-profile".into(),
+            destination: Some("+15551234567".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(endpoint).unwrap(),
+            serde_json::json!({
+                "provider": "vonage",
+                "account_profile": "provider-profile",
+                "destination": "+15551234567",
+            })
+        );
+
+        let target = TransferTarget::Provider {
+            provider: ProviderKind::Twilio,
+            account_profile: "provider-profile".into(),
+            destination: "+15557654321".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(target).unwrap(),
+            serde_json::json!({
+                "type": "provider",
+                "provider": "twilio",
+                "account_profile": "provider-profile",
+                "destination": "+15557654321",
+            })
+        );
     }
 }

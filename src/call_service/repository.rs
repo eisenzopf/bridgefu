@@ -5,10 +5,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rvoip_core::ids::ConnectionId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
-    AttachmentTransport, BindingGeneration, CallId, CallRepository, ClaimGeneration, CommandCommit,
+    AttachmentTransport, BindingGeneration, CallId, ClaimGeneration, CommandCommit,
     CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId, FailureDetails, LegId,
     OutboxRecord, OutboxState, PrincipalFingerprint, ProviderEventEnvelope, RepositoryError,
     StoredCall, TenantId, WorkerLease,
@@ -134,6 +134,56 @@ pub struct StoredControlCommand {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// Monotonic, database-safe order of controls targeting one binding generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ControlSequence(u64);
+
+impl ControlSequence {
+    /// First control queued for a binding generation.
+    pub const INITIAL: Self = Self(1);
+
+    /// Returns the database-safe signed representation.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// Reconstructs a sequence read from a signed database column.
+    pub fn from_i64(value: i64) -> Result<Self, RepositoryError> {
+        if value <= 0 {
+            Err(RepositoryError::InvalidInput(
+                "control sequence must be a positive database integer",
+            ))
+        } else {
+            Ok(Self(value as u64))
+        }
+    }
+
+    pub(crate) fn next(self) -> Result<Self, RepositoryError> {
+        if self.0 >= i64::MAX as u64 {
+            Err(RepositoryError::CounterExhausted)
+        } else {
+            Ok(Self(self.0 + 1))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 || value > i64::MAX as u64 {
+            return Err(serde::de::Error::custom(
+                "control sequence must fit a positive signed database integer",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
 /// Outbox record for a control command.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControlOutboxRecord {
@@ -151,10 +201,14 @@ pub struct ControlOutboxRecord {
     pub binding_generation: BindingGeneration,
     /// Fenced execution owner.
     pub worker: WorkerLease,
+    /// FIFO order within this exact call/leg/binding generation.
+    pub sequence: ControlSequence,
     /// Control operation to execute.
     pub intent: ControlIntent,
     /// Earliest claim time.
     pub available_at: DateTime<Utc>,
+    /// Start time of the current claim, when claimed.
+    pub claimed_at: Option<DateTime<Utc>>,
     /// Durable claim/completion state.
     pub state: OutboxState,
 }
@@ -317,7 +371,7 @@ pub enum EffectResultOutcome {
 
 /// Durable service companion. Implementations perform no provider or rvoip I/O.
 #[async_trait]
-pub trait CallServiceRepository: CallRepository {
+pub trait CallServiceRepository: Send + Sync {
     /// Creates the core call and immutable execution plan atomically.
     async fn create_with_plan(
         &self,
