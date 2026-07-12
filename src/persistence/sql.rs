@@ -50,11 +50,12 @@ use crate::call_service::{
 };
 
 use super::memory::{
-    AttachmentRow, MemoryRepository, MemoryStateSnapshot, PersistedCommandRow,
-    PersistedControlCommandRow, PersistedControlSequenceRow, PersistedExecutionPlanRow,
-    PersistedIdempotencyRow, PersistedOutboundBindingRow, PersistedProviderCompletionRow,
-    PersistedProviderReferenceRow, PersistedReconciliationRow, PersistedServiceCommandRow,
-    ProviderCompletionRow,
+    AttachmentRow, ControlRetirementReceipt, MemoryRepository, MemoryStateSnapshot,
+    PersistedCommandRow, PersistedControlCommandRow, PersistedControlSequenceRow,
+    PersistedExecutionPlanRow, PersistedIdempotencyRow, PersistedOutboundBindingRow,
+    PersistedProviderCompletionRow, PersistedProviderReferenceRow, PersistedReconciliationRow,
+    PersistedServiceCommandRow, ProviderCompletionRow, RetiredOperationClaim,
+    RetiredOperationReceiptKind,
 };
 
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -85,6 +86,8 @@ struct ServiceSnapshotRows {
     outbound_binding_results: Vec<PersistedOutboundBindingRow>,
     external_references: Vec<StoredExternalReference>,
     reconciliation_results: Vec<PersistedReconciliationRow>,
+    retired_operation_claims: Vec<RetiredOperationClaim>,
+    control_retirements: Vec<ControlRetirementReceipt>,
 }
 
 /// Safe retention threshold for terminal call history.
@@ -567,6 +570,7 @@ async fn load_sqlite_snapshot(
 
     let workers = load_sqlite_workers(transaction).await?;
     let calls = load_sqlite_calls(transaction).await?;
+    let service_managed_calls = load_sqlite_service_managed_calls(transaction).await?;
     let commands = load_sqlite_commands(transaction).await?;
     let idempotency = load_sqlite_idempotency(transaction).await?;
     let attachments = load_sqlite_attachments(transaction).await?;
@@ -602,6 +606,7 @@ async fn load_sqlite_snapshot(
         used_connection_ids,
         outbox,
         deadlines,
+        service_managed_calls,
         execution_plans: service.execution_plans,
         service_effect_payloads: service.service_effect_payloads,
         service_command_results: service.service_command_results,
@@ -611,6 +616,8 @@ async fn load_sqlite_snapshot(
         outbound_binding_results: service.outbound_binding_results,
         external_references: service.external_references,
         reconciliation_results: service.reconciliation_results,
+        retired_operation_claims: service.retired_operation_claims,
+        control_retirements: service.control_retirements,
     })
 }
 
@@ -630,6 +637,7 @@ async fn load_postgres_snapshot(
 
     let workers = load_postgres_workers(transaction).await?;
     let calls = load_postgres_calls(transaction).await?;
+    let service_managed_calls = load_postgres_service_managed_calls(transaction).await?;
     let commands = load_postgres_commands(transaction).await?;
     let idempotency = load_postgres_idempotency(transaction).await?;
     let attachments = load_postgres_attachments(transaction).await?;
@@ -665,6 +673,7 @@ async fn load_postgres_snapshot(
         used_connection_ids,
         outbox,
         deadlines,
+        service_managed_calls,
         execution_plans: service.execution_plans,
         service_effect_payloads: service.service_effect_payloads,
         service_command_results: service.service_command_results,
@@ -674,7 +683,45 @@ async fn load_postgres_snapshot(
         outbound_binding_results: service.outbound_binding_results,
         external_references: service.external_references,
         reconciliation_results: service.reconciliation_results,
+        retired_operation_claims: service.retired_operation_claims,
+        control_retirements: service.control_retirements,
     })
+}
+
+async fn load_sqlite_service_managed_calls(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<CallId>, RepositoryError> {
+    sqlx::query("SELECT call_id FROM calls WHERE service_managed = 1 ORDER BY call_id")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            parse_call_id(
+                &row.try_get::<String, _>("call_id")
+                    .map_err(database_error)?,
+            )
+        })
+        .collect()
+}
+
+async fn load_postgres_service_managed_calls(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<CallId>, RepositoryError> {
+    sqlx::query(
+        "SELECT call_id::text AS call_id FROM calls WHERE service_managed = TRUE ORDER BY call_id",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .into_iter()
+    .map(|row| {
+        parse_call_id(
+            &row.try_get::<String, _>("call_id")
+                .map_err(database_error)?,
+        )
+    })
+    .collect()
 }
 
 fn decode_optional_receipt(
@@ -778,6 +825,63 @@ fn idempotency_receipt_columns(
             ("control_command", service_operation_kind(*operation))
         }
     }
+}
+
+fn retired_receipt_kind(kind: RetiredOperationReceiptKind) -> &'static str {
+    match kind {
+        RetiredOperationReceiptKind::ServiceCommand => "service_command",
+        RetiredOperationReceiptKind::ControlCommand => "control_command",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_retired_operation_claim_columns(
+    retired: &RetiredOperationClaim,
+    command_id: &str,
+    receipt_kind: &str,
+    tenant_id: &str,
+    key_digest: &[u8],
+    request_digest: &[u8],
+    call_id: &str,
+    operation_kind: &str,
+    expires_at: DateTime<Utc>,
+    retired_at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    invalid_if(
+        retired.command_id.to_string() != command_id
+            || retired_receipt_kind(retired.receipt_kind) != receipt_kind
+            || retired.tenant_id.as_str() != tenant_id
+            || retired.key_digest.expose_bytes().as_slice() != key_digest
+            || retired.request_digest.expose_bytes().as_slice() != request_digest
+            || retired.call_id.to_string() != call_id
+            || service_operation_kind(retired.operation) != operation_kind
+            || retired.expires_at != expires_at
+            || retired.retired_at != retired_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_control_retirement_columns(
+    receipt: &ControlRetirementReceipt,
+    effect_id: &str,
+    command_id: &str,
+    tenant_id: &str,
+    call_id: &str,
+    leg_id: &str,
+    binding_generation: i64,
+    retired_at: DateTime<Utc>,
+    failure_code: &str,
+) -> Result<(), RepositoryError> {
+    invalid_if(
+        receipt.effect_id.to_string() != effect_id
+            || receipt.command_id.to_string() != command_id
+            || receipt.tenant_id.as_str() != tenant_id
+            || receipt.call_id.to_string() != call_id
+            || receipt.leg_id.to_string() != leg_id
+            || receipt.binding_generation.as_i64() != binding_generation
+            || receipt.retired_at != retired_at
+            || receipt.failure.code() != failure_code,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1372,6 +1476,20 @@ async fn load_sqlite_service_rows(
             validate_reconciliation_columns(&value, &row.try_get::<String, _>("effect_id").map_err(database_error)?, &row.try_get::<String, _>("effect_source").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("worker_fence").map_err(database_error)?, &row.try_get::<String, _>("result_kind").map_err(database_error)?, sqlite_time(&row, "reconciled_at")?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let retired_operation_claims = sqlx::query("SELECT command_id, receipt_kind, tenant_id, key_digest, request_digest, call_id, operation_kind, expires_at, retired_at, body FROM retired_operation_claims ORDER BY command_id")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: RetiredOperationClaim = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_retired_operation_claim_columns(&value, &row.try_get::<String, _>("command_id").map_err(database_error)?, &row.try_get::<String, _>("receipt_kind").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<Vec<u8>, _>("key_digest").map_err(database_error)?, &row.try_get::<Vec<u8>, _>("request_digest").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("operation_kind").map_err(database_error)?, sqlite_time(&row, "expires_at")?, sqlite_time(&row, "retired_at")?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let control_retirements = sqlx::query("SELECT effect_id, command_id, tenant_id, call_id, leg_id, binding_generation, retired_at, failure_code, body FROM control_outbox_retirements ORDER BY effect_id")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: ControlRetirementReceipt = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_control_retirement_columns(&value, &row.try_get::<String, _>("effect_id").map_err(database_error)?, &row.try_get::<String, _>("command_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, sqlite_time(&row, "retired_at")?, &row.try_get::<String, _>("failure_code").map_err(database_error)?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
     Ok(ServiceSnapshotRows {
         execution_plans,
         service_effect_payloads,
@@ -1382,6 +1500,8 @@ async fn load_sqlite_service_rows(
         outbound_binding_results,
         external_references,
         reconciliation_results,
+        retired_operation_claims,
+        control_retirements,
     })
 }
 
@@ -1559,6 +1679,20 @@ async fn load_postgres_service_rows(
             validate_reconciliation_columns(&value, &row.try_get::<String, _>("effect_id").map_err(database_error)?, &row.try_get::<String, _>("effect_source").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("worker_fence").map_err(database_error)?, &row.try_get::<String, _>("result_kind").map_err(database_error)?, row.try_get("reconciled_at").map_err(database_error)?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let retired_operation_claims = sqlx::query("SELECT command_id::text AS command_id, receipt_kind, tenant_id, key_digest, request_digest, call_id::text AS call_id, operation_kind, expires_at, retired_at, body::text AS body FROM retired_operation_claims ORDER BY command_id")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: RetiredOperationClaim = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_retired_operation_claim_columns(&value, &row.try_get::<String, _>("command_id").map_err(database_error)?, &row.try_get::<String, _>("receipt_kind").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<Vec<u8>, _>("key_digest").map_err(database_error)?, &row.try_get::<Vec<u8>, _>("request_digest").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("operation_kind").map_err(database_error)?, row.try_get("expires_at").map_err(database_error)?, row.try_get("retired_at").map_err(database_error)?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let control_retirements = sqlx::query("SELECT effect_id::text AS effect_id, command_id::text AS command_id, tenant_id, call_id::text AS call_id, leg_id::text AS leg_id, binding_generation, retired_at, failure_code, body::text AS body FROM control_outbox_retirements ORDER BY effect_id")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: ControlRetirementReceipt = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_control_retirement_columns(&value, &row.try_get::<String, _>("effect_id").map_err(database_error)?, &row.try_get::<String, _>("command_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, row.try_get("retired_at").map_err(database_error)?, &row.try_get::<String, _>("failure_code").map_err(database_error)?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
     Ok(ServiceSnapshotRows {
         execution_plans,
         service_effect_payloads,
@@ -1569,6 +1703,8 @@ async fn load_postgres_service_rows(
         outbound_binding_results,
         external_references,
         reconciliation_results,
+        retired_operation_claims,
+        control_retirements,
     })
 }
 
@@ -2004,6 +2140,11 @@ fn changed_snapshot(
                 && left.kind == right.kind
                 && left.generation == right.generation
         }),
+        service_managed_calls: changed_rows(
+            &before.service_managed_calls,
+            &after.service_managed_calls,
+            PartialEq::eq,
+        ),
         execution_plans: changed_rows(
             &before.execution_plans,
             &after.execution_plans,
@@ -2051,6 +2192,16 @@ fn changed_snapshot(
         reconciliation_results: changed_rows(
             &before.reconciliation_results,
             &after.reconciliation_results,
+            |left, right| left.effect_id == right.effect_id,
+        ),
+        retired_operation_claims: changed_rows(
+            &before.retired_operation_claims,
+            &after.retired_operation_claims,
+            |left, right| left.command_id == right.command_id,
+        ),
+        control_retirements: changed_rows(
+            &before.control_retirements,
+            &after.control_retirements,
             |left, right| left.effect_id == right.effect_id,
         ),
     }
@@ -2113,6 +2264,12 @@ fn validate_supported_removals(
         })
         .len()
         + removed_rows(
+            &before.service_managed_calls,
+            &after.service_managed_calls,
+            PartialEq::eq,
+        )
+        .len()
+        + removed_rows(
             &before.execution_plans,
             &after.execution_plans,
             |left, right| left.call_id == right.call_id,
@@ -2167,6 +2324,18 @@ fn validate_supported_removals(
         + removed_rows(
             &before.reconciliation_results,
             &after.reconciliation_results,
+            |left, right| left.effect_id == right.effect_id,
+        )
+        .len()
+        + removed_rows(
+            &before.retired_operation_claims,
+            &after.retired_operation_claims,
+            |left, right| left.command_id == right.command_id,
+        )
+        .len()
+        + removed_rows(
+            &before.control_retirements,
+            &after.control_retirements,
             |left, right| left.effect_id == right.effect_id,
         )
         .len();
@@ -2333,6 +2502,17 @@ async fn upsert_sqlite_rows(
             .execute(&mut **connection)
             .await
             .map_err(database_error)?;
+        }
+    }
+
+    for call_id in &snapshot.service_managed_calls {
+        let changed = sqlx::query("UPDATE calls SET service_managed = 1 WHERE call_id = ?")
+            .bind(call_id.to_string())
+            .execute(&mut **connection)
+            .await
+            .map_err(database_error)?;
+        if changed.rows_affected() != 1 {
+            return Err(RepositoryError::Unavailable);
         }
     }
 
@@ -2647,6 +2827,41 @@ async fn upsert_sqlite_rows(
         .await
         .map_err(database_error)?;
     }
+    for retired in &snapshot.retired_operation_claims {
+        sqlx::query(
+            "INSERT INTO retired_operation_claims(command_id, receipt_kind, tenant_id, key_digest, request_digest, call_id, operation_kind, expires_at, retired_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(command_id) DO UPDATE SET receipt_kind=excluded.receipt_kind, tenant_id=excluded.tenant_id, key_digest=excluded.key_digest, request_digest=excluded.request_digest, call_id=excluded.call_id, operation_kind=excluded.operation_kind, expires_at=excluded.expires_at, retired_at=excluded.retired_at, body=excluded.body",
+        )
+        .bind(retired.command_id.to_string())
+        .bind(retired_receipt_kind(retired.receipt_kind))
+        .bind(retired.tenant_id.as_str())
+        .bind(retired.key_digest.expose_bytes().as_slice())
+        .bind(retired.request_digest.expose_bytes().as_slice())
+        .bind(retired.call_id.to_string())
+        .bind(service_operation_kind(retired.operation))
+        .bind(retired.expires_at.to_rfc3339())
+        .bind(retired.retired_at.to_rfc3339())
+        .bind(encode(retired)?)
+        .execute(&mut **connection)
+        .await
+        .map_err(database_error)?;
+    }
+    for receipt in &snapshot.control_retirements {
+        sqlx::query(
+            "INSERT INTO control_outbox_retirements(effect_id, command_id, tenant_id, call_id, leg_id, binding_generation, retired_at, failure_code, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(effect_id) DO UPDATE SET command_id=excluded.command_id, tenant_id=excluded.tenant_id, call_id=excluded.call_id, leg_id=excluded.leg_id, binding_generation=excluded.binding_generation, retired_at=excluded.retired_at, failure_code=excluded.failure_code, body=excluded.body",
+        )
+        .bind(receipt.effect_id.to_string())
+        .bind(receipt.command_id.to_string())
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.call_id.to_string())
+        .bind(receipt.leg_id.to_string())
+        .bind(receipt.binding_generation.as_i64())
+        .bind(receipt.retired_at.to_rfc3339())
+        .bind(receipt.failure.code())
+        .bind(encode(receipt)?)
+        .execute(&mut **connection)
+        .await
+        .map_err(database_error)?;
+    }
     Ok(())
 }
 
@@ -2726,6 +2941,17 @@ async fn upsert_postgres_rows(
             .execute(&mut **transaction)
             .await
             .map_err(database_error)?;
+        }
+    }
+
+    for call_id in &snapshot.service_managed_calls {
+        let changed = sqlx::query("UPDATE calls SET service_managed = TRUE WHERE call_id = $1")
+            .bind(call_id.as_uuid())
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+        if changed.rows_affected() != 1 {
+            return Err(RepositoryError::Unavailable);
         }
     }
 
@@ -3036,6 +3262,41 @@ async fn upsert_postgres_rows(
         .bind(service_result_kind(&request.result))
         .bind(request.at)
         .bind(encode(persisted)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+    for retired in &snapshot.retired_operation_claims {
+        sqlx::query(
+            "INSERT INTO retired_operation_claims(command_id, receipt_kind, tenant_id, key_digest, request_digest, call_id, operation_kind, expires_at, retired_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT(command_id) DO UPDATE SET receipt_kind=EXCLUDED.receipt_kind, tenant_id=EXCLUDED.tenant_id, key_digest=EXCLUDED.key_digest, request_digest=EXCLUDED.request_digest, call_id=EXCLUDED.call_id, operation_kind=EXCLUDED.operation_kind, expires_at=EXCLUDED.expires_at, retired_at=EXCLUDED.retired_at, body=EXCLUDED.body",
+        )
+        .bind(retired.command_id.as_uuid())
+        .bind(retired_receipt_kind(retired.receipt_kind))
+        .bind(retired.tenant_id.as_str())
+        .bind(retired.key_digest.expose_bytes().as_slice())
+        .bind(retired.request_digest.expose_bytes().as_slice())
+        .bind(retired.call_id.as_uuid())
+        .bind(service_operation_kind(retired.operation))
+        .bind(retired.expires_at)
+        .bind(retired.retired_at)
+        .bind(encode(retired)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+    for receipt in &snapshot.control_retirements {
+        sqlx::query(
+            "INSERT INTO control_outbox_retirements(effect_id, command_id, tenant_id, call_id, leg_id, binding_generation, retired_at, failure_code, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) ON CONFLICT(effect_id) DO UPDATE SET command_id=EXCLUDED.command_id, tenant_id=EXCLUDED.tenant_id, call_id=EXCLUDED.call_id, leg_id=EXCLUDED.leg_id, binding_generation=EXCLUDED.binding_generation, retired_at=EXCLUDED.retired_at, failure_code=EXCLUDED.failure_code, body=EXCLUDED.body",
+        )
+        .bind(receipt.effect_id.as_uuid())
+        .bind(receipt.command_id.as_uuid())
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.call_id.as_uuid())
+        .bind(receipt.leg_id.as_uuid())
+        .bind(receipt.binding_generation.as_i64())
+        .bind(receipt.retired_at)
+        .bind(receipt.failure.code())
+        .bind(encode(receipt)?)
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;

@@ -6,8 +6,8 @@ use bridgefu::call_engine::{
     AttachmentTransport, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
     CommandCommit, CommandId, ConnectionBinding, CreateCall, EffectIntent, IdempotencyKeyDigest,
     LegDirection, LegId, LegKind, LegSpec, LegState, PrincipalFingerprint, ProviderAccountKey,
-    ProviderCallId, RegisterWorker, RepositoryError, RequestDigest, StoredCall, TenantId,
-    WorkerLease,
+    ProviderCallId, RegisterWorker, RepositoryError, RequestDigest, StopLegReason, StoredCall,
+    TenantId, WorkerLease,
 };
 use bridgefu::call_service::{
     CallExecutionPlan, CallServiceRepository, ControlCommandOutcome, ControlCommandTransaction,
@@ -29,6 +29,19 @@ fn at(second: i64) -> DateTime<Utc> {
 
 fn digest(byte: u8) -> [u8; 32] {
     [byte; 32]
+}
+
+fn digest_hex(byte: u8, uppercase: bool) -> String {
+    digest(byte)
+        .into_iter()
+        .map(|value| {
+            if uppercase {
+                format!("{value:02X}")
+            } else {
+                format!("{value:02x}")
+            }
+        })
+        .collect()
 }
 
 fn operation_idempotency(
@@ -640,6 +653,110 @@ where
     );
 }
 
+async fn assert_expiry_and_same_key_reuse<R>(
+    repository: &R,
+    evidence: &ConformanceEvidence,
+) -> (
+    ControlCommandTransaction,
+    bridgefu::call_service::ControlCommandView,
+)
+where
+    R: CallServiceRepository + Sync,
+{
+    // The original DTMF receipt used key 60 at second 8. This operation is
+    // deliberately much later than its fixed 24-hour retention boundary and
+    // reuses the same key for a different canonical request.
+    let request = ControlCommandTransaction {
+        command_id: CommandId::new(),
+        tenant_id: evidence.owner.clone(),
+        call_id: evidence.call_id,
+        leg_id: evidence.control_leg_id,
+        binding_generation: BindingGeneration::INITIAL,
+        worker: evidence.worker,
+        intent: ControlIntent::Dtmf {
+            sequence: DtmfSequence {
+                digits: "7".to_owned(),
+                duration_ms: 120,
+                gap_ms: 60,
+            },
+        },
+        at: at(90_000),
+        operation_idempotency: Some(operation_idempotency(
+            60,
+            68,
+            ServiceOperationKind::DtmfCall,
+        )),
+    };
+    let ControlCommandOutcome::Enqueued(view) =
+        repository.enqueue_control(request.clone()).await.unwrap()
+    else {
+        panic!("expired operation key unexpectedly replayed")
+    };
+    (request, view)
+}
+
+async fn assert_reused_key_restart<R>(
+    repository: &R,
+    request: ControlCommandTransaction,
+    expected: bridgefu::call_service::ControlCommandView,
+) where
+    R: CallServiceRepository + Sync,
+{
+    assert_eq!(
+        repository.enqueue_control(request).await.unwrap(),
+        ControlCommandOutcome::Replayed(expected)
+    );
+}
+
+async fn assert_control_retirement_receipt<R>(
+    repository: &R,
+    evidence: &ConformanceEvidence,
+    effect_id: bridgefu::call_engine::EffectId,
+) -> CommandId
+where
+    R: CallServiceRepository + Sync,
+{
+    let current = repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+    let command_id = CommandId::new();
+    let outcome = repository
+        .commit_with_effect_payloads(ServiceCommandTransaction {
+            command: CommandCommit {
+                tenant_id: evidence.owner.clone(),
+                call_id: evidence.call_id,
+                expected_version: current.call.aggregate.version(),
+                command_id,
+                command: CallCommand::BeginEnding {
+                    at: at(90_001),
+                    ending_deadline: Some(at(90_031)),
+                    reason: StopLegReason::Requested,
+                },
+                worker: evidence.worker,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(90_001),
+            },
+            effect_payloads: Vec::new(),
+            operation_idempotency: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ServiceCommandOutcome::Committed(_)));
+    let claimed = repository
+        .claim_control_effects(evidence.worker, at(90_002), Duration::from_secs(10), 64)
+        .await
+        .unwrap();
+    assert!(
+        claimed
+            .iter()
+            .all(|claim| claim.record.effect_id != effect_id),
+        "retired control effect remained claimable"
+    );
+    command_id
+}
+
 async fn assert_two_instance_control_race<R>(left: &R, right: &R, evidence: &ConformanceEvidence)
 where
     R: CallServiceRepository + Sync,
@@ -767,6 +884,10 @@ fn sqlite_database(label: &str) -> (String, std::path::PathBuf) {
 
 const SERVICE_DRIFT_CASES: &[(&str, &str)] = &[
     (
+        "UPDATE calls SET service_managed = FALSE WHERE service_managed = TRUE",
+        "UPDATE calls SET service_managed = TRUE WHERE service_managed = FALSE",
+    ),
+    (
         "UPDATE call_execution_plans SET plan_version = plan_version + 1",
         "UPDATE call_execution_plans SET plan_version = plan_version - 1",
     ),
@@ -803,12 +924,16 @@ const SERVICE_DRIFT_CASES: &[(&str, &str)] = &[
         "UPDATE reconciliation_results SET tenant_id = substr(tenant_id, 1, length(tenant_id) - 6)",
     ),
     (
-        "UPDATE idempotency SET receipt_kind = 'service_command' WHERE receipt_kind = 'create_call'",
-        "UPDATE idempotency SET receipt_kind = 'create_call' WHERE operation_kind = 'create_call' AND receipt_kind = 'service_command'",
-    ),
-    (
         "UPDATE idempotency SET operation_kind = 'transfer_call' WHERE receipt_kind = 'control_command' AND operation_kind = 'dtmf_call'",
         "UPDATE idempotency SET operation_kind = 'dtmf_call' WHERE receipt_kind = 'control_command' AND operation_kind = 'transfer_call'",
+    ),
+    (
+        "UPDATE retired_operation_claims SET tenant_id = tenant_id || '_drift'",
+        "UPDATE retired_operation_claims SET tenant_id = substr(tenant_id, 1, length(tenant_id) - 6)",
+    ),
+    (
+        "UPDATE control_outbox_retirements SET failure_code = failure_code || '_drift'",
+        "UPDATE control_outbox_retirements SET failure_code = substr(failure_code, 1, length(failure_code) - 6)",
     ),
 ];
 
@@ -866,11 +991,93 @@ async fn assert_postgres_service_drift_detection(
     }
 }
 
+async fn assert_sqlite_deletion_fails_closed(
+    repository: &SqliteRepository,
+    owner: &TenantId,
+    call_id: CallId,
+    table: &str,
+    predicate: &str,
+) {
+    let backup = format!("integrity_backup_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE TABLE {backup} AS SELECT * FROM {table} WHERE {predicate}"
+    ))
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {backup}"))
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "integrity deletion fixture was ambiguous");
+    sqlx::query(&format!("DELETE FROM {table} WHERE {predicate}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_service_call(owner, call_id).await,
+        Err(RepositoryError::Unavailable),
+        "deletion from {table} was accepted"
+    );
+    sqlx::query(&format!("INSERT INTO {table} SELECT * FROM {backup}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {backup}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository.load_service_call(owner, call_id).await.unwrap();
+}
+
+async fn assert_postgres_deletion_fails_closed(
+    repository: &PostgresRepository,
+    owner: &TenantId,
+    call_id: CallId,
+    table: &str,
+    predicate: &str,
+) {
+    let backup = format!("integrity_backup_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE TABLE {backup} AS SELECT * FROM {table} WHERE {predicate}"
+    ))
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {backup}"))
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "integrity deletion fixture was ambiguous");
+    sqlx::query(&format!("DELETE FROM {table} WHERE {predicate}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_service_call(owner, call_id).await,
+        Err(RepositoryError::Unavailable),
+        "deletion from {table} was accepted"
+    );
+    sqlx::query(&format!("INSERT INTO {table} SELECT * FROM {backup}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {backup}"))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository.load_service_call(owner, call_id).await.unwrap();
+}
+
 #[tokio::test]
 async fn memory_service_repository_conformance() {
     let repository = MemoryRepository::new();
     let evidence = assert_service_conformance(&repository).await;
     assert_restart_replays(&repository, &evidence).await;
+    let (request, view) = assert_expiry_and_same_key_reuse(&repository, &evidence).await;
+    let effect_id = view.effect.effect_id;
+    assert_reused_key_restart(&repository, request, view).await;
+    assert_control_retirement_receipt(&repository, &evidence, effect_id).await;
 }
 
 #[tokio::test]
@@ -881,9 +1088,143 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
     let second = SqliteRepository::connect(&url).await.unwrap();
     assert_restart_replays(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
+    let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
+    let third = SqliteRepository::connect(&url).await.unwrap();
+    let effect_id = view.effect.effect_id;
+    assert_reused_key_restart(&third, request, view).await;
+
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "idempotency",
+        &format!(
+            "tenant_id = '{}' AND hex(key_digest) = '{}'",
+            evidence.owner,
+            digest_hex(60, true)
+        ),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "retired_operation_claims",
+        &format!("command_id = '{}'", evidence.control_request.command_id),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "retired_operation_claims",
+        &format!(
+            "command_id = '{}'",
+            evidence.transfer_request.command.command_id
+        ),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "reconciliation_results",
+        &format!(
+            "effect_id = '{}'",
+            evidence.control_reconciliation.effect_id
+        ),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.provider_owner,
+        evidence.provider_call_id,
+        "reconciliation_results",
+        &format!(
+            "effect_id = '{}'",
+            evidence.provider_reconciliation.effect_id
+        ),
+    )
+    .await;
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "outbound_binding_results",
+        &format!(
+            "operation_id = '{}'",
+            evidence.outbound_request.operation_id
+        ),
+    )
+    .await;
+
+    let retirement_command = assert_control_retirement_receipt(&third, &evidence, effect_id).await;
     assert_sqlite_service_drift_detection(&first, &evidence).await;
+    assert!(
+        sqlx::query("SELECT command_id FROM retired_operation_claims")
+            .fetch_all(third.pool())
+            .await
+            .unwrap()
+            .len()
+            >= 2
+    );
+    let stored_retirement_command: String =
+        sqlx::query_scalar("SELECT command_id FROM control_outbox_retirements WHERE effect_id = ?")
+            .bind(effect_id.to_string())
+            .fetch_one(third.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_retirement_command, retirement_command.to_string());
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "control_outbox_retirements",
+        &format!("effect_id = '{effect_id}'"),
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE commands SET body = json_set(body, '$.command.disposition', 'ignored_noop', '$.result.command.disposition', 'ignored_noop') WHERE command_id = ?",
+    )
+    .bind(retirement_command.to_string())
+        .execute(third.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        third
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "an ignored command was accepted as causal retirement evidence"
+    );
+    sqlx::query(
+        "UPDATE commands SET body = json_set(body, '$.command.disposition', 'applied', '$.result.command.disposition', 'applied') WHERE command_id = ?",
+    )
+    .bind(retirement_command.to_string())
+    .execute(third.pool())
+    .await
+    .unwrap();
+    third
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM call_execution_plans WHERE call_id = ?")
+        .bind(evidence.call_id.to_string())
+        .execute(third.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        third
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "a managed call with a deleted execution plan was accepted as raw"
+    );
     first.pool().close().await;
     second.pool().close().await;
+    third.pool().close().await;
     std::fs::remove_file(path).unwrap();
 }
 
@@ -911,9 +1252,150 @@ async fn postgres_service_repository_conformance_restart_and_races() {
     let second = PostgresRepository::connect(&scoped).await.unwrap();
     assert_restart_replays(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
+    let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
+    let third = PostgresRepository::connect(&scoped).await.unwrap();
+    let effect_id = view.effect.effect_id;
+    assert_reused_key_restart(&third, request, view).await;
+
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "idempotency",
+        &format!(
+            "tenant_id = '{}' AND encode(key_digest, 'hex') = '{}'",
+            evidence.owner,
+            digest_hex(60, false)
+        ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "retired_operation_claims",
+        &format!(
+            "command_id = '{}'::uuid",
+            evidence.control_request.command_id
+        ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "retired_operation_claims",
+        &format!(
+            "command_id = '{}'::uuid",
+            evidence.transfer_request.command.command_id
+        ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "reconciliation_results",
+        &format!(
+            "effect_id = '{}'::uuid",
+            evidence.control_reconciliation.effect_id
+        ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.provider_owner,
+        evidence.provider_call_id,
+        "reconciliation_results",
+        &format!(
+            "effect_id = '{}'::uuid",
+            evidence.provider_reconciliation.effect_id
+        ),
+    )
+    .await;
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "outbound_binding_results",
+        &format!(
+            "operation_id = '{}'::uuid",
+            evidence.outbound_request.operation_id
+        ),
+    )
+    .await;
+
+    let retirement_command = assert_control_retirement_receipt(&third, &evidence, effect_id).await;
     assert_postgres_service_drift_detection(&first, &evidence).await;
+    assert!(
+        sqlx::query("SELECT command_id FROM retired_operation_claims")
+            .fetch_all(third.pool())
+            .await
+            .unwrap()
+            .len()
+            >= 2
+    );
+    let stored_retirement_command: uuid::Uuid = sqlx::query_scalar(
+        "SELECT command_id FROM control_outbox_retirements WHERE effect_id = $1",
+    )
+    .bind(effect_id.as_uuid())
+    .fetch_one(third.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_retirement_command.to_string(),
+        retirement_command.to_string()
+    );
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "control_outbox_retirements",
+        &format!("effect_id = '{effect_id}'::uuid"),
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE commands SET body = jsonb_set(jsonb_set(body, '{command,disposition}', '\"ignored_noop\"'::jsonb), '{result,command,disposition}', '\"ignored_noop\"'::jsonb) WHERE command_id = $1",
+    )
+    .bind(retirement_command.as_uuid())
+        .execute(third.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        third
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "an ignored command was accepted as causal retirement evidence"
+    );
+    sqlx::query(
+        "UPDATE commands SET body = jsonb_set(jsonb_set(body, '{command,disposition}', '\"applied\"'::jsonb), '{result,command,disposition}', '\"applied\"'::jsonb) WHERE command_id = $1",
+    )
+    .bind(retirement_command.as_uuid())
+    .execute(third.pool())
+    .await
+    .unwrap();
+    third
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM call_execution_plans WHERE call_id = $1")
+        .bind(evidence.call_id.as_uuid())
+        .execute(third.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        third
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "a managed call with a deleted execution plan was accepted as raw"
+    );
     first.pool().close().await;
     second.pool().close().await;
+    third.pool().close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&administration)
         .await

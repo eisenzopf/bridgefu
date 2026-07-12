@@ -40,7 +40,8 @@ use crate::call_service::{
     OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
     ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
-    StoredControlCommand, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    ServiceOperationKind, StoredControlCommand, StoredExternalReference, StoredServiceCall,
+    StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -205,6 +206,44 @@ pub(super) struct PersistedReconciliationRow {
     pub(super) result: StoredReconciliationResult,
 }
 
+/// Historical proof that an operation receipt was retired only after its
+/// fixed retention window elapsed. The immutable command result remains the
+/// authoritative replay history.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct RetiredOperationClaim {
+    pub(super) tenant_id: TenantId,
+    pub(super) key_digest: IdempotencyKeyDigest,
+    pub(super) request_digest: crate::call_engine::RequestDigest,
+    pub(super) call_id: CallId,
+    pub(super) command_id: CommandId,
+    pub(super) operation: ServiceOperationKind,
+    pub(super) receipt_kind: RetiredOperationReceiptKind,
+    pub(super) expires_at: DateTime<Utc>,
+    pub(super) retired_at: DateTime<Utc>,
+}
+
+/// Exact core-command evidence for a control effect cancelled because its
+/// target binding was retired before execution.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct ControlRetirementReceipt {
+    pub(super) effect_id: EffectId,
+    pub(super) command_id: CommandId,
+    pub(super) tenant_id: TenantId,
+    pub(super) call_id: CallId,
+    pub(super) leg_id: LegId,
+    pub(super) binding_generation: BindingGeneration,
+    pub(super) retired_at: DateTime<Utc>,
+    pub(super) failure: FailureDetails,
+}
+
+/// Durable command family owning a retired operation claim.
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RetiredOperationReceiptKind {
+    ServiceCommand,
+    ControlCommand,
+}
+
 /// Authoritative, backend-neutral primary rows persisted by SQL repositories.
 ///
 /// Secondary indexes are deliberately omitted and rebuilt with uniqueness
@@ -224,6 +263,7 @@ pub(super) struct MemoryStateSnapshot {
     pub(super) used_connection_ids: Vec<ConnectionId>,
     pub(super) outbox: Vec<OutboxRecord>,
     pub(super) deadlines: Vec<DeadlineRecord>,
+    pub(super) service_managed_calls: Vec<CallId>,
     pub(super) execution_plans: Vec<PersistedExecutionPlanRow>,
     pub(super) service_effect_payloads: Vec<StoredServiceEffectPayload>,
     pub(super) service_command_results: Vec<PersistedServiceCommandRow>,
@@ -233,6 +273,8 @@ pub(super) struct MemoryStateSnapshot {
     pub(super) outbound_binding_results: Vec<PersistedOutboundBindingRow>,
     pub(super) external_references: Vec<StoredExternalReference>,
     pub(super) reconciliation_results: Vec<PersistedReconciliationRow>,
+    pub(super) retired_operation_claims: Vec<RetiredOperationClaim>,
+    pub(super) control_retirements: Vec<ControlRetirementReceipt>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -266,6 +308,7 @@ struct MemoryState {
     provider_receipt_sequence: Option<ProviderReceiptSequence>,
     outbox: HashMap<EffectId, OutboxRecord>,
     deadlines: HashMap<DeadlineKey, DeadlineRecord>,
+    service_managed_calls: HashSet<CallId>,
     execution_plans: HashMap<CallId, CallExecutionPlan>,
     service_effect_payloads: HashMap<EffectId, StoredServiceEffectPayload>,
     service_command_results: HashMap<CommandId, StoredServiceCommandResult>,
@@ -277,6 +320,8 @@ struct MemoryState {
     external_references: HashMap<ExternalReferenceKey, StoredExternalReference>,
     external_reference_bindings: HashMap<ExternalBindingKey, ExternalReferenceKey>,
     reconciliation_results: HashMap<EffectId, StoredReconciliationResult>,
+    retired_operation_claims: HashMap<CommandId, RetiredOperationClaim>,
+    control_retirements: HashMap<EffectId, ControlRetirementReceipt>,
 }
 
 /// Standalone/test repository with database-equivalent atomic visibility.
@@ -384,6 +429,7 @@ impl MemoryRepository {
             used_connection_ids: state.used_connection_ids.iter().cloned().collect(),
             outbox: state.outbox.values().cloned().collect(),
             deadlines: state.deadlines.values().cloned().collect(),
+            service_managed_calls: state.service_managed_calls.iter().copied().collect(),
             execution_plans: state
                 .execution_plans
                 .iter()
@@ -439,6 +485,8 @@ impl MemoryRepository {
                     result: result.clone(),
                 })
                 .collect(),
+            retired_operation_claims: state.retired_operation_claims.values().cloned().collect(),
+            control_retirements: state.control_retirements.values().cloned().collect(),
         })
     }
 
@@ -636,6 +684,11 @@ impl MemoryRepository {
             }
         }
 
+        for call_id in snapshot.service_managed_calls {
+            if !state.calls.contains_key(&call_id) || !state.service_managed_calls.insert(call_id) {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
         for persisted in snapshot.execution_plans {
             let call = state
                 .calls
@@ -652,6 +705,18 @@ impl MemoryRepository {
             {
                 return Err(RepositoryError::Unavailable);
             }
+        }
+        if state.service_managed_calls.len() != state.execution_plans.len()
+            || state
+                .service_managed_calls
+                .iter()
+                .any(|call_id| !state.execution_plans.contains_key(call_id))
+            || state
+                .execution_plans
+                .keys()
+                .any(|call_id| !state.service_managed_calls.contains(call_id))
+        {
+            return Err(RepositoryError::Unavailable);
         }
         for payload in snapshot.service_effect_payloads {
             payload
@@ -764,6 +829,7 @@ impl MemoryRepository {
                 .filter(|call| call.aggregate.tenant_id() == &record.tenant_id)
                 .ok_or(RepositoryError::Unavailable)?;
             if call.aggregate.leg(record.leg_id).is_none()
+                || !state.service_managed_calls.contains(&record.call_id)
                 || !state.execution_plans.contains_key(&record.call_id)
                 || state.outbox.contains_key(&record.effect_id)
                 || state
@@ -860,6 +926,10 @@ impl MemoryRepository {
                 .get(&request.call_id)
                 .filter(|call| call.aggregate.tenant_id() == &request.tenant_id)
                 .ok_or(RepositoryError::Unavailable)?;
+            let leg = call
+                .aggregate
+                .leg(request.leg_id)
+                .ok_or(RepositoryError::Unavailable)?;
             if persisted.operation_id != request.operation_id
                 || result.binding.connection_id != request.connection_id
                 || result.binding.leg_id != request.leg_id
@@ -868,11 +938,12 @@ impl MemoryRepository {
                 || result.binding.principal_fingerprint != request.principal_fingerprint
                 || result.binding.bound_at != request.at
                 || !state.used_connection_ids.contains(&request.connection_id)
-                || call.aggregate.leg(request.leg_id).is_none()
+                || leg.direction() != crate::call_engine::LegDirection::Outbound
                 || call.bindings.get(&request.leg_id).is_some_and(|binding| {
                     binding.binding_generation == request.binding_generation
                         && binding != &result.binding
                 })
+                || !state.service_managed_calls.contains(&request.call_id)
                 || !state.execution_plans.contains_key(&request.call_id)
                 || !outbound_connection_ids.insert(request.connection_id.clone())
                 || state
@@ -882,6 +953,25 @@ impl MemoryRepository {
             {
                 return Err(RepositoryError::Unavailable);
             }
+        }
+        if state.service_managed_calls.iter().any(|call_id| {
+            let Some(call) = state.calls.get(call_id) else {
+                return true;
+            };
+            call.bindings.values().any(|binding| {
+                call.aggregate.leg(binding.leg_id).is_some_and(|leg| {
+                    leg.direction() == crate::call_engine::LegDirection::Outbound
+                }) && state
+                    .outbound_binding_results
+                    .values()
+                    .filter(|result| {
+                        result.request.call_id == *call_id && result.binding == *binding
+                    })
+                    .count()
+                    != 1
+            })
+        }) {
+            return Err(RepositoryError::Unavailable);
         }
 
         for reference in snapshot.external_references {
@@ -971,6 +1061,16 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
+        for receipt in snapshot.control_retirements {
+            if !Self::control_retirement_crosslinks(&state, &receipt)
+                || state
+                    .control_retirements
+                    .insert(receipt.effect_id, receipt)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
         if state.external_references.values().any(|reference| {
             state
                 .reconciliation_results
@@ -981,6 +1081,34 @@ impl MemoryRepository {
                 })
         }) {
             return Err(RepositoryError::Unavailable);
+        }
+
+        if state.outbox.values().any(|record| {
+            state.service_managed_calls.contains(&record.call_id)
+                && matches!(
+                    record.state,
+                    OutboxState::Succeeded { .. } | OutboxState::Failed { .. }
+                )
+                && !state.reconciliation_results.contains_key(&record.effect_id)
+        }) || state.control_outbox.values().any(|record| {
+            matches!(
+                record.state,
+                OutboxState::Succeeded { .. } | OutboxState::Failed { .. }
+            ) && !state.reconciliation_results.contains_key(&record.effect_id)
+                && !Self::control_retirement_is_explained(&state, record)
+        }) {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        for retired in snapshot.retired_operation_claims {
+            if !Self::retired_operation_claim_crosslinks(&state, &retired)
+                || state
+                    .retired_operation_claims
+                    .insert(retired.command_id, retired)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
         }
 
         if state
@@ -995,20 +1123,7 @@ impl MemoryRepository {
                     .operation_idempotency
                     .as_ref()
                     .is_some_and(|claim| {
-                        state
-                            .idempotency
-                            .get(&(result.request.command.tenant_id.clone(), claim.key_digest))
-                            .is_none_or(|row| {
-                                row.request_digest != claim.request_digest
-                                    || row.call_id != result.request.command.call_id
-                                    || !matches!(
-                                        &row.receipt,
-                                        OperationIdempotencyReceipt::ServiceCommand {
-                                            operation,
-                                            view,
-                                        } if *operation == claim.operation && **view == result.view
-                                    )
-                            })
+                        !Self::service_operation_claim_has_proof(&state, result, claim)
                     })
             })
             || state.control_command_results.values().any(|result| {
@@ -1017,20 +1132,7 @@ impl MemoryRepository {
                     .operation_idempotency
                     .as_ref()
                     .is_some_and(|claim| {
-                        state
-                            .idempotency
-                            .get(&(result.request.tenant_id.clone(), claim.key_digest))
-                            .is_none_or(|row| {
-                                row.request_digest != claim.request_digest
-                                    || row.call_id != result.request.call_id
-                                    || !matches!(
-                                        &row.receipt,
-                                        OperationIdempotencyReceipt::ControlCommand {
-                                            operation,
-                                            view,
-                                        } if *operation == claim.operation && **view == result.view
-                                    )
-                            })
+                        !Self::control_operation_claim_has_proof(&state, result, claim)
                     })
             })
         {
@@ -1147,6 +1249,170 @@ impl MemoryRepository {
                             })
                 }),
         }
+    }
+
+    fn retired_operation_claim_crosslinks(
+        state: &MemoryState,
+        retired: &RetiredOperationClaim,
+    ) -> bool {
+        if retired.retired_at < retired.expires_at {
+            return false;
+        }
+        let key = (retired.tenant_id.clone(), retired.key_digest);
+        let active_is_same_command = state.idempotency.get(&key).is_some_and(|row| {
+            row.request_digest == retired.request_digest
+                && row.call_id == retired.call_id
+                && match &row.receipt {
+                    OperationIdempotencyReceipt::ServiceCommand { view, .. } => {
+                        view.command.command.command_id == retired.command_id
+                    }
+                    OperationIdempotencyReceipt::ControlCommand { view, .. } => {
+                        view.command.command_id == retired.command_id
+                    }
+                    OperationIdempotencyReceipt::CreateCall => false,
+                }
+        });
+        if active_is_same_command {
+            return false;
+        }
+
+        match retired.receipt_kind {
+            RetiredOperationReceiptKind::ServiceCommand => state
+                .service_command_results
+                .get(&retired.command_id)
+                .is_some_and(|stored| {
+                    stored.request.command.tenant_id == retired.tenant_id
+                        && stored.request.command.call_id == retired.call_id
+                        && idempotency_expiry(stored.request.command.at).ok()
+                            == Some(retired.expires_at)
+                        && stored
+                            .request
+                            .operation_idempotency
+                            .as_ref()
+                            .is_some_and(|claim| {
+                                claim.key_digest == retired.key_digest
+                                    && claim.request_digest == retired.request_digest
+                                    && claim.operation == retired.operation
+                            })
+                }),
+            RetiredOperationReceiptKind::ControlCommand => state
+                .control_command_results
+                .get(&retired.command_id)
+                .is_some_and(|stored| {
+                    stored.request.tenant_id == retired.tenant_id
+                        && stored.request.call_id == retired.call_id
+                        && idempotency_expiry(stored.request.at).ok() == Some(retired.expires_at)
+                        && stored
+                            .request
+                            .operation_idempotency
+                            .as_ref()
+                            .is_some_and(|claim| {
+                                claim.key_digest == retired.key_digest
+                                    && claim.request_digest == retired.request_digest
+                                    && claim.operation == retired.operation
+                            })
+                }),
+        }
+    }
+
+    fn service_operation_claim_has_proof(
+        state: &MemoryState,
+        result: &StoredServiceCommandResult,
+        claim: &OperationIdempotency,
+    ) -> bool {
+        let key = (result.request.command.tenant_id.clone(), claim.key_digest);
+        state.idempotency.get(&key).is_some_and(|row| {
+            row.request_digest == claim.request_digest
+                && row.call_id == result.request.command.call_id
+                && matches!(
+                    &row.receipt,
+                    OperationIdempotencyReceipt::ServiceCommand { operation, view }
+                        if *operation == claim.operation && **view == result.view
+                )
+        }) || state
+            .retired_operation_claims
+            .get(&result.request.command.command_id)
+            .is_some_and(|retired| {
+                retired.receipt_kind == RetiredOperationReceiptKind::ServiceCommand
+                    && retired.tenant_id == result.request.command.tenant_id
+                    && retired.key_digest == claim.key_digest
+                    && retired.request_digest == claim.request_digest
+                    && retired.call_id == result.request.command.call_id
+                    && retired.operation == claim.operation
+            })
+    }
+
+    fn control_operation_claim_has_proof(
+        state: &MemoryState,
+        result: &StoredControlCommandResult,
+        claim: &OperationIdempotency,
+    ) -> bool {
+        let key = (result.request.tenant_id.clone(), claim.key_digest);
+        state.idempotency.get(&key).is_some_and(|row| {
+            row.request_digest == claim.request_digest
+                && row.call_id == result.request.call_id
+                && matches!(
+                    &row.receipt,
+                    OperationIdempotencyReceipt::ControlCommand { operation, view }
+                        if *operation == claim.operation && **view == result.view
+                )
+        }) || state
+            .retired_operation_claims
+            .get(&result.request.command_id)
+            .is_some_and(|retired| {
+                retired.receipt_kind == RetiredOperationReceiptKind::ControlCommand
+                    && retired.tenant_id == result.request.tenant_id
+                    && retired.key_digest == claim.key_digest
+                    && retired.request_digest == claim.request_digest
+                    && retired.call_id == result.request.call_id
+                    && retired.operation == claim.operation
+            })
+    }
+
+    fn control_retirement_is_explained(state: &MemoryState, record: &ControlOutboxRecord) -> bool {
+        state
+            .control_retirements
+            .get(&record.effect_id)
+            .is_some_and(|receipt| Self::control_retirement_crosslinks(state, receipt))
+    }
+
+    fn control_retirement_crosslinks(
+        state: &MemoryState,
+        receipt: &ControlRetirementReceipt,
+    ) -> bool {
+        let Some(record) = state.control_outbox.get(&receipt.effect_id) else {
+            return false;
+        };
+        let Some(result) = state.command_results.get(&receipt.command_id) else {
+            return false;
+        };
+        record.tenant_id == receipt.tenant_id
+            && !state
+                .reconciliation_results
+                .contains_key(&receipt.effect_id)
+            && record.call_id == receipt.call_id
+            && record.leg_id == receipt.leg_id
+            && record.binding_generation == receipt.binding_generation
+            && matches!(
+                &record.state,
+                OutboxState::Failed { at, failure }
+                    if *at == receipt.retired_at && *failure == receipt.failure
+            )
+            && receipt.failure
+                == FailureDetails::sanitized(
+                    "binding_retired",
+                    "control target binding retired",
+                    false,
+                )
+            && result.command.call_id == receipt.call_id
+            && result.command.tenant_id == receipt.tenant_id
+            && result.command.recorded_at == receipt.retired_at
+            && result.command.disposition == CommandDisposition::Applied
+            && result.command.result_version.value() > result.command.observed_version.value()
+            && result.call.aggregate.leg(receipt.leg_id).is_none_or(|leg| {
+                leg.binding_generation() != receipt.binding_generation
+                    || !matches!(leg.state(), LegState::Connected | LegState::Held)
+            })
     }
 
     fn reconciliation_request_matches_effect(
@@ -1814,7 +2080,7 @@ impl CallRepository for MemoryRepository {
                 {
                     return Err(RepositoryError::ProviderReferenceConflict);
                 }
-                if state.execution_plans.contains_key(&target.call_id) {
+                if state.service_managed_calls.contains(&target.call_id) {
                     return Err(RepositoryError::InvalidInput(
                         "service-managed provider event requires service reconciliation",
                     ));
@@ -2008,7 +2274,7 @@ impl CallRepository for MemoryRepository {
             if state
                 .outbox
                 .get(&effect_id)
-                .is_some_and(|record| state.execution_plans.contains_key(&record.call_id))
+                .is_some_and(|record| state.service_managed_calls.contains(&record.call_id))
             {
                 return Err(RepositoryError::InvalidInput(
                     "service-managed effect requires service reconciliation",
@@ -2216,10 +2482,11 @@ impl CallServiceRepository for MemoryRepository {
             let plan = request.plan;
             match create_call_in_state(state, request.create)? {
                 CreateCallOutcome::Created(call) => {
-                    if state
-                        .execution_plans
-                        .insert(call.aggregate.id(), plan.clone())
-                        .is_some()
+                    if !state.service_managed_calls.insert(call.aggregate.id())
+                        || state
+                            .execution_plans
+                            .insert(call.aggregate.id(), plan.clone())
+                            .is_some()
                     {
                         return Err(RepositoryError::Unavailable);
                     }
@@ -2230,6 +2497,9 @@ impl CallServiceRepository for MemoryRepository {
                 }
                 CreateCallOutcome::Replayed(call) => {
                     let call_id = call.aggregate.id();
+                    if !state.service_managed_calls.contains(&call_id) {
+                        return Err(RepositoryError::Unavailable);
+                    }
                     let original = state
                         .execution_plans
                         .get(&call_id)
@@ -2251,6 +2521,9 @@ impl CallServiceRepository for MemoryRepository {
     ) -> Result<StoredServiceCall, RepositoryError> {
         self.read(|state| {
             let call = tenant_call(state, tenant_id, call_id)?;
+            if !state.service_managed_calls.contains(&call_id) {
+                return Err(RepositoryError::NotFound);
+            }
             let plan = state
                 .execution_plans
                 .get(&call_id)
@@ -2433,9 +2706,7 @@ fn replay_service_operation(
     let Some(idempotency) = &request.operation_idempotency else {
         return Ok(None);
     };
-    state
-        .idempotency
-        .retain(|_, existing| existing.expires_at > request.command.at);
+    retire_expired_idempotency(state, request.command.at)?;
     let key = (request.command.tenant_id.clone(), idempotency.key_digest);
     let Some(existing) = state.idempotency.get(&key).cloned() else {
         return Ok(None);
@@ -2464,9 +2735,7 @@ fn replay_control_operation(
     let Some(idempotency) = &request.operation_idempotency else {
         return Ok(None);
     };
-    state
-        .idempotency
-        .retain(|_, existing| existing.expires_at > request.at);
+    retire_expired_idempotency(state, request.at)?;
     let key = (request.tenant_id.clone(), idempotency.key_digest);
     let Some(existing) = state.idempotency.get(&key).cloned() else {
         return Ok(None);
@@ -2511,6 +2780,69 @@ fn retain_operation_receipt(
         .is_some()
     {
         return Err(RepositoryError::Unavailable);
+    }
+    Ok(())
+}
+
+fn retire_expired_idempotency(
+    state: &mut MemoryState,
+    at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    let expired = state
+        .idempotency
+        .iter()
+        .filter(|(_, row)| row.expires_at <= at)
+        .map(|((tenant_id, key_digest), _)| (tenant_id.clone(), *key_digest))
+        .collect::<Vec<_>>();
+    for (tenant_id, key_digest) in expired {
+        let key = (tenant_id.clone(), key_digest);
+        let row = state
+            .idempotency
+            .get(&key)
+            .cloned()
+            .ok_or(RepositoryError::Unavailable)?;
+        if !MemoryRepository::idempotency_receipt_crosslinks(state, &tenant_id, key_digest, &row) {
+            return Err(RepositoryError::Unavailable);
+        }
+        let retired = match &row.receipt {
+            OperationIdempotencyReceipt::CreateCall => None,
+            OperationIdempotencyReceipt::ServiceCommand { operation, view } => {
+                Some(RetiredOperationClaim {
+                    tenant_id: tenant_id.clone(),
+                    key_digest,
+                    request_digest: row.request_digest,
+                    call_id: row.call_id,
+                    command_id: view.command.command.command_id,
+                    operation: *operation,
+                    receipt_kind: RetiredOperationReceiptKind::ServiceCommand,
+                    expires_at: row.expires_at,
+                    retired_at: at,
+                })
+            }
+            OperationIdempotencyReceipt::ControlCommand { operation, view } => {
+                Some(RetiredOperationClaim {
+                    tenant_id: tenant_id.clone(),
+                    key_digest,
+                    request_digest: row.request_digest,
+                    call_id: row.call_id,
+                    command_id: view.command.command_id,
+                    operation: *operation,
+                    receipt_kind: RetiredOperationReceiptKind::ControlCommand,
+                    expires_at: row.expires_at,
+                    retired_at: at,
+                })
+            }
+        };
+        state.idempotency.remove(&key);
+        if let Some(retired) = retired {
+            if state
+                .retired_operation_claims
+                .insert(retired.command_id, retired)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
     }
     Ok(())
 }
@@ -2566,7 +2898,11 @@ fn commit_service_command_in_state(
     {
         return Err(RepositoryError::CommandConflict);
     }
-    if !state.execution_plans.contains_key(&request.command.call_id) {
+    if !state
+        .service_managed_calls
+        .contains(&request.command.call_id)
+        || !state.execution_plans.contains_key(&request.command.call_id)
+    {
         return Err(RepositoryError::NotFound);
     }
 
@@ -2680,7 +3016,9 @@ fn enqueue_control_in_state(
         return Err(RepositoryError::CommandConflict);
     }
     ensure_call_worker(state, &request.tenant_id, request.call_id, request.worker)?;
-    if !state.execution_plans.contains_key(&request.call_id) {
+    if !state.service_managed_calls.contains(&request.call_id)
+        || !state.execution_plans.contains_key(&request.call_id)
+    {
         return Err(RepositoryError::NotFound);
     }
     let call = state
@@ -2988,7 +3326,9 @@ fn reconcile_effect_result_in_state(
     if let ServiceEffectSnapshot::Control(record) = &effect {
         validate_control_effect_target(call, record)?;
     }
-    if !state.execution_plans.contains_key(&request.call_id) {
+    if !state.service_managed_calls.contains(&request.call_id)
+        || !state.execution_plans.contains_key(&request.call_id)
+    {
         return Err(RepositoryError::NotFound);
     }
 
@@ -3365,7 +3705,7 @@ fn reject_service_managed_call(
     call_id: CallId,
     worker: WorkerLease,
 ) -> Result<(), RepositoryError> {
-    if state.execution_plans.contains_key(&call_id) {
+    if state.service_managed_calls.contains(&call_id) {
         ensure_call_worker(state, tenant_id, call_id, worker)?;
         Err(RepositoryError::InvalidInput(
             "service-managed call requires service repository transaction",
@@ -3561,9 +3901,7 @@ fn create_call_in_state(
     }
     let expires_at = idempotency_expiry(request.at)?;
 
-    state
-        .idempotency
-        .retain(|_, existing| existing.expires_at > request.at);
+    retire_expired_idempotency(state, request.at)?;
     let tenant_id = request.initial.tenant_id().clone();
     let idempotency_key = (tenant_id.clone(), request.idempotency_key);
     if let Some(existing) = state.idempotency.get(&idempotency_key) {
@@ -3740,7 +4078,7 @@ fn commit_command_in_state(
     let observed_version = current.aggregate.version();
     let (aggregate, effects, disposition) = decision.into_parts();
     if disposition == CommandDisposition::Applied {
-        retire_inactive_bindings(state, request.call_id, &aggregate)?;
+        retire_inactive_bindings(state, request.call_id, &aggregate, request.command_id)?;
     }
     let call = state
         .calls
@@ -3818,24 +4156,21 @@ fn retire_inactive_bindings(
     state: &mut MemoryState,
     call_id: CallId,
     next: &CallAggregate,
+    retirement_command_id: CommandId,
 ) -> Result<(), RepositoryError> {
-    for record in state.control_outbox.values_mut().filter(|record| {
-        record.call_id == call_id
-            && control_outbox_is_unfinished(record)
-            && next.leg(record.leg_id).is_none_or(|leg| {
-                leg.binding_generation() != record.binding_generation
-                    || !matches!(leg.state(), LegState::Connected | LegState::Held)
-            })
-    }) {
-        record.state = OutboxState::Failed {
-            at: next.updated_at(),
-            failure: FailureDetails::sanitized(
-                "binding_retired",
-                "control target binding retired",
-                false,
-            ),
-        };
-    }
+    let retired_control_effects = state
+        .control_outbox
+        .values()
+        .filter(|record| {
+            record.call_id == call_id
+                && control_outbox_is_unfinished(record)
+                && next.leg(record.leg_id).is_none_or(|leg| {
+                    leg.binding_generation() != record.binding_generation
+                        || !matches!(leg.state(), LegState::Connected | LegState::Held)
+                })
+        })
+        .map(|record| record.effect_id)
+        .collect::<Vec<_>>();
 
     let retired = state
         .calls
@@ -3872,20 +4207,35 @@ fn retire_inactive_bindings(
         if state.principal_bindings.get(&principal_binding_key) == Some(&binding.connection_id) {
             state.principal_bindings.remove(&principal_binding_key);
         }
-        for record in state.control_outbox.values_mut().filter(|record| {
-            record.call_id == call_id
-                && record.leg_id == leg_id
-                && record.binding_generation == binding.binding_generation
-                && control_outbox_is_unfinished(record)
-        }) {
-            record.state = OutboxState::Failed {
-                at: next.updated_at(),
-                failure: FailureDetails::sanitized(
-                    "binding_retired",
-                    "control target binding retired",
-                    false,
-                ),
-            };
+    }
+
+    for effect_id in retired_control_effects {
+        let failure =
+            FailureDetails::sanitized("binding_retired", "control target binding retired", false);
+        let record = state
+            .control_outbox
+            .get_mut(&effect_id)
+            .ok_or(RepositoryError::Unavailable)?;
+        record.state = OutboxState::Failed {
+            at: next.updated_at(),
+            failure: failure.clone(),
+        };
+        let receipt = ControlRetirementReceipt {
+            effect_id,
+            command_id: retirement_command_id,
+            tenant_id: record.tenant_id.clone(),
+            call_id: record.call_id,
+            leg_id: record.leg_id,
+            binding_generation: record.binding_generation,
+            retired_at: next.updated_at(),
+            failure,
+        };
+        if state
+            .control_retirements
+            .insert(effect_id, receipt)
+            .is_some()
+        {
+            return Err(RepositoryError::Unavailable);
         }
     }
     Ok(())
@@ -4573,8 +4923,24 @@ mod tests {
         };
 
         let snapshot = repo.snapshot().unwrap();
+        assert_eq!(
+            snapshot.service_managed_calls,
+            vec![stored.call.aggregate.id()]
+        );
         assert_eq!(snapshot.execution_plans.len(), 1);
         assert_eq!(snapshot.service_command_results.len(), 1);
+        let mut missing_plan = snapshot.clone();
+        missing_plan.execution_plans.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_plan),
+            Err(RepositoryError::Unavailable)
+        ));
+        let mut missing_marker = snapshot.clone();
+        missing_marker.service_managed_calls.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_marker),
+            Err(RepositoryError::Unavailable)
+        ));
         let recovered = MemoryRepository::from_snapshot(snapshot).unwrap();
         assert_eq!(
             recovered
@@ -4598,9 +4964,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_idempotency_snapshot_requires_current_rows_but_allows_state_progress() {
+    async fn service_snapshot_requires_outbound_binding_and_reconciliation_evidence() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-service-evidence");
+        let aggregate = new_call(owner.clone());
+        let call_id = aggregate.id();
+        let outbound_leg = aggregate.legs()[1].id();
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[0].id(),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                },
+                LegExecutionSpec {
+                    leg_id: outbound_leg,
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/evidence".into()),
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+        repo.create_with_plan(ServiceCreateTransaction {
+            create: create_request(aggregate, worker.lease, 92, 93),
+            plan,
+        })
+        .await
+        .unwrap();
+        repo.bind_outbound_connection(OutboundConnectionBind {
+            operation_id: CommandId::new(),
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: worker.lease,
+            connection_id: ConnectionId::from_string("outbound-evidence"),
+            transport: AttachmentTransport::WebRtc,
+            principal_fingerprint: PrincipalFingerprint::new(digest(94)),
+            at: at(3),
+        })
+        .await
+        .unwrap();
+        let claimed = repo
+            .claim_outbox(worker.lease, at(3), Duration::from_secs(10), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        repo.reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner,
+            call_id,
+            effect_id: claimed.record.effect_id,
+            worker: worker.lease,
+            claim_generation: claimed.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: None,
+            follow_up: None,
+            at: at(4),
+        })
+        .await
+        .unwrap();
+
+        let snapshot = repo.snapshot().unwrap();
+        MemoryRepository::from_snapshot(snapshot.clone()).unwrap();
+        let mut missing_binding_receipt = snapshot.clone();
+        missing_binding_receipt.outbound_binding_results.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_binding_receipt),
+            Err(RepositoryError::Unavailable)
+        ));
+        let mut missing_reconciliation = snapshot;
+        missing_reconciliation.reconciliation_results.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_reconciliation),
+            Err(RepositoryError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_idempotency_snapshot_requires_current_rows_but_allows_state_progress() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
         let owner = tenant("tenant-control-receipt-snapshot");
         let aggregate = new_call(owner.clone());
         let call_id = aggregate.id();
@@ -4708,7 +5154,7 @@ mod tests {
                 IdempotencyRow {
                     request_digest,
                     call_id,
-                    expires_at: at(1_000),
+                    expires_at: idempotency_expiry(at(4))?,
                     receipt: OperationIdempotencyReceipt::ControlCommand {
                         operation: ServiceOperationKind::DtmfCall,
                         view: Box::new(view),
@@ -4757,6 +5203,108 @@ mod tests {
         view.command.recorded_at = at(6);
         assert!(matches!(
             MemoryRepository::from_snapshot(mismatched_receipt),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let retirement_at = idempotency_expiry(at(4)).unwrap();
+        repo.create_call(create_request_at(
+            new_call(owner.clone()),
+            worker.lease,
+            70,
+            91,
+            retirement_at,
+        ))
+        .await
+        .unwrap();
+        let retired = repo.snapshot().unwrap();
+        assert_eq!(retired.retired_operation_claims.len(), 1);
+        assert!(retired.idempotency.iter().any(|row| {
+            row.tenant_id == owner
+                && row.key_digest == key_digest
+                && matches!(row.row.receipt, OperationIdempotencyReceipt::CreateCall)
+        }));
+        MemoryRepository::from_snapshot(retired.clone()).unwrap();
+
+        let mut missing_tombstone = retired.clone();
+        missing_tombstone.retired_operation_claims.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_tombstone),
+            Err(RepositoryError::Unavailable)
+        ));
+        let mut premature_tombstone = retired.clone();
+        premature_tombstone.retired_operation_claims[0].retired_at = at(4);
+        assert!(matches!(
+            MemoryRepository::from_snapshot(premature_tombstone),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let current = repo.load_service_call(&owner, call_id).await.unwrap();
+        let retirement_command = CommandId::new();
+        let retirement_at = retirement_at + chrono::Duration::seconds(1);
+        assert!(matches!(
+            repo.commit_with_effect_payloads(ServiceCommandTransaction {
+                command: CommandCommit {
+                    tenant_id: owner,
+                    call_id,
+                    expected_version: current.call.aggregate.version(),
+                    command_id: retirement_command,
+                    command: CallCommand::BeginEnding {
+                        at: retirement_at,
+                        ending_deadline: Some(retirement_at + chrono::Duration::seconds(30)),
+                        reason: StopLegReason::Requested,
+                    },
+                    worker: worker.lease,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                    at: retirement_at,
+                },
+                effect_payloads: Vec::new(),
+                operation_idempotency: None,
+            })
+            .await
+            .unwrap(),
+            ServiceCommandOutcome::Committed(_)
+        ));
+
+        let retired_control = repo.snapshot().unwrap();
+        assert_eq!(retired_control.control_retirements.len(), 1);
+        assert_eq!(retired_control.control_retirements[0].effect_id, effect_id);
+        assert_eq!(
+            retired_control.control_retirements[0].command_id,
+            retirement_command
+        );
+        MemoryRepository::from_snapshot(retired_control.clone()).unwrap();
+
+        let mut missing_receipt = retired_control.clone();
+        missing_receipt.control_retirements.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_receipt),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut ignored_cause = retired_control.clone();
+        let causal = ignored_cause
+            .commands
+            .iter_mut()
+            .find(|row| row.command.command_id == retirement_command)
+            .unwrap();
+        causal.command.disposition = CommandDisposition::IgnoredNoop;
+        causal.result.command.disposition = CommandDisposition::IgnoredNoop;
+        assert!(matches!(
+            MemoryRepository::from_snapshot(ignored_cause),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut nonadvancing_cause = retired_control;
+        let causal = nonadvancing_cause
+            .commands
+            .iter_mut()
+            .find(|row| row.command.command_id == retirement_command)
+            .unwrap();
+        causal.command.result_version = causal.command.observed_version;
+        causal.result.command.result_version = causal.result.command.observed_version;
+        assert!(matches!(
+            MemoryRepository::from_snapshot(nonadvancing_cause),
             Err(RepositoryError::Unavailable)
         ));
     }
