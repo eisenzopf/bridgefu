@@ -16,9 +16,10 @@ use bridgefu::call_service::{
     AmazonConnectEndpointConfig, CallExecutionPlan, CallServiceRepository, CompletedServiceEffect,
     ControlCommandOutcome, ControlCommandTransaction, ControlIntent, DtmfSequence,
     EffectResultOutcome, EffectResultReconciliation, ExternalReferenceBinding,
-    ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, OperationIdempotency,
-    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
+    ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, MediaActivityCommit,
+    MediaActivityGeneration, MediaActivityGuard, OperationIdempotency, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
+    ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
     ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
     WebRtcEndpointConfig,
@@ -121,6 +122,7 @@ fn sip_webrtc_create(
                 }),
             },
         ],
+        principal(key),
     )
     .unwrap();
     let create = CreateCall {
@@ -185,6 +187,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
                 endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
             },
         ],
+        principal(key),
     )
     .unwrap();
     ServiceCreateTransaction {
@@ -236,6 +239,7 @@ async fn service_command(
             effect_payloads: Vec::new(),
             operation_idempotency: None,
             bound_connection: None,
+            media_activity: None,
         })
         .await
         .unwrap();
@@ -300,7 +304,7 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
         worker,
         connection_id: ConnectionId::from_string(format!("outbound-{key}")),
         transport: AttachmentTransport::WebRtc,
-        principal_fingerprint: principal(2),
+        principal_fingerprint: principal(key),
         at: at(4),
     };
     assert!(matches!(
@@ -396,6 +400,9 @@ fn transfer_operation(
         effect_payloads: vec![ServiceEffectPayloadInput {
             ordinal,
             payload: ServiceEffectPayload::Transfer {
+                target_leg_id: fixture.service_call.call.aggregate.legs()[0].id(),
+                target_binding_generation: fixture.service_call.call.aggregate.legs()[0]
+                    .binding_generation(),
                 target: TransferTarget::Sip {
                     uri: destination.to_owned(),
                 },
@@ -407,6 +414,7 @@ fn transfer_operation(
             ServiceOperationKind::TransferCall,
         )),
         bound_connection: None,
+        media_activity: None,
     }
 }
 
@@ -466,21 +474,48 @@ async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
     );
 
     let duplicate = [original_plan.legs[0].clone(), original_plan.legs[0].clone()];
-    assert!(CallExecutionPlan::new(&request.create.initial, duplicate).is_err());
+    assert!(CallExecutionPlan::new(&request.create.initial, duplicate, principal(1)).is_err());
     let mut wrong_kind = original_plan.legs.clone();
     wrong_kind[1].endpoint = LegEndpointConfig::AmazonConnect(AmazonConnectEndpointConfig {
         instance_id: "instance".to_owned(),
         contact_flow_id: "flow".to_owned(),
     });
-    assert!(CallExecutionPlan::new(&request.create.initial, wrong_kind).is_err());
+    assert!(CallExecutionPlan::new(&request.create.initial, wrong_kind, principal(1)).is_err());
     let mut missing_outbound = original_plan.legs.clone();
     missing_outbound[1].endpoint = LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
         signaling_uri: None,
     });
-    assert!(CallExecutionPlan::new(&request.create.initial, missing_outbound).is_err());
+    assert!(
+        CallExecutionPlan::new(&request.create.initial, missing_outbound, principal(1)).is_err()
+    );
+
+    let mut legacy_value = serde_json::to_value(&original_plan).unwrap();
+    let legacy_object = legacy_value.as_object_mut().unwrap();
+    legacy_object.insert("version".to_owned(), serde_json::json!(1));
+    legacy_object.remove("authorization_principal_fingerprint");
+    let legacy_plan: CallExecutionPlan = serde_json::from_value(legacy_value).unwrap();
+    legacy_plan
+        .validate_against(&request.create.initial)
+        .unwrap();
+    assert!(legacy_plan.authorization_principal_fingerprint().is_err());
+    let mut legacy_create = request.clone();
+    legacy_create.plan = legacy_plan;
+    assert_eq!(
+        repository.create_with_plan(legacy_create).await,
+        Err(RepositoryError::InvalidInput(
+            "execution plan has no durable outbound authorization"
+        ))
+    );
 
     let created = created(repository.create_with_plan(request.clone()).await.unwrap());
     assert_eq!(created.plan, original_plan);
+    assert_eq!(
+        created.plan.authorization_principal_fingerprint().unwrap(),
+        principal(10)
+    );
+    let plan_debug = format!("{:?}", created.plan);
+    assert!(plan_debug.contains("[redacted]"));
+    assert!(!plan_debug.contains("10, 10"));
     let outbound_leg = created.call.aggregate.legs()[1].id();
     let advanced = service_command(
         &repository,
@@ -601,6 +636,8 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
         effect_payloads: vec![ServiceEffectPayloadInput {
             ordinal,
             payload: ServiceEffectPayload::Transfer {
+                target_leg_id: before.aggregate.legs()[0].id(),
+                target_binding_generation: before.aggregate.legs()[0].binding_generation(),
                 target: TransferTarget::Sip {
                     uri: destination.to_owned(),
                 },
@@ -608,6 +645,7 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
         }],
         operation_idempotency: None,
         bound_connection: None,
+        media_activity: None,
     };
 
     assert_eq!(
@@ -684,6 +722,8 @@ async fn operation_idempotency_replays_original_before_time_and_cas_evaluation()
         effect_payloads: vec![ServiceEffectPayloadInput {
             ordinal: 1,
             payload: ServiceEffectPayload::Transfer {
+                target_leg_id: before.aggregate.legs()[0].id(),
+                target_binding_generation: before.aggregate.legs()[0].binding_generation(),
                 target: TransferTarget::Sip {
                     uri: "sip:replay@example.test".to_owned(),
                 },
@@ -695,6 +735,7 @@ async fn operation_idempotency_replays_original_before_time_and_cas_evaluation()
             ServiceOperationKind::TransferCall,
         )),
         bound_connection: None,
+        media_activity: None,
     };
     let ServiceCommandOutcome::Committed(original) = repository
         .commit_with_effect_payloads(first.clone())
@@ -759,6 +800,7 @@ async fn operation_idempotency_conflicts_across_body_kind_and_create_receipt() {
             ServiceOperationKind::HangupCall,
         )),
         bound_connection: None,
+        media_activity: None,
     };
     assert_eq!(
         repository.commit_with_effect_payloads(wrong_kind).await,
@@ -1234,6 +1276,7 @@ async fn operation_idempotency_keys_are_isolated_by_tenant() {
             ServiceOperationKind::HangupCall,
         )),
         bound_connection: None,
+        media_activity: None,
     };
     assert!(matches!(
         repository
@@ -1508,6 +1551,15 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
         OutboundConnectionBindOutcome::Replayed(_)
     ));
 
+    let mut wrong_authority = fixture.outbound_bind.clone();
+    wrong_authority.operation_id = CommandId::new();
+    wrong_authority.connection_id = ConnectionId::from_string("wrong-authority-connection");
+    wrong_authority.principal_fingerprint = principal(99);
+    assert_eq!(
+        repository.bind_outbound_connection(wrong_authority).await,
+        Err(RepositoryError::StaleClaim)
+    );
+
     let mut wrong_tenant = fixture.outbound_bind.clone();
     wrong_tenant.operation_id = CommandId::new();
     wrong_tenant.tenant_id = tenant("wrong-owner");
@@ -1568,13 +1620,170 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
         worker: fixture.worker,
         connection_id: fixture.outbound_bind.connection_id,
         transport: AttachmentTransport::WebRtc,
-        principal_fingerprint: principal(9),
+        principal_fingerprint: principal(41),
         at: at(21),
     };
     assert_eq!(
         repository.bind_outbound_connection(reused).await,
         Err(RepositoryError::AttachmentConflict)
     );
+}
+
+#[tokio::test]
+async fn media_activity_is_exact_consecutive_and_cannot_resurrect_cancelled_deadline() {
+    let (repository, fixture) = active_fixture(42).await;
+    let inbound_leg = fixture.service_call.call.aggregate.legs()[0].id();
+    let connection_id = ConnectionId::from_string("inbound-42");
+    let first = MediaActivityCommit {
+        tenant_id: fixture.owner.clone(),
+        call_id: fixture.service_call.call.aggregate.id(),
+        expected_version: fixture.service_call.call.aggregate.version(),
+        command_id: CommandId::new(),
+        leg_id: inbound_leg,
+        binding_generation: BindingGeneration::INITIAL,
+        connection_id: connection_id.clone(),
+        activity_generation: MediaActivityGeneration::INITIAL,
+        worker: fixture.worker,
+        at: at(8),
+        due_at: at(38),
+    };
+    assert_eq!(
+        repository
+            .commit_with_effect_payloads(ServiceCommandTransaction {
+                command: CommandCommit {
+                    tenant_id: first.tenant_id.clone(),
+                    call_id: first.call_id,
+                    expected_version: first.expected_version,
+                    command_id: CommandId::new(),
+                    command: CallCommand::ArmDeadline {
+                        at: first.at,
+                        kind: bridgefu::call_engine::DeadlineKind::Media,
+                        due_at: first.due_at,
+                    },
+                    worker: first.worker,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                    at: first.at,
+                },
+                effect_payloads: Vec::new(),
+                operation_idempotency: None,
+                bound_connection: None,
+                media_activity: Some(MediaActivityGuard {
+                    connection_id: first.connection_id.clone(),
+                    leg_id: first.leg_id,
+                    binding_generation: first.binding_generation,
+                    activity_generation: first.activity_generation,
+                }),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "media activity requires the guarded repository operation"
+        ))
+    );
+    let ServiceCommandOutcome::Committed(first_view) = repository
+        .commit_media_activity(first.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh media activity replayed")
+    };
+    assert_eq!(
+        first_view
+            .command
+            .call
+            .aggregate
+            .deadlines()
+            .get(bridgefu::call_engine::DeadlineKind::Media)
+            .due_at(),
+        Some(at(38))
+    );
+    assert!(matches!(
+        repository.commit_media_activity(first.clone()).await.unwrap(),
+        ServiceCommandOutcome::Replayed(ref replayed) if replayed == &first_view
+    ));
+
+    let mut stale = first.clone();
+    stale.command_id = CommandId::new();
+    stale.expected_version = first_view.command.call.aggregate.version();
+    stale.at = at(9);
+    stale.due_at = at(39);
+    assert_eq!(
+        repository.commit_media_activity(stale.clone()).await,
+        Err(RepositoryError::StaleClaim)
+    );
+    let mut skipped = stale.clone();
+    skipped.activity_generation = MediaActivityGeneration::INITIAL
+        .next()
+        .unwrap()
+        .next()
+        .unwrap();
+    assert_eq!(
+        repository.commit_media_activity(skipped).await,
+        Err(RepositoryError::StaleClaim)
+    );
+
+    let mut second = stale;
+    second.activity_generation = MediaActivityGeneration::INITIAL.next().unwrap();
+    let ServiceCommandOutcome::Committed(second_view) = repository
+        .commit_media_activity(second.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("second media activity replayed")
+    };
+    assert_eq!(
+        second_view
+            .command
+            .call
+            .aggregate
+            .deadlines()
+            .get(bridgefu::call_engine::DeadlineKind::Media)
+            .due_at(),
+        Some(at(39))
+    );
+
+    let ending = service_command(
+        &repository,
+        &second_view.command.call,
+        fixture.worker,
+        CallCommand::BeginEnding {
+            at: at(10),
+            ending_deadline: Some(at(40)),
+            reason: StopLegReason::Requested,
+        },
+        at(10),
+    )
+    .await;
+    assert!(ending
+        .aggregate
+        .deadlines()
+        .get(bridgefu::call_engine::DeadlineKind::Media)
+        .due_at()
+        .is_none());
+
+    let mut late = second;
+    late.command_id = CommandId::new();
+    late.expected_version = ending.aggregate.version();
+    late.activity_generation = MediaActivityGeneration::INITIAL
+        .next()
+        .unwrap()
+        .next()
+        .unwrap();
+    late.at = at(11);
+    late.due_at = at(41);
+    assert_eq!(
+        repository.commit_media_activity(late).await,
+        Err(RepositoryError::StaleClaim)
+    );
+    assert!(repository
+        .load_call(&fixture.owner, ending.aggregate.id())
+        .await
+        .unwrap()
+        .aggregate
+        .deadlines()
+        .get(bridgefu::call_engine::DeadlineKind::Media)
+        .due_at()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1813,6 +2022,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
         effect_payloads: Vec::new(),
         operation_idempotency: None,
         bound_connection: None,
+        media_activity: None,
     };
     let base = EffectResultReconciliation {
         tenant_id: owner.clone(),

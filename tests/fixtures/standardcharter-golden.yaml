@@ -36,6 +36,7 @@ runtime:
   mode: all-in-one
   max_concurrent_calls: 8
   setup_timeout_secs: 2
+  media_idle_timeout_secs: 30
   drain_timeout_secs: 1
 
 observability:

@@ -28,6 +28,14 @@ legacy operational contract remains intact.
 Active media stays worker-local. Draining refuses new work, allows the bounded
 drain interval, and ends remaining legs; 1.0 does not migrate sessions.
 
+The immutable execution plan carries the redacted authorization fingerprint
+needed to prepare outbound rvoip routes after restart. Transfers identify one
+existing leg and its exact binding generation in the durable effect payload.
+Once authoritative rvoip media activity begins, each exact route advances a
+durable activity generation and atomically refreshes `DeadlineKind::Media`
+using `runtime.media_idle_timeout_secs`. Duplicate, skipped, retired-route, and
+post-teardown observations cannot resurrect that deadline.
+
 ## Broadcast state
 
 `POST /v1/calls/{id}/broadcasts` selects exactly one source graph and adds an

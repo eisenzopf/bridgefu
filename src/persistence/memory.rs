@@ -6,7 +6,7 @@
 //! rollback semantics over throughput; clustered deployments use the SQL
 //! implementations added by the next roadmap item.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -38,12 +38,13 @@ use crate::call_service::{
     ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction,
     ControlCommandView, ControlOutboxRecord, ControlSequence, EffectResultOutcome,
     EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
-    OperationIdempotency, OperationIdempotencyReceipt, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
-    ProviderEventReconciliationTransaction, ProviderEventReconciliationView, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction,
-    ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind,
-    StoredControlCommand, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    MediaActivityCommit, MediaActivityGeneration, MediaActivityGuard, OperationIdempotency,
+    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
+    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction,
+    ProviderEventReconciliationView, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, StoredControlCommand,
+    StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -321,6 +322,7 @@ struct MemoryState {
     execution_plans: HashMap<CallId, CallExecutionPlan>,
     service_effect_payloads: HashMap<EffectId, StoredServiceEffectPayload>,
     service_command_results: HashMap<CommandId, StoredServiceCommandResult>,
+    media_activity_generations: HashMap<BindingKey, MediaActivityGeneration>,
     control_commands: HashMap<CommandId, StoredControlCommand>,
     control_command_results: HashMap<CommandId, StoredControlCommandResult>,
     control_outbox: HashMap<EffectId, ControlOutboxRecord>,
@@ -804,9 +806,13 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
+        let mut recovered_media_activity =
+            HashMap::<BindingKey, BTreeSet<MediaActivityGeneration>>::new();
         for persisted in snapshot.service_command_results {
             let result = persisted.result;
+            let media_activity = result.request.media_activity.clone();
             let request = &result.request.command;
+            let result_call_id = request.call_id;
             let stored = &result.view.command.command;
             let request_matches = request.command_id == stored.command_id
                 && request.tenant_id == stored.tenant_id
@@ -825,6 +831,10 @@ impl MemoryRepository {
                 .all(|(requested, stored)| {
                     requested.ordinal == stored.ordinal
                         && requested.payload == stored.payload
+                        && transfer_payload_matches_aggregate(
+                            &requested.payload,
+                            &result.view.command.call.aggregate,
+                        )
                         && stored.command_id == persisted.command_id
                         && result.view.command.outbox.iter().any(|effect| {
                             effect.effect_id == stored.effect_id
@@ -854,6 +864,37 @@ impl MemoryRepository {
                     .service_command_results
                     .insert(persisted.command_id, result)
                     .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+            if let Some(activity) = media_activity {
+                let key = (result_call_id, activity.leg_id, activity.binding_generation);
+                if !recovered_media_activity
+                    .entry(key)
+                    .or_default()
+                    .insert(activity.activity_generation)
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+        }
+        for (key, generations) in recovered_media_activity {
+            let mut previous: Option<MediaActivityGeneration> = None;
+            for generation in &generations {
+                let expected = match previous {
+                    Some(previous) => previous.next().map_err(|_| RepositoryError::Unavailable)?,
+                    None => MediaActivityGeneration::INITIAL,
+                };
+                if *generation != expected {
+                    return Err(RepositoryError::Unavailable);
+                }
+                previous = Some(*generation);
+            }
+            let latest = previous.ok_or(RepositoryError::Unavailable)?;
+            if state
+                .media_activity_generations
+                .insert(key, latest)
+                .is_some()
             {
                 return Err(RepositoryError::Unavailable);
             }
@@ -990,6 +1031,11 @@ impl MemoryRepository {
                 .aggregate
                 .leg(request.leg_id)
                 .ok_or(RepositoryError::Unavailable)?;
+            let authorization_matches = state
+                .execution_plans
+                .get(&request.call_id)
+                .and_then(|plan| plan.authorization_principal_fingerprint().ok())
+                == Some(request.principal_fingerprint);
             if persisted.operation_id != request.operation_id
                 || result.binding.connection_id != request.connection_id
                 || result.binding.leg_id != request.leg_id
@@ -1005,6 +1051,7 @@ impl MemoryRepository {
                 })
                 || !state.service_managed_calls.contains(&request.call_id)
                 || !state.execution_plans.contains_key(&request.call_id)
+                || !authorization_matches
                 || !outbound_connection_ids.insert(request.connection_id.clone())
                 || state
                     .outbound_binding_results
@@ -1194,6 +1241,7 @@ impl MemoryRepository {
                         !Self::service_operation_claim_has_proof(&state, result, claim)
                     })
                     || !Self::bound_connection_guard_crosslinks(&state, result)
+                    || !Self::media_activity_guard_crosslinks(&state, result)
             })
             || state.control_command_results.values().any(|result| {
                 result
@@ -1340,21 +1388,71 @@ impl MemoryRepository {
             return false;
         }
         let call_id = result.request.command.call_id;
+        Self::connection_guard_has_historical_binding(
+            state,
+            call_id,
+            guard.leg_id,
+            guard.binding_generation,
+            &guard.connection_id,
+        )
+    }
+
+    fn media_activity_guard_crosslinks(
+        state: &MemoryState,
+        result: &StoredServiceCommandResult,
+    ) -> bool {
+        let Some(guard) = &result.request.media_activity else {
+            return true;
+        };
+        if !matches!(
+            result.request.command.command,
+            CallCommand::ArmDeadline {
+                kind: DeadlineKind::Media,
+                ..
+            }
+        ) {
+            return false;
+        }
+        let call_id = result.request.command.call_id;
+        let key = (call_id, guard.leg_id, guard.binding_generation);
+        state
+            .media_activity_generations
+            .get(&key)
+            .is_some_and(|latest| *latest >= guard.activity_generation)
+            && Self::connection_guard_has_historical_binding(
+                state,
+                call_id,
+                guard.leg_id,
+                guard.binding_generation,
+                &guard.connection_id,
+            )
+    }
+
+    fn connection_guard_has_historical_binding(
+        state: &MemoryState,
+        call_id: CallId,
+        leg_id: LegId,
+        binding_generation: BindingGeneration,
+        connection_id: &ConnectionId,
+    ) -> bool {
+        if !state.used_connection_ids.contains(connection_id) {
+            return false;
+        }
         state.attachments.values().any(|row| {
             row.call_id == call_id
-                && row.leg_id == guard.leg_id
-                && row.binding_generation == guard.binding_generation
+                && row.leg_id == leg_id
+                && row.binding_generation == binding_generation
                 && row.binding.as_ref().is_some_and(|binding| {
-                    binding.connection_id == guard.connection_id
-                        && binding.leg_id == guard.leg_id
-                        && binding.binding_generation == guard.binding_generation
+                    binding.connection_id == *connection_id
+                        && binding.leg_id == leg_id
+                        && binding.binding_generation == binding_generation
                 })
         }) || state.outbound_binding_results.values().any(|stored| {
             stored.request.call_id == call_id
-                && stored.request.leg_id == guard.leg_id
-                && stored.request.binding_generation == guard.binding_generation
-                && stored.request.connection_id == guard.connection_id
-                && stored.binding.connection_id == guard.connection_id
+                && stored.request.leg_id == leg_id
+                && stored.request.binding_generation == binding_generation
+                && stored.request.connection_id == *connection_id
+                && stored.binding.connection_id == *connection_id
         })
     }
 
@@ -1716,6 +1814,10 @@ fn validate_idempotency_snapshot(
                             EffectIntent::ExecuteTransfer { .. },
                             ServiceEffectPayload::Transfer { .. }
                         )
+                    )
+                    || !transfer_payload_matches_aggregate(
+                        &payload.payload,
+                        &view.command.call.aggregate,
                     )
                     || !payload_effects.insert(payload.effect_id)
                 {
@@ -2704,6 +2806,13 @@ impl CallServiceRepository for MemoryRepository {
         self.transaction(|state| commit_bound_connection_state_in_state(state, request))
     }
 
+    async fn commit_media_activity(
+        &self,
+        request: MediaActivityCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError> {
+        self.transaction(|state| commit_media_activity_in_state(state, request))
+    }
+
     async fn load_create_replay(
         &self,
         tenant_id: &TenantId,
@@ -2748,6 +2857,7 @@ impl CallServiceRepository for MemoryRepository {
         request: ServiceCreateTransaction,
     ) -> Result<ServiceCreateOutcome, RepositoryError> {
         request.plan.validate_against(&request.create.initial)?;
+        request.plan.authorization_principal_fingerprint()?;
         self.transaction(|state| {
             let ServiceCreateTransaction {
                 create,
@@ -2845,7 +2955,7 @@ impl CallServiceRepository for MemoryRepository {
         request: ServiceCommandTransaction,
     ) -> Result<ServiceCommandOutcome, RepositoryError> {
         let request = normalize_service_command(request)?;
-        self.transaction(|state| commit_service_command_in_state(state, request))
+        self.transaction(|state| commit_service_command_in_state(state, request, false))
     }
 
     async fn load_effect_payload(
@@ -3179,6 +3289,11 @@ fn retire_expired_idempotency(
 fn normalize_service_command(
     mut request: ServiceCommandTransaction,
 ) -> Result<ServiceCommandTransaction, RepositoryError> {
+    if request.bound_connection.is_some() && request.media_activity.is_some() {
+        return Err(RepositoryError::InvalidInput(
+            "service command cannot carry multiple connection guards",
+        ));
+    }
     if let Some(idempotency) = &request.operation_idempotency {
         idempotency.validate_service_command(&request.command.command)?;
     }
@@ -3198,6 +3313,21 @@ fn normalize_service_command(
                 "bound connection guard does not match lifecycle command",
             ));
         }
+    }
+    if request.media_activity.is_some()
+        && (request.operation_idempotency.is_some()
+            || !request.effect_payloads.is_empty()
+            || !matches!(
+                &request.command.command,
+                CallCommand::ArmDeadline {
+                    kind: DeadlineKind::Media,
+                    ..
+                }
+            ))
+    {
+        return Err(RepositoryError::InvalidInput(
+            "media activity guard does not match media deadline command",
+        ));
     }
     request
         .effect_payloads
@@ -3220,7 +3350,13 @@ fn normalize_service_command(
 fn commit_service_command_in_state(
     state: &mut MemoryState,
     request: ServiceCommandTransaction,
+    allow_media_activity: bool,
 ) -> Result<ServiceCommandOutcome, RepositoryError> {
+    if request.media_activity.is_some() && !allow_media_activity {
+        return Err(RepositoryError::InvalidInput(
+            "media activity requires the guarded repository operation",
+        ));
+    }
     if let Some(replayed) = replay_service_operation(state, &request)? {
         return Ok(replayed);
     }
@@ -3251,6 +3387,9 @@ fn commit_service_command_in_state(
     {
         return Err(RepositoryError::NotFound);
     }
+
+    validate_transfer_payload_targets(state, &request)?;
+    validate_media_activity_guard(state, &request)?;
 
     let core_request = request.command.clone();
     let core = match commit_command_in_state(state, core_request)? {
@@ -3310,6 +3449,7 @@ fn commit_service_command_in_state(
         effect_payloads: stored_payloads,
     };
     let operation_idempotency = request.operation_idempotency.clone();
+    let media_activity = request.media_activity.clone();
     let operation_at = request.command.at;
     let operation_tenant = request.command.tenant_id.clone();
     let operation_call = request.command.call_id;
@@ -3320,6 +3460,12 @@ fn commit_service_command_in_state(
             view: view.clone(),
         },
     );
+    if let Some(activity) = media_activity {
+        state.media_activity_generations.insert(
+            (operation_call, activity.leg_id, activity.binding_generation),
+            activity.activity_generation,
+        );
+    }
     if let Some(idempotency) = operation_idempotency {
         let operation = idempotency.operation;
         retain_operation_receipt(
@@ -3335,6 +3481,97 @@ fn commit_service_command_in_state(
         )?;
     }
     Ok(ServiceCommandOutcome::Committed(view))
+}
+
+fn validate_transfer_payload_targets(
+    state: &MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<(), RepositoryError> {
+    let call = state
+        .calls
+        .get(&request.command.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    for payload in &request.effect_payloads {
+        let ServiceEffectPayload::Transfer {
+            target_leg_id,
+            target_binding_generation,
+            ..
+        } = &payload.payload;
+        let leg = call
+            .aggregate
+            .leg(*target_leg_id)
+            .ok_or(RepositoryError::InvalidInput(
+                "transfer target leg does not belong to call",
+            ))?;
+        if leg.binding_generation() != *target_binding_generation {
+            return Err(RepositoryError::StaleClaim);
+        }
+        if !matches!(leg.state(), LegState::Connected | LegState::Held) {
+            return Err(RepositoryError::DomainRejected);
+        }
+    }
+    Ok(())
+}
+
+fn transfer_payload_matches_aggregate(
+    payload: &ServiceEffectPayload,
+    aggregate: &CallAggregate,
+) -> bool {
+    let ServiceEffectPayload::Transfer {
+        target_leg_id,
+        target_binding_generation,
+        ..
+    } = payload;
+    aggregate.leg(*target_leg_id).is_some_and(|leg| {
+        leg.binding_generation() == *target_binding_generation
+            && matches!(leg.state(), LegState::Connected | LegState::Held)
+    })
+}
+
+fn validate_media_activity_guard(
+    state: &MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<(), RepositoryError> {
+    let Some(activity) = &request.media_activity else {
+        return Ok(());
+    };
+    let call = state
+        .calls
+        .get(&request.command.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let leg = call
+        .aggregate
+        .leg(activity.leg_id)
+        .ok_or(RepositoryError::StaleClaim)?;
+    let binding = call
+        .bindings
+        .get(&activity.leg_id)
+        .filter(|binding| {
+            binding.connection_id == activity.connection_id
+                && binding.binding_generation == activity.binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    let key = (
+        request.command.call_id,
+        activity.leg_id,
+        activity.binding_generation,
+    );
+    if leg.binding_generation() != activity.binding_generation
+        || !matches!(leg.state(), LegState::Connected | LegState::Held)
+        || state.connection_owners.get(&activity.connection_id) != Some(&key)
+        || request.command.at < call.aggregate.updated_at()
+        || request.command.at < binding.bound_at
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    let expected = match state.media_activity_generations.get(&key) {
+        Some(previous) => previous.next()?,
+        None => MediaActivityGeneration::INITIAL,
+    };
+    if activity.activity_generation != expected {
+        return Err(RepositoryError::StaleClaim);
+    }
+    Ok(())
 }
 
 fn commit_bound_connection_state_in_state(
@@ -3378,6 +3615,7 @@ fn commit_bound_connection_state_in_state(
             leg_id: request.leg_id,
             binding_generation: request.binding_generation,
         }),
+        media_activity: None,
     })?;
 
     // Exact lost-response replay wins even after the call or binding advances.
@@ -3387,7 +3625,7 @@ fn commit_bound_connection_state_in_state(
         .service_command_results
         .contains_key(&transaction.command.command_id)
     {
-        return commit_service_command_in_state(state, transaction);
+        return commit_service_command_in_state(state, transaction, false);
     }
 
     ensure_call_worker(
@@ -3415,7 +3653,40 @@ fn commit_bound_connection_state_in_state(
     {
         return Err(RepositoryError::StaleClaim);
     }
-    commit_service_command_in_state(state, transaction)
+    commit_service_command_in_state(state, transaction, false)
+}
+
+fn commit_media_activity_in_state(
+    state: &mut MemoryState,
+    request: MediaActivityCommit,
+) -> Result<ServiceCommandOutcome, RepositoryError> {
+    let transaction = normalize_service_command(ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: request.tenant_id,
+            call_id: request.call_id,
+            expected_version: request.expected_version,
+            command_id: request.command_id,
+            command: CallCommand::ArmDeadline {
+                at: request.at,
+                kind: DeadlineKind::Media,
+                due_at: request.due_at,
+            },
+            worker: request.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: request.at,
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: Some(MediaActivityGuard {
+            connection_id: request.connection_id,
+            leg_id: request.leg_id,
+            binding_generation: request.binding_generation,
+            activity_generation: request.activity_generation,
+        }),
+    })?;
+    commit_service_command_in_state(state, transaction, true)
 }
 
 fn enqueue_control_in_state(
@@ -3582,6 +3853,9 @@ fn bind_outbound_connection_in_state(
         .execution_plans
         .get(&request.call_id)
         .ok_or(RepositoryError::NotFound)?;
+    if plan.authorization_principal_fingerprint()? != request.principal_fingerprint {
+        return Err(RepositoryError::StaleClaim);
+    }
     let spec = plan
         .legs
         .iter()
@@ -3808,7 +4082,7 @@ fn reconcile_effect_result_in_state(
                 ));
             }
             validate_effect_follow_up(&record.intent, &request.result, &follow_up.command.command)?;
-            match commit_service_command_in_state(state, follow_up)? {
+            match commit_service_command_in_state(state, follow_up, false)? {
                 ServiceCommandOutcome::Committed(view) => Some(view),
                 ServiceCommandOutcome::Replayed(_) => {
                     return Err(RepositoryError::CommandConflict);
@@ -3943,7 +4217,7 @@ fn reconcile_provider_event_in_state(
                 reference.binding_generation,
                 &follow_up.command.command,
             )?;
-            match commit_service_command_in_state(state, follow_up)? {
+            match commit_service_command_in_state(state, follow_up, false)? {
                 ServiceCommandOutcome::Committed(view) => Some(view),
                 ServiceCommandOutcome::Replayed(_) => {
                     return Err(RepositoryError::CommandConflict);
@@ -5641,6 +5915,7 @@ mod tests {
                 effect_payloads: Vec::new(),
                 operation_idempotency: None,
                 bound_connection: None,
+                media_activity: None,
             })
             .await
             .unwrap();
@@ -5746,6 +6021,7 @@ mod tests {
                     }),
                 },
             ],
+            service_principal(),
         )
         .unwrap();
         let created = repo
@@ -5781,6 +6057,7 @@ mod tests {
             effect_payloads: Vec::new(),
             operation_idempotency: None,
             bound_connection: None,
+            media_activity: None,
         };
         let committed = match repo
             .commit_with_effect_payloads(command.clone())
@@ -5869,6 +6146,7 @@ mod tests {
                     endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
                 },
             ],
+            service_principal(),
         )
         .unwrap();
         let created = repo
@@ -5982,6 +6260,7 @@ mod tests {
                 effect_payloads: Vec::new(),
                 operation_idempotency: None,
                 bound_connection: None,
+                media_activity: None,
             }),
             at: at(6),
         };
@@ -6167,6 +6446,7 @@ mod tests {
                     }),
                 },
             ],
+            service_principal(),
         )
         .unwrap();
         let stored = match repo
@@ -6303,6 +6583,7 @@ mod tests {
                     }),
                 },
             ],
+            PrincipalFingerprint::new(digest(94)),
         )
         .unwrap();
         repo.create_with_plan(ServiceCreateTransaction {
@@ -6384,6 +6665,7 @@ mod tests {
                     }),
                 },
             ],
+            service_principal(),
         )
         .unwrap();
         repo.create_with_plan(ServiceCreateTransaction {
@@ -6597,6 +6879,7 @@ mod tests {
                 effect_payloads: Vec::new(),
                 operation_idempotency: None,
                 bound_connection: None,
+                media_activity: None,
             })
             .await
             .unwrap(),

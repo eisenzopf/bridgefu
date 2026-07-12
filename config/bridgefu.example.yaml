@@ -67,6 +67,7 @@ runtime:
   mode: all-in-one            # all-in-one | gateway | worker | moq-relay
   max_concurrent_calls: 100
   setup_timeout_secs: 30
+  media_idle_timeout_secs: 30 # refreshed only by authoritative rvoip media activity
   drain_timeout_secs: 30
 
 # Transactional call state is durable by default. The local path is suitable
@@ -121,15 +122,16 @@ generic_bridge:
   webrtc_whip_bind: 0.0.0.0:8081
 
 # Configure any subset. Provider media is delivered through SIP/RTP.
-providers:
-  # twilio:
-  #   account_sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  #   auth_token: env:TWILIO_AUTH_TOKEN
-  # telnyx:
-  #   connection_id: "0000000000000000000"
-  #   api_key: env:TELNYX_API_KEY
-  #   webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
-  # vonage:
-  #   application_id: 00000000-0000-0000-0000-000000000000
-  #   private_key: env:VONAGE_PRIVATE_KEY_PEM
-  #   signature_secret: env:VONAGE_SIGNATURE_SECRET
+# providers:
+#   twilio:
+#     account_sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#     auth_token: env:TWILIO_AUTH_TOKEN
+#   telnyx:
+#     connection_id: "0000000000000000000"
+#     api_key: env:TELNYX_API_KEY
+#     webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
+#   vonage:
+#     application_id: 00000000-0000-0000-0000-000000000000
+#     private_key: env:VONAGE_PRIVATE_KEY_PEM
+#     signature_secret: env:VONAGE_SIGNATURE_SECRET
+providers: {}

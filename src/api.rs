@@ -162,6 +162,7 @@ impl ApiState {
                     control_key: control_key.resolve()?.into_bytes(),
                     timeouts: CallTimeoutPolicy {
                         setup: Duration::from_secs(config.runtime.setup_timeout_secs),
+                        media_idle: Duration::from_secs(config.runtime.media_idle_timeout_secs),
                         transfer: Duration::from_secs(30),
                         ending: Duration::from_secs(config.runtime.drain_timeout_secs.max(1)),
                     },
@@ -1562,17 +1563,16 @@ persistence:
             create_body(),
         )
         .await;
-        let call_id = response_json(created).await["call_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let created = response_json(created).await;
+        let call_id = created["call_id"].as_str().unwrap().to_owned();
+        let target_leg_id = created["legs"][0]["leg_id"].as_str().unwrap();
         assert_eq!(
             post_json(
                 &app,
                 &format!("/v1/calls/{call_id}/transfer"),
                 Some("diagnostics-secret"),
                 &["transfer-invalid"],
-                json!({"target": {"type": "sip", "uri": "sip:queue@sip.example.test"}}),
+                json!({"target_leg_id": target_leg_id, "target": {"type": "sip", "uri": "sip:queue@sip.example.test"}}),
             )
             .await
             .status(),
@@ -1646,7 +1646,7 @@ persistence:
             (format!("/v1/calls/{id}/hangup"), json!({})),
             (
                 format!("/v1/calls/{id}/transfer"),
-                json!({"target": {"type": "sip", "uri": "sip:test@example.test"}}),
+                json!({"target_leg_id": id, "target": {"type": "sip", "uri": "sip:test@example.test"}}),
             ),
             (
                 format!("/v1/calls/{id}/dtmf"),

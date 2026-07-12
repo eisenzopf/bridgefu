@@ -15,8 +15,9 @@ use bridgefu::call_service::{
     BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository, ControlCommandOutcome,
     ControlCommandTransaction, ControlIntent, DtmfSequence, EffectResultOutcome,
     EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
-    LegEndpointConfig, LegExecutionSpec, OperationIdempotency, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderEventReconciliationOutcome,
+    LegEndpointConfig, LegExecutionSpec, MediaActivityCommit, MediaActivityGeneration,
+    OperationIdempotency, OutboundConnectionBind, OutboundConnectionBindOutcome,
+    ProviderEndpointConfig, ProviderEventReconciliationOutcome,
     ProviderEventReconciliationTransaction, ProviderEventReconciliationView, ProviderKind,
     ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
@@ -124,6 +125,7 @@ fn sip_webrtc_create(
                 }),
             },
         ],
+        principal(key),
     )
     .unwrap();
     let create = CreateCall {
@@ -330,6 +332,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
                 endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
             },
         ],
+        principal(key),
     )
     .unwrap();
     ServiceCreateTransaction {
@@ -382,6 +385,7 @@ where
         effect_payloads: Vec::new(),
         operation_idempotency: None,
         bound_connection: None,
+        media_activity: None,
     };
     let ServiceCommandOutcome::Committed(view) = repository
         .commit_with_effect_payloads(request.clone())
@@ -407,6 +411,8 @@ struct ConformanceEvidence {
     inbound_lifecycle_view: ServiceCommandView,
     outbound_lifecycle_request: BoundConnectionStateCommit,
     outbound_lifecycle_view: ServiceCommandView,
+    media_activity_request: MediaActivityCommit,
+    media_activity_view: ServiceCommandView,
     control_request: ControlCommandTransaction,
     control_view: bridgefu::call_service::ControlCommandView,
     control_reconciliation: EffectResultReconciliation,
@@ -477,7 +483,7 @@ where
         worker,
         connection_id: ConnectionId::from_string("service-outbound"),
         transport: AttachmentTransport::WebRtc,
-        principal_fingerprint: principal(2),
+        principal_fingerprint: principal(10),
         at: at(4),
     };
     let OutboundConnectionBindOutcome::Bound(outbound_binding) = repository
@@ -640,9 +646,55 @@ where
         panic!("fresh control reconciliation replayed")
     };
 
-    let transfer_command = CallCommand::BeginTransfer {
+    let media_activity_request = MediaActivityCommit {
+        tenant_id: owner.clone(),
+        call_id: active.command.call.aggregate.id(),
+        expected_version: active.command.call.aggregate.version(),
+        command_id: CommandId::new(),
+        leg_id: inbound_leg,
+        binding_generation: BindingGeneration::INITIAL,
+        connection_id: consumed.binding.connection_id.clone(),
+        activity_generation: MediaActivityGeneration::INITIAL,
+        worker,
         at: at(11),
-        transfer_deadline: at(41),
+        due_at: at(41),
+    };
+    let ServiceCommandOutcome::Committed(media_activity_view) = repository
+        .commit_media_activity(media_activity_request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh media activity replayed")
+    };
+    assert_eq!(
+        media_activity_view
+            .command
+            .call
+            .aggregate
+            .deadlines()
+            .get(bridgefu::call_engine::DeadlineKind::Media)
+            .due_at(),
+        Some(at(41))
+    );
+    let mut skipped_activity = media_activity_request.clone();
+    skipped_activity.command_id = CommandId::new();
+    skipped_activity.expected_version = media_activity_view.command.call.aggregate.version();
+    skipped_activity.activity_generation = MediaActivityGeneration::INITIAL
+        .next()
+        .unwrap()
+        .next()
+        .unwrap();
+    skipped_activity.at = at(12);
+    skipped_activity.due_at = at(42);
+    assert_eq!(
+        repository.commit_media_activity(skipped_activity).await,
+        Err(RepositoryError::StaleClaim)
+    );
+    let active = &media_activity_view;
+
+    let transfer_command = CallCommand::BeginTransfer {
+        at: at(12),
+        transfer_deadline: at(42),
     };
     let decision = active
         .command
@@ -665,11 +717,14 @@ where
             worker,
             attachments: Vec::new(),
             deadline_claim: None,
-            at: at(11),
+            at: at(12),
         },
         effect_payloads: vec![ServiceEffectPayloadInput {
             ordinal: transfer_ordinal,
             payload: ServiceEffectPayload::Transfer {
+                target_leg_id: active.command.call.aggregate.legs()[0].id(),
+                target_binding_generation: active.command.call.aggregate.legs()[0]
+                    .binding_generation(),
                 target: TransferTarget::Sip {
                     uri: "sip:transfer@example.test".to_owned(),
                 },
@@ -681,6 +736,7 @@ where
             ServiceOperationKind::TransferCall,
         )),
         bound_connection: None,
+        media_activity: None,
     };
     let mut invalid_transfer = transfer_request.clone();
     invalid_transfer.effect_payloads[0].ordinal = 999;
@@ -691,6 +747,32 @@ where
         Err(RepositoryError::InvalidInput(
             "transfer effect requires a service payload"
         ))
+    );
+    let mut foreign_leg_transfer = transfer_request.clone();
+    let ServiceEffectPayload::Transfer { target_leg_id, .. } =
+        &mut foreign_leg_transfer.effect_payloads[0].payload;
+    *target_leg_id = provider_create(tenant("foreign-transfer"), worker, 99)
+        .create
+        .initial
+        .legs()[0]
+        .id();
+    assert_eq!(
+        repository
+            .commit_with_effect_payloads(foreign_leg_transfer)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "transfer target leg does not belong to call"
+        ))
+    );
+    let mut stale_transfer = transfer_request.clone();
+    let ServiceEffectPayload::Transfer {
+        target_binding_generation,
+        ..
+    } = &mut stale_transfer.effect_payloads[0].payload;
+    *target_binding_generation = serde_json::from_value(serde_json::json!(2)).unwrap();
+    assert_eq!(
+        repository.commit_with_effect_payloads(stale_transfer).await,
+        Err(RepositoryError::StaleClaim)
     );
     let ServiceCommandOutcome::Committed(transfer_view) = repository
         .commit_with_effect_payloads(transfer_request.clone())
@@ -757,7 +839,7 @@ where
             worker,
             connection_id: cross_call_connection_id.clone(),
             transport: AttachmentTransport::Sip,
-            principal_fingerprint: principal(3),
+            principal_fingerprint: principal(40),
             at: at(22),
         })
         .await
@@ -887,6 +969,7 @@ where
         effect_payloads: Vec::new(),
         operation_idempotency: None,
         bound_connection: None,
+        media_activity: None,
     };
     let provider_event_reconciliation = ProviderEventReconciliationTransaction {
         account: provider_account.clone(),
@@ -1052,6 +1135,8 @@ where
         inbound_lifecycle_view,
         outbound_lifecycle_request,
         outbound_lifecycle_view,
+        media_activity_request,
+        media_activity_view,
         control_request,
         control_view,
         control_reconciliation,
@@ -1132,6 +1217,26 @@ where
             .unwrap(),
         ServiceCommandOutcome::Replayed(evidence.outbound_lifecycle_view.clone())
     );
+    assert_eq!(
+        repository
+            .commit_media_activity(evidence.media_activity_request.clone())
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(evidence.media_activity_view.clone())
+    );
+    let mut next_activity = evidence.media_activity_request.clone();
+    next_activity.command_id = CommandId::new();
+    next_activity.expected_version = evidence.transfer_view.command.call.aggregate.version();
+    next_activity.activity_generation = MediaActivityGeneration::INITIAL.next().unwrap();
+    next_activity.at = at(13);
+    next_activity.due_at = at(43);
+    assert!(matches!(
+        repository
+            .commit_media_activity(next_activity)
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Committed(_)
+    ));
     assert_eq!(
         repository
             .enqueue_control(evidence.control_request.clone())
@@ -1284,6 +1389,7 @@ where
             effect_payloads: Vec::new(),
             operation_idempotency: None,
             bound_connection: None,
+            media_activity: None,
         })
         .await
         .unwrap();
@@ -1533,6 +1639,147 @@ async fn assert_postgres_service_drift_detection(
             .await
             .unwrap();
     }
+}
+
+async fn assert_sqlite_execution_authority_tamper_fails_closed(
+    repository: &SqliteRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let original: Vec<u8> = sqlx::query_scalar(
+        "SELECT authorization_principal_fingerprint FROM call_execution_plans WHERE call_id = ?",
+    )
+    .bind(evidence.call_id.to_string())
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE call_execution_plans SET authorization_principal_fingerprint = zeroblob(32) WHERE call_id = ?",
+    )
+    .bind(evidence.call_id.to_string())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable)
+    );
+    sqlx::query(
+        "UPDATE call_execution_plans SET authorization_principal_fingerprint = ? WHERE call_id = ?",
+    )
+    .bind(original)
+    .bind(evidence.call_id.to_string())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+
+    let media_command_id = evidence.media_activity_request.command_id.to_string();
+    let media_original: String =
+        sqlx::query_scalar("SELECT body FROM service_command_results WHERE command_id = ?")
+            .bind(&media_command_id)
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE service_command_results SET body = json_set(body, '$.result.request.media_activity.activity_generation', 2) WHERE command_id = ?",
+    )
+    .bind(&media_command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "SQLite accepted a non-consecutive media activity generation"
+    );
+    sqlx::query("UPDATE service_command_results SET body = ? WHERE command_id = ?")
+        .bind(media_original)
+        .bind(media_command_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+}
+
+async fn assert_postgres_execution_authority_tamper_fails_closed(
+    repository: &PostgresRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let original: Vec<u8> = sqlx::query_scalar(
+        "SELECT authorization_principal_fingerprint FROM call_execution_plans WHERE call_id = $1",
+    )
+    .bind(evidence.call_id.as_uuid())
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE call_execution_plans SET authorization_principal_fingerprint = decode(repeat('00', 32), 'hex') WHERE call_id = $1",
+    )
+    .bind(evidence.call_id.as_uuid())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable)
+    );
+    sqlx::query(
+        "UPDATE call_execution_plans SET authorization_principal_fingerprint = $1 WHERE call_id = $2",
+    )
+    .bind(original)
+    .bind(evidence.call_id.as_uuid())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+
+    let media_command_id = evidence.media_activity_request.command_id.to_string();
+    let media_original: String = sqlx::query_scalar(
+        "SELECT body::text FROM service_command_results WHERE command_id = $1::uuid",
+    )
+    .bind(&media_command_id)
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE service_command_results SET body = jsonb_set(body, '{result,request,media_activity,activity_generation}', '2'::jsonb, false) WHERE command_id = $1::uuid",
+    )
+    .bind(&media_command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "PostgreSQL accepted a non-consecutive media activity generation"
+    );
+    sqlx::query("UPDATE service_command_results SET body = $1::jsonb WHERE command_id = $2::uuid")
+        .bind(media_original)
+        .bind(media_command_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
 }
 
 async fn assert_sqlite_bound_guard_tamper_fails_closed(
@@ -1902,6 +2149,7 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
             .unwrap();
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
+    assert_sqlite_execution_authority_tamper_fails_closed(&second, &evidence).await;
     assert_sqlite_bound_guard_tamper_fails_closed(&second, &evidence).await;
     assert_sqlite_provider_completion_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
@@ -2107,6 +2355,7 @@ async fn postgres_service_repository_conformance_restart_and_races() {
             .unwrap();
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
+    assert_postgres_execution_authority_tamper_fails_closed(&second, &evidence).await;
     assert_postgres_bound_guard_tamper_fails_closed(&second, &evidence).await;
     assert_postgres_provider_completion_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;

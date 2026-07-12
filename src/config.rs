@@ -100,6 +100,9 @@ pub struct RuntimeCfg {
     pub max_concurrent_calls: usize,
     #[serde(default = "default_setup_timeout")]
     pub setup_timeout_secs: u64,
+    /// Maximum idle interval after authoritative media activity begins.
+    #[serde(default = "default_media_idle_timeout")]
+    pub media_idle_timeout_secs: u64,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_secs: u64,
 }
@@ -305,6 +308,11 @@ impl Config {
         if self.runtime.max_concurrent_calls == 0 {
             return Err(anyhow!(
                 "runtime.max_concurrent_calls must be greater than zero"
+            ));
+        }
+        if self.runtime.media_idle_timeout_secs == 0 {
+            return Err(anyhow!(
+                "runtime.media_idle_timeout_secs must be greater than zero"
             ));
         }
         if self.generic_bridge.bearer_token.is_some() {
@@ -925,6 +933,9 @@ fn default_max_calls() -> usize {
 fn default_setup_timeout() -> u64 {
     30
 }
+fn default_media_idle_timeout() -> u64 {
+    30
+}
 fn default_drain_timeout() -> u64 {
     30
 }
@@ -1007,6 +1018,7 @@ impl Default for RuntimeCfg {
             mode: default_runtime_mode(),
             max_concurrent_calls: default_max_calls(),
             setup_timeout_secs: default_setup_timeout(),
+            media_idle_timeout_secs: default_media_idle_timeout(),
             drain_timeout_secs: default_drain_timeout(),
         }
     }
@@ -1090,6 +1102,22 @@ mapping:
 
     fn parse(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("yaml parses")
+    }
+
+    #[test]
+    fn media_idle_timeout_defaults_and_rejects_zero() {
+        let defaults = parse(LEGACY);
+        assert_eq!(defaults.runtime.media_idle_timeout_secs, 30);
+        defaults.validate().unwrap();
+
+        let invalid = parse(&format!(
+            "{LEGACY}\nruntime:\n  media_idle_timeout_secs: 0\n"
+        ));
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("media_idle_timeout_secs must be greater than zero"));
     }
 
     #[test]

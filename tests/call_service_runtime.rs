@@ -145,6 +145,7 @@ async fn build(
             control_key: vec![0x74; 32],
             timeouts: CallTimeoutPolicy {
                 setup: Duration::from_secs(30),
+                media_idle: Duration::from_secs(30),
                 transfer: Duration::from_secs(30),
                 ending: Duration::from_secs(30),
             },

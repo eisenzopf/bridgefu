@@ -43,7 +43,7 @@ use crate::call_service::{
     BoundConnectionStateCommit, CallServiceRepository, ClaimedControlEffect,
     CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
     ControlOutboxRecord, EffectResultOutcome, EffectResultReconciliation, ExternalReferenceValue,
-    LegEndpointConfig, OperationIdempotencyReceipt, OutboundConnectionBind,
+    LegEndpointConfig, MediaActivityCommit, OperationIdempotencyReceipt, OutboundConnectionBind,
     OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
     ProviderEventReconciliationTransaction, ServiceCommandOutcome, ServiceCommandTransaction,
     ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult,
@@ -1341,14 +1341,22 @@ fn validate_execution_plan_columns(
     first_endpoint_kind: &str,
     second_leg_id: &str,
     second_endpoint_kind: &str,
+    authorization_principal_fingerprint: Option<&[u8]>,
 ) -> Result<(), RepositoryError> {
+    let persisted_authorization = persisted
+        .plan
+        .persisted_authorization_principal_fingerprint();
     invalid_if(
         persisted.call_id.to_string() != call_id
             || i64::from(persisted.plan.version) != plan_version
             || persisted.plan.legs[0].leg_id.to_string() != first_leg_id
             || endpoint_kind(&persisted.plan.legs[0].endpoint) != first_endpoint_kind
             || persisted.plan.legs[1].leg_id.to_string() != second_leg_id
-            || endpoint_kind(&persisted.plan.legs[1].endpoint) != second_endpoint_kind,
+            || endpoint_kind(&persisted.plan.legs[1].endpoint) != second_endpoint_kind
+            || persisted_authorization
+                .as_ref()
+                .map(|fingerprint| fingerprint.expose_bytes().as_slice())
+                != authorization_principal_fingerprint,
     )
 }
 
@@ -1710,11 +1718,12 @@ async fn load_sqlite_deadlines(
 async fn load_sqlite_service_rows(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<ServiceSnapshotRows, RepositoryError> {
-    let execution_plans = sqlx::query("SELECT call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body FROM call_execution_plans ORDER BY call_id")
+    let execution_plans = sqlx::query("SELECT call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, authorization_principal_fingerprint, body FROM call_execution_plans ORDER BY call_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: PersistedExecutionPlanRow = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_execution_plan_columns(&value, &row.try_get::<String, _>("call_id").map_err(database_error)?, row.try_get("plan_version").map_err(database_error)?, &row.try_get::<String, _>("first_leg_id").map_err(database_error)?, &row.try_get::<String, _>("first_endpoint_kind").map_err(database_error)?, &row.try_get::<String, _>("second_leg_id").map_err(database_error)?, &row.try_get::<String, _>("second_endpoint_kind").map_err(database_error)?)?;
+            let authorization: Option<Vec<u8>> = row.try_get("authorization_principal_fingerprint").map_err(database_error)?;
+            validate_execution_plan_columns(&value, &row.try_get::<String, _>("call_id").map_err(database_error)?, row.try_get("plan_version").map_err(database_error)?, &row.try_get::<String, _>("first_leg_id").map_err(database_error)?, &row.try_get::<String, _>("first_endpoint_kind").map_err(database_error)?, &row.try_get::<String, _>("second_leg_id").map_err(database_error)?, &row.try_get::<String, _>("second_endpoint_kind").map_err(database_error)?, authorization.as_deref())?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
     let service_command_results = sqlx::query("SELECT command_id, tenant_id, call_id, recorded_at, body FROM service_command_results ORDER BY command_id")
@@ -1913,11 +1922,12 @@ async fn load_postgres_deadlines(
 async fn load_postgres_service_rows(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<ServiceSnapshotRows, RepositoryError> {
-    let execution_plans = sqlx::query("SELECT call_id::text AS call_id, plan_version, first_leg_id::text AS first_leg_id, first_endpoint_kind, second_leg_id::text AS second_leg_id, second_endpoint_kind, body::text AS body FROM call_execution_plans ORDER BY call_id")
+    let execution_plans = sqlx::query("SELECT call_id::text AS call_id, plan_version, first_leg_id::text AS first_leg_id, first_endpoint_kind, second_leg_id::text AS second_leg_id, second_endpoint_kind, authorization_principal_fingerprint, body::text AS body FROM call_execution_plans ORDER BY call_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: PersistedExecutionPlanRow = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_execution_plan_columns(&value, &row.try_get::<String, _>("call_id").map_err(database_error)?, row.try_get("plan_version").map_err(database_error)?, &row.try_get::<String, _>("first_leg_id").map_err(database_error)?, &row.try_get::<String, _>("first_endpoint_kind").map_err(database_error)?, &row.try_get::<String, _>("second_leg_id").map_err(database_error)?, &row.try_get::<String, _>("second_endpoint_kind").map_err(database_error)?)?;
+            let authorization: Option<Vec<u8>> = row.try_get("authorization_principal_fingerprint").map_err(database_error)?;
+            validate_execution_plan_columns(&value, &row.try_get::<String, _>("call_id").map_err(database_error)?, row.try_get("plan_version").map_err(database_error)?, &row.try_get::<String, _>("first_leg_id").map_err(database_error)?, &row.try_get::<String, _>("first_endpoint_kind").map_err(database_error)?, &row.try_get::<String, _>("second_leg_id").map_err(database_error)?, &row.try_get::<String, _>("second_endpoint_kind").map_err(database_error)?, authorization.as_deref())?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
     let service_command_results = sqlx::query("SELECT command_id::text AS command_id, tenant_id, call_id::text AS call_id, recorded_at, body::text AS body FROM service_command_results ORDER BY command_id")
@@ -2968,7 +2978,7 @@ async fn upsert_sqlite_rows(
     for persisted in &snapshot.execution_plans {
         let [first, second] = &persisted.plan.legs;
         sqlx::query(
-            "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(call_id) DO UPDATE SET plan_version=excluded.plan_version, first_leg_id=excluded.first_leg_id, first_endpoint_kind=excluded.first_endpoint_kind, second_leg_id=excluded.second_leg_id, second_endpoint_kind=excluded.second_endpoint_kind, body=excluded.body",
+            "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, authorization_principal_fingerprint, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(call_id) DO UPDATE SET plan_version=excluded.plan_version, first_leg_id=excluded.first_leg_id, first_endpoint_kind=excluded.first_endpoint_kind, second_leg_id=excluded.second_leg_id, second_endpoint_kind=excluded.second_endpoint_kind, authorization_principal_fingerprint=excluded.authorization_principal_fingerprint, body=excluded.body",
         )
         .bind(persisted.call_id.to_string())
         .bind(i64::from(persisted.plan.version))
@@ -2976,6 +2986,12 @@ async fn upsert_sqlite_rows(
         .bind(endpoint_kind(&first.endpoint))
         .bind(second.leg_id.to_string())
         .bind(endpoint_kind(&second.endpoint))
+        .bind(
+            persisted
+                .plan
+                .persisted_authorization_principal_fingerprint()
+                .map(|fingerprint| fingerprint.expose_bytes().to_vec()),
+        )
         .bind(encode(persisted)?)
         .execute(&mut **connection)
         .await
@@ -3409,7 +3425,7 @@ async fn upsert_postgres_rows(
     for persisted in &snapshot.execution_plans {
         let [first, second] = &persisted.plan.legs;
         sqlx::query(
-            "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT(call_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, first_leg_id=EXCLUDED.first_leg_id, first_endpoint_kind=EXCLUDED.first_endpoint_kind, second_leg_id=EXCLUDED.second_leg_id, second_endpoint_kind=EXCLUDED.second_endpoint_kind, body=EXCLUDED.body",
+            "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, authorization_principal_fingerprint, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) ON CONFLICT(call_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, first_leg_id=EXCLUDED.first_leg_id, first_endpoint_kind=EXCLUDED.first_endpoint_kind, second_leg_id=EXCLUDED.second_leg_id, second_endpoint_kind=EXCLUDED.second_endpoint_kind, authorization_principal_fingerprint=EXCLUDED.authorization_principal_fingerprint, body=EXCLUDED.body",
         )
         .bind(persisted.call_id.as_uuid())
         .bind(i64::from(persisted.plan.version))
@@ -3417,6 +3433,12 @@ async fn upsert_postgres_rows(
         .bind(endpoint_kind(&first.endpoint))
         .bind(second.leg_id.as_uuid())
         .bind(endpoint_kind(&second.endpoint))
+        .bind(
+            persisted
+                .plan
+                .persisted_authorization_principal_fingerprint()
+                .map(|fingerprint| fingerprint.expose_bytes().to_vec()),
+        )
         .bind(encode(persisted)?)
         .execute(&mut **transaction)
         .await
@@ -3936,6 +3958,17 @@ macro_rules! impl_call_service_repository {
                         Box::pin(
                             async move { repository.commit_bound_connection_state(request).await },
                         )
+                    })
+                    .await
+            }
+
+            async fn commit_media_activity(
+                &self,
+                request: MediaActivityCommit,
+            ) -> Result<ServiceCommandOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move { repository.commit_media_activity(request).await })
                     })
                     .await
             }

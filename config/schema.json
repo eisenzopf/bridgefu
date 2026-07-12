@@ -32,6 +32,7 @@
         "mode": { "enum": ["all-in-one", "gateway", "worker", "moq-relay"] },
         "max_concurrent_calls": { "type": "integer", "minimum": 1 },
         "setup_timeout_secs": { "type": "integer", "minimum": 1 },
+        "media_idle_timeout_secs": { "type": "integer", "minimum": 1 },
         "drain_timeout_secs": { "type": "integer", "minimum": 1 }
       },
       "additionalProperties": false

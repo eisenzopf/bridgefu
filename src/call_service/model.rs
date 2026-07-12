@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::call_engine::{
-    CallAggregate, LegDirection, LegId, LegKind, ProviderAccountKey, ProviderCallId,
-    RepositoryError,
+    CallAggregate, LegDirection, LegId, LegKind, PrincipalFingerprint, ProviderAccountKey,
+    ProviderCallId, RepositoryError,
 };
 
-/// The only execution-plan schema understood by this release.
-pub const CALL_EXECUTION_PLAN_VERSION: u16 = 1;
+/// Current execution-plan schema written by this release.
+pub const CALL_EXECUTION_PLAN_VERSION: u16 = 2;
+
+const LEGACY_CALL_EXECUTION_PLAN_VERSION: u16 = 1;
 
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -232,12 +234,36 @@ pub struct LegExecutionSpec {
 }
 
 /// Immutable execution plan persisted atomically with call creation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallExecutionPlan {
     /// Versioned schema discriminator.
     pub version: u16,
+    /// Exact API principal that authorized outbound work for this call.
+    ///
+    /// Version-one plans deserialize with `None` so operators can inspect and
+    /// terminate legacy calls after upgrade. They cannot authorize a new
+    /// outbound rvoip binding or restart recovery operation.
+    #[serde(default)]
+    authorization_principal_fingerprint: Option<PrincipalFingerprint>,
     /// Exactly two leg specifications.
     pub legs: [LegExecutionSpec; 2],
+}
+
+impl fmt::Debug for CallExecutionPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallExecutionPlan")
+            .field("version", &self.version)
+            .field(
+                "authorization_principal_fingerprint",
+                &self
+                    .authorization_principal_fingerprint
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .field("legs", &self.legs)
+            .finish()
+    }
 }
 
 impl CallExecutionPlan {
@@ -245,21 +271,53 @@ impl CallExecutionPlan {
     pub fn new(
         aggregate: &CallAggregate,
         legs: [LegExecutionSpec; 2],
+        authorization_principal_fingerprint: PrincipalFingerprint,
     ) -> Result<Self, RepositoryError> {
         let plan = Self {
             version: CALL_EXECUTION_PLAN_VERSION,
+            authorization_principal_fingerprint: Some(authorization_principal_fingerprint),
             legs,
         };
         plan.validate_against(aggregate)?;
         Ok(plan)
     }
 
+    /// Returns the exact persisted principal allowed to authorize outbound
+    /// rvoip work. Legacy plans fail closed instead of deriving authority from
+    /// process-local API state.
+    pub fn authorization_principal_fingerprint(
+        &self,
+    ) -> Result<PrincipalFingerprint, RepositoryError> {
+        self.authorization_principal_fingerprint
+            .ok_or(RepositoryError::InvalidInput(
+                "execution plan has no durable outbound authorization",
+            ))
+    }
+
+    /// Returns the optional persisted value for database integrity checks.
+    #[must_use]
+    pub(crate) const fn persisted_authorization_principal_fingerprint(
+        &self,
+    ) -> Option<PrincipalFingerprint> {
+        self.authorization_principal_fingerprint
+    }
+
     /// Verifies version, exact leg ownership, endpoint kind, and direction rules.
     pub fn validate_against(&self, aggregate: &CallAggregate) -> Result<(), RepositoryError> {
-        if self.version != CALL_EXECUTION_PLAN_VERSION {
-            return Err(RepositoryError::InvalidInput(
-                "unsupported call execution plan version",
-            ));
+        match self.version {
+            CALL_EXECUTION_PLAN_VERSION if self.authorization_principal_fingerprint.is_some() => {}
+            LEGACY_CALL_EXECUTION_PLAN_VERSION
+                if self.authorization_principal_fingerprint.is_none() => {}
+            CALL_EXECUTION_PLAN_VERSION | LEGACY_CALL_EXECUTION_PLAN_VERSION => {
+                return Err(RepositoryError::InvalidInput(
+                    "execution plan authorization does not match its version",
+                ));
+            }
+            _ => {
+                return Err(RepositoryError::InvalidInput(
+                    "unsupported call execution plan version",
+                ));
+            }
         }
         if self.legs[0].leg_id == self.legs[1].leg_id {
             return Err(RepositoryError::InvalidInput(
@@ -377,13 +435,20 @@ impl TransferTarget {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceEffectPayload {
     /// Concrete destination for the core transfer intent.
-    Transfer { target: TransferTarget },
+    Transfer {
+        /// Exact existing call leg whose signaling session receives transfer.
+        target_leg_id: LegId,
+        /// Exact target-leg incarnation at transfer acceptance.
+        target_binding_generation: crate::call_engine::BindingGeneration,
+        /// Typed external transfer destination.
+        target: TransferTarget,
+    },
 }
 
 impl ServiceEffectPayload {
     pub(crate) fn validate(&self) -> Result<(), RepositoryError> {
         match self {
-            Self::Transfer { target } => target.validate(),
+            Self::Transfer { target, .. } => target.validate(),
         }
     }
 }
@@ -664,7 +729,14 @@ mod tests {
         ];
 
         for target in targets {
-            let debug = format!("{:?}", ServiceEffectPayload::Transfer { target });
+            let debug = format!(
+                "{:?}",
+                ServiceEffectPayload::Transfer {
+                    target_leg_id: LegId::new(),
+                    target_binding_generation: crate::call_engine::BindingGeneration::INITIAL,
+                    target,
+                }
+            );
             assert!(debug.contains("[redacted]"));
             for sensitive in [
                 "+15551234567",

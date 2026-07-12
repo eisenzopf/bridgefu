@@ -90,6 +90,7 @@ fn service_create_request(
                 }),
             },
         ],
+        PrincipalFingerprint::new(digest(key)),
     )
     .unwrap();
     ServiceCreateTransaction {
@@ -787,7 +788,7 @@ async fn sqlite_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 5);
+    assert_eq!(schema_version, 6);
     let persisted_body: String = sqlx::query_scalar("SELECT body FROM workers WHERE worker_id = ?")
         .bind(worker_id.to_string())
         .fetch_one(upgraded.pool())
@@ -860,7 +861,7 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
         "INSERT INTO attachments SELECT * FROM source.attachments",
         "INSERT INTO outbox SELECT * FROM source.outbox",
         "INSERT INTO deadlines SELECT * FROM source.deadlines",
-        "INSERT INTO call_execution_plans SELECT * FROM source.call_execution_plans",
+        "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, json_remove(json_set(body, '$.plan.version', 1), '$.plan.authorization_principal_fingerprint') FROM source.call_execution_plans",
     ] {
         sqlx::query(statement).execute(&target).await.unwrap();
     }
@@ -877,16 +878,9 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
         .await
         .unwrap();
     assert_eq!(managed, 1);
-    assert_eq!(
-        upgraded
-            .load_service_call(&owner, call_id)
-            .await
-            .unwrap()
-            .call
-            .aggregate
-            .id(),
-        call_id
-    );
+    let legacy = upgraded.load_service_call(&owner, call_id).await.unwrap();
+    assert_eq!(legacy.call.aggregate.id(), call_id);
+    assert!(legacy.plan.authorization_principal_fingerprint().is_err());
     upgraded.pool().close().await;
     std::fs::remove_file(source_path).unwrap();
     std::fs::remove_file(target_path).unwrap();
@@ -963,7 +957,7 @@ async fn postgres_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 5);
+    assert_eq!(schema_version, 6);
     let has_expiry: bool =
         sqlx::query_scalar("SELECT body ? 'lease_expires_at' FROM workers WHERE worker_id = $1")
             .bind(worker_id.as_uuid())
@@ -1194,7 +1188,7 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
         format!("INSERT INTO {target_schema}.attachments SELECT * FROM {source_schema}.attachments"),
         format!("INSERT INTO {target_schema}.outbox SELECT * FROM {source_schema}.outbox"),
         format!("INSERT INTO {target_schema}.deadlines SELECT * FROM {source_schema}.deadlines"),
-        format!("INSERT INTO {target_schema}.call_execution_plans SELECT * FROM {source_schema}.call_execution_plans"),
+        format!("INSERT INTO {target_schema}.call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) #- '{{plan,authorization_principal_fingerprint}}' FROM {source_schema}.call_execution_plans"),
     ] {
         sqlx::query(&statement)
             .execute(&administration)
@@ -1210,16 +1204,9 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
         .await
         .unwrap();
     assert!(managed);
-    assert_eq!(
-        upgraded
-            .load_service_call(&owner, call_id)
-            .await
-            .unwrap()
-            .call
-            .aggregate
-            .id(),
-        call_id
-    );
+    let legacy = upgraded.load_service_call(&owner, call_id).await.unwrap();
+    assert_eq!(legacy.call.aggregate.id(), call_id);
+    assert!(legacy.plan.authorization_principal_fingerprint().is_err());
     upgraded.pool().close().await;
     source.pool().close().await;
     sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
@@ -2103,8 +2090,8 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 5);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=5) {
+    assert_eq!(migrations.len(), 6);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=6) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2114,7 +2101,7 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        5
+        6
     );
 }
 
@@ -2141,8 +2128,8 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 5);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=5) {
+    assert_eq!(migrations.len(), 6);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=6) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2152,7 +2139,7 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        5
+        6
     );
 }
 

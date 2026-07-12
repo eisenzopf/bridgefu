@@ -158,6 +158,70 @@ pub struct BoundConnectionGuard {
     pub binding_generation: BindingGeneration,
 }
 
+/// Monotonic media-activity observation for one exact connection binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct MediaActivityGeneration(u64);
+
+impl MediaActivityGeneration {
+    /// First authoritative activity observation for a connection binding.
+    pub const INITIAL: Self = Self(1);
+
+    /// Returns the database-safe signed representation.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// Reconstructs a positive signed database generation.
+    pub fn from_i64(value: i64) -> Result<Self, RepositoryError> {
+        if value <= 0 {
+            Err(RepositoryError::InvalidInput(
+                "media activity generation must be positive",
+            ))
+        } else {
+            Ok(Self(value as u64))
+        }
+    }
+
+    /// Advances to the next exact activity observation.
+    pub fn next(self) -> Result<Self, RepositoryError> {
+        if self.0 >= i64::MAX as u64 {
+            Err(RepositoryError::CounterExhausted)
+        } else {
+            Ok(Self(self.0 + 1))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaActivityGeneration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 || value > i64::MAX as u64 {
+            return Err(serde::de::Error::custom(
+                "media activity generation must fit a positive signed database integer",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Exact activity proof retained with a media-deadline refresh command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaActivityGuard {
+    /// Exact rvoip route that emitted authoritative media activity.
+    pub connection_id: ConnectionId,
+    /// Exact logical leg carrying that route.
+    pub leg_id: LegId,
+    /// Exact signaling/media incarnation.
+    pub binding_generation: BindingGeneration,
+    /// Strictly consecutive route-local activity observation.
+    pub activity_generation: MediaActivityGeneration,
+}
+
 /// Atomic core command plus service-owned effect payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceCommandTransaction {
@@ -171,6 +235,9 @@ pub struct ServiceCommandTransaction {
     /// Optional exact connection guard for transport lifecycle observations.
     #[serde(default)]
     pub bound_connection: Option<BoundConnectionGuard>,
+    /// Optional exact activity proof for a media-idle deadline refresh.
+    #[serde(default)]
+    pub media_activity: Option<MediaActivityGuard>,
 }
 
 /// Fenced lifecycle transition for one exact durably bound connection.
@@ -222,6 +289,33 @@ impl std::fmt::Debug for BoundConnectionStateCommit {
             .field("at", &self.at)
             .finish()
     }
+}
+
+/// Fenced media activity that arms or refreshes the call's media-idle timer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaActivityCommit {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Durable call receiving the observation.
+    pub call_id: CallId,
+    /// Compare-and-swap version retained across lost-response retries.
+    pub expected_version: AggregateVersion,
+    /// Stable activity delivery identity retained across retries.
+    pub command_id: CommandId,
+    /// Exact logical leg where media was observed.
+    pub leg_id: LegId,
+    /// Exact signaling/media incarnation.
+    pub binding_generation: BindingGeneration,
+    /// Exact rvoip route that emitted activity.
+    pub connection_id: ConnectionId,
+    /// Strictly consecutive route-local activity generation.
+    pub activity_generation: MediaActivityGeneration,
+    /// Current fenced worker.
+    pub worker: WorkerLease,
+    /// Authoritative activity observation time.
+    pub at: DateTime<Utc>,
+    /// Absolute media-idle deadline derived from configured policy.
+    pub due_at: DateTime<Utc>,
 }
 
 /// Exact result of a service command transaction.
@@ -618,6 +712,14 @@ pub trait CallServiceRepository: Send + Sync {
     async fn commit_bound_connection_state(
         &self,
         request: BoundConnectionStateCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError>;
+
+    /// Atomically validates exact, consecutive media activity and arms or
+    /// refreshes `DeadlineKind::Media` without allowing stale activity to
+    /// resurrect a cancelled timer.
+    async fn commit_media_activity(
+        &self,
+        request: MediaActivityCommit,
     ) -> Result<ServiceCommandOutcome, RepositoryError>;
 
     /// Returns an unexpired exact create receipt before worker placement.

@@ -15,10 +15,10 @@ use zeroize::Zeroize;
 
 use crate::api_principal::{ApiPrincipal, ApiPrincipalError, CallScope};
 use crate::call_engine::{
-    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTransport,
-    CallAggregate, CallCommand, CallId, CallRepository, CommandCommitView, CommandId,
-    ConnectionBinding, LegDirection, LegId, LegSpec, LegState, PrincipalFingerprint,
-    RepositoryError, StopLegReason, TenantId, WorkerLease,
+    AggregateVersion, AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup,
+    AttachmentTransport, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
+    CommandCommitView, CommandId, ConnectionBinding, LegDirection, LegId, LegSpec, LegState,
+    PrincipalFingerprint, RepositoryError, StopLegReason, TenantId, WorkerLease,
 };
 use crate::coordination::{CoordinationProjection, WorkerSelectionRequest};
 
@@ -28,9 +28,9 @@ use super::{
     CallServiceCrypto, CallServiceRepository, CallView, CanonicalRequestTranscript,
     ControlCommandOutcome, ControlCommandTransaction, ControlIntent, CreateCallView,
     DtmfAcceptedView, DtmfSequence, IdempotencyKey, LegEndpointConfig, LegExecutionSpec,
-    OperationIdempotency, ProviderEndpointConfig, ProviderEventReconciliationOutcome,
-    ProviderEventReconciliationTransaction, ProviderKind, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
+    MediaActivityCommit, MediaActivityGeneration, OperationIdempotency, ProviderEndpointConfig,
+    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction, ProviderKind,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput,
     ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
     WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
@@ -73,6 +73,8 @@ pub struct TransferCallInput {
     /// Optional tenant override; requires the literal administrative scope.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Exact existing call leg whose signaling session receives transfer.
+    pub target_leg_id: LegId,
     /// Typed transfer destination.
     pub target: TransferTarget,
 }
@@ -373,6 +375,8 @@ impl AttachmentPrincipalResolver for SamePrincipalAttachmentResolver {
 pub struct CallTimeoutPolicy {
     /// Maximum setup time.
     pub setup: Duration,
+    /// Maximum time without authoritative media activity once active.
+    pub media_idle: Duration,
     /// Maximum native/signaling transfer time.
     pub transfer: Duration,
     /// Maximum peer teardown time.
@@ -383,10 +387,36 @@ impl Default for CallTimeoutPolicy {
     fn default() -> Self {
         Self {
             setup: Duration::from_secs(30),
+            media_idle: Duration::from_secs(30),
             transfer: Duration::from_secs(30),
             ending: Duration::from_secs(30),
         }
     }
+}
+
+/// One authoritative rvoip media-activity observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaActivityObservation {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Durable call receiving the observation.
+    pub call_id: CallId,
+    /// Compare-and-swap version retained across lost-response retries.
+    pub expected_version: AggregateVersion,
+    /// Stable event delivery identity retained across retries.
+    pub command_id: CommandId,
+    /// Exact logical leg carrying observed media.
+    pub leg_id: LegId,
+    /// Exact signaling/media incarnation.
+    pub binding_generation: BindingGeneration,
+    /// Exact rvoip route that emitted activity.
+    pub connection_id: ConnectionId,
+    /// Strictly consecutive route-local activity generation.
+    pub activity_generation: MediaActivityGeneration,
+    /// Current fenced worker.
+    pub worker: WorkerLease,
+    /// Authoritative activity observation time.
+    pub at: DateTime<Utc>,
 }
 
 /// Service-layer error with safe HTTP mapping semantics.
@@ -683,6 +713,32 @@ impl CallService {
         Ok(self.repository.reconcile_provider_event(request).await?)
     }
 
+    /// Arms or refreshes the media-idle timer from an authoritative, exact
+    /// rvoip route observation. The configured policy is applied here so an
+    /// executor cannot choose an unbounded deadline.
+    pub async fn record_media_activity(
+        &self,
+        observation: MediaActivityObservation,
+    ) -> Result<ServiceCommandOutcome, CallServiceError> {
+        let due_at = checked_deadline(observation.at, self.timeouts.media_idle)?;
+        Ok(self
+            .repository
+            .commit_media_activity(MediaActivityCommit {
+                tenant_id: observation.tenant_id,
+                call_id: observation.call_id,
+                expected_version: observation.expected_version,
+                command_id: observation.command_id,
+                leg_id: observation.leg_id,
+                binding_generation: observation.binding_generation,
+                connection_id: observation.connection_id,
+                activity_generation: observation.activity_generation,
+                worker: observation.worker,
+                at: observation.at,
+                due_at,
+            })
+            .await?)
+    }
+
     /// Authenticates ownership, reserves a worker, and creates both legs atomically.
     pub async fn create_call(
         &self,
@@ -751,6 +807,7 @@ impl CallService {
                     endpoint: input.legs[1].endpoint.clone(),
                 },
             ],
+            owner_fingerprint,
         )?;
 
         let resolver_budget = match remaining_budget(self.clock.now(), creation_deadline) {
@@ -970,11 +1027,19 @@ impl CallService {
             principal.resolve_tenant(input.tenant_id.as_deref(), CallScope::Transfer, at)?;
         input.target.validate()?;
         let stored = self.repository.load_service_call(&tenant, call_id).await?;
+        let target_leg = stored.call.aggregate.leg(input.target_leg_id).ok_or(
+            CallServiceError::InvalidInput("transfer target leg does not belong to call"),
+        )?;
+        if !matches!(target_leg.state(), LegState::Connected | LegState::Held) {
+            return Err(CallServiceError::InvalidTransition);
+        }
+        let target_binding_generation = target_leg.binding_generation();
         let command = CallCommand::BeginTransfer {
             at,
             transfer_deadline: checked_deadline(at, self.timeouts.transfer)?,
         };
         let mut transcript = CanonicalRequestTranscript::new();
+        transcript.push_bytes(input.target_leg_id.as_uuid().as_bytes());
         push_transfer_target(&mut transcript, &input.target);
         let operation = self.operation(
             &tenant,
@@ -992,6 +1057,8 @@ impl CallService {
                 // The repository validates this semantic mapping before persistence.
                 ordinal: 1,
                 payload: ServiceEffectPayload::Transfer {
+                    target_leg_id: input.target_leg_id,
+                    target_binding_generation,
                     target: input.target,
                 },
             }],
@@ -1084,6 +1151,7 @@ impl CallService {
                 effect_payloads,
                 operation_idempotency: Some(operation),
                 bound_connection: None,
+                media_activity: None,
             })
             .await?;
         let (view, replayed) = match outcome {
@@ -1674,6 +1742,13 @@ mod tests {
             self.inner.commit_bound_connection_state(request).await
         }
 
+        async fn commit_media_activity(
+            &self,
+            request: MediaActivityCommit,
+        ) -> Result<ServiceCommandOutcome, RepositoryError> {
+            self.inner.commit_media_activity(request).await
+        }
+
         async fn load_create_replay(
             &self,
             _tenant_id: &TenantId,
@@ -1982,6 +2057,7 @@ mod tests {
                     effect_payloads: Vec::new(),
                     operation_idempotency: None,
                     bound_connection: None,
+                    media_activity: None,
                 })
                 .await
                 .unwrap();
@@ -3477,6 +3553,7 @@ mod tests {
                     effect_payloads: Vec::new(),
                     operation_idempotency: None,
                     bound_connection: None,
+                    media_activity: None,
                 })
                 .await
                 .unwrap();
@@ -3562,6 +3639,7 @@ mod tests {
         let transfer_key = IdempotencyKey::parse("transfer-1").unwrap();
         let transfer_input = TransferCallInput {
             tenant_id: None,
+            target_leg_id: created.value.call.legs[0].leg_id,
             target: TransferTarget::Sip {
                 uri: "sip:queue@sip.example.test".into(),
             },
@@ -3576,6 +3654,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transferred.value.state, CallState::Transferring);
+        let mut changed_leg = transfer_input.clone();
+        changed_leg.target_leg_id = created.value.call.legs[1].leg_id;
+        assert!(matches!(
+            service
+                .transfer_call(
+                    &owner,
+                    created.value.call.call_id,
+                    &transfer_key,
+                    changed_leg,
+                )
+                .await,
+            Err(CallServiceError::Repository(
+                RepositoryError::IdempotencyConflict
+            ))
+        ));
         let replayed_transfer = service
             .transfer_call(
                 &owner,
@@ -3587,6 +3680,60 @@ mod tests {
             .unwrap();
         assert!(replayed_transfer.replayed);
         assert_eq!(replayed_transfer.value, transferred.value);
+    }
+
+    #[tokio::test]
+    async fn service_applies_media_idle_policy_to_exact_activity_generation() {
+        let (repository, service, _, worker) = harness(1).await;
+        let owner = principal("tenant-a");
+        let created = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("create-media-idle").unwrap(),
+                two_inbound_input(),
+            )
+            .await
+            .unwrap();
+        connect_created_call(&repository, &service, &owner, worker, &created.value).await;
+        let tenant = TenantId::parse("tenant-a").unwrap();
+        let stored = repository
+            .load_service_call(&tenant, created.value.call.call_id)
+            .await
+            .unwrap();
+        let leg_id = stored.call.aggregate.legs()[0].id();
+        let binding = stored.call.bindings.get(&leg_id).unwrap();
+        let observation = MediaActivityObservation {
+            tenant_id: tenant,
+            call_id: stored.call.aggregate.id(),
+            expected_version: stored.call.aggregate.version(),
+            command_id: CommandId::new(),
+            leg_id,
+            binding_generation: binding.binding_generation,
+            connection_id: binding.connection_id.clone(),
+            activity_generation: MediaActivityGeneration::INITIAL,
+            worker,
+            at: at(5),
+        };
+        let ServiceCommandOutcome::Committed(view) = service
+            .record_media_activity(observation.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("fresh media activity replayed")
+        };
+        assert_eq!(
+            view.command
+                .call
+                .aggregate
+                .deadlines()
+                .get(crate::call_engine::DeadlineKind::Media)
+                .due_at(),
+            Some(at(35))
+        );
+        assert_eq!(
+            service.record_media_activity(observation).await.unwrap(),
+            ServiceCommandOutcome::Replayed(view)
+        );
     }
 
     #[tokio::test]
