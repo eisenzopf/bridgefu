@@ -664,6 +664,31 @@ Gate 6 progress evidence recorded on 2026-07-12:
   group recreation, v3-to-v4 migration, values above `2^53`, startup failure,
   expired/replaced fences, acknowledgement outages, bounded fallback polling,
   and clean shutdown. Formatting, JSON Schema parsing, and diff checks pass.
+- Bridgefu revisions `5fda49c` and `8816cdb` add the fail-closed attachment
+  service transaction and close its independent security-audit finding.
+  Canonical 256-bit hints are parsed and zeroized, issuer/tenant/subject
+  ownership and the exact worker fence/Connection ID are checked, and token
+  plus principal expiry are enforced inside the final atomic transaction using
+  authoritative database time after lock acquisition. Blocked-consume,
+  in-memory authority injection, SQLite clock-skew, and PostgreSQL clock-skew
+  tests prove expiry cannot be bypassed by transaction contention.
+- rvoip revisions `b90d4cc8` through `fc8a2fe3`, `0a56978f`, and `df1a5dc1`
+  add bounded inbound admission, process-lifetime connection-ID retirement,
+  adapter lifecycle capabilities, generation-scoped protocol confirmation,
+  first-party SIP/WebRTC/UCTP handoff and cleanup, and enforceable SIP Bearer
+  scopes. Admission is single-consumer and precedes the compatibility event;
+  saturation, timeout, receiver loss, stale generations, terminal races, and
+  cross-tenant ownership all fail closed. Outbound UCTP route creation remains
+  explicitly unsupported rather than being represented as operational.
+- Bridgefu revision `f474408` removes global FIFO authorization. The generic
+  runtime now shares the API's exact validator, service, repository, crypto,
+  and worker fence; installs the admission gate before adapter registration;
+  consumes owner-bound SIP Request-URI or WHIP/WS routing hints once; commits
+  the exact durable connection binding before accepting; and uses a bounded,
+  supervisor-owned `JoinSet`. Crossed-call and duplicate-leg tests prove that
+  arrival order cannot cross-connect calls. Gate 6 item 7 remains open until
+  the WebRTC listener consumes protocol confirmation and terminal compensation
+  is driven by the strong lifecycle supervisor.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
