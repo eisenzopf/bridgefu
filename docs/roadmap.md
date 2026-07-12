@@ -869,10 +869,18 @@ not hide an earlier adapter side effect behind a nominally staged API.
      authentication value is bounded and control-free at its final insertion
      point and at every public typed transport `send_message` boundary; the
      explicitly raw transport escape hatch remains the only verbatim bypass.
+     Typed sends also validate every extension header name as an exact SIP
+     token and every raw field value as one line, so whitespace-before-colon,
+     embedded-colon, CR/LF, and malformed `Other` spellings cannot reconstitute
+     an Authorization header downstream. Response reason phrases are bounded
+     and reject line/control injection before any typed transport performs I/O.
      Authorization-bearing raw values, their enclosing typed headers, and
      complete requests must also redact secrets from diagnostics regardless of
      whether the header name uses a canonical variant or a case-insensitive
-     `Other` alias. Request start lines redact the complete Request-URI and
+     `Other` alias. Transport/session event diagnostics retain raw bytes only
+     functionally; their `Debug` and default log surfaces expose presence/size,
+     never raw signaling or body content. Request start lines redact the
+     complete Request-URI and
      response start lines redact untrusted reason text in both the raw trace and
      the separate event field. A custom Call-ID decision must also govern the
      separately retained `sip_call_id`; no parallel event field may bypass the
