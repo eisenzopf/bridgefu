@@ -323,13 +323,13 @@ Gate 5 completion evidence recorded on 2026-07-12:
 Exit: both substrates traverse a relay and version, packet-capture, and
 interoperability suites pass.
 
-### Gate 6 — Build Bridgefu's durable call engine (`pending`)
+### Gate 6 — Build Bridgefu's durable call engine (`in progress`)
 
 The implementation order is deliberate. In particular, FIFO pairing cannot be
 removed safely until rvoip preserves a single-take, redacted inbound routing
 hint for SIP and WebRTC connections.
 
-1. [ ] Add an additive rvoip inbound-context seam before the normalized
+1. [x] Add an additive rvoip inbound-context seam before the normalized
    `ConnectionInbound` event. Preserve the SIP Request-URI routing hint and the
    WHIP/WS path or authenticated session hint, expose it through Orchestrator as
    a single-take value, and erase it on terminal cleanup. Prove once-only,
@@ -380,10 +380,18 @@ Gate 6 progress evidence recorded on 2026-07-12:
   invariant, and property-like tests. The complete Bridgefu all-target suite
   passes 20 binary tests plus 14 StandardCharter contract tests; strict library
   Clippy and warning-free library rustdoc pass.
-- The rvoip inbound-context seam is implemented but remains unchecked here
-  until its independent review findings on saturated terminal delivery,
-  post-gather principal expiry, SIP metadata policy, pending-context bounds,
-  and atomic authenticated-inbound delivery are fixed and requalified.
+- rvoip revision `87b213b33f26ca6f178c899b8b91a18ba30ebedf`
+  completes the inbound-context seam and is pushed on
+  `codex/bridgefu-1.0-rvoip`; Bridgefu CI pins that exact revision. SIP and
+  WebRTC preserve redacted transport-bound hints through a single atomic
+  authenticated handoff, while the public adapter event API remains source
+  compatible. Context is owner-bound, single-take, bounded, expiry-checked at
+  publication, and erased on every terminal path.
+- The final focused qualification passes 9 core dispatch tests, 14 SIP inbound
+  context tests, 3 WebRTC inbound-hardening tests, and 3 signaling ownership
+  tests. It covers interleaving, queue saturation, fast-auto-accept cleanup,
+  principal expiry, tenantless principals, reserved-header denial, and
+  cross-principal update/delete isolation.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
