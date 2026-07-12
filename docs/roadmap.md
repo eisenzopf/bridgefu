@@ -418,10 +418,16 @@ hint for SIP and WebRTC connections.
    - Add expiring, non-resurrectable worker leases, exact-fence renewal, and a
      one-way drain transition. PostgreSQL lease decisions use database time;
      standalone backends use an injected clock for deterministic parity tests.
+     A delayed projector evaluates renewal eligibility against the durable
+     event's recorded database time, not Redis recovery time, so an ordered
+     backlog can always converge after an outage.
    - Persist a separate, ordered coordination outbox for worker snapshots, call
      routes, and work-available notifications. A projector applies each event
      idempotently to memory or Redis, then acknowledges PostgreSQL; it never
      writes PostgreSQL and Redis as one request-path operation.
+     PostgreSQL sequence allocation and claims share a deployment-scoped
+     transactional lock so visible sequence order is commit order; a paused
+     lower-sequence producer cannot be overtaken by a later commit.
    - Treat Redis route/replay entries and per-worker Streams as short-lived
      sequence-checked hints only. Consumers still claim authoritative database
      work before external I/O, use bounded database fallback polling, and
@@ -431,6 +437,25 @@ hint for SIP and WebRTC connections.
      `XREADGROUP`/`XACK`/`XAUTOCLAIM`, bounded streams, deployment-prefixed keys,
      `rediss://` in clustered modes, and no raw tokens, secrets, provider
      payloads, or tenant authorization decisions in Redis.
+     Blocking response deadlines must exceed the configured interval;
+     disconnect, restart, `NOGROUP`, flush, and stream expiry reconnect and
+     recreate state with bounded backoff. Persist the `XAUTOCLAIM` cursor,
+     bound both stream length and pending-entry cleanup, and force a paced
+     authoritative-database poll after every timeout or coordination error.
+   - Retain sequence tombstones beyond route/replay payload expiry so delayed
+     older projections cannot resurrect stale hints. Apply equivalent expiry,
+     tombstone, blocking-poll, and cleanup behavior in the standalone memory
+     coordinator, and bound Redis worker candidate scans/pipelining before
+     falling back to authoritative placement.
+   - Wire coordination into real transactions and process supervision: worker
+     register/renew/drain, capacity reservation/release, call assignment/route,
+     replay markers, and work creation append events atomically; projectors and
+     wakeup consumers run as bounded supervised tasks. Redis supplies hints
+     only, and every placement/work claim is revalidated in the repository.
+   - Make disposable PostgreSQL and digest-pinned Redis 7.2 coordination tests
+     mandatory in CI and local backend scripts, including delayed recovery,
+     commit reordering, restart/flush/group recreation, v3-to-v4 migration, and
+     values above `2^53`; ignored external tests alone are not evidence.
 7. [ ] Replace global FIFO pairing with at least 256-bit, two-minute,
    single-use attachment tokens. Persist only a digest bound to tenant, call,
    leg, expected transport, and worker fence; atomically bind the exact rvoip
