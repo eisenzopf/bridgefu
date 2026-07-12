@@ -14,7 +14,7 @@ publish = false
 rvoip-amazon-connect = { path = "../rvoip/crates/webrtc/rvoip-amazon-connect", version = "0.1.3", features = ["server", "aws-control"] }
 rvoip-core = { path = "../rvoip/crates/foundation/rvoip-core", version = "0.2.5" }
 rvoip-moq = { path = "../rvoip/crates/moq/rvoip-moq", version = "0.1.0" }
-rvoip-quic = { path = "../rvoip/crates/uctp/rvoip-quic", version = "0.1.3" }
+rvoip-quic = { path = "../rvoip/crates/uctp/rvoip-quic", version = "0.2.0" }
 rvoip-sip = { path = "../rvoip/crates/sip/rvoip-sip", version = "0.2.5" }
 rvoip-webrtc = { path = "../rvoip/crates/webrtc/rvoip-webrtc", version = "0.1.3", features = ["signaling-whip", "signaling-ws"] }
 

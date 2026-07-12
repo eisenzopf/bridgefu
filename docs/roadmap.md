@@ -177,26 +177,73 @@ Gate 3 evidence recorded on 2026-07-11:
 Exit: auth-negative, cross-tenant, replay, expiry, cap, and leak tests pass on
 every supported substrate.
 
-### Gate 4 — Release UCTP 0.2 (`in progress`)
+### Gate 4 — Release UCTP 0.2 (`complete`)
 
-- [ ] Finalize the eight-byte UCTP header followed by a complete RTP packet.
-- [ ] Route simultaneous sessions on one QUIC/WebTransport peer by an
-  authenticated core-session mapping and peer-global stream-local-ID
-  allocation; remove the first-session reader context and first-route lookup.
-- [ ] Replace random-only subscription namespaces with authorized wire-to-core
-  Session/Connection bindings so legitimate peers can share a Session without
-  cross-tenant collisions; add real-wire subscribe/fanout and concurrent-
-  session packet tests.
-- [ ] Register MediaGraph virtual publishers through the existing Orchestrator
-  publisher/subscriber path and authorize real network listeners.
-- [ ] Add golden byte vectors and packet-capture conformance tests.
-- [ ] Version UCTP, QUIC, and WebTransport crates as 0.2 only after the wire,
-  routing, listener, and compatibility suites pass.
+The audited implementation order is deliberate; a crate-version change is the
+last step rather than evidence that the wire path is complete.
+
+1. [x] Define one `UctpCompatibility` descriptor for the crate release,
+   envelope version, RTP-datagram version, and ALPN; use it in negotiation,
+   diagnostics, and `auth.challenge` capabilities.
+2. [x] Enforce the eight-byte UCTP header followed by one complete RTP packet
+   through typed pack/unpack APIs, retaining any raw helpers only as explicitly
+   unchecked compatibility surfaces; add an authoritative full-byte vector.
+3. [x] Replace per-Session allocators and first-route lookup with one
+   peer-scoped, non-reusing media router shared by QUIC and WebTransport. Bind
+   every negotiated wire Stream ID to its real adapter Stream before emitting
+   `stream.opened`; route each datagram with that binding's Session,
+   Connection, Stream, and fanout context.
+4. [x] Replace random-only subscription namespaces with authenticated,
+   resolver-backed wire-to-core Session/Connection bindings. Tie subscriber
+   route handles to peer cancellation and remove exactly the owning route on
+   unsubscribe, disconnect, expiry, or drain.
+5. [x] Register managed MediaGraph virtual publishers through the existing
+   Orchestrator publisher/subscriber path, with one source receiver and atomic
+   graph-route/registry cleanup.
+6. [x] Prove same-peer multi-Session isolation and real wire-driven subscribe,
+   fanout, disconnect, reconnect, scope/tenant denial, and token-expiry behavior
+   on QUIC and WebTransport; add key-log-enabled packet-capture conformance.
+7. [x] Version UCTP, QUIC, and WebTransport crates as 0.2, update locks and the
+   breaking-wire migration guide, only after every preceding compatibility,
+   routing, listener, and conformance suite passes.
 
 Exit: authenticated QUIC and WebTransport listeners receive media and the 0.2
 wire suite passes.
 
-### Gate 5 — Finish rvoip-moq draft-19 (`pending`)
+Gate 4 evidence recorded on 2026-07-11:
+
+- rvoip revision `ef74512967e26f994c4593ed2187517e2c0307b4` is pushed on
+  `codex/bridgefu-1.0-rvoip`; Bridgefu CI pins that exact revision.
+- `rvoip-uctp`, `rvoip-quic`, and `rvoip-webtransport` are versioned 0.2.0
+  with coordinated changelogs. The serializable compatibility descriptor is
+  advertised in `auth.challenge` and keeps crate, envelope, datagram, ALPN,
+  and RTP-profile versions distinct.
+- The full post-bump core/UCTP/QUIC/WebTransport/all-feature WebSocket matrix
+  passes 333 tests (165 + 143 + 9 + 5 + 11). All-target/all-feature strict
+  clippy is clean for the same packages.
+- The checked media API rejects payload-only bodies and passes an exact
+  24-byte UCTP+RTP vector plus a checked-in PCAP fixture. TLS key logging is an
+  explicit conformance-only opt-in and is never enabled from environment alone.
+- QUIC and WebTransport each prove several Sessions on one physical peer have
+  non-reused, non-aliasing media IDs; failed batches roll back; ending one
+  Session preserves its siblings; both transports receive real RTP media.
+- Real authenticated `stream.subscribe` and `stream.unsubscribe` envelopes on
+  both QUIC and WebTransport resolve through an explicit canonical Session,
+  deliver media, remove the exact subscriber row, and stop post-unsubscribe
+  delivery. Resolver rejection happens before Session state or events exist.
+- `Orchestrator::register_virtual_publisher` attaches a bounded ten-frame sink
+  to the reusable MediaGraph, fans canonical Stream IDs through the existing
+  registry, and uses generation-scoped cleanup that cannot delete a
+  replacement publisher.
+- Bridgefu's locked consumer graph passes 34 tests against the 0.2.0 crates;
+  StandardCharter remains unchanged and passes all 35 core and 3 web tests.
+  CI now runs the all-target Gate 4 matrix and the same strict clippy set.
+- The current rvoip revision packages `rvoip-uctp` 0.2.0 successfully. Dry
+  packaging the dependent QUIC/WebTransport crates correctly waits for a
+  separately authorized publication of `rvoip-uctp` 0.2.0; no artifacts were
+  published.
+
+### Gate 5 — Finish rvoip-moq draft-19 (`in progress`)
 
 - [ ] Patch and exact-pin moq-rs for MOQT-19/MSF-01/LOC-03.
 - [ ] Replace the current runtime/target mismatch with `MoqProtocolVersion` and
