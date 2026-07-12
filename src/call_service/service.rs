@@ -7,27 +7,31 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rvoip_auth_core::AuthenticatedPrincipal;
+use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::api_principal::{ApiPrincipal, ApiPrincipalError, CallScope};
 use crate::call_engine::{
-    AttachmentId, AttachmentIssue, AttachmentTransport, CallAggregate, CallCommand, CallId,
-    CallRepository, CommandId, LegDirection, LegId, LegSpec, PrincipalFingerprint, RepositoryError,
-    StopLegReason, TenantId, WorkerLease,
+    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTransport,
+    CallAggregate, CallCommand, CallId, CallRepository, CommandCommitView, CommandId,
+    ConnectionBinding, LegDirection, LegId, LegSpec, LegState, PrincipalFingerprint,
+    RepositoryError, StopLegReason, TenantId, WorkerLease,
 };
 use crate::coordination::{CoordinationProjection, WorkerSelectionRequest};
 
 use super::{
-    AmazonConnectEndpointConfig, AttachmentTokenContext, AttachmentView, CallExecutionPlan,
-    CallOperationResult, CallServiceCrypto, CallServiceRepository, CallView,
-    CanonicalRequestTranscript, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
-    CreateCallView, DtmfAcceptedView, DtmfSequence, IdempotencyKey, LegEndpointConfig,
-    LegExecutionSpec, OperationIdempotency, ProviderEndpointConfig, ProviderKind,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
-    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput,
-    ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
-    WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
+    digest_presented_attachment_token, AmazonConnectEndpointConfig, AttachmentTokenContext,
+    AttachmentView, CallExecutionPlan, CallOperationResult, CallServiceCrypto,
+    CallServiceRepository, CallView, CanonicalRequestTranscript, ControlCommandOutcome,
+    ControlCommandTransaction, ControlIntent, CreateCallView, DtmfAcceptedView, DtmfSequence,
+    IdempotencyKey, LegEndpointConfig, LegExecutionSpec, OperationIdempotency,
+    ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCreateCandidate, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectPayloadInput, ServiceOperationKind, SipEndpointConfig, StoredServiceCall,
+    TransferTarget, WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
 };
 
 /// One API-requested logical leg.
@@ -412,6 +416,95 @@ pub enum CallServiceError {
     InvalidTransition,
 }
 
+/// Complete signaling proof presented by an inbound rvoip connection.
+///
+/// Sensitive fields are private so callers cannot accidentally derive a
+/// verbose `Debug` representation containing the bearer or principal. The
+/// request intentionally owns the optional routing token so the service can
+/// zeroize it on every return path.
+pub struct InboundAttachmentRequest {
+    principal: AuthenticatedPrincipal,
+    routing_token: Option<String>,
+    transport: AttachmentTransport,
+    worker: WorkerLease,
+    connection_id: ConnectionId,
+}
+
+impl InboundAttachmentRequest {
+    /// Creates one complete inbound signaling proof request.
+    #[must_use]
+    pub fn new(
+        principal: AuthenticatedPrincipal,
+        routing_token: Option<String>,
+        transport: AttachmentTransport,
+        worker: WorkerLease,
+        connection_id: ConnectionId,
+    ) -> Self {
+        Self {
+            principal,
+            routing_token,
+            transport,
+            worker,
+            connection_id,
+        }
+    }
+}
+
+impl fmt::Debug for InboundAttachmentRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InboundAttachmentRequest")
+            .field("principal", &"[redacted]")
+            .field(
+                "routing_token",
+                &self.routing_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("transport", &self.transport)
+            .field("worker", &self.worker)
+            .field("connection_id", &self.connection_id)
+            .finish()
+    }
+}
+
+impl Drop for InboundAttachmentRequest {
+    fn drop(&mut self) {
+        if let Some(token) = &mut self.routing_token {
+            token.zeroize();
+        }
+    }
+}
+
+/// Successful atomic attachment consumption and signaling transition.
+#[derive(Clone, Eq, PartialEq)]
+pub struct InboundAttachmentResult {
+    /// Durable rvoip connection ownership binding.
+    pub binding: ConnectionBinding,
+    /// Atomic state-machine commit that moved the exact leg generation to signaling.
+    pub commit: CommandCommitView,
+}
+
+impl fmt::Debug for InboundAttachmentResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InboundAttachmentResult")
+            .field("call_id", &self.commit.call.aggregate.id())
+            .field("binding", &self.binding)
+            .field("aggregate_version", &self.commit.call.aggregate.version())
+            .finish()
+    }
+}
+
+/// Public, oracle-resistant result of inbound attachment admission.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum InboundAttachmentError {
+    /// Any missing, malformed, stale, replayed, conflicting, or mismatched proof.
+    #[error("attachment proof rejected")]
+    ProofRejected,
+    /// The durable repository could not complete the proof transaction.
+    #[error("attachment proof service unavailable")]
+    Unavailable,
+}
+
 /// Authenticated transaction boundary used by HTTP and future command transports.
 pub struct CallService {
     repository: Arc<dyn CallServiceRepository>,
@@ -455,6 +548,80 @@ impl CallService {
             clock,
             timeouts,
         }
+    }
+
+    /// Validates and atomically consumes one inbound signaling attachment.
+    ///
+    /// Every proof mismatch deliberately collapses to
+    /// [`InboundAttachmentError::ProofRejected`]. Only a true repository
+    /// availability failure remains distinguishable. The complete rvoip
+    /// principal is validated before the first await, then its expiry and the
+    /// candidate token expiry are observed again after inspection and before
+    /// the atomic binding transaction.
+    pub async fn consume_inbound_attachment(
+        &self,
+        mut request: InboundAttachmentRequest,
+    ) -> Result<InboundAttachmentResult, InboundAttachmentError> {
+        // Consume the owned bearer first so even principal-validation failures
+        // take the parser's guaranteed zeroizing path.
+        let token_digest = request
+            .routing_token
+            .take()
+            .ok_or(InboundAttachmentError::ProofRejected)
+            .and_then(|token| {
+                digest_presented_attachment_token(token)
+                    .map_err(|_| InboundAttachmentError::ProofRejected)
+            })?;
+        let inspected_at = self.clock.now();
+        let principal = ApiPrincipal::new(request.principal.clone(), inspected_at)
+            .map_err(|_| InboundAttachmentError::ProofRejected)?;
+        let tenant = principal.tenant().clone();
+        let principal_fingerprint = self.crypto.principal_fingerprint(&principal);
+        let candidate = self
+            .repository
+            .inspect_inbound_attachment(AttachmentLookup {
+                token_digest,
+                tenant_id: tenant,
+                transport: request.transport,
+                principal_fingerprint,
+                worker: request.worker,
+                at: inspected_at,
+            })
+            .await
+            .map_err(map_inbound_attachment_repository_error)?;
+
+        // The inspection await is an attacker-controlled delay at a remote
+        // database boundary. Never reuse its pre-await time observation.
+        let consume_at = self.clock.now();
+        if principal.authenticated().is_expired_at(consume_at)
+            || candidate.expires_at() <= consume_at
+        {
+            return Err(InboundAttachmentError::ProofRejected);
+        }
+        let leg_id = candidate.leg_id();
+        let binding_generation = candidate.binding_generation();
+        let consumed = self
+            .repository
+            .consume_inbound_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: consume_at,
+                    leg_id,
+                    binding_generation,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: request.connection_id.clone(),
+                principal_fingerprint,
+                at: consume_at,
+            })
+            .await
+            .map_err(map_inbound_attachment_repository_error)?;
+        Ok(InboundAttachmentResult {
+            binding: consumed.binding,
+            commit: consumed.commit,
+        })
     }
 
     /// Authenticates ownership, reserves a worker, and creates both legs atomically.
@@ -1018,6 +1185,26 @@ fn map_placement_error(error: PlacementError) -> CallServiceError {
     }
 }
 
+fn map_inbound_attachment_repository_error(error: RepositoryError) -> InboundAttachmentError {
+    match error {
+        RepositoryError::Unavailable
+        | RepositoryError::CapacityExceeded
+        | RepositoryError::IdempotencyConflict
+        | RepositoryError::ProviderEventConflict
+        | RepositoryError::ProviderReferenceConflict
+        | RepositoryError::StaleClaim
+        | RepositoryError::CounterExhausted
+        | RepositoryError::InvalidInput(_) => InboundAttachmentError::Unavailable,
+        RepositoryError::NotFound
+        | RepositoryError::StaleWorkerFence
+        | RepositoryError::VersionConflict
+        | RepositoryError::CommandConflict
+        | RepositoryError::AttachmentRejected
+        | RepositoryError::AttachmentConflict
+        | RepositoryError::DomainRejected => InboundAttachmentError::ProofRejected,
+    }
+}
+
 fn checked_deadline(
     at: DateTime<Utc>,
     duration: Duration,
@@ -1156,6 +1343,7 @@ fn provider_label(provider: ProviderKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1167,8 +1355,14 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::call_engine::{
-        AttachmentConsume, AttachmentLookup, AttachmentTokenDigest, BindingGeneration,
-        CallRepository, CallState, CommandCommit, LegState, RegisterWorker, WorkerId,
+        AttachmentCandidate, AttachmentConsume, AttachmentLookup, AttachmentTokenDigest,
+        BindingGeneration, CallRepository, CallState, CommandCommit, ConsumedAttachment, EffectId,
+        IdempotencyKeyDigest, LegState, RegisterWorker, RequestDigest, WorkerId,
+    };
+    use crate::call_service::{
+        ClaimedControlEffect, ControlCommandOutcome, ControlCommandTransaction,
+        EffectResultOutcome, EffectResultReconciliation, OutboundConnectionBind,
+        OutboundConnectionBindOutcome, StoredExternalReference, StoredServiceEffectPayload,
     };
     use crate::persistence::MemoryRepository;
 
@@ -1302,6 +1496,147 @@ mod tests {
         release: Arc<tokio::sync::Barrier>,
     }
 
+    #[derive(Debug)]
+    struct BlockingAttachmentRepository {
+        inner: Arc<MemoryRepository>,
+        block_next_inspection: AtomicBool,
+        unavailable: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingAttachmentRepository {
+        fn new(inner: Arc<MemoryRepository>) -> Self {
+            Self {
+                inner,
+                block_next_inspection: AtomicBool::new(false),
+                unavailable: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn block_next_inspection(&self) {
+            self.block_next_inspection.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_inspection(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release_inspection(&self) {
+            self.release.notify_one();
+        }
+
+        fn set_unavailable(&self, unavailable: bool) {
+            self.unavailable.store(unavailable, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl CallServiceRepository for BlockingAttachmentRepository {
+        async fn inspect_inbound_attachment(
+            &self,
+            request: AttachmentLookup,
+        ) -> Result<AttachmentCandidate, RepositoryError> {
+            if self.unavailable.load(Ordering::SeqCst) {
+                return Err(RepositoryError::Unavailable);
+            }
+            if self.block_next_inspection.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.inspect_inbound_attachment(request).await
+        }
+
+        async fn consume_inbound_attachment(
+            &self,
+            request: AttachmentConsume,
+        ) -> Result<ConsumedAttachment, RepositoryError> {
+            self.inner.consume_inbound_attachment(request).await
+        }
+
+        async fn load_create_replay(
+            &self,
+            _tenant_id: &TenantId,
+            _key_digest: IdempotencyKeyDigest,
+            _request_digest: RequestDigest,
+            _at: DateTime<Utc>,
+        ) -> Result<Option<StoredServiceCall>, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn create_with_plan(
+            &self,
+            _request: ServiceCreateTransaction,
+        ) -> Result<ServiceCreateOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn load_service_call(
+            &self,
+            _tenant_id: &TenantId,
+            _call_id: CallId,
+        ) -> Result<StoredServiceCall, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn commit_with_effect_payloads(
+            &self,
+            _request: ServiceCommandTransaction,
+        ) -> Result<ServiceCommandOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn load_effect_payload(
+            &self,
+            _tenant_id: &TenantId,
+            _effect_id: EffectId,
+        ) -> Result<Option<StoredServiceEffectPayload>, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn enqueue_control(
+            &self,
+            _request: ControlCommandTransaction,
+        ) -> Result<ControlCommandOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn claim_control_effects(
+            &self,
+            _worker: WorkerLease,
+            _at: DateTime<Utc>,
+            _claim_ttl: Duration,
+            _limit: usize,
+        ) -> Result<Vec<ClaimedControlEffect>, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn bind_outbound_connection(
+            &self,
+            _request: OutboundConnectionBind,
+        ) -> Result<OutboundConnectionBindOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn load_external_reference(
+            &self,
+            _tenant_id: &TenantId,
+            _call_id: CallId,
+            _leg_id: LegId,
+        ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn reconcile_effect_result(
+            &self,
+            _request: EffectResultReconciliation,
+        ) -> Result<EffectResultOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+    }
+
     #[async_trait]
     impl WorkerPlacement for BarrierSuccessfulPlacement {
         async fn select_workers(
@@ -1320,19 +1655,27 @@ mod tests {
         Utc.timestamp_opt(1_900_000_000 + second, 0).unwrap()
     }
 
+    fn authenticated_principal(
+        tenant: &str,
+        subject: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            subject: subject.into(),
+            tenant: Some(tenant.into()),
+            scopes: vec!["*".into()],
+            issuer: Some("test-issuer".into()),
+            expires_at,
+            method: AuthenticationMethod::Jwt,
+            assurance: IdentityAssurance::Pseudonymous {
+                ephemeral_key: Jwk(serde_json::json!({"kty": "test"})),
+            },
+        }
+    }
+
     fn principal(tenant: &str) -> ApiPrincipal {
         ApiPrincipal::new(
-            AuthenticatedPrincipal {
-                subject: format!("subject-{tenant}"),
-                tenant: Some(tenant.into()),
-                scopes: vec!["*".into()],
-                issuer: Some("test-issuer".into()),
-                expires_at: None,
-                method: AuthenticationMethod::Jwt,
-                assurance: IdentityAssurance::Pseudonymous {
-                    ephemeral_key: Jwk(serde_json::json!({"kty": "test"})),
-                },
-            },
+            authenticated_principal(tenant, &format!("subject-{tenant}"), None),
             at(0),
         )
         .unwrap()
@@ -1412,6 +1755,39 @@ mod tests {
         AttachmentTokenDigest::new(Sha256::digest(raw).into())
     }
 
+    fn take_first_attachment(
+        created: &mut CallOperationResult<CreateCallView>,
+    ) -> (CallId, LegId, String, DateTime<Utc>) {
+        let call_id = created.value.call.call_id;
+        let leg = &mut created.value.call.legs[0];
+        let leg_id = leg.leg_id;
+        let attachment = leg.attachment.as_mut().unwrap();
+        (
+            call_id,
+            leg_id,
+            std::mem::take(&mut attachment.token),
+            attachment.expires_at,
+        )
+    }
+
+    fn inbound_request(
+        tenant: &str,
+        subject: &str,
+        expires_at: Option<DateTime<Utc>>,
+        token: Option<String>,
+        transport: AttachmentTransport,
+        worker: WorkerLease,
+        connection_id: ConnectionId,
+    ) -> InboundAttachmentRequest {
+        InboundAttachmentRequest::new(
+            authenticated_principal(tenant, subject, expires_at),
+            token,
+            transport,
+            worker,
+            connection_id,
+        )
+    }
+
     async fn connect_created_call(
         repository: &MemoryRepository,
         service: &CallService,
@@ -1482,6 +1858,36 @@ mod tests {
                 })
                 .await
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn inbound_attachment_error_mapping_separates_proofs_from_operational_faults() {
+        for error in [
+            RepositoryError::AttachmentRejected,
+            RepositoryError::AttachmentConflict,
+            RepositoryError::StaleWorkerFence,
+            RepositoryError::VersionConflict,
+            RepositoryError::CommandConflict,
+            RepositoryError::DomainRejected,
+        ] {
+            assert_eq!(
+                map_inbound_attachment_repository_error(error),
+                InboundAttachmentError::ProofRejected
+            );
+        }
+        for error in [
+            RepositoryError::Unavailable,
+            RepositoryError::CounterExhausted,
+            RepositoryError::ProviderEventConflict,
+            RepositoryError::ProviderReferenceConflict,
+            RepositoryError::StaleClaim,
+            RepositoryError::InvalidInput("impossible attachment path error"),
+        ] {
+            assert_eq!(
+                map_inbound_attachment_repository_error(error),
+                InboundAttachmentError::Unavailable
+            );
         }
     }
 
@@ -1991,6 +2397,554 @@ mod tests {
         assert_eq!(
             service.create_view(stored, true).unwrap_err(),
             CallServiceError::DependencyUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_rechecks_principal_and_token_expiry_after_blocked_inspection() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 4,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let creator = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x71; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let owner = principal("tenant-a");
+        let mut principal_expiry_call = creator
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-principal-expiry").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let mut token_expiry_call = creator
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-token-expiry").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (_, _, principal_token, _) = take_first_attachment(&mut principal_expiry_call);
+        let principal_retry_token = principal_token.clone();
+        let (_, _, token_expiring, token_expires_at) =
+            take_first_attachment(&mut token_expiry_call);
+
+        let blocking = Arc::new(BlockingAttachmentRepository::new(repository));
+        let service = Arc::new(CallService::new(
+            blocking.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x71; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        ));
+
+        clock.set(at(1));
+        blocking.block_next_inspection();
+        let principal_expiry_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        Some(at(2)),
+                        Some(principal_token),
+                        AttachmentTransport::Sip,
+                        worker,
+                        ConnectionId::new(),
+                    ))
+                    .await
+            })
+        };
+        blocking.wait_until_inspection().await;
+        clock.set(at(2));
+        blocking.release_inspection();
+        assert_eq!(
+            principal_expiry_task.await.unwrap(),
+            Err(InboundAttachmentError::ProofRejected)
+        );
+        service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(principal_retry_token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .unwrap();
+
+        clock.set(token_expires_at - chrono::Duration::seconds(1));
+        blocking.block_next_inspection();
+        let token_expiry_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        None,
+                        Some(token_expiring),
+                        AttachmentTransport::Sip,
+                        worker,
+                        ConnectionId::new(),
+                    ))
+                    .await
+            })
+        };
+        blocking.wait_until_inspection().await;
+        clock.set(token_expires_at);
+        blocking.release_inspection();
+        assert_eq!(
+            token_expiry_task.await.unwrap(),
+            Err(InboundAttachmentError::ProofRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_exposes_only_true_repository_unavailability() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let creator = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x72; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let mut created = creator
+            .create_call(
+                &principal("tenant-a"),
+                &IdempotencyKey::parse("service-attachment-unavailable").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (_, _, token, _) = take_first_attachment(&mut created);
+        let retry_token = token.clone();
+        let blocking = Arc::new(BlockingAttachmentRepository::new(repository));
+        let service = CallService::new(
+            blocking.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x72; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        clock.set(at(1));
+        blocking.set_unavailable(true);
+        assert_eq!(
+            service
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    None,
+                    Some(token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::Unavailable)
+        );
+        blocking.set_unavailable(false);
+        service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(retry_token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_service_binds_exact_leg_and_rejects_replay() {
+        let (repository, service, clock, worker) = harness(4).await;
+        let owner = principal("tenant-a");
+        let mut created = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-success").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (call_id, leg_id, token, _) = take_first_attachment(&mut created);
+        let replay_token = token.clone();
+        let connection_id = ConnectionId::new();
+        clock.set(at(1));
+        let request = inbound_request(
+            "tenant-a",
+            "subject-tenant-a",
+            None,
+            Some(token.clone()),
+            AttachmentTransport::Sip,
+            worker,
+            connection_id.clone(),
+        );
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains(&token));
+        assert!(!request_debug.contains("subject-tenant-a"));
+
+        let result = service.consume_inbound_attachment(request).await.unwrap();
+        assert_eq!(result.commit.call.aggregate.id(), call_id);
+        assert_eq!(result.binding.leg_id, leg_id);
+        assert_eq!(result.binding.connection_id, connection_id);
+        assert_eq!(
+            result.binding.binding_generation,
+            BindingGeneration::INITIAL
+        );
+        assert_eq!(
+            result.commit.call.aggregate.leg(leg_id).unwrap().state(),
+            LegState::Signaling
+        );
+        let result_debug = format!("{result:?}");
+        assert!(!result_debug.contains("subject-tenant-a"));
+        assert!(!result_debug.contains(&token));
+
+        assert_eq!(
+            service
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    None,
+                    Some(replay_token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+        let stored = repository
+            .load_call(&TenantId::parse("tenant-a").unwrap(), call_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.bindings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_service_collapses_missing_malformed_and_expired_proofs() {
+        let (_repository, service, clock, worker) = harness(4).await;
+        let owner = principal("tenant-a");
+        let mut created = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-malformed").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (_, _, token, expires_at) = take_first_attachment(&mut created);
+        let mut noncanonical = URL_SAFE_NO_PAD.encode([0_u8; 32]);
+        assert_eq!(noncanonical.pop(), Some('A'));
+        noncanonical.push('B');
+        for malformed in [None, Some("short".into()), Some(noncanonical)] {
+            assert_eq!(
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        None,
+                        malformed,
+                        AttachmentTransport::Sip,
+                        worker,
+                        ConnectionId::new(),
+                    ))
+                    .await,
+                Err(InboundAttachmentError::ProofRejected)
+            );
+        }
+
+        let mut missing_tenant = authenticated_principal("tenant-a", "subject-tenant-a", None);
+        missing_tenant.tenant = None;
+        assert_eq!(
+            service
+                .consume_inbound_attachment(InboundAttachmentRequest::new(
+                    missing_tenant,
+                    Some(token.clone()),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+
+        clock.set(at(1));
+        assert_eq!(
+            service
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    Some(at(1)),
+                    Some(token.clone()),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+
+        clock.set(expires_at);
+        assert_eq!(
+            service
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    None,
+                    Some(token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_service_collapses_transport_tenant_principal_and_fence_mismatch() {
+        let (_repository, service, clock, worker) = harness(4).await;
+        let owner = principal("tenant-a");
+        let mut created = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-mismatches").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (call_id, _, token, _) = take_first_attachment(&mut created);
+        clock.set(at(1));
+        let wrong_fence = WorkerLease {
+            worker_id: worker.worker_id,
+            fence: serde_json::from_value(serde_json::json!(2)).unwrap(),
+        };
+        let mut wrong_issuer = authenticated_principal("tenant-a", "subject-tenant-a", None);
+        wrong_issuer.issuer = Some("another-issuer".into());
+        let mismatches = [
+            inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(token.clone()),
+                AttachmentTransport::WebRtc,
+                worker,
+                ConnectionId::new(),
+            ),
+            inbound_request(
+                "tenant-b",
+                "subject-tenant-b",
+                None,
+                Some(token.clone()),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ),
+            inbound_request(
+                "tenant-a",
+                "another-subject",
+                None,
+                Some(token.clone()),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ),
+            InboundAttachmentRequest::new(
+                wrong_issuer,
+                Some(token.clone()),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ),
+            inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(token.clone()),
+                AttachmentTransport::Sip,
+                wrong_fence,
+                ConnectionId::new(),
+            ),
+        ];
+        for request in mismatches {
+            assert_eq!(
+                service.consume_inbound_attachment(request).await,
+                Err(InboundAttachmentError::ProofRejected)
+            );
+        }
+
+        let result = service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.commit.call.aggregate.id(), call_id);
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_service_duplicate_connection_rolls_back_second_proof() {
+        let (_repository, service, clock, worker) = harness(4).await;
+        let owner = principal("tenant-a");
+        let mut first = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-connection-first").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let mut second = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-connection-second").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (_, _, first_token, _) = take_first_attachment(&mut first);
+        let (second_call_id, _, second_token, _) = take_first_attachment(&mut second);
+        let retry_token = second_token.clone();
+        let duplicate = ConnectionId::new();
+        clock.set(at(1));
+        service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(first_token),
+                AttachmentTransport::Sip,
+                worker,
+                duplicate.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    None,
+                    Some(second_token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    duplicate,
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+
+        let recovered = service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(retry_token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recovered.commit.call.aggregate.id(), second_call_id);
+    }
+
+    #[tokio::test]
+    async fn interleaved_inbound_attachment_proofs_cannot_cross_bind_calls() {
+        let (_repository, service, clock, worker) = harness(4).await;
+        let owner = principal("tenant-a");
+        let mut first = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-interleaved-first").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let mut second = service
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-attachment-interleaved-second").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (first_call_id, first_leg_id, first_token, _) = take_first_attachment(&mut first);
+        let (second_call_id, second_leg_id, second_token, _) = take_first_attachment(&mut second);
+        clock.set(at(1));
+        let first_future = service.consume_inbound_attachment(inbound_request(
+            "tenant-a",
+            "subject-tenant-a",
+            None,
+            Some(first_token),
+            AttachmentTransport::Sip,
+            worker,
+            ConnectionId::new(),
+        ));
+        let second_future = service.consume_inbound_attachment(inbound_request(
+            "tenant-a",
+            "subject-tenant-a",
+            None,
+            Some(second_token),
+            AttachmentTransport::Sip,
+            worker,
+            ConnectionId::new(),
+        ));
+        let (first_result, second_result) = tokio::join!(first_future, second_future);
+        let first_result = first_result.unwrap();
+        let second_result = second_result.unwrap();
+        assert_eq!(first_result.commit.call.aggregate.id(), first_call_id);
+        assert_eq!(first_result.binding.leg_id, first_leg_id);
+        assert_eq!(second_result.commit.call.aggregate.id(), second_call_id);
+        assert_eq!(second_result.binding.leg_id, second_leg_id);
+        assert_ne!(
+            first_result.binding.connection_id,
+            second_result.binding.connection_id
         );
     }
 

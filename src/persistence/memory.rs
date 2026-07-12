@@ -2623,6 +2623,20 @@ impl CallRepository for MemoryRepository {
 
 #[async_trait]
 impl CallServiceRepository for MemoryRepository {
+    async fn inspect_inbound_attachment(
+        &self,
+        request: AttachmentLookup,
+    ) -> Result<AttachmentCandidate, RepositoryError> {
+        <Self as CallRepository>::inspect_attachment(self, request).await
+    }
+
+    async fn consume_inbound_attachment(
+        &self,
+        request: AttachmentConsume,
+    ) -> Result<ConsumedAttachment, RepositoryError> {
+        <Self as CallRepository>::consume_attachment(self, request).await
+    }
+
     async fn load_create_replay(
         &self,
         tenant_id: &TenantId,

@@ -8,9 +8,10 @@ use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
-    AttachmentIssue, AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration,
-    CommandCommit, CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId,
-    FailureDetails, IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
+    AttachmentCandidate, AttachmentConsume, AttachmentIssue, AttachmentLookup, AttachmentTransport,
+    BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit, CommandCommitView,
+    CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId, FailureDetails,
+    IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
     ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
 };
 
@@ -479,6 +480,23 @@ pub enum EffectResultOutcome {
 /// Durable service companion. Implementations perform no provider or rvoip I/O.
 #[async_trait]
 pub trait CallServiceRepository: Send + Sync {
+    /// Inspects one inbound attachment proof without consuming it.
+    ///
+    /// Implementations must preserve the core repository's indistinguishable
+    /// proof-rejection semantics. This seam keeps the complete proof flow on
+    /// the service repository used by [`super::CallService`].
+    async fn inspect_inbound_attachment(
+        &self,
+        request: AttachmentLookup,
+    ) -> Result<AttachmentCandidate, RepositoryError>;
+
+    /// Atomically consumes one inspected proof, binds its rvoip connection,
+    /// and commits the supplied signaling transition.
+    async fn consume_inbound_attachment(
+        &self,
+        request: AttachmentConsume,
+    ) -> Result<ConsumedAttachment, RepositoryError>;
+
     /// Returns an unexpired exact create receipt before worker placement.
     ///
     /// Implementations do not mutate retention state during this preflight.
