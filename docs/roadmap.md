@@ -421,6 +421,20 @@ hint for SIP and WebRTC connections.
    leg, expected transport, and worker fence; atomically bind the exact rvoip
    Connection ID and reject expiry, replay, wrong transport, and cross-call or
    cross-tenant use.
+   - Treat signaling authentication and attachment proof as separate checks.
+     The attachment token never substitutes for the authenticated rvoip
+     principal, and an inbound provider leg resolves its expected transport
+     principal from the configured account/authentication profile rather than
+     blindly inheriting the control-API caller.
+   - Present the token as the SIP Request-URI user, the WHIP/WHEP resource tag,
+     or a dedicated `bridgefu.attach.<token>` WebSocket subprotocol value.
+     Keep the WebSocket authentication bearer in its existing independent
+     subprotocol/header path; do not put attachment tokens in query strings.
+     rvoip's auth hook retains only a redacted, single-take session hint.
+   - On every inbound connection, obtain the complete authenticated principal,
+     consume its owner-bound rvoip inbound context once, hash the routing hint,
+     inspect and consume the durable attachment atomically, and reject/close
+     the connection on any mismatch. Never log or serialize the raw hint.
 8. [ ] Add a bounded lifecycle supervisor for setup/media/transfer/cleanup
    deadlines, cancellation and compensation, hangup-versus-transfer glare,
    peer teardown, stale generation rejection, worker drain, and fenced restart
