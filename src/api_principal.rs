@@ -217,6 +217,16 @@ impl ApiBearerAuthenticator {
         Self { validator }
     }
 
+    /// Returns the exact validator shared by HTTP and signaling ingress.
+    ///
+    /// Keeping one validator instance prevents the control API, SIP, and
+    /// WebRTC listeners from constructing subtly different principals for
+    /// the same credential.
+    #[must_use]
+    pub fn validator(&self) -> Arc<dyn BearerValidator> {
+        Arc::clone(&self.validator)
+    }
+
     /// Parses one credential, validates it, and retains the complete principal.
     pub async fn authenticate(
         &self,
@@ -389,6 +399,10 @@ impl ConfiguredApiKeyValidator {
                     CallScope::Hangup.as_str().into(),
                     CallScope::Transfer.as_str().into(),
                     CallScope::Dtmf.as_str().into(),
+                    "sip:connect".into(),
+                    "webrtc:connect".into(),
+                    "whip:publish".into(),
+                    "whep:subscribe".into(),
                 ],
                 issuer: Some("bridgefu:configured-api-key".into()),
                 expires_at: None,
@@ -803,6 +817,14 @@ mod tests {
             CallScope::Dtmf,
         ] {
             static_principal.authorize(scope, now()).unwrap();
+        }
+        for scope in [
+            "sip:connect",
+            "webrtc:connect",
+            "whip:publish",
+            "whep:subscribe",
+        ] {
+            assert!(static_principal.authenticated().has_scope(scope));
         }
         assert_eq!(
             static_principal.resolve_tenant(Some("tenant-b"), CallScope::Read, now()),
