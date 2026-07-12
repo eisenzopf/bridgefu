@@ -896,6 +896,12 @@ not hide an earlier adapter side effect behind a nominally staged API.
      failures expose only offsets, error classes, and remaining byte counts;
      they never log the unparsed remainder because it may contain credentials,
      malformed headers, or a body.
+     Legacy dialog/API/manager/protocol logs follow the same rule: From, To,
+     target, resolver, Contact, REFER, Route, and Via URIs; arbitrary response
+     reasons; transaction identifiers; complete messages; and lower parser or
+     validation errors are represented only by fixed class, status,
+     presence/length/count, and safe standard-method metadata. Source sockets
+     may remain for network diagnostics; caller/peer signaling values may not.
      Authorization-bearing raw values, their enclosing typed headers, and
      complete requests must also redact secrets from diagnostics regardless of
      whether the header name uses a canonical variant or a case-insensitive
@@ -1075,7 +1081,10 @@ Gate 7 progress evidence recorded on 2026-07-12:
   values reflected by transaction-layer logs, plus a parser failure path that
   reflects the unparsed peer-controlled remainder. The 2b dependency audit also
   found raw P-Asserted-Identity/proxy URI values in SIP option-materialization
-  errors. Those diagnostic surfaces
+  errors. A final source-wide scan also found the same caller-controlled URI,
+  Contact, REFER target, reason, transaction identifier, and lower-error values
+  in legacy dialog/API/manager/protocol logs outside the transaction tree.
+  Those diagnostic surfaces
   must be closed with log-only wrappers before 2a may be represented as
   complete. `TransactionKey`'s public `Display`/`Debug` formats remain unchanged
   because legacy event/API round trips parse them functionally; only log sinks
