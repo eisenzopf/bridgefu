@@ -540,6 +540,16 @@ Gate 6 progress evidence recorded on 2026-07-12:
   suite passes 49 library, 20 binary, 10 repository, and 14 StandardCharter
   tests; strict library/repository Clippy and warning-free rustdoc pass. CI
   provisions PostgreSQL and cannot silently use the local skip path.
+- Bridgefu revision `fb24b7a` upgrades both SQL backends to integrity schema
+  version 3. Service ownership is now an independent one-way call marker;
+  expired service/control idempotency claims leave immutable cross-linked
+  tombstones; locally retired control work has an exact causal-command receipt;
+  and terminal reconciliation plus outbound binding evidence is validated in
+  both directions. The standalone and disposable PostgreSQL suites pass 16
+  repository and 3 call-service backend tests, including v2 upgrades, exact
+  key reuse after 24 hours, ignored-command tampering, and direct deletion of
+  every required evidence row. The full locked suite passes 136 tests with
+  strict Clippy, rustdoc, formatting, and checksum validation.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
