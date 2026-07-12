@@ -334,7 +334,7 @@ hint for SIP and WebRTC connections.
    WHIP/WS path or authenticated session hint, expose it through Orchestrator as
    a single-take value, and erase it on terminal cleanup. Prove once-only,
    redacted, transport-bound, and cross-tenant-safe behavior.
-2. [ ] Add Bridgefu's pure typed two-leg aggregate with strong call/leg/tenant
+2. [x] Add Bridgefu's pure typed two-leg aggregate with strong call/leg/tenant
    IDs, exact call and leg states, directions, typed leg kinds, UTC deadlines,
    binding generations, sanitized failures, transition invariants, and
    serializable effect intents. Keep the frozen Amazon runtime untouched.
@@ -367,6 +367,23 @@ hint for SIP and WebRTC connections.
    peer teardown, stale generation rejection, worker drain, and fenced restart
    recovery. Active media is ended and cleaned after worker loss, never
    migrated.
+
+Gate 6 progress evidence recorded on 2026-07-12:
+
+- Bridgefu revision `6e8bc0a2534b9cb962d0e613e4715e3aea30a525`
+  adds the pure, fixed-size two-leg aggregate without changing the API,
+  generic runtime, or frozen Amazon runtime. It includes strong IDs,
+  database-safe generations, exact call/leg states and leg kinds, UTC
+  generation-bound deadlines, sanitized failures, and serializable commands,
+  decisions, and ordered effect intents.
+- The domain suite passes 19 transition, stale-generation, serialization,
+  invariant, and property-like tests. The complete Bridgefu all-target suite
+  passes 20 binary tests plus 14 StandardCharter contract tests; strict library
+  Clippy and warning-free library rustdoc pass.
+- The rvoip inbound-context seam is implemented but remains unchecked here
+  until its independent review findings on saturated terminal delivery,
+  post-gather principal expiry, SIP metadata policy, pending-context bounds,
+  and atomic authenticated-inbound delivery are fixed and requalified.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
