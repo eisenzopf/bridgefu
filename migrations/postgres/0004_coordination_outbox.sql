@@ -29,3 +29,15 @@ CREATE TABLE coordination_outbox (
 CREATE INDEX coordination_outbox_pending
     ON coordination_outbox (deployment_id, sequence)
     WHERE applied_at_ms IS NULL;
+
+-- Existing v3 workers are expired at migration time by setting the new
+-- authoritative expiry to their last update. A process must re-register and
+-- advance the fence after upgrade.
+ALTER TABLE workers
+    ADD COLUMN lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT 'epoch';
+UPDATE workers
+SET lease_expires_at = updated_at,
+    body = jsonb_set(body, '{lease_expires_at}', to_jsonb(updated_at), TRUE);
+ALTER TABLE workers ALTER COLUMN lease_expires_at DROP DEFAULT;
+CREATE INDEX workers_admission_idx
+    ON workers (draining, lease_expires_at, reserved_calls, max_calls, worker_id);

@@ -19,6 +19,7 @@ use bridgefu::call_service::{
     CallExecutionPlan, CallServiceRepository, LegEndpointConfig, LegExecutionSpec,
     ServiceCreateTransaction, SipEndpointConfig, WebRtcEndpointConfig,
 };
+use bridgefu::coordination::{CoordinationPayload, DeploymentId};
 use bridgefu::persistence::{
     MemoryRepository, PostgresRepository, SqlRetentionPolicy, SqliteRepository,
 };
@@ -94,6 +95,7 @@ fn service_create_request(
     ServiceCreateTransaction {
         create: create_request(aggregate, worker, key, request),
         plan,
+        alternatives: Vec::new(),
     }
 }
 
@@ -136,6 +138,7 @@ async fn register(repo: &Repository, max_calls: usize) -> WorkerSnapshot {
         max_calls,
         capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
         at: at(0),
+        lease_ttl: std::time::Duration::from_secs(300),
     })
     .await
     .unwrap()
@@ -455,6 +458,7 @@ async fn shared_repository_conformance(repo: Repository) {
             max_calls: 4,
             capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
             at: at(41),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -471,12 +475,10 @@ async fn shared_repository_conformance(repo: Repository) {
             .unwrap()
             .draining
     );
-    assert!(
-        !repo
-            .set_worker_draining(next_worker.lease, false, at(44))
-            .await
-            .unwrap()
-            .draining
+    assert_eq!(
+        repo.set_worker_draining(next_worker.lease, false, at(44))
+            .await,
+        Err(RepositoryError::StaleWorkerFence)
     );
 }
 
@@ -518,6 +520,77 @@ async fn sqlite_repository_shared_conformance_and_schema() {
         1
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_authoritative_mutations_append_coordination_in_the_same_transaction() {
+    let (url, path) = sqlite_database("transactional-coordination");
+    let deployment = DeploymentId::parse("coordination-test").unwrap();
+    let repository = SqliteRepository::connect_for_deployment(&url, deployment.clone())
+        .await
+        .unwrap();
+    let repository_view: Repository = Arc::new(repository.clone());
+    let worker = register(&repository_view, 2).await;
+    assert_ne!(worker.updated_at, at(0));
+    assert_eq!(
+        worker.lease_expires_at - worker.updated_at,
+        chrono::TimeDelta::seconds(300)
+    );
+    let before_create: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM coordination_outbox WHERE deployment_id = ?")
+            .bind(deployment.as_str())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    assert!(before_create >= 2);
+
+    let request = create_request(
+        new_call(tenant("coordination-owner")),
+        worker.lease,
+        220,
+        221,
+    );
+    repository_view.create_call(request.clone()).await.unwrap();
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json FROM coordination_outbox WHERE deployment_id = ? ORDER BY sequence",
+    )
+    .bind(deployment.as_str())
+    .fetch_all(repository.pool())
+    .await
+    .unwrap();
+    let payloads = rows
+        .iter()
+        .map(|row| serde_json::from_str::<CoordinationPayload>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Worker(_))));
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Route(_))));
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Replay(_))));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        CoordinationPayload::WakeWorker { worker_id, .. } if *worker_id == worker.lease.worker_id
+    )));
+
+    let committed_count = i64::try_from(payloads.len()).unwrap();
+    assert!(matches!(
+        repository_view.create_call(request).await.unwrap(),
+        CreateCallOutcome::Replayed(_)
+    ));
+    let replay_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM coordination_outbox WHERE deployment_id = ?")
+            .bind(deployment.as_str())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(replay_count, committed_count);
+
+    repository.pool().close().await;
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
@@ -569,7 +642,7 @@ async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() 
         .await
         .unwrap();
     for statement in [
-        "INSERT INTO workers SELECT * FROM source.workers",
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, json_remove(body, '$.lease_expires_at') FROM source.workers",
         "INSERT INTO calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM source.calls",
         "INSERT INTO legs SELECT * FROM source.legs",
         "INSERT INTO worker_assignments SELECT * FROM source.worker_assignments",
@@ -596,6 +669,14 @@ async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() 
     target.close().await;
 
     let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    let migrated_worker = upgraded
+        .worker_snapshot(worker.lease.worker_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        migrated_worker.lease_expires_at, migrated_worker.updated_at,
+        "legacy worker fences must migrate expired"
+    );
     let idempotency =
         sqlx::query("SELECT receipt_kind, operation_kind, body FROM idempotency WHERE call_id = ?")
             .bind(call_id.to_string())
@@ -638,6 +719,85 @@ async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() 
     upgraded.pool().close().await;
     std::fs::remove_file(source_path).unwrap();
     std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
+    let (url, path) = sqlite_database("direct-v3-v4-worker");
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v3-sqlite-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+        "0003_service_integrity.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/sqlite/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new();
+    let updated_at = at(77);
+    let legacy_body = json!({
+        "lease": {"worker_id": worker_id, "fence": 1},
+        "max_calls": 2,
+        "reserved_calls": 0,
+        "draining": false,
+        "capabilities": ["sip"],
+        "updated_at": updated_at,
+    });
+    sqlx::query(
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES (?, 1, 2, 0, 0, ?, ?)",
+    )
+    .bind(worker_id.to_string())
+    .bind(updated_at.to_rfc3339())
+    .bind(legacy_body.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let upgraded = SqliteRepository::connect(&url).await.unwrap();
+    let worker = upgraded.worker_snapshot(worker_id).await.unwrap();
+    assert_eq!(worker.updated_at, updated_at);
+    assert_eq!(worker.lease_expires_at, updated_at);
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM repository_metadata WHERE singleton = 1")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(schema_version, 4);
+    let persisted_body: String = sqlx::query_scalar("SELECT body FROM workers WHERE worker_id = ?")
+        .bind(worker_id.to_string())
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&persisted_body)
+        .unwrap()
+        .get("lease_expires_at")
+        .is_some());
+    upgraded.pool().close().await;
+    std::fs::remove_file(path).unwrap();
     std::fs::remove_dir_all(migration_dir).unwrap();
 }
 
@@ -690,7 +850,7 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
         .await
         .unwrap();
     for statement in [
-        "INSERT INTO workers SELECT * FROM source.workers",
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, json_remove(body, '$.lease_expires_at') FROM source.workers",
         "INSERT INTO calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM source.calls",
         "INSERT INTO legs SELECT * FROM source.legs",
         "INSERT INTO worker_assignments SELECT * FROM source.worker_assignments",
@@ -729,6 +889,93 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
     upgraded.pool().close().await;
     std::fs::remove_file(source_path).unwrap();
     std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_direct_v3_to_v4_expires_and_rewrites_legacy_worker_body() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v3 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("bridgefu_v3_target_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let target_url = scoped.to_string();
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v3-postgres-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+        "0003_service_integrity.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/postgres/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let pool = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new();
+    let updated_at = at(78);
+    let legacy_body = json!({
+        "lease": {"worker_id": worker_id, "fence": 1},
+        "max_calls": 2,
+        "reserved_calls": 0,
+        "draining": false,
+        "capabilities": ["sip"],
+        "updated_at": updated_at,
+    });
+    sqlx::query(
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES ($1, 1, 2, 0, FALSE, $2, $3::jsonb)",
+    )
+    .bind(worker_id.as_uuid())
+    .bind(updated_at)
+    .bind(legacy_body.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    let worker = upgraded.worker_snapshot(worker_id).await.unwrap();
+    assert_eq!(worker.updated_at, updated_at);
+    assert_eq!(worker.lease_expires_at, updated_at);
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM repository_metadata WHERE singleton = TRUE")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(schema_version, 4);
+    let has_expiry: bool =
+        sqlx::query_scalar("SELECT body ? 'lease_expires_at' FROM workers WHERE worker_id = $1")
+            .bind(worker_id.as_uuid())
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert!(has_expiry);
+    upgraded.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
     std::fs::remove_dir_all(migration_dir).unwrap();
 }
 
@@ -790,7 +1037,7 @@ async fn postgres_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time(
         .await
         .unwrap();
     for statement in [
-        format!("INSERT INTO {target_schema}.workers SELECT * FROM {source_schema}.workers"),
+        format!("INSERT INTO {target_schema}.workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, body - 'lease_expires_at' FROM {source_schema}.workers"),
         format!("INSERT INTO {target_schema}.calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM {source_schema}.calls"),
         format!("INSERT INTO {target_schema}.legs SELECT * FROM {source_schema}.legs"),
         format!("INSERT INTO {target_schema}.worker_assignments SELECT * FROM {source_schema}.worker_assignments"),
@@ -937,7 +1184,7 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
         .await
         .unwrap();
     for statement in [
-        format!("INSERT INTO {target_schema}.workers SELECT * FROM {source_schema}.workers"),
+        format!("INSERT INTO {target_schema}.workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, body - 'lease_expires_at' FROM {source_schema}.workers"),
         format!("INSERT INTO {target_schema}.calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM {source_schema}.calls"),
         format!("INSERT INTO {target_schema}.legs SELECT * FROM {source_schema}.legs"),
         format!("INSERT INTO {target_schema}.worker_assignments SELECT * FROM {source_schema}.worker_assignments"),
@@ -1304,6 +1551,7 @@ async fn sqlite_raii_transaction_recovers_from_rollback_and_cancellation() {
             max_calls: 1,
             capabilities: BTreeSet::from(["sip".into()]),
             at: at(50),
+            lease_ttl: std::time::Duration::from_secs(300),
         }),
     )
     .await
@@ -1556,6 +1804,7 @@ async fn two_calls_for_delta<R: CallRepository>(
             max_calls: 2,
             capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
             at: at(0),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -1592,6 +1841,7 @@ async fn prepare_active_binding<R: CallRepository>(repository: &R) -> WorkerId {
             max_calls: 1,
             capabilities: BTreeSet::from(["sip".into()]),
             at: at(45),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -1665,6 +1915,7 @@ async fn exercise_expired_idempotency<R: CallRepository>(repository: &R) {
             max_calls: 3,
             capabilities: BTreeSet::from(["sip".into()]),
             at: at(90),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -1725,6 +1976,7 @@ async fn prepare_read_probe<R: CallRepository>(repository: &R) -> ReadProbe {
             max_calls: 1,
             capabilities: BTreeSet::from(["sip".into()]),
             at: at(-10),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();

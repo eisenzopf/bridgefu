@@ -56,11 +56,20 @@ fn event(
     sequence_value: i64,
     payload: CoordinationPayload,
 ) -> CoordinationEvent {
+    event_at(deployment, sequence_value, payload, instant())
+}
+
+fn event_at(
+    deployment: &DeploymentId,
+    sequence_value: i64,
+    payload: CoordinationPayload,
+    recorded_at: DateTime<Utc>,
+) -> CoordinationEvent {
     CoordinationEvent {
         deployment: deployment.clone(),
         sequence: sequence(sequence_value),
         payload,
-        recorded_at: instant(),
+        recorded_at,
     }
 }
 
@@ -134,10 +143,11 @@ async fn memory_worker_projection_enforces_sequence_fence_expiry_and_one_way_dra
     renewed.lease_expires_at = instant() + TimeDelta::minutes(2);
     assert_eq!(
         coordinator
-            .apply(&event(
+            .apply(&event_at(
                 &deployment,
                 4,
                 CoordinationPayload::Worker(renewed.clone()),
+                clock.now(),
             ))
             .await,
         Err(CoordinationError::LeaseExpired)
@@ -165,6 +175,215 @@ async fn memory_worker_projection_enforces_sequence_fence_expiry_and_one_way_dra
             .await,
         Err(CoordinationError::StaleFence)
     );
+}
+
+#[tokio::test]
+async fn memory_delayed_same_fence_renewal_uses_authoritative_event_time() {
+    let deployment = DeploymentId::parse("event-time-worker").expect("deployment");
+    let clock = Arc::new(ManualCoordinationClock::new(instant()));
+    let coordinator =
+        MemoryCoordinator::new(deployment.clone(), clock.clone(), 8).expect("coordinator");
+    let worker_id = worker_id(2);
+    let first = worker_snapshot(worker_id, 1, instant() + TimeDelta::seconds(30));
+    coordinator
+        .apply(&event_at(
+            &deployment,
+            1,
+            CoordinationPayload::Worker(first),
+            instant(),
+        ))
+        .await
+        .expect("initial snapshot");
+
+    clock.set(instant() + TimeDelta::seconds(40));
+    let renewed = worker_snapshot(worker_id, 1, instant() + TimeDelta::seconds(50));
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                2,
+                CoordinationPayload::Worker(renewed.clone()),
+                instant() + TimeDelta::seconds(20),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+    assert_eq!(
+        coordinator
+            .worker_hints(&WorkerSelectionRequest {
+                required_capabilities: BTreeSet::new(),
+                limit: 1,
+            })
+            .await,
+        Ok(vec![renewed])
+    );
+}
+
+#[tokio::test]
+async fn memory_route_replay_and_worker_tombstones_reject_delayed_resurrection() {
+    let deployment = DeploymentId::parse("memory-tombstones").expect("deployment");
+    let clock = Arc::new(ManualCoordinationClock::new(instant()));
+    let coordinator = Arc::new(
+        MemoryCoordinator::new(deployment.clone(), clock.clone(), 8)
+            .expect("coordinator")
+            .with_retention(Duration::from_secs(5), Duration::from_secs(1))
+            .expect("retention"),
+    );
+    let worker_id = worker_id(3);
+    let worker = worker_snapshot(worker_id, 1, instant() + TimeDelta::seconds(12));
+    coordinator
+        .apply(&event_at(
+            &deployment,
+            1,
+            CoordinationPayload::Worker(worker.clone()),
+            instant(),
+        ))
+        .await
+        .expect("worker");
+
+    let call = call_id(3);
+    let newer_expired_route = CallRouteHint {
+        call_id: call,
+        worker: worker.lease,
+        expires_at: instant() + TimeDelta::seconds(2),
+    };
+    let delayed_older_route = CallRouteHint {
+        expires_at: instant() + TimeDelta::seconds(30),
+        ..newer_expired_route.clone()
+    };
+    let digest = ReplayDigest::new([0x44; 32]);
+    clock.set(instant() + TimeDelta::seconds(10));
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                20,
+                CoordinationPayload::Route(newer_expired_route),
+                instant() + TimeDelta::seconds(1),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                19,
+                CoordinationPayload::Route(delayed_older_route),
+                instant(),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Stale)
+    );
+    assert_eq!(coordinator.route_hint(call).await, Ok(None));
+
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                22,
+                CoordinationPayload::Replay(ReplayMarker {
+                    digest,
+                    expires_at: instant() + TimeDelta::seconds(2),
+                }),
+                instant() + TimeDelta::seconds(1),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                21,
+                CoordinationPayload::Replay(ReplayMarker {
+                    digest,
+                    expires_at: instant() + TimeDelta::seconds(30),
+                }),
+                instant(),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Stale)
+    );
+    assert_eq!(coordinator.replay_seen(digest).await, Ok(false));
+
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                24,
+                CoordinationPayload::RouteRemoved { call_id: call },
+                instant() + TimeDelta::seconds(9),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                23,
+                CoordinationPayload::Route(CallRouteHint {
+                    call_id: call,
+                    worker: worker.lease,
+                    expires_at: instant() + TimeDelta::seconds(30),
+                }),
+                instant() + TimeDelta::seconds(8),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Stale)
+    );
+
+    clock.set(instant() + TimeDelta::seconds(13));
+    let same_fence = worker_snapshot(worker_id, 1, instant() + TimeDelta::seconds(30));
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                25,
+                CoordinationPayload::Worker(same_fence.clone()),
+                instant() + TimeDelta::seconds(13),
+            ))
+            .await,
+        Err(CoordinationError::LeaseExpired)
+    );
+    clock.set(instant() + TimeDelta::seconds(18));
+    assert_eq!(
+        coordinator
+            .apply(&event_at(
+                &deployment,
+                26,
+                CoordinationPayload::Worker(same_fence),
+                instant() + TimeDelta::seconds(17),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+
+    let wakeup = event_at(
+        &deployment,
+        30,
+        CoordinationPayload::WakeWorker {
+            worker_id,
+            reason: WakeupReason::Assignment,
+        },
+        instant() + TimeDelta::seconds(18),
+    );
+    let mut consumer = coordinator
+        .wakeup_consumer(worker_id, "cleanup", "cleanup-a", Duration::from_millis(10))
+        .expect("cleanup consumer");
+    assert_eq!(
+        coordinator.apply(&wakeup).await,
+        Ok(ProjectionApplyOutcome::Applied)
+    );
+    assert_eq!(consumer.poll(1).await.messages.len(), 1);
+    clock.set(instant() + TimeDelta::seconds(20));
+    assert_eq!(
+        coordinator.apply(&wakeup).await,
+        Ok(ProjectionApplyOutcome::Applied),
+        "expired stream, sequence tombstone, pending state, and group are cleaned"
+    );
+    assert_eq!(consumer.poll(1).await.messages.len(), 1);
 }
 
 #[tokio::test]
@@ -284,12 +503,28 @@ async fn memory_wakeup_groups_deduplicate_reclaim_ack_and_fall_back_to_database(
         second.acknowledge(&[reclaimed[0].entry_id.clone()]).await,
         Ok(1)
     );
+    let fallback_started = tokio::time::Instant::now();
     let empty = second.poll(10).await;
+    assert!(fallback_started.elapsed() >= Duration::from_millis(20));
     assert!(empty.messages.is_empty());
     assert_eq!(
         empty.database_poll_reason,
         DatabasePollReason::IntervalElapsed
     );
+
+    let publisher = Arc::clone(&coordinator);
+    let publish = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        publisher
+            .publish_wakeup(worker, sequence(2), WakeupReason::Controls)
+            .await
+            .expect("publish while waiting");
+    });
+    let awakened = second.poll(10).await;
+    publish.await.expect("publisher task");
+    assert_eq!(awakened.database_poll_reason, DatabasePollReason::Wakeup);
+    assert_eq!(awakened.messages.len(), 1);
+    assert_eq!(awakened.messages[0].sequence, sequence(2));
 }
 
 struct FailOnceProjection {

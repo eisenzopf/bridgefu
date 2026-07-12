@@ -219,3 +219,66 @@ async fn postgres_two_instances_have_one_ordered_claim_winner() {
         .await
         .expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "requires BRIDGEFU_TEST_POSTGRES_URL pointing at disposable PostgreSQL"]
+async fn postgres_paused_earlier_producer_cannot_publish_after_a_later_sequence() {
+    let url = std::env::var("BRIDGEFU_TEST_POSTGRES_URL")
+        .expect("BRIDGEFU_TEST_POSTGRES_URL is required");
+    let first_repository = PostgresRepository::connect(&url).await.expect("first repo");
+    let second_repository = PostgresRepository::connect(&url)
+        .await
+        .expect("second repo");
+    let deployment =
+        DeploymentId::parse(format!("pg-order-{}", Uuid::new_v4().simple())).expect("deployment");
+    let first =
+        PostgresCoordinationOutbox::from_pool(first_repository.pool().clone(), deployment.clone());
+    let second =
+        PostgresCoordinationOutbox::from_pool(second_repository.pool().clone(), deployment.clone());
+    let worker = WorkerId::from_uuid(Uuid::from_u128(3)).expect("worker");
+
+    let mut paused = first_repository.pool().begin().await.expect("paused tx");
+    let earlier = first
+        .append_in_transaction(&mut paused, wake(worker, WakeupReason::Effects))
+        .await
+        .expect("earlier append");
+    let later_task =
+        tokio::spawn(async move { second.append(wake(worker, WakeupReason::Controls)).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !later_task.is_finished(),
+        "later producer must wait for the deployment commit-order lock"
+    );
+
+    paused.commit().await.expect("commit earlier producer");
+    let later = tokio::time::timeout(Duration::from_secs(5), later_task)
+        .await
+        .expect("later producer unblocked")
+        .expect("later task")
+        .expect("later append");
+    assert!(earlier.event.sequence < later.event.sequence);
+
+    let claims = first
+        .claim("pg-order-projector", Duration::from_secs(1), 8)
+        .await
+        .expect("ordered claim");
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].record.event.sequence, earlier.event.sequence);
+    assert_eq!(claims[1].record.event.sequence, later.event.sequence);
+    for claim in claims {
+        first
+            .acknowledge(
+                claim.record.event.sequence,
+                "pg-order-projector",
+                claim.claim_generation,
+            )
+            .await
+            .expect("acknowledge");
+    }
+
+    sqlx::query("DELETE FROM coordination_outbox WHERE deployment_id = $1")
+        .bind(deployment.as_str())
+        .execute(first_repository.pool())
+        .await
+        .expect("cleanup");
+}

@@ -34,6 +34,19 @@ pub struct ServiceCreateTransaction {
     pub create: CreateCall,
     /// Plan validated against `create.initial`.
     pub plan: CallExecutionPlan,
+    /// Additional prevalidated worker-bound attachment choices, in placement
+    /// order. The repository tries these only when an earlier candidate lost
+    /// its fence or capacity race.
+    pub alternatives: Vec<ServiceCreateCandidate>,
+}
+
+/// One worker-specific call-creation choice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCreateCandidate {
+    /// Candidate worker fence.
+    pub worker: WorkerLease,
+    /// Attachment descriptors bound to that exact worker fence.
+    pub attachments: Vec<AttachmentIssue>,
 }
 
 /// Service creation result. Replays always carry the originally stored plan.

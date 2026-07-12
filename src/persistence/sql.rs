@@ -14,7 +14,7 @@
 //! read-only transactions and never acquire the epoch write lock, rewrite
 //! rows, or advance the epoch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -35,7 +35,7 @@ use crate::call_engine::{
     ConsumedAttachment, CreateCall, CreateCallOutcome, DeadlineState, EffectId, LegId,
     OutboxCompletion, OutboxRecord, OutboxState, ProviderEventCommit, ProviderEventCommitOutcome,
     ProviderEventEnvelope, ProviderEventInput, ProviderEventOutcome, ProviderEventState,
-    RegisterWorker, RepositoryError, RestartClaim, StoredCall, TenantId,
+    RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim, StoredCall, TenantId,
     TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerAssignment,
     WorkerId, WorkerLease, WorkerSnapshot,
 };
@@ -47,6 +47,10 @@ use crate::call_service::{
     ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult, ServiceOperationKind,
     StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+};
+use crate::coordination::{
+    CallRouteHint, CoordinationPayload, DeploymentId, PostgresCoordinationOutbox, ReplayDigest,
+    ReplayMarker, SqliteCoordinationOutbox, WakeupReason, WorkerCoordinationSnapshot,
 };
 
 use super::memory::{
@@ -73,6 +77,7 @@ enum SqlBackend {
 #[derive(Clone)]
 struct SqlRepository {
     backend: SqlBackend,
+    deployment: DeploymentId,
 }
 
 #[derive(Default)]
@@ -143,6 +148,19 @@ impl std::fmt::Debug for SqliteRepository {
 impl SqliteRepository {
     /// Opens (and creates when absent) a SQLite database and applies embedded migrations.
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
+        Self::connect_for_deployment(
+            database_url,
+            DeploymentId::parse("bridgefu").map_err(|_| RepositoryError::Unavailable)?,
+        )
+        .await
+    }
+
+    /// Connects with the deployment namespace used by transactional
+    /// coordination events.
+    pub async fn connect_for_deployment(
+        database_url: &str,
+        deployment: DeploymentId,
+    ) -> Result<Self, RepositoryError> {
         let options = SqliteConnectOptions::from_str(database_url)
             .map_err(|_| RepositoryError::Unavailable)?
             .create_if_missing(true)
@@ -166,6 +184,7 @@ impl SqliteRepository {
         Ok(Self {
             inner: SqlRepository {
                 backend: SqlBackend::Sqlite(pool),
+                deployment,
             },
         })
     }
@@ -210,6 +229,19 @@ impl PostgresRepository {
     /// The URL must name a Bridgefu-owned database; migrations and repository
     /// tables are intentionally not schema-qualified.
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
+        Self::connect_for_deployment(
+            database_url,
+            DeploymentId::parse("bridgefu").map_err(|_| RepositoryError::Unavailable)?,
+        )
+        .await
+    }
+
+    /// Connects with the deployment namespace used by transactional
+    /// coordination events.
+    pub async fn connect_for_deployment(
+        database_url: &str,
+        deployment: DeploymentId,
+    ) -> Result<Self, RepositoryError> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .connect(database_url)
@@ -222,6 +254,7 @@ impl PostgresRepository {
         Ok(Self {
             inner: SqlRepository {
                 backend: SqlBackend::Postgres(pool),
+                deployment,
             },
         })
     }
@@ -253,8 +286,10 @@ impl SqlRepository {
         F: for<'a> FnOnce(&'a MemoryRepository) -> RepositoryFuture<'a, T> + Send,
     {
         match &self.backend {
-            SqlBackend::Sqlite(pool) => sqlite_transaction(pool, operation).await,
-            SqlBackend::Postgres(pool) => postgres_transaction(pool, operation).await,
+            SqlBackend::Sqlite(pool) => sqlite_transaction(pool, &self.deployment, operation).await,
+            SqlBackend::Postgres(pool) => {
+                postgres_transaction(pool, &self.deployment, operation).await
+            }
         }
     }
 
@@ -387,8 +422,9 @@ where
         .await
         .map_err(|_| RepositoryError::Unavailable)?;
     let result = async {
+        let authority_time = sqlite_database_time(&mut transaction).await?;
         let snapshot = load_sqlite_snapshot(&mut transaction).await?;
-        let memory = MemoryRepository::from_snapshot(snapshot)?;
+        let memory = MemoryRepository::from_snapshot_at(snapshot, authority_time)?;
         operation(&memory).await
     }
     .await;
@@ -421,7 +457,8 @@ where
         .await
         .map_err(database_error)?;
     let snapshot = load_postgres_snapshot(&mut transaction).await?;
-    let memory = MemoryRepository::from_snapshot(snapshot)?;
+    let authority_time = postgres_database_time(&mut transaction).await?;
+    let memory = MemoryRepository::from_snapshot_at(snapshot, authority_time)?;
     let result = operation(&memory).await;
     match result {
         Ok(value) => {
@@ -441,7 +478,11 @@ where
     }
 }
 
-async fn sqlite_transaction<T, F>(pool: &SqlitePool, operation: F) -> Result<T, RepositoryError>
+async fn sqlite_transaction<T, F>(
+    pool: &SqlitePool,
+    deployment: &DeploymentId,
+    operation: F,
+) -> Result<T, RepositoryError>
 where
     T: Send,
     F: for<'a> FnOnce(&'a MemoryRepository) -> RepositoryFuture<'a, T> + Send,
@@ -452,11 +493,19 @@ where
         .map_err(|_| RepositoryError::Unavailable)?;
 
     let result = async {
+        let authority_time = sqlite_database_time(&mut transaction).await?;
         let before = load_sqlite_snapshot(&mut transaction).await?;
-        let memory = MemoryRepository::from_snapshot(before.clone())?;
+        let memory = MemoryRepository::from_snapshot_at(before.clone(), authority_time)?;
         let result = operation(&memory).await?;
         let after = memory.snapshot()?;
         persist_sqlite_delta(&mut transaction, &before, &after).await?;
+        append_sqlite_coordination_events(
+            pool,
+            &mut transaction,
+            deployment,
+            coordination_payloads(&before, &after, authority_time)?,
+        )
+        .await?;
         sqlx::query(
             "UPDATE repository_metadata SET epoch = epoch + 1, provider_receipt_sequence = ? WHERE singleton = 1",
         )
@@ -487,7 +536,11 @@ where
     }
 }
 
-async fn postgres_transaction<T, F>(pool: &PgPool, operation: F) -> Result<T, RepositoryError>
+async fn postgres_transaction<T, F>(
+    pool: &PgPool,
+    deployment: &DeploymentId,
+    operation: F,
+) -> Result<T, RepositoryError>
 where
     T: Send,
     F: for<'a> FnOnce(&'a MemoryRepository) -> RepositoryFuture<'a, T> + Send,
@@ -500,11 +553,19 @@ where
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| RepositoryError::Unavailable)?;
+    let authority_time = postgres_database_time(&mut transaction).await?;
     let before = load_postgres_snapshot(&mut transaction).await?;
-    let memory = MemoryRepository::from_snapshot(before.clone())?;
+    let memory = MemoryRepository::from_snapshot_at(before.clone(), authority_time)?;
     let result = operation(&memory).await?;
     let after = memory.snapshot()?;
     persist_postgres_delta(&mut transaction, &before, &after).await?;
+    append_postgres_coordination_events(
+        pool,
+        &mut transaction,
+        deployment,
+        coordination_payloads(&before, &after, authority_time)?,
+    )
+    .await?;
     sqlx::query(
         "UPDATE repository_metadata SET epoch = epoch + 1, provider_receipt_sequence = $1 WHERE singleton = TRUE",
     )
@@ -525,6 +586,237 @@ where
 
 fn database_error(_error: sqlx::Error) -> RepositoryError {
     RepositoryError::Unavailable
+}
+
+async fn sqlite_database_time(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<DateTime<Utc>, RepositoryError> {
+    let value = sqlx::query_scalar::<_, String>("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    parse_sqlite_time(&value)
+}
+
+async fn postgres_database_time(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<DateTime<Utc>, RepositoryError> {
+    sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(database_error)
+}
+
+fn coordination_payloads(
+    before: &MemoryStateSnapshot,
+    after: &MemoryStateSnapshot,
+    recorded_at: DateTime<Utc>,
+) -> Result<Vec<CoordinationPayload>, RepositoryError> {
+    let mut payloads = Vec::new();
+    let mut wakeups = Vec::<(WorkerId, WakeupReason)>::new();
+
+    let mut workers = after.workers.clone();
+    workers.sort_by_key(|worker| worker.lease.worker_id.to_string());
+    for worker in workers {
+        let changed = before
+            .workers
+            .iter()
+            .find(|existing| existing.lease.worker_id == worker.lease.worker_id)
+            != Some(&worker);
+        if !changed {
+            continue;
+        }
+        payloads.push(CoordinationPayload::Worker(WorkerCoordinationSnapshot {
+            lease: worker.lease,
+            max_calls: worker.max_calls,
+            reserved_calls: worker.reserved_calls,
+            draining: worker.draining,
+            capabilities: worker.capabilities.clone(),
+            lease_expires_at: worker.lease_expires_at,
+        }));
+        push_wakeup(
+            &mut wakeups,
+            worker.lease.worker_id,
+            WakeupReason::Assignment,
+        );
+    }
+
+    let route_expiry = recorded_at
+        .checked_add_signed(chrono::TimeDelta::hours(24))
+        .ok_or(RepositoryError::Unavailable)?;
+    let mut calls = after.calls.clone();
+    calls.sort_by_key(|call| call.aggregate.id());
+    for call in calls {
+        let call_id = call.aggregate.id();
+        let previous = before
+            .calls
+            .iter()
+            .find(|existing| existing.aggregate.id() == call_id);
+        let assignment_changed = previous
+            .map(|existing| existing.assignment != call.assignment)
+            .unwrap_or(true);
+        if !assignment_changed {
+            continue;
+        }
+        if call.assignment.released_at.is_some() {
+            payloads.push(CoordinationPayload::RouteRemoved { call_id });
+        } else {
+            payloads.push(CoordinationPayload::Route(CallRouteHint {
+                call_id,
+                worker: call.assignment.lease,
+                expires_at: route_expiry,
+            }));
+            push_wakeup(
+                &mut wakeups,
+                call.assignment.lease.worker_id,
+                WakeupReason::Assignment,
+            );
+        }
+    }
+
+    let mut replay = after.idempotency.clone();
+    replay.sort_by(|left, right| {
+        left.tenant_id
+            .as_str()
+            .cmp(right.tenant_id.as_str())
+            .then_with(|| {
+                left.key_digest
+                    .expose_bytes()
+                    .cmp(right.key_digest.expose_bytes())
+            })
+    });
+    for marker in replay {
+        let changed = before.idempotency.iter().find(|existing| {
+            existing.tenant_id == marker.tenant_id && existing.key_digest == marker.key_digest
+        }) != Some(&marker);
+        if changed && marker.row.expires_at > recorded_at {
+            let hint_expires_at = marker.row.expires_at.min(route_expiry);
+            payloads.push(CoordinationPayload::Replay(ReplayMarker {
+                digest: ReplayDigest::new(*marker.key_digest.expose_bytes()),
+                expires_at: hint_expires_at,
+            }));
+        }
+    }
+
+    for record in &after.outbox {
+        if before
+            .outbox
+            .iter()
+            .find(|existing| existing.effect_id == record.effect_id)
+            != Some(record)
+            && matches!(record.state, OutboxState::Ready)
+        {
+            push_wakeup(&mut wakeups, record.worker.worker_id, WakeupReason::Effects);
+        }
+    }
+    for record in &after.control_outbox {
+        if before
+            .control_outbox
+            .iter()
+            .find(|existing| existing.effect_id == record.effect_id)
+            != Some(record)
+            && matches!(record.state, OutboxState::Ready)
+        {
+            push_wakeup(
+                &mut wakeups,
+                record.worker.worker_id,
+                WakeupReason::Controls,
+            );
+        }
+    }
+    for deadline in &after.deadlines {
+        if before.deadlines.iter().find(|existing| {
+            existing.call_id == deadline.call_id
+                && existing.kind == deadline.kind
+                && existing.generation == deadline.generation
+        }) != Some(deadline)
+            && matches!(deadline.state, DeadlineState::Pending)
+        {
+            if let Some(call) = after.calls.iter().find(|call| {
+                call.aggregate.id() == deadline.call_id && call.assignment.released_at.is_none()
+            }) {
+                push_wakeup(
+                    &mut wakeups,
+                    call.assignment.lease.worker_id,
+                    WakeupReason::Deadlines,
+                );
+            }
+        }
+    }
+    for event in &after.provider_events {
+        if before.provider_events.iter().find(|existing| {
+            existing.account == event.account && existing.event_digest == event.event_digest
+        }) != Some(event)
+            && matches!(event.state, ProviderEventState::Ready)
+        {
+            if let Some(call) = event.target.as_ref().and_then(|target| {
+                after.calls.iter().find(|call| {
+                    call.aggregate.id() == target.call_id && call.assignment.released_at.is_none()
+                })
+            }) {
+                push_wakeup(
+                    &mut wakeups,
+                    call.assignment.lease.worker_id,
+                    WakeupReason::ProviderEvents,
+                );
+            }
+        }
+    }
+
+    wakeups.sort_by(|left, right| {
+        left.0
+            .to_string()
+            .cmp(&right.0.to_string())
+            .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+    });
+    payloads.extend(
+        wakeups
+            .into_iter()
+            .map(|(worker_id, reason)| CoordinationPayload::WakeWorker { worker_id, reason }),
+    );
+    Ok(payloads)
+}
+
+fn push_wakeup(
+    wakeups: &mut Vec<(WorkerId, WakeupReason)>,
+    worker_id: WorkerId,
+    reason: WakeupReason,
+) {
+    if !wakeups.contains(&(worker_id, reason)) {
+        wakeups.push((worker_id, reason));
+    }
+}
+
+async fn append_sqlite_coordination_events(
+    pool: &SqlitePool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    deployment: &DeploymentId,
+    payloads: Vec<CoordinationPayload>,
+) -> Result<(), RepositoryError> {
+    let outbox = SqliteCoordinationOutbox::from_pool(pool.clone(), deployment.clone());
+    for payload in payloads {
+        outbox
+            .append_in_transaction(transaction, payload)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+    }
+    Ok(())
+}
+
+async fn append_postgres_coordination_events(
+    pool: &PgPool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deployment: &DeploymentId,
+    payloads: Vec<CoordinationPayload>,
+) -> Result<(), RepositoryError> {
+    let outbox = PostgresCoordinationOutbox::from_pool(pool.clone(), deployment.clone());
+    for payload in payloads {
+        outbox
+            .append_in_transaction(transaction, payload)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+    }
+    Ok(())
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<String, RepositoryError> {
@@ -751,6 +1043,7 @@ fn validate_worker_columns(
     reserved_calls: i64,
     draining: bool,
     updated_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
     invalid_if(
         worker.lease.worker_id.to_string() != worker_id
@@ -758,7 +1051,8 @@ fn validate_worker_columns(
             || i64::try_from(worker.max_calls).ok() != Some(max_calls)
             || i64::try_from(worker.reserved_calls).ok() != Some(reserved_calls)
             || worker.draining != draining
-            || worker.updated_at != updated_at,
+            || worker.updated_at != updated_at
+            || worker.lease_expires_at != lease_expires_at,
     )
 }
 
@@ -1305,11 +1599,11 @@ fn sqlite_optional_time(
 async fn load_sqlite_workers(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<Vec<WorkerSnapshot>, RepositoryError> {
-    sqlx::query("SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, body FROM workers ORDER BY worker_id")
+    sqlx::query("SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, lease_expires_at, body FROM workers ORDER BY worker_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: WorkerSnapshot = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_worker_columns(&value, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("fence").map_err(database_error)?, row.try_get("max_calls").map_err(database_error)?, row.try_get("reserved_calls").map_err(database_error)?, row.try_get("draining").map_err(database_error)?, sqlite_time(&row, "updated_at")?)?;
+            validate_worker_columns(&value, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("fence").map_err(database_error)?, row.try_get("max_calls").map_err(database_error)?, row.try_get("reserved_calls").map_err(database_error)?, row.try_get("draining").map_err(database_error)?, sqlite_time(&row, "updated_at")?, sqlite_time(&row, "lease_expires_at")?)?;
             Ok(value)
         }).collect()
 }
@@ -1508,11 +1802,11 @@ async fn load_sqlite_service_rows(
 async fn load_postgres_workers(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<WorkerSnapshot>, RepositoryError> {
-    sqlx::query("SELECT worker_id::text AS worker_id, fence, max_calls, reserved_calls, draining, updated_at, body::text AS body FROM workers ORDER BY worker_id")
+    sqlx::query("SELECT worker_id::text AS worker_id, fence, max_calls, reserved_calls, draining, updated_at, lease_expires_at, body::text AS body FROM workers ORDER BY worker_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: WorkerSnapshot = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_worker_columns(&value, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("fence").map_err(database_error)?, row.try_get("max_calls").map_err(database_error)?, row.try_get("reserved_calls").map_err(database_error)?, row.try_get("draining").map_err(database_error)?, row.try_get("updated_at").map_err(database_error)?)?;
+            validate_worker_columns(&value, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("fence").map_err(database_error)?, row.try_get("max_calls").map_err(database_error)?, row.try_get("reserved_calls").map_err(database_error)?, row.try_get("draining").map_err(database_error)?, row.try_get("updated_at").map_err(database_error)?, row.try_get("lease_expires_at").map_err(database_error)?)?;
             Ok(value)
         }).collect()
 }
@@ -2432,7 +2726,7 @@ async fn upsert_sqlite_rows(
 ) -> Result<(), RepositoryError> {
     for worker in &snapshot.workers {
         sqlx::query(
-            "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_id) DO UPDATE SET fence=excluded.fence, max_calls=excluded.max_calls, reserved_calls=excluded.reserved_calls, draining=excluded.draining, updated_at=excluded.updated_at, body=excluded.body",
+            "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, lease_expires_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_id) DO UPDATE SET fence=excluded.fence, max_calls=excluded.max_calls, reserved_calls=excluded.reserved_calls, draining=excluded.draining, updated_at=excluded.updated_at, lease_expires_at=excluded.lease_expires_at, body=excluded.body",
         )
         .bind(worker.lease.worker_id.to_string())
         .bind(worker.lease.fence.as_i64())
@@ -2440,6 +2734,7 @@ async fn upsert_sqlite_rows(
         .bind(i64::try_from(worker.reserved_calls).map_err(|_| RepositoryError::Unavailable)?)
         .bind(worker.draining)
         .bind(worker.updated_at.to_rfc3339())
+        .bind(worker.lease_expires_at.to_rfc3339())
         .bind(encode(worker)?)
         .execute(&mut **connection)
         .await
@@ -2871,7 +3166,7 @@ async fn upsert_postgres_rows(
 ) -> Result<(), RepositoryError> {
     for worker in &snapshot.workers {
         sqlx::query(
-            "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT(worker_id) DO UPDATE SET fence=EXCLUDED.fence, max_calls=EXCLUDED.max_calls, reserved_calls=EXCLUDED.reserved_calls, draining=EXCLUDED.draining, updated_at=EXCLUDED.updated_at, body=EXCLUDED.body",
+            "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, lease_expires_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) ON CONFLICT(worker_id) DO UPDATE SET fence=EXCLUDED.fence, max_calls=EXCLUDED.max_calls, reserved_calls=EXCLUDED.reserved_calls, draining=EXCLUDED.draining, updated_at=EXCLUDED.updated_at, lease_expires_at=EXCLUDED.lease_expires_at, body=EXCLUDED.body",
         )
         .bind(worker.lease.worker_id.as_uuid())
         .bind(worker.lease.fence.as_i64())
@@ -2879,6 +3174,7 @@ async fn upsert_postgres_rows(
         .bind(i64::try_from(worker.reserved_calls).map_err(|_| RepositoryError::Unavailable)?)
         .bind(worker.draining)
         .bind(worker.updated_at)
+        .bind(worker.lease_expires_at)
         .bind(encode(worker)?)
         .execute(&mut **transaction)
         .await
@@ -3319,6 +3615,17 @@ macro_rules! impl_call_repository {
                     .await
             }
 
+            async fn renew_worker_lease(
+                &self,
+                request: RenewWorkerLease,
+            ) -> Result<WorkerSnapshot, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move { repository.renew_worker_lease(request).await })
+                    })
+                    .await
+            }
+
             async fn set_worker_draining(
                 &self,
                 worker: WorkerLease,
@@ -3341,6 +3648,36 @@ macro_rules! impl_call_repository {
                 self.inner
                     .read(move |repository| {
                         Box::pin(async move { repository.worker_snapshot(worker_id).await })
+                    })
+                    .await
+            }
+
+            async fn active_worker_snapshot(
+                &self,
+                worker: WorkerLease,
+                at: DateTime<Utc>,
+            ) -> Result<WorkerSnapshot, RepositoryError> {
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move { repository.active_worker_snapshot(worker, at).await })
+                    })
+                    .await
+            }
+
+            async fn worker_candidates(
+                &self,
+                required_capabilities: &BTreeSet<String>,
+                at: DateTime<Utc>,
+                limit: usize,
+            ) -> Result<Vec<WorkerSnapshot>, RepositoryError> {
+                let required_capabilities = required_capabilities.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .worker_candidates(&required_capabilities, at, limit)
+                                .await
+                        })
                     })
                     .await
             }

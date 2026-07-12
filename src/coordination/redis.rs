@@ -5,7 +5,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use redis::aio::{ConnectionManager, MultiplexedConnection};
-use redis::streams::{StreamAutoClaimReply, StreamId, StreamReadReply};
+use redis::streams::{
+    StreamAutoClaimReply, StreamId, StreamPendingCountReply, StreamPendingReply, StreamReadReply,
+};
+use zeroize::Zeroize;
 
 use crate::call_engine::{CallId, WorkerId};
 
@@ -16,6 +19,13 @@ use super::{
     WakeupMessage, WakeupPoll, WakeupPublisher, WakeupReason, WorkerCoordinationSnapshot,
     WorkerSelectionRequest,
 };
+
+const MAX_WORKER_CANDIDATES: usize = 4_096;
+const MIN_WORKER_CANDIDATES: usize = 64;
+const CANDIDATE_OVERSAMPLE: usize = 8;
+const RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_millis(250);
+const OUTER_TIMEOUT_GRACE: Duration = Duration::from_millis(500);
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(50);
 
 const WORKER_APPLY_SCRIPT: &str = r#"
 local function decimal_compare(left, right)
@@ -35,6 +45,7 @@ local current_fence = redis.call('HGET', KEYS[1], 'fence')
 local current_draining = redis.call('HGET', KEYS[1], 'draining')
 local current_expiry = redis.call('HGET', KEYS[1], 'lease_expiry_ms')
 local incoming_expiry = tonumber(ARGV[5])
+local event_time = tonumber(ARGV[8])
 local clock = redis.call('TIME')
 local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 if current_seq then
@@ -46,13 +57,14 @@ if current_seq then
   local fence_order = decimal_compare(ARGV[3], current_fence)
   if fence_order < 0 then return -5 end
   if fence_order == 0 then
-    if tonumber(current_expiry) <= now_ms then return -3 end
+    if tonumber(current_expiry) <= event_time then return -3 end
     if current_draining == '1' and ARGV[4] == '0' then return -4 end
   end
 end
 redis.call('HSET', KEYS[1],
   'seq', ARGV[1], 'body', ARGV[2], 'fence', ARGV[3],
-  'draining', ARGV[4], 'lease_expiry_ms', ARGV[5])
+  'draining', ARGV[4], 'lease_expiry_ms', ARGV[5],
+  'recorded_at_ms', ARGV[8])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now_ms)
 redis.call('ZADD', KEYS[2], incoming_expiry, ARGV[6])
 local keep_until = math.max(incoming_expiry, now_ms) + tonumber(ARGV[7])
@@ -72,21 +84,24 @@ local function decimal_compare(left, right)
   if left > right then return 1 end
   return 0
 end
-local expiry_ms = tonumber(ARGV[3])
 local clock = redis.call('TIME')
 local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-if expiry_ms <= now_ms then return -1 end
 local current_seq = redis.call('HGET', KEYS[1], 'seq')
 local current_body = redis.call('HGET', KEYS[1], 'body')
+local current_active = redis.call('HGET', KEYS[1], 'active')
+if current_seq and not current_active then current_active = '1' end
 if current_seq then
   local sequence_order = decimal_compare(ARGV[1], current_seq)
   if sequence_order < 0 then return -1 end
   if sequence_order == 0 then
-    if current_body == ARGV[2] then return 0 else return -2 end
+    if current_body == ARGV[2] and current_active == ARGV[5] then return 0 else return -2 end
   end
 end
-redis.call('HSET', KEYS[1], 'seq', ARGV[1], 'body', ARGV[2])
-redis.call('PEXPIREAT', KEYS[1], expiry_ms)
+local expiry_ms = tonumber(ARGV[3])
+redis.call('HSET', KEYS[1],
+  'seq', ARGV[1], 'body', ARGV[2], 'expiry_ms', ARGV[3], 'active', ARGV[5])
+local keep_until = math.max(expiry_ms, now_ms) + tonumber(ARGV[4])
+redis.call('PEXPIREAT', KEYS[1], keep_until)
 return 1
 "#;
 
@@ -129,6 +144,8 @@ pub struct RedisCoordinationConfig {
     pub clustered: bool,
     /// Retain expired worker fence tombstones to reject same-fence resurrection.
     pub lease_tombstone_ttl: Duration,
+    /// Retain route/replay sequence tombstones after their payload expires.
+    pub projection_tombstone_ttl: Duration,
     /// Maximum approximate entries per worker Stream.
     pub max_stream_len: usize,
     /// Stream and wakeup-sequence idle retention.
@@ -148,6 +165,7 @@ impl RedisCoordinationConfig {
             deployment,
             clustered: false,
             lease_tombstone_ttl: Duration::from_secs(24 * 60 * 60),
+            projection_tombstone_ttl: Duration::from_secs(24 * 60 * 60),
             max_stream_len: 10_000,
             stream_ttl: Duration::from_secs(24 * 60 * 60),
             database_fallback_interval: Duration::from_secs(2),
@@ -172,6 +190,17 @@ impl RedisCoordinationConfig {
         Ok(self)
     }
 
+    /// Sets route/replay sequence-tombstone retention. Payload visibility still
+    /// ends at its authoritative expiry; only the sequence survives this long.
+    pub fn with_projection_tombstone_ttl(
+        mut self,
+        ttl: Duration,
+    ) -> Result<Self, CoordinationError> {
+        self.projection_tombstone_ttl = ttl;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Sets bounded Stream retention and the mandatory authoritative-database
     /// fallback interval.
     pub fn with_stream_policy(
@@ -187,7 +216,7 @@ impl RedisCoordinationConfig {
         Ok(self)
     }
 
-    fn validate(&self) -> Result<(), CoordinationError> {
+    pub(crate) fn validate(&self) -> Result<(), CoordinationError> {
         if self.url.is_empty()
             || (!self.url.starts_with("redis://") && !self.url.starts_with("rediss://"))
         {
@@ -200,6 +229,8 @@ impl RedisCoordinationConfig {
         }
         if self.lease_tombstone_ttl.is_zero()
             || self.lease_tombstone_ttl > Duration::from_secs(7 * 24 * 60 * 60)
+            || self.projection_tombstone_ttl.is_zero()
+            || self.projection_tombstone_ttl > Duration::from_secs(7 * 24 * 60 * 60)
             || self.stream_ttl.is_zero()
             || self.stream_ttl > Duration::from_secs(7 * 24 * 60 * 60)
             || self.max_stream_len == 0
@@ -221,6 +252,7 @@ impl std::fmt::Debug for RedisCoordinationConfig {
             .field("deployment", &self.deployment)
             .field("clustered", &self.clustered)
             .field("lease_tombstone_ttl", &self.lease_tombstone_ttl)
+            .field("projection_tombstone_ttl", &self.projection_tombstone_ttl)
             .field("max_stream_len", &self.max_stream_len)
             .field("stream_ttl", &self.stream_ttl)
             .field(
@@ -228,6 +260,12 @@ impl std::fmt::Debug for RedisCoordinationConfig {
                 &self.database_fallback_interval,
             )
             .finish()
+    }
+}
+
+impl Drop for RedisCoordinationConfig {
+    fn drop(&mut self) {
+        self.url.zeroize();
     }
 }
 
@@ -288,10 +326,11 @@ impl std::fmt::Debug for RedisCoordinator {
 
 impl RedisCoordinator {
     /// Connects a projection manager. Connection errors are redacted.
-    pub async fn connect(config: RedisCoordinationConfig) -> Result<Self, CoordinationError> {
+    pub async fn connect(mut config: RedisCoordinationConfig) -> Result<Self, CoordinationError> {
         config.validate()?;
-        let client =
-            redis::Client::open(config.url.as_str()).map_err(|_| CoordinationError::Unavailable)?;
+        let client = redis::Client::open(config.url.as_str());
+        config.url.zeroize();
+        let client = client.map_err(|_| CoordinationError::Unavailable)?;
         let manager = ConnectionManager::new(client.clone())
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
@@ -313,32 +352,25 @@ impl RedisCoordinator {
     ) -> Result<RedisWakeupConsumer, CoordinationError> {
         let group = validate_stream_name(group.into())?;
         let consumer = validate_stream_name(consumer.into())?;
-        let stream_key = self.keys.wakeup_stream(worker_id);
-        let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|_| CoordinationError::Unavailable)?;
-        let create = redis::cmd("XGROUP")
-            .arg("CREATE")
-            .arg(&stream_key)
-            .arg(&group)
-            .arg("0")
-            .arg("MKSTREAM")
-            .query_async::<String>(&mut connection)
-            .await;
-        if let Err(error) = create {
-            if error.code() != Some("BUSYGROUP") {
-                return Err(CoordinationError::Unavailable);
-            }
-        }
-        Ok(RedisWakeupConsumer {
-            connection,
-            stream_key,
+        let mut result = RedisWakeupConsumer {
+            client: self.client.clone(),
+            connection: None,
+            stream_key: self.keys.wakeup_stream(worker_id),
             group,
             consumer,
             poll_interval: self.config.database_fallback_interval,
-        })
+            stream_ttl: self.config.stream_ttl,
+            max_stream_len: self.config.max_stream_len,
+            next_reconnect_at: None,
+            reconnect_backoff: INITIAL_RECONNECT_BACKOFF,
+            auto_claim_cursor: "0-0".to_owned(),
+            pending_entries: 0,
+            pel_evictions: 0,
+            deleted_pending_entries: 0,
+            reconnects: 0,
+        };
+        result.ensure_ready().await?;
+        Ok(result)
     }
 
     async fn redis_now(&self) -> Result<DateTime<Utc>, CoordinationError> {
@@ -355,6 +387,7 @@ impl RedisCoordinator {
     async fn apply_worker(
         &self,
         sequence: ProjectionSequence,
+        recorded_at: DateTime<Utc>,
         worker: &WorkerCoordinationSnapshot,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
         worker.validate()?;
@@ -373,6 +406,7 @@ impl RedisCoordinator {
             .arg(worker.lease_expires_at.timestamp_millis())
             .arg(worker.lease.worker_id.to_string())
             .arg(tombstone_ms)
+            .arg(recorded_at.timestamp_millis())
             .query_async::<i64>(&mut connection)
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
@@ -385,6 +419,7 @@ impl RedisCoordinator {
         sequence: ProjectionSequence,
         value: &T,
         expires_at: DateTime<Utc>,
+        active: bool,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
         let body = serde_json::to_string(value).map_err(|_| CoordinationError::InvalidData)?;
         let mut connection = self.manager.clone();
@@ -395,6 +430,8 @@ impl RedisCoordinator {
             .arg(sequence.as_i64())
             .arg(body)
             .arg(expires_at.timestamp_millis())
+            .arg(duration_millis(self.config.projection_tombstone_ttl)?)
+            .arg(if active { 1 } else { 0 })
             .query_async::<i64>(&mut connection)
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
@@ -452,13 +489,27 @@ impl CoordinationProjection for RedisCoordinator {
             ));
         }
         match &event.payload {
-            CoordinationPayload::Worker(worker) => self.apply_worker(event.sequence, worker).await,
+            CoordinationPayload::Worker(worker) => {
+                self.apply_worker(event.sequence, event.recorded_at, worker)
+                    .await
+            }
             CoordinationPayload::Route(route) => {
                 self.apply_expiring(
                     self.keys.route(route.call_id),
                     event.sequence,
                     route,
                     route.expires_at,
+                    true,
+                )
+                .await
+            }
+            CoordinationPayload::RouteRemoved { call_id } => {
+                self.apply_expiring(
+                    self.keys.route(*call_id),
+                    event.sequence,
+                    call_id,
+                    event.recorded_at,
+                    false,
                 )
                 .await
             }
@@ -468,6 +519,7 @@ impl CoordinationProjection for RedisCoordinator {
                     event.sequence,
                     marker,
                     marker.expires_at,
+                    true,
                 )
                 .await
             }
@@ -495,21 +547,40 @@ impl CoordinationProjection for RedisCoordinator {
             .arg(self.keys.workers())
             .arg(format!("({}", now.timestamp_millis()))
             .arg("+inf")
+            .arg("LIMIT")
+            .arg(0)
+            .arg(
+                request
+                    .limit
+                    .saturating_mul(CANDIDATE_OVERSAMPLE)
+                    .clamp(MIN_WORKER_CANDIDATES, MAX_WORKER_CANDIDATES),
+            )
             .query_async::<Vec<String>>(&mut connection)
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reads = redis::pipe();
+        for id in &ids {
+            reads.cmd("HGET").arg(self.keys.worker(id)).arg("body");
+        }
+        let bodies = reads
+            .query_async::<Vec<Option<String>>>(&mut connection)
+            .await
+            .map_err(|_| CoordinationError::Unavailable)?;
         let mut workers = Vec::new();
-        for id in ids {
-            if let Some(worker) = self.worker_body(&id).await? {
-                if worker.lease_expires_at > now
-                    && !worker.draining
-                    && worker.reserved_calls < worker.max_calls
-                    && request
-                        .required_capabilities
-                        .is_subset(&worker.capabilities)
-                {
-                    workers.push(worker);
-                }
+        for body in bodies.into_iter().flatten() {
+            let worker: WorkerCoordinationSnapshot =
+                serde_json::from_str(&body).map_err(|_| CoordinationError::InvalidData)?;
+            if worker.lease_expires_at > now
+                && !worker.draining
+                && worker.reserved_calls < worker.max_calls
+                && request
+                    .required_capabilities
+                    .is_subset(&worker.capabilities)
+            {
+                workers.push(worker);
             }
         }
         sort_workers(&mut workers);
@@ -522,12 +593,16 @@ impl CoordinationProjection for RedisCoordinator {
         call_id: CallId,
     ) -> Result<Option<CallRouteHint>, CoordinationError> {
         let mut connection = self.manager.clone();
-        let body = redis::cmd("HGET")
+        let (body, active) = redis::cmd("HMGET")
             .arg(self.keys.route(call_id))
             .arg("body")
-            .query_async::<Option<String>>(&mut connection)
+            .arg("active")
+            .query_async::<(Option<String>, Option<String>)>(&mut connection)
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
+        if active.as_deref() == Some("0") {
+            return Ok(None);
+        }
         let Some(body) = body else {
             return Ok(None);
         };
@@ -545,12 +620,16 @@ impl CoordinationProjection for RedisCoordinator {
 
     async fn replay_seen(&self, digest: ReplayDigest) -> Result<bool, CoordinationError> {
         let mut connection = self.manager.clone();
-        let body = redis::cmd("HGET")
+        let (body, active) = redis::cmd("HMGET")
             .arg(self.keys.replay(digest))
             .arg("body")
-            .query_async::<Option<String>>(&mut connection)
+            .arg("active")
+            .query_async::<(Option<String>, Option<String>)>(&mut connection)
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
+        if active.as_deref() == Some("0") {
+            return Ok(false);
+        }
         let Some(body) = body else {
             return Ok(false);
         };
@@ -576,11 +655,21 @@ impl WakeupPublisher for RedisCoordinator {
 
 /// Dedicated blocking Redis Streams consumer.
 pub struct RedisWakeupConsumer {
-    connection: MultiplexedConnection,
+    client: redis::Client,
+    connection: Option<MultiplexedConnection>,
     stream_key: String,
     group: String,
     consumer: String,
     poll_interval: Duration,
+    stream_ttl: Duration,
+    max_stream_len: usize,
+    next_reconnect_at: Option<tokio::time::Instant>,
+    reconnect_backoff: Duration,
+    auto_claim_cursor: String,
+    pending_entries: usize,
+    pel_evictions: u64,
+    deleted_pending_entries: u64,
+    reconnects: u64,
 }
 
 impl std::fmt::Debug for RedisWakeupConsumer {
@@ -591,7 +680,250 @@ impl std::fmt::Debug for RedisWakeupConsumer {
             .field("group", &self.group)
             .field("consumer", &self.consumer)
             .field("poll_interval", &self.poll_interval)
+            .field("pending_entries", &self.pending_entries)
+            .field("pel_evictions", &self.pel_evictions)
+            .field("deleted_pending_entries", &self.deleted_pending_entries)
+            .field("reconnects", &self.reconnects)
             .finish()
+    }
+}
+
+impl RedisWakeupConsumer {
+    /// Last measured consumer-group pending-entry count.
+    #[must_use]
+    pub const fn pending_entries(&self) -> usize {
+        self.pending_entries
+    }
+
+    /// Hints deliberately evicted from the PEL to enforce the configured
+    /// bound. Every consumer still performs periodic authoritative DB polls.
+    #[must_use]
+    pub const fn pel_evictions(&self) -> u64 {
+        self.pel_evictions
+    }
+
+    /// Stale PEL references Redis removed while scanning with XAUTOCLAIM.
+    #[must_use]
+    pub const fn deleted_pending_entries(&self) -> u64 {
+        self.deleted_pending_entries
+    }
+
+    /// Successful dedicated-connection recreations, including the initial one.
+    #[must_use]
+    pub const fn reconnects(&self) -> u64 {
+        self.reconnects
+    }
+
+    fn response_timeout(&self) -> Duration {
+        self.poll_interval
+            .checked_add(RESPONSE_TIMEOUT_GRACE)
+            .unwrap_or(self.poll_interval)
+    }
+
+    fn outer_timeout(&self) -> Duration {
+        self.poll_interval
+            .checked_add(OUTER_TIMEOUT_GRACE)
+            .unwrap_or(self.poll_interval)
+    }
+
+    async fn ensure_ready(&mut self) -> Result<(), CoordinationError> {
+        if self.connection.is_some() {
+            return Ok(());
+        }
+        if let Some(next_attempt) = self.next_reconnect_at {
+            tokio::time::sleep_until(next_attempt).await;
+        }
+        let connection_config = redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(RESPONSE_TIMEOUT_GRACE))
+            .set_response_timeout(Some(self.response_timeout()));
+        let connection = self
+            .client
+            .get_multiplexed_async_connection_with_config(&connection_config)
+            .await;
+        let mut connection = match connection {
+            Ok(connection) => connection,
+            Err(_) => {
+                self.mark_connection_failed();
+                return Err(CoordinationError::Unavailable);
+            }
+        };
+        match create_consumer_group(
+            &mut connection,
+            &self.stream_key,
+            &self.group,
+            self.stream_ttl,
+        )
+        .await
+        {
+            Ok(created) => {
+                if created {
+                    self.auto_claim_cursor = "0-0".to_owned();
+                    self.pending_entries = 0;
+                }
+                self.connection = Some(connection);
+                self.next_reconnect_at = None;
+                self.reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
+                self.reconnects = self.reconnects.saturating_add(1);
+                Ok(())
+            }
+            Err(_) => {
+                self.mark_connection_failed();
+                Err(CoordinationError::Unavailable)
+            }
+        }
+    }
+
+    async fn recreate_group(&mut self) -> Result<(), CoordinationError> {
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(CoordinationError::Unavailable);
+        };
+        let created =
+            create_consumer_group(connection, &self.stream_key, &self.group, self.stream_ttl).await;
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                self.mark_connection_failed();
+                return Err(error);
+            }
+        };
+        if created {
+            self.auto_claim_cursor = "0-0".to_owned();
+            self.pending_entries = 0;
+        }
+        Ok(())
+    }
+
+    fn mark_connection_failed(&mut self) {
+        self.connection = None;
+        self.next_reconnect_at = Some(tokio::time::Instant::now() + self.reconnect_backoff);
+        self.reconnect_backoff = self
+            .reconnect_backoff
+            .saturating_mul(2)
+            .min(self.poll_interval);
+    }
+
+    async fn read_once(&mut self, count: usize) -> Result<Vec<WakeupMessage>, CoordinationError> {
+        self.ensure_ready().await?;
+        let mut recreated = false;
+        loop {
+            let result = {
+                let connection = self
+                    .connection
+                    .as_mut()
+                    .ok_or(CoordinationError::Unavailable)?;
+                redis::cmd("XREADGROUP")
+                    .arg("GROUP")
+                    .arg(&self.group)
+                    .arg(&self.consumer)
+                    .arg("COUNT")
+                    .arg(count)
+                    .arg("BLOCK")
+                    .arg(duration_millis(self.poll_interval)?)
+                    .arg("STREAMS")
+                    .arg(&self.stream_key)
+                    .arg(">")
+                    .query_async::<StreamReadReply>(connection)
+                    .await
+            };
+            match result {
+                Ok(reply) => return parse_read_reply(reply),
+                Err(error) if is_no_group(&error) && !recreated => {
+                    self.recreate_group().await?;
+                    recreated = true;
+                }
+                Err(_) => {
+                    self.mark_connection_failed();
+                    return Err(CoordinationError::Unavailable);
+                }
+            }
+        }
+    }
+
+    async fn maintain_pel(&mut self) -> Result<(), CoordinationError> {
+        self.ensure_ready().await?;
+        let pending = {
+            let connection = self
+                .connection
+                .as_mut()
+                .ok_or(CoordinationError::Unavailable)?;
+            redis::cmd("XPENDING")
+                .arg(&self.stream_key)
+                .arg(&self.group)
+                .query_async::<StreamPendingReply>(connection)
+                .await
+        };
+        let pending = match pending {
+            Ok(pending) => pending.count(),
+            Err(error) if is_no_group(&error) => {
+                self.recreate_group().await?;
+                self.pending_entries = 0;
+                return Ok(());
+            }
+            Err(_) => {
+                self.mark_connection_failed();
+                return Err(CoordinationError::Unavailable);
+            }
+        };
+        if pending <= self.max_stream_len {
+            self.pending_entries = pending;
+            return Ok(());
+        }
+
+        let excess = pending - self.max_stream_len;
+        let oldest = {
+            let connection = self
+                .connection
+                .as_mut()
+                .ok_or(CoordinationError::Unavailable)?;
+            redis::cmd("XPENDING")
+                .arg(&self.stream_key)
+                .arg(&self.group)
+                .arg("-")
+                .arg("+")
+                .arg(excess)
+                .query_async::<StreamPendingCountReply>(connection)
+                .await
+        };
+        let oldest = match oldest {
+            Ok(oldest) => oldest,
+            Err(_) => {
+                self.mark_connection_failed();
+                return Err(CoordinationError::Unavailable);
+            }
+        };
+        let ids = oldest
+            .ids
+            .into_iter()
+            .map(|pending| pending.id)
+            .collect::<Vec<_>>();
+        let evicted = if ids.is_empty() {
+            0
+        } else {
+            let connection = self
+                .connection
+                .as_mut()
+                .ok_or(CoordinationError::Unavailable)?;
+            let result = redis::cmd("XACK")
+                .arg(&self.stream_key)
+                .arg(&self.group)
+                .arg(ids)
+                .query_async::<usize>(connection)
+                .await;
+            match result {
+                Ok(evicted) => evicted,
+                Err(_) => {
+                    self.mark_connection_failed();
+                    return Err(CoordinationError::Unavailable);
+                }
+            }
+        };
+        self.pel_evictions = self.pel_evictions.saturating_add(evicted as u64);
+        self.pending_entries = pending.saturating_sub(evicted);
+        Ok(())
+    }
+
+    async fn pace_unavailable(&self, started_at: tokio::time::Instant) {
+        tokio::time::sleep_until(started_at + self.poll_interval).await;
     }
 }
 
@@ -599,39 +931,35 @@ impl std::fmt::Debug for RedisWakeupConsumer {
 impl WakeupConsumer for RedisWakeupConsumer {
     async fn poll(&mut self, count: usize) -> WakeupPoll {
         let count = count.clamp(1, 1_024);
-        let block_ms = u64::try_from(self.poll_interval.as_millis()).unwrap_or(u64::MAX);
-        let result = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(&self.group)
-            .arg(&self.consumer)
-            .arg("COUNT")
-            .arg(count)
-            .arg("BLOCK")
-            .arg(block_ms)
-            .arg("STREAMS")
-            .arg(&self.stream_key)
-            .arg(">")
-            .query_async::<StreamReadReply>(&mut self.connection)
-            .await;
+        let started_at = tokio::time::Instant::now();
+        let result = tokio::time::timeout(self.outer_timeout(), self.read_once(count)).await;
         match result {
-            Ok(reply) => match parse_read_reply(reply) {
-                Ok(messages) => WakeupPoll {
+            Ok(Ok(messages)) => {
+                let _ = self.maintain_pel().await;
+                WakeupPoll {
                     database_poll_reason: if messages.is_empty() {
                         DatabasePollReason::IntervalElapsed
                     } else {
                         DatabasePollReason::Wakeup
                     },
                     messages,
-                },
-                Err(_) => WakeupPoll {
+                }
+            }
+            Ok(Err(_)) => {
+                self.pace_unavailable(started_at).await;
+                WakeupPoll {
                     messages: Vec::new(),
                     database_poll_reason: DatabasePollReason::CoordinationUnavailable,
-                },
-            },
-            Err(_) => WakeupPoll {
-                messages: Vec::new(),
-                database_poll_reason: DatabasePollReason::CoordinationUnavailable,
-            },
+                }
+            }
+            Err(_) => {
+                self.mark_connection_failed();
+                self.pace_unavailable(started_at).await;
+                WakeupPoll {
+                    messages: Vec::new(),
+                    database_poll_reason: DatabasePollReason::CoordinationUnavailable,
+                }
+            }
         }
     }
 
@@ -645,32 +973,129 @@ impl WakeupConsumer for RedisWakeupConsumer {
                 "invalid wakeup auto-claim request",
             ));
         }
-        let reply = redis::cmd("XAUTOCLAIM")
-            .arg(&self.stream_key)
-            .arg(&self.group)
-            .arg(&self.consumer)
-            .arg(duration_millis(min_idle)?)
-            .arg("0-0")
-            .arg("COUNT")
-            .arg(count)
-            .query_async::<StreamAutoClaimReply>(&mut self.connection)
-            .await
-            .map_err(|_| CoordinationError::Unavailable)?;
-        parse_stream_ids(reply.claimed)
+        self.ensure_ready().await?;
+        let mut recreated = false;
+        loop {
+            let reply = {
+                let connection = self
+                    .connection
+                    .as_mut()
+                    .ok_or(CoordinationError::Unavailable)?;
+                redis::cmd("XAUTOCLAIM")
+                    .arg(&self.stream_key)
+                    .arg(&self.group)
+                    .arg(&self.consumer)
+                    .arg(duration_millis(min_idle)?)
+                    .arg(&self.auto_claim_cursor)
+                    .arg("COUNT")
+                    .arg(count)
+                    .query_async::<StreamAutoClaimReply>(connection)
+                    .await
+            };
+            match reply {
+                Ok(reply) => {
+                    self.auto_claim_cursor = reply.next_stream_id;
+                    self.deleted_pending_entries = self
+                        .deleted_pending_entries
+                        .saturating_add(reply.deleted_ids.len() as u64);
+                    let messages = parse_stream_ids(reply.claimed)?;
+                    self.maintain_pel().await?;
+                    return Ok(messages);
+                }
+                Err(error) if is_no_group(&error) && !recreated => {
+                    self.recreate_group().await?;
+                    recreated = true;
+                }
+                Err(_) => {
+                    self.mark_connection_failed();
+                    return Err(CoordinationError::Unavailable);
+                }
+            }
+        }
     }
 
     async fn acknowledge(&mut self, entry_ids: &[String]) -> Result<usize, CoordinationError> {
         if entry_ids.is_empty() {
             return Ok(0);
         }
-        redis::cmd("XACK")
-            .arg(&self.stream_key)
-            .arg(&self.group)
-            .arg(entry_ids)
-            .query_async::<usize>(&mut self.connection)
-            .await
-            .map_err(|_| CoordinationError::Unavailable)
+        if entry_ids.len() > 1_024 || entry_ids.iter().any(|id| !valid_stream_id(id)) {
+            return Err(CoordinationError::InvalidInput(
+                "invalid wakeup acknowledgement",
+            ));
+        }
+        self.ensure_ready().await?;
+        let acknowledged = {
+            let connection = self
+                .connection
+                .as_mut()
+                .ok_or(CoordinationError::Unavailable)?;
+            redis::cmd("XACK")
+                .arg(&self.stream_key)
+                .arg(&self.group)
+                .arg(entry_ids)
+                .query_async::<usize>(connection)
+                .await
+        };
+        match acknowledged {
+            Ok(acknowledged) => {
+                self.maintain_pel().await?;
+                Ok(acknowledged)
+            }
+            Err(error) if is_no_group(&error) => {
+                self.recreate_group().await?;
+                Ok(0)
+            }
+            Err(_) => {
+                self.mark_connection_failed();
+                Err(CoordinationError::Unavailable)
+            }
+        }
     }
+}
+
+async fn create_consumer_group(
+    connection: &mut MultiplexedConnection,
+    stream_key: &str,
+    group: &str,
+    stream_ttl: Duration,
+) -> Result<bool, CoordinationError> {
+    let create = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(stream_key)
+        .arg(group)
+        .arg("0")
+        .arg("MKSTREAM")
+        .query_async::<String>(connection)
+        .await;
+    let created = match create {
+        Ok(_) => true,
+        Err(error) if error.code() == Some("BUSYGROUP") => false,
+        Err(_) => return Err(CoordinationError::Unavailable),
+    };
+    redis::cmd("PEXPIRE")
+        .arg(stream_key)
+        .arg(duration_millis(stream_ttl)?)
+        .query_async::<bool>(connection)
+        .await
+        .map_err(|_| CoordinationError::Unavailable)?;
+    Ok(created)
+}
+
+fn is_no_group(error: &redis::RedisError) -> bool {
+    error.code() == Some("NOGROUP")
+}
+
+fn valid_stream_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    let Some((milliseconds, sequence)) = value.split_once('-') else {
+        return false;
+    };
+    !milliseconds.is_empty()
+        && !sequence.is_empty()
+        && milliseconds.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn parse_read_reply(reply: StreamReadReply) -> Result<Vec<WakeupMessage>, CoordinationError> {

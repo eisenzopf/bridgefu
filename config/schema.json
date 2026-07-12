@@ -46,7 +46,25 @@
           "format": "uuid",
           "not": { "const": "00000000-0000-0000-0000-000000000000" }
         },
-        "allow_ephemeral_memory": { "type": "boolean" }
+        "allow_ephemeral_memory": { "type": "boolean" },
+        "deployment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,63}$"
+        },
+        "worker_lease_ttl_secs": { "type": "integer", "minimum": 5, "maximum": 300 },
+        "worker_renew_interval_secs": { "type": "integer", "minimum": 1 },
+        "worker_capabilities": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "redis_url": {
+          "type": "string",
+          "pattern": "^(?:rediss?://|env:[A-Za-z_][A-Za-z0-9_]*)$"
+        },
+        "redis_clustered": { "type": "boolean" },
+        "allow_db_only_coordination": { "type": "boolean" }
       },
       "allOf": [
         {
@@ -65,7 +83,29 @@
             "properties": { "backend": { "enum": ["postgres", "postgresql"] } },
             "required": ["backend"]
           },
-          "then": { "required": ["database_url", "worker_id"] }
+          "then": {
+            "required": ["database_url", "worker_id"],
+            "anyOf": [
+              {
+                "required": ["redis_url", "redis_clustered"],
+                "properties": { "redis_clustered": { "const": true } }
+              },
+              {
+                "required": ["allow_db_only_coordination"],
+                "properties": { "allow_db_only_coordination": { "const": true } }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "allow_db_only_coordination": { "const": true } },
+            "required": ["allow_db_only_coordination"]
+          },
+          "then": {
+            "required": ["backend"],
+            "properties": { "backend": { "enum": ["postgres", "postgresql"] } }
+          }
         }
       ],
       "additionalProperties": false
@@ -105,5 +145,25 @@
     "providers": { "type": "object" },
     "context": { "type": "object" },
     "tenants": { "type": "object" }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "persistence": {
+            "properties": { "allow_db_only_coordination": { "const": true } },
+            "required": ["allow_db_only_coordination"]
+          }
+        },
+        "required": ["persistence"]
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": { "mode": { "const": "all-in-one" } }
+          }
+        }
+      }
+    }
+  ]
 }

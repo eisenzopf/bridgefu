@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,10 +15,11 @@ use bridgefu::call_engine::{
 use bridgefu::call_service::{
     build_call_service_runtime, AttachmentPrincipalRequest, AttachmentPrincipalResolver,
     AttachmentPrincipalResolverError, CallRepositoryBackendConfig, CallServiceClock,
-    CallServiceError, CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy,
-    CreateCallInput, IdempotencyKey, LegEndpointConfig, RequestedLeg,
+    CallServiceCoordinationConfig, CallServiceError, CallServiceRuntime, CallServiceRuntimeConfig,
+    CallTimeoutPolicy, CreateCallInput, IdempotencyKey, LegEndpointConfig, RequestedLeg,
     SamePrincipalAttachmentResolver, SipEndpointConfig, WebRtcEndpointConfig,
 };
+use bridgefu::coordination::{DatabasePollReason, DeploymentId};
 use chrono::{DateTime, TimeZone, Utc};
 use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod};
 use rvoip_core::ids::ConnectionId;
@@ -26,6 +28,18 @@ use sha2::{Digest, Sha256};
 
 fn at(second: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_940_000_000 + second, 0).unwrap()
+}
+
+fn coordination() -> CallServiceCoordinationConfig {
+    let mut config =
+        CallServiceCoordinationConfig::new(DeploymentId::parse("runtime-test").unwrap());
+    config.worker_lease_ttl = Duration::from_secs(300);
+    config.worker_renew_interval = Duration::from_secs(100);
+    config
+}
+
+fn capabilities() -> BTreeSet<String> {
+    BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()])
 }
 
 #[derive(Debug)]
@@ -118,17 +132,23 @@ async fn build(
     clock: Arc<TestClock>,
     resolver: Arc<SwitchableResolver>,
 ) -> CallServiceRuntime {
+    let mut runtime_coordination = coordination();
+    if matches!(&backend, CallRepositoryBackendConfig::Postgres { .. }) {
+        runtime_coordination.allow_db_only_coordination = true;
+    }
     build_call_service_runtime(
         CallServiceRuntimeConfig {
             backend,
             worker_id,
             max_calls: 1,
+            worker_capabilities: capabilities(),
             control_key: vec![0x74; 32],
             timeouts: CallTimeoutPolicy {
                 setup: Duration::from_secs(30),
                 transfer: Duration::from_secs(30),
                 ending: Duration::from_secs(30),
             },
+            coordination: runtime_coordination,
         },
         resolver,
         clock,
@@ -254,12 +274,12 @@ async fn assert_consumed_expired_replay_and_capacity(
             input(),
         )
         .await;
-    assert_eq!(
-        capacity,
-        Err(CallServiceError::Repository(
-            RepositoryError::CapacityExceeded
-        ))
-    );
+    let expected_capacity = if durable_restart {
+        CallServiceError::CapacityExceeded
+    } else {
+        CallServiceError::Repository(RepositoryError::CapacityExceeded)
+    };
+    assert_eq!(capacity, Err(expected_capacity));
     let worker = runtime
         .repository()
         .worker_snapshot(worker_id)
@@ -291,6 +311,95 @@ async fn sqlite_runtime_restart_preserves_exact_replay_fence_and_capacity() {
     std::fs::remove_file(path).unwrap();
 }
 
+async fn wait_for_sqlite_coordination_drain(pool: &sqlx::SqlitePool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM coordination_outbox WHERE applied_at_ms IS NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if pending == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("local coordination projector must drain its SQL outbox");
+}
+
+#[tokio::test]
+async fn sqlite_supervisor_projects_wakes_falls_back_and_restarts_cleanly() {
+    let path = std::env::temp_dir().join(format!(
+        "bridgefu-coordination-runtime-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}", path.display());
+    let worker_id = WorkerId::new();
+    let clock = Arc::new(TestClock::new(at(0)));
+    let resolver = Arc::new(SwitchableResolver::default());
+    let runtime = build(
+        CallRepositoryBackendConfig::Sqlite {
+            database_url: url.clone(),
+        },
+        worker_id,
+        clock.clone(),
+        resolver.clone(),
+    )
+    .await;
+    let mut wakeups = runtime.subscribe_work_wakeups();
+    runtime
+        .service()
+        .create_call(
+            &principal(),
+            &IdempotencyKey::parse("coordination-runtime-wakeup").unwrap(),
+            input(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wakeups.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let wakeup = wakeups.borrow().clone().unwrap();
+    assert_eq!(wakeup.observed_worker.lease, runtime.worker().lease);
+    assert_eq!(wakeup.poll.database_poll_reason, DatabasePollReason::Wakeup);
+    assert!(!wakeup.poll.messages.is_empty());
+
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    wait_for_sqlite_coordination_drain(&pool).await;
+    runtime.shutdown().await.unwrap();
+
+    let restarted = build(
+        CallRepositoryBackendConfig::Sqlite {
+            database_url: url.clone(),
+        },
+        worker_id,
+        clock,
+        resolver,
+    )
+    .await;
+    let mut restarted_wakeups = restarted.subscribe_work_wakeups();
+    wait_for_sqlite_coordination_drain(&pool).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            restarted_wakeups.changed().await.unwrap();
+            if restarted_wakeups.borrow().as_ref().is_some_and(|wakeup| {
+                wakeup.poll.database_poll_reason == DatabasePollReason::IntervalElapsed
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    restarted.shutdown().await.unwrap();
+    pool.close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
 #[tokio::test]
 async fn requested_sqlite_outage_fails_closed_without_memory_fallback() {
     let private_url = format!(
@@ -305,8 +414,10 @@ async fn requested_sqlite_outage_fails_closed_without_memory_fallback() {
         },
         worker_id: WorkerId::new(),
         max_calls: 1,
+        worker_capabilities: capabilities(),
         control_key: vec![0x74; 32],
         timeouts: CallTimeoutPolicy::default(),
+        coordination: coordination(),
     };
     assert!(!format!("{config:?}").contains(&private_url));
     let error = build_call_service_runtime(
@@ -324,6 +435,35 @@ async fn requested_sqlite_outage_fails_closed_without_memory_fallback() {
 }
 
 #[tokio::test]
+async fn invalid_coordination_mode_is_rejected_before_postgres_network_io() {
+    let config = CallServiceRuntimeConfig {
+        backend: CallRepositoryBackendConfig::Postgres {
+            database_url: "postgres://127.0.0.1:1/must-not-connect".to_owned(),
+        },
+        worker_id: WorkerId::new(),
+        max_calls: 1,
+        worker_capabilities: capabilities(),
+        control_key: vec![0x74; 32],
+        timeouts: CallTimeoutPolicy::default(),
+        coordination: coordination(),
+    };
+    let error = tokio::time::timeout(
+        Duration::from_millis(250),
+        build_call_service_runtime(
+            config,
+            Arc::new(SamePrincipalAttachmentResolver),
+            Arc::new(TestClock::new(at(0))),
+        ),
+    )
+    .await
+    .expect("invalid mode validation must not attempt network I/O")
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires clustered Redis or explicit database-only dev"));
+}
+
+#[tokio::test]
 async fn invalid_control_key_is_rejected_before_repository_mutation() {
     let path = std::env::temp_dir().join(format!(
         "bridgefu-invalid-key-{}.sqlite",
@@ -336,8 +476,10 @@ async fn invalid_control_key_is_rejected_before_repository_mutation() {
             },
             worker_id: WorkerId::new(),
             max_calls: 1,
+            worker_capabilities: capabilities(),
             control_key: vec![0x74; 31],
             timeouts: CallTimeoutPolicy::default(),
+            coordination: coordination(),
         },
         Arc::new(SamePrincipalAttachmentResolver),
         Arc::new(TestClock::new(at(0))),
@@ -349,6 +491,27 @@ async fn invalid_control_key_is_rejected_before_repository_mutation() {
         "control HMAC key must contain 32 to 4096 bytes"
     );
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn explicit_shutdown_drains_worker_and_joins_supervisor() {
+    let worker_id = WorkerId::new();
+    let runtime = build(
+        CallRepositoryBackendConfig::Memory,
+        worker_id,
+        Arc::new(TestClock::new(at(0))),
+        Arc::new(SwitchableResolver::default()),
+    )
+    .await;
+    let repository = runtime.repository();
+    runtime.shutdown().await.unwrap();
+    assert!(
+        repository
+            .worker_snapshot(worker_id)
+            .await
+            .unwrap()
+            .draining
+    );
 }
 
 #[tokio::test]

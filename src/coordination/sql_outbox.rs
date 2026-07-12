@@ -69,6 +69,10 @@ impl PostgresCoordinationOutbox {
         transaction: &mut Transaction<'_, Postgres>,
         payload: CoordinationPayload,
     ) -> Result<CoordinationOutboxRecord, CoordinationError> {
+        // Producer allocation and projector claiming share this lock. A
+        // transaction cannot publish a later visible sequence while an
+        // earlier producer for the same deployment is still uncommitted.
+        postgres_deployment_lock(transaction, &self.deployment).await?;
         let now_ms = postgres_now_ms(transaction).await?;
         validate_payload_at(&self.deployment, &payload, now_ms)?;
         let payload_json =
@@ -106,11 +110,7 @@ impl PostgresCoordinationOutbox {
             .begin()
             .await
             .map_err(|_| CoordinationError::Unavailable)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(self.deployment.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| CoordinationError::Unavailable)?;
+        postgres_deployment_lock(&mut transaction, &self.deployment).await?;
         let now_ms = postgres_now_ms(&mut transaction).await?;
         let expires_at_ms = claim_expiry_millis(now_ms, claim_ttl)?;
         let rows = sqlx::query(
@@ -576,6 +576,18 @@ async fn postgres_now_ms(connection: &mut PgConnection) -> Result<i64, Coordinat
         .fetch_one(connection)
         .await
         .map_err(|_| CoordinationError::Unavailable)
+}
+
+async fn postgres_deployment_lock(
+    transaction: &mut Transaction<'_, Postgres>,
+    deployment: &DeploymentId,
+) -> Result<(), CoordinationError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(deployment.as_str())
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| CoordinationError::Unavailable)?;
+    Ok(())
 }
 
 async fn sqlite_now_ms(connection: &mut SqliteConnection) -> Result<i64, CoordinationError> {

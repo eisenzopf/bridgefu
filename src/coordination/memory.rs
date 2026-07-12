@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use tokio::sync::Notify;
 
 use crate::call_engine::{CallId, WorkerId};
 
@@ -17,10 +18,15 @@ use super::{
     WorkerSelectionRequest,
 };
 
+const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_STREAM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Clone)]
 struct Versioned<T> {
     sequence: ProjectionSequence,
     value: T,
+    retained_until: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -40,15 +46,21 @@ struct PendingWakeup {
 struct MemoryConsumerGroup {
     last_delivered: u64,
     pending: HashMap<u64, PendingWakeup>,
+    retained_until: Option<DateTime<Utc>>,
+}
+
+struct MemoryWakeupStream {
+    entries: VecDeque<MemoryWakeupEntry>,
+    retained_until: DateTime<Utc>,
 }
 
 #[derive(Default)]
 struct MemoryState {
     workers: HashMap<WorkerId, Versioned<WorkerCoordinationSnapshot>>,
-    routes: HashMap<CallId, Versioned<CallRouteHint>>,
+    routes: HashMap<CallId, Versioned<Option<CallRouteHint>>>,
     replay: HashMap<ReplayDigest, Versioned<ReplayMarker>>,
     wakeup_sequences: HashMap<WorkerId, Versioned<WakeupReason>>,
-    streams: HashMap<WorkerId, VecDeque<MemoryWakeupEntry>>,
+    streams: HashMap<WorkerId, MemoryWakeupStream>,
     groups: HashMap<(WorkerId, String), MemoryConsumerGroup>,
     next_stream_id: u64,
 }
@@ -58,6 +70,9 @@ pub struct MemoryCoordinator {
     deployment: DeploymentId,
     clock: Arc<dyn CoordinationClock>,
     max_stream_len: usize,
+    tombstone_ttl: Duration,
+    stream_ttl: Duration,
+    notify: Notify,
     state: Mutex<MemoryState>,
 }
 
@@ -67,6 +82,8 @@ impl std::fmt::Debug for MemoryCoordinator {
             .debug_struct("MemoryCoordinator")
             .field("deployment", &self.deployment)
             .field("max_stream_len", &self.max_stream_len)
+            .field("tombstone_ttl", &self.tombstone_ttl)
+            .field("stream_ttl", &self.stream_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -87,8 +104,33 @@ impl MemoryCoordinator {
             deployment,
             clock,
             max_stream_len,
+            tombstone_ttl: DEFAULT_TOMBSTONE_TTL,
+            stream_ttl: DEFAULT_STREAM_TTL,
+            notify: Notify::new(),
             state: Mutex::new(MemoryState::default()),
         })
+    }
+
+    /// Overrides bounded tombstone and idle stream retention. This is useful
+    /// for deterministic standalone lifecycle tests; production defaults are
+    /// twenty-four hours.
+    pub fn with_retention(
+        mut self,
+        tombstone_ttl: Duration,
+        stream_ttl: Duration,
+    ) -> Result<Self, CoordinationError> {
+        if tombstone_ttl.is_zero()
+            || tombstone_ttl > MAX_RETENTION
+            || stream_ttl.is_zero()
+            || stream_ttl > MAX_RETENTION
+        {
+            return Err(CoordinationError::InvalidInput(
+                "invalid memory coordination retention",
+            ));
+        }
+        self.tombstone_ttl = tombstone_ttl;
+        self.stream_ttl = stream_ttl;
+        Ok(self)
     }
 
     /// Creates a dedicated logical consumer for one worker stream.
@@ -102,10 +144,16 @@ impl MemoryCoordinator {
         validate_poll_interval(poll_interval)?;
         let group = validate_name(group.into())?;
         let consumer = validate_name(consumer.into())?;
-        self.lock()?
+        let now = self.clock.now();
+        let retained_until = retained_until(now, now, self.stream_ttl)?;
+        let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, now);
+        state
             .groups
             .entry((worker_id, group.clone()))
-            .or_default();
+            .or_default()
+            .retained_until = Some(retained_until);
+        drop(state);
         Ok(MemoryWakeupConsumer {
             coordinator: Arc::clone(self),
             worker_id,
@@ -121,6 +169,32 @@ impl MemoryCoordinator {
             .map_err(|_| CoordinationError::Unavailable)
     }
 
+    fn cleanup_locked(&self, state: &mut MemoryState, now: DateTime<Utc>) {
+        state.workers.retain(|_, entry| entry.retained_until > now);
+        state.routes.retain(|_, entry| entry.retained_until > now);
+        state.replay.retain(|_, entry| entry.retained_until > now);
+        state
+            .wakeup_sequences
+            .retain(|_, entry| entry.retained_until > now);
+
+        let expired_workers = state
+            .streams
+            .iter()
+            .filter_map(|(worker_id, stream)| (stream.retained_until <= now).then_some(*worker_id))
+            .collect::<Vec<_>>();
+        for worker_id in expired_workers {
+            state.streams.remove(&worker_id);
+            state
+                .groups
+                .retain(|(pending_worker, _), _| *pending_worker != worker_id);
+        }
+        state.groups.retain(|_, group| {
+            group
+                .retained_until
+                .is_some_and(|retained_until| retained_until > now)
+        });
+    }
+
     fn publish_locked(
         &self,
         state: &mut MemoryState,
@@ -128,6 +202,8 @@ impl MemoryCoordinator {
         sequence: ProjectionSequence,
         reason: WakeupReason,
     ) -> Result<(), CoordinationError> {
+        let now = self.clock.now();
+        let stream_retained_until = retained_until(now, now, self.stream_ttl)?;
         state.next_stream_id = state
             .next_stream_id
             .checked_add(1)
@@ -137,10 +213,17 @@ impl MemoryCoordinator {
             sequence,
             reason,
         };
-        let stream = state.streams.entry(worker_id).or_default();
-        stream.push_back(entry);
-        while stream.len() > self.max_stream_len {
-            if let Some(trimmed) = stream.pop_front() {
+        let stream = state
+            .streams
+            .entry(worker_id)
+            .or_insert_with(|| MemoryWakeupStream {
+                entries: VecDeque::new(),
+                retained_until: stream_retained_until,
+            });
+        stream.retained_until = stream_retained_until;
+        stream.entries.push_back(entry);
+        while stream.entries.len() > self.max_stream_len {
+            if let Some(trimmed) = stream.entries.pop_front() {
                 for ((pending_worker, _), group) in &mut state.groups {
                     if *pending_worker == worker_id {
                         group.pending.remove(&trimmed.id);
@@ -148,6 +231,10 @@ impl MemoryCoordinator {
                 }
             }
         }
+        self.notify.notify_waiters();
+        // Preserve one permit for a publisher racing between a consumer's
+        // empty check and registration with `notified()`.
+        self.notify.notify_one();
         Ok(())
     }
 
@@ -155,10 +242,12 @@ impl MemoryCoordinator {
         &self,
         state: &mut MemoryState,
         sequence: ProjectionSequence,
+        recorded_at: DateTime<Utc>,
         incoming: WorkerCoordinationSnapshot,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
         incoming.validate()?;
         let now = self.clock.now();
+        let keep_until = retained_until(incoming.lease_expires_at, now, self.tombstone_ttl)?;
         if let Some(existing) = state.workers.get(&incoming.lease.worker_id) {
             if sequence < existing.sequence {
                 return Ok(ProjectionApplyOutcome::Stale);
@@ -174,7 +263,7 @@ impl MemoryCoordinator {
                 return Err(CoordinationError::StaleFence);
             }
             if incoming.lease.fence == existing.value.lease.fence {
-                if existing.value.lease_expires_at <= now {
+                if existing.value.lease_expires_at <= recorded_at {
                     return Err(CoordinationError::LeaseExpired);
                 }
                 if existing.value.draining && !incoming.draining {
@@ -187,6 +276,7 @@ impl MemoryCoordinator {
             Versioned {
                 sequence,
                 value: incoming,
+                retained_until: keep_until,
             },
         );
         Ok(ProjectionApplyOutcome::Applied)
@@ -198,10 +288,27 @@ impl MemoryCoordinator {
         sequence: ProjectionSequence,
         incoming: CallRouteHint,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
-        if incoming.expires_at <= self.clock.now() {
-            return Ok(ProjectionApplyOutcome::Stale);
-        }
-        apply_versioned(&mut state.routes, incoming.call_id, sequence, incoming)
+        let now = self.clock.now();
+        let keep_until = retained_until(incoming.expires_at, now, self.tombstone_ttl)?;
+        apply_versioned(
+            &mut state.routes,
+            incoming.call_id,
+            sequence,
+            Some(incoming),
+            keep_until,
+        )
+    }
+
+    fn remove_route(
+        &self,
+        state: &mut MemoryState,
+        sequence: ProjectionSequence,
+        recorded_at: DateTime<Utc>,
+        call_id: CallId,
+    ) -> Result<ProjectionApplyOutcome, CoordinationError> {
+        let now = self.clock.now();
+        let keep_until = retained_until(recorded_at, now, self.tombstone_ttl)?;
+        apply_versioned(&mut state.routes, call_id, sequence, None, keep_until)
     }
 
     fn apply_replay(
@@ -210,10 +317,15 @@ impl MemoryCoordinator {
         sequence: ProjectionSequence,
         incoming: ReplayMarker,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
-        if incoming.expires_at <= self.clock.now() {
-            return Ok(ProjectionApplyOutcome::Stale);
-        }
-        apply_versioned(&mut state.replay, incoming.digest, sequence, incoming)
+        let now = self.clock.now();
+        let keep_until = retained_until(incoming.expires_at, now, self.tombstone_ttl)?;
+        apply_versioned(
+            &mut state.replay,
+            incoming.digest,
+            sequence,
+            incoming,
+            keep_until,
+        )
     }
 
     fn apply_wakeup(
@@ -223,7 +335,15 @@ impl MemoryCoordinator {
         worker_id: WorkerId,
         reason: WakeupReason,
     ) -> Result<ProjectionApplyOutcome, CoordinationError> {
-        let outcome = apply_versioned(&mut state.wakeup_sequences, worker_id, sequence, reason)?;
+        let now = self.clock.now();
+        let keep_until = retained_until(now, now, self.stream_ttl)?;
+        let outcome = apply_versioned(
+            &mut state.wakeup_sequences,
+            worker_id,
+            sequence,
+            reason,
+            keep_until,
+        )?;
         if outcome == ProjectionApplyOutcome::Applied {
             self.publish_locked(state, worker_id, sequence, reason)?;
         }
@@ -236,6 +356,7 @@ fn apply_versioned<K, V>(
     key: K,
     sequence: ProjectionSequence,
     value: V,
+    retained_until: DateTime<Utc>,
 ) -> Result<ProjectionApplyOutcome, CoordinationError>
 where
     K: Eq + std::hash::Hash,
@@ -253,8 +374,28 @@ where
             };
         }
     }
-    values.insert(key, Versioned { sequence, value });
+    values.insert(
+        key,
+        Versioned {
+            sequence,
+            value,
+            retained_until,
+        },
+    );
     Ok(ProjectionApplyOutcome::Applied)
+}
+
+fn retained_until(
+    expiry: DateTime<Utc>,
+    now: DateTime<Utc>,
+    retention: Duration,
+) -> Result<DateTime<Utc>, CoordinationError> {
+    let retention = TimeDelta::from_std(retention)
+        .map_err(|_| CoordinationError::InvalidInput("coordination retention is too large"))?;
+    expiry
+        .max(now)
+        .checked_add_signed(retention)
+        .ok_or(CoordinationError::InvalidData)
 }
 
 #[async_trait]
@@ -270,12 +411,19 @@ impl CoordinationProjection for MemoryCoordinator {
             ));
         }
         let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, self.clock.now());
         match &event.payload {
-            CoordinationPayload::Worker(worker) => {
-                self.apply_worker(&mut state, event.sequence, worker.clone())
-            }
+            CoordinationPayload::Worker(worker) => self.apply_worker(
+                &mut state,
+                event.sequence,
+                event.recorded_at,
+                worker.clone(),
+            ),
             CoordinationPayload::Route(route) => {
                 self.apply_route(&mut state, event.sequence, route.clone())
+            }
+            CoordinationPayload::RouteRemoved { call_id } => {
+                self.remove_route(&mut state, event.sequence, event.recorded_at, *call_id)
             }
             CoordinationPayload::Replay(marker) => {
                 self.apply_replay(&mut state, event.sequence, marker.clone())
@@ -292,7 +440,8 @@ impl CoordinationProjection for MemoryCoordinator {
     ) -> Result<Vec<WorkerCoordinationSnapshot>, CoordinationError> {
         request.validate()?;
         let now = self.clock.now();
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, now);
         let mut workers = state
             .workers
             .values()
@@ -324,8 +473,13 @@ impl CoordinationProjection for MemoryCoordinator {
         call_id: CallId,
     ) -> Result<Option<CallRouteHint>, CoordinationError> {
         let now = self.clock.now();
-        let state = self.lock()?;
-        let Some(route) = state.routes.get(&call_id).map(|entry| &entry.value) else {
+        let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, now);
+        let Some(route) = state
+            .routes
+            .get(&call_id)
+            .and_then(|entry| entry.value.as_ref())
+        else {
             return Ok(None);
         };
         if route.expires_at <= now {
@@ -342,8 +496,9 @@ impl CoordinationProjection for MemoryCoordinator {
 
     async fn replay_seen(&self, digest: ReplayDigest) -> Result<bool, CoordinationError> {
         let now = self.clock.now();
-        Ok(self
-            .lock()?
+        let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, now);
+        Ok(state
             .replay
             .get(&digest)
             .is_some_and(|entry| entry.value.expires_at > now))
@@ -359,6 +514,7 @@ impl WakeupPublisher for MemoryCoordinator {
         reason: WakeupReason,
     ) -> Result<(), CoordinationError> {
         let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, self.clock.now());
         self.apply_wakeup(&mut state, sequence, worker_id, reason)
             .map(|_| ())
     }
@@ -385,17 +541,12 @@ impl std::fmt::Debug for MemoryWakeupConsumer {
     }
 }
 
-#[async_trait]
-impl WakeupConsumer for MemoryWakeupConsumer {
-    async fn poll(&mut self, count: usize) -> WakeupPoll {
-        let count = count.clamp(1, 1_024);
+impl MemoryWakeupConsumer {
+    fn take_ready(&self, count: usize) -> Result<Vec<WakeupMessage>, CoordinationError> {
         let now = self.coordinator.clock.now();
-        let Ok(mut state) = self.coordinator.lock() else {
-            return WakeupPoll {
-                messages: Vec::new(),
-                database_poll_reason: DatabasePollReason::CoordinationUnavailable,
-            };
-        };
+        let group_retained_until = retained_until(now, now, self.coordinator.stream_ttl)?;
+        let mut state = self.coordinator.lock()?;
+        self.coordinator.cleanup_locked(&mut state, now);
         let key = (self.worker_id, self.group.clone());
         let last_delivered = state
             .groups
@@ -405,12 +556,13 @@ impl WakeupConsumer for MemoryWakeupConsumer {
             .streams
             .get(&self.worker_id)
             .into_iter()
-            .flatten()
+            .flat_map(|stream| &stream.entries)
             .filter(|entry| entry.id > last_delivered)
             .take(count)
             .cloned()
             .collect::<Vec<_>>();
         let group = state.groups.entry(key).or_default();
+        group.retained_until = Some(group_retained_until);
         let mut messages = Vec::with_capacity(entries.len());
         for entry in entries {
             group.last_delivered = group.last_delivered.max(entry.id);
@@ -423,13 +575,40 @@ impl WakeupConsumer for MemoryWakeupConsumer {
             );
             messages.push(memory_message(entry));
         }
-        WakeupPoll {
-            database_poll_reason: if messages.is_empty() {
-                DatabasePollReason::IntervalElapsed
-            } else {
-                DatabasePollReason::Wakeup
-            },
-            messages,
+        Ok(messages)
+    }
+}
+
+#[async_trait]
+impl WakeupConsumer for MemoryWakeupConsumer {
+    async fn poll(&mut self, count: usize) -> WakeupPoll {
+        let count = count.clamp(1, 1_024);
+        let deadline = tokio::time::Instant::now() + self.poll_interval;
+        loop {
+            match self.take_ready(count) {
+                Ok(messages) if !messages.is_empty() => {
+                    return WakeupPoll {
+                        messages,
+                        database_poll_reason: DatabasePollReason::Wakeup,
+                    };
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return WakeupPoll {
+                        messages: Vec::new(),
+                        database_poll_reason: DatabasePollReason::CoordinationUnavailable,
+                    };
+                }
+            }
+            if tokio::time::timeout_at(deadline, self.coordinator.notify.notified())
+                .await
+                .is_err()
+            {
+                return WakeupPoll {
+                    messages: Vec::new(),
+                    database_poll_reason: DatabasePollReason::IntervalElapsed,
+                };
+            }
         }
     }
 
@@ -447,7 +626,10 @@ impl WakeupConsumer for MemoryWakeupConsumer {
             .map_err(|_| CoordinationError::InvalidInput("auto-claim idle is too large"))?;
         let now = self.coordinator.clock.now();
         let mut state = self.coordinator.lock()?;
+        self.coordinator.cleanup_locked(&mut state, now);
         let key = (self.worker_id, self.group.clone());
+        let group_retained_until = retained_until(now, now, self.coordinator.stream_ttl)?;
+        state.groups.entry(key.clone()).or_default().retained_until = Some(group_retained_until);
         let eligible = state
             .groups
             .get(&key)
@@ -463,7 +645,7 @@ impl WakeupConsumer for MemoryWakeupConsumer {
             .streams
             .get(&self.worker_id)
             .into_iter()
-            .flatten()
+            .flat_map(|stream| &stream.entries)
             .filter(|entry| eligible.contains(&entry.id))
             .cloned()
             .collect::<Vec<_>>();
@@ -488,10 +670,13 @@ impl WakeupConsumer for MemoryWakeupConsumer {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut state = self.coordinator.lock()?;
+        let now = self.coordinator.clock.now();
+        self.coordinator.cleanup_locked(&mut state, now);
         let group = state
             .groups
             .entry((self.worker_id, self.group.clone()))
             .or_default();
+        group.retained_until = Some(retained_until(now, now, self.coordinator.stream_ttl)?);
         Ok(ids
             .into_iter()
             .filter(|id| group.pending.remove(id).is_some())

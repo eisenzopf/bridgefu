@@ -76,6 +76,17 @@ persistence:
   database_url: sqlite:///var/lib/bridgefu/bridgefu.db
   # PostgreSQL clusters require a distinct, stable non-nil UUID per worker.
   # worker_id: 00000000-0000-4000-8000-000000000001
+  deployment_id: bridgefu
+  worker_lease_ttl_secs: 30
+  worker_renew_interval_secs: 10
+  worker_capabilities: [sip, webrtc, amazon_connect, twilio, telnyx, vonage]
+  # Optional projection/cache. PostgreSQL always remains authoritative, but
+  # clustered PostgreSQL requires rediss:// and redis_clustered: true.
+  # redis_url: env:BRIDGEFU_REDIS_URL
+  # redis_clustered: true
+  # Dev/test-only PostgreSQL escape hatch; valid only in all-in-one mode and
+  # never inferred merely because redis_url is absent:
+  # allow_db_only_coordination: false
   # Memory never activates implicitly:
   # allow_ephemeral_memory: false
 

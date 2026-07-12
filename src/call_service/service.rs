@@ -13,9 +13,10 @@ use thiserror::Error;
 use crate::api_principal::{ApiPrincipal, ApiPrincipalError, CallScope};
 use crate::call_engine::{
     AttachmentId, AttachmentIssue, AttachmentTransport, CallAggregate, CallCommand, CallId,
-    CommandId, LegDirection, LegId, LegSpec, PrincipalFingerprint, RepositoryError, StopLegReason,
-    TenantId, WorkerLease,
+    CallRepository, CommandId, LegDirection, LegId, LegSpec, PrincipalFingerprint, RepositoryError,
+    StopLegReason, TenantId, WorkerLease,
 };
+use crate::coordination::{CoordinationProjection, WorkerSelectionRequest};
 
 use super::{
     AmazonConnectEndpointConfig, AttachmentTokenContext, AttachmentView, CallExecutionPlan,
@@ -23,7 +24,7 @@ use super::{
     CanonicalRequestTranscript, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
     CreateCallView, DtmfAcceptedView, DtmfSequence, IdempotencyKey, LegEndpointConfig,
     LegExecutionSpec, OperationIdempotency, ProviderEndpointConfig, ProviderKind,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateOutcome,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput,
     ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
     WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
@@ -139,14 +140,17 @@ impl CallServiceClock for SystemCallServiceClock {
 /// Worker-selection seam. Gate 6 item 6 replaces the fixed implementation.
 #[async_trait]
 pub trait WorkerPlacement: Send + Sync {
-    /// Selects a current worker fence for a validated two-leg execution plan.
-    async fn select_worker(
+    /// Returns bounded, ordered candidate fences for a validated plan. The
+    /// authoritative repository still chooses and reserves inside creation.
+    async fn select_workers(
         &self,
         tenant: &TenantId,
         plan: &CallExecutionPlan,
         at: DateTime<Utc>,
-    ) -> Result<WorkerLease, PlacementError>;
+    ) -> Result<Vec<WorkerLease>, PlacementError>;
 }
+
+const MAX_WORKER_CANDIDATES: usize = 8;
 
 /// Safe worker-placement failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -175,14 +179,124 @@ impl FixedWorkerPlacement {
 
 #[async_trait]
 impl WorkerPlacement for FixedWorkerPlacement {
-    async fn select_worker(
+    async fn select_workers(
         &self,
         _tenant: &TenantId,
         _plan: &CallExecutionPlan,
         _at: DateTime<Utc>,
-    ) -> Result<WorkerLease, PlacementError> {
-        Ok(self.worker)
+    ) -> Result<Vec<WorkerLease>, PlacementError> {
+        Ok(vec![self.worker])
     }
+}
+
+/// Database-authoritative placement used by durable runtimes. Any Redis view
+/// may order candidates before this seam in the future, but these snapshots
+/// are always revalidated by the repository and reservation remains atomic.
+pub struct RepositoryWorkerPlacement {
+    repository: Arc<dyn CallRepository>,
+    projection: Option<Arc<dyn CoordinationProjection>>,
+    limit: usize,
+}
+
+impl RepositoryWorkerPlacement {
+    /// Creates bounded durable placement.
+    #[must_use]
+    pub fn new(repository: Arc<dyn CallRepository>) -> Self {
+        Self {
+            repository,
+            projection: None,
+            limit: MAX_WORKER_CANDIDATES,
+        }
+    }
+
+    /// Adds a best-effort ordered projection. Every hint is revalidated in
+    /// the authoritative repository and database fallback remains mandatory.
+    #[must_use]
+    pub fn with_projection(mut self, projection: Arc<dyn CoordinationProjection>) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+}
+
+impl fmt::Debug for RepositoryWorkerPlacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositoryWorkerPlacement")
+            .field("repository", &"[configured]")
+            .field(
+                "projection",
+                &self.projection.as_ref().map(|_| "[configured]"),
+            )
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl WorkerPlacement for RepositoryWorkerPlacement {
+    async fn select_workers(
+        &self,
+        _tenant: &TenantId,
+        plan: &CallExecutionPlan,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<WorkerLease>, PlacementError> {
+        let required = required_worker_capabilities(plan);
+        let mut selected = Vec::new();
+        if let Some(projection) = &self.projection {
+            if let Ok(hints) = projection
+                .worker_hints(&WorkerSelectionRequest {
+                    required_capabilities: required.clone(),
+                    limit: self.limit,
+                })
+                .await
+            {
+                for hint in hints {
+                    let Ok(worker) = self.repository.worker_snapshot(hint.lease.worker_id).await
+                    else {
+                        continue;
+                    };
+                    if worker.lease == hint.lease
+                        && worker.lease_expires_at > at
+                        && !worker.draining
+                        && worker.reserved_calls < worker.max_calls
+                        && required.is_subset(&worker.capabilities)
+                    {
+                        selected.push(worker.lease);
+                    }
+                }
+            }
+        }
+        let workers = self
+            .repository
+            .worker_candidates(&required, at, self.limit)
+            .await
+            .map_err(|_| PlacementError::Unavailable)?;
+        for worker in workers {
+            if !selected.contains(&worker.lease) && selected.len() < self.limit {
+                selected.push(worker.lease);
+            }
+        }
+        if selected.is_empty() {
+            Err(PlacementError::CapacityExceeded)
+        } else {
+            Ok(selected)
+        }
+    }
+}
+
+fn required_worker_capabilities(plan: &CallExecutionPlan) -> BTreeSet<String> {
+    plan.legs
+        .iter()
+        .map(|leg| match &leg.endpoint {
+            LegEndpointConfig::Sip(_) => "sip",
+            LegEndpointConfig::WebRtc(_)
+            | LegEndpointConfig::Whip(_)
+            | LegEndpointConfig::Whep(_) => "webrtc",
+            LegEndpointConfig::AmazonConnect(_) => "amazon_connect",
+            LegEndpointConfig::Provider(config) => provider_label(config.provider),
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Validated inbound leg passed to signaling-principal policy.
@@ -455,9 +569,9 @@ impl CallService {
                     .await;
             }
         };
-        let worker = match tokio::time::timeout(
+        let workers = match tokio::time::timeout(
             placement_budget,
-            self.placement.select_worker(&tenant, &plan, placement_at),
+            self.placement.select_workers(&tenant, &plan, placement_at),
         )
         .await
         {
@@ -479,6 +593,25 @@ impl CallService {
                     .await;
             }
         };
+        if workers.is_empty() {
+            return self
+                .replay_create_or_error(&tenant, &operation, CallServiceError::CapacityExceeded)
+                .await;
+        }
+        if workers.len() > MAX_WORKER_CANDIDATES
+            || workers
+                .iter()
+                .enumerate()
+                .any(|(index, worker)| workers[..index].contains(worker))
+        {
+            return self
+                .replay_create_or_error(
+                    &tenant,
+                    &operation,
+                    CallServiceError::DependencyUnavailable,
+                )
+                .await;
+        }
         let commit_at = self.clock.now();
         if let Err(error) = remaining_budget(commit_at, creation_deadline) {
             return self
@@ -492,13 +625,20 @@ impl CallService {
         let decided = aggregate
             .decide(command.clone())
             .map_err(|_| CallServiceError::InvalidTransition)?;
-        let attachments = self.attachment_issues(
-            &tenant,
-            decided.aggregate(),
-            &resolved_principals,
-            worker,
-            request_at,
-        )?;
+        let mut candidates = Vec::with_capacity(workers.len());
+        for worker in workers {
+            candidates.push(ServiceCreateCandidate {
+                worker,
+                attachments: self.attachment_issues(
+                    &tenant,
+                    decided.aggregate(),
+                    &resolved_principals,
+                    worker,
+                    request_at,
+                )?,
+            });
+        }
+        let selected = candidates.remove(0);
         let outcome = self
             .repository
             .create_with_plan(ServiceCreateTransaction {
@@ -506,13 +646,14 @@ impl CallService {
                     initial: aggregate,
                     command_id: CommandId::new(),
                     command,
-                    worker,
+                    worker: selected.worker,
                     idempotency_key: operation.key_digest,
                     request_digest: operation.request_digest,
-                    attachments,
+                    attachments: selected.attachments,
                     at: commit_at,
                 },
                 plan,
+                alternatives: candidates,
             })
             .await?;
         let (stored, replayed) = match outcome {
@@ -1066,15 +1207,15 @@ mod tests {
 
     #[async_trait]
     impl WorkerPlacement for SwitchablePlacement {
-        async fn select_worker(
+        async fn select_workers(
             &self,
             _tenant: &TenantId,
             _plan: &CallExecutionPlan,
             _at: DateTime<Utc>,
-        ) -> Result<WorkerLease, PlacementError> {
+        ) -> Result<Vec<WorkerLease>, PlacementError> {
             match *self.failure.lock().unwrap() {
                 Some(error) => Err(error),
-                None => Ok(self.worker),
+                None => Ok(vec![self.worker]),
             }
         }
     }
@@ -1163,15 +1304,15 @@ mod tests {
 
     #[async_trait]
     impl WorkerPlacement for BarrierSuccessfulPlacement {
-        async fn select_worker(
+        async fn select_workers(
             &self,
             _tenant: &TenantId,
             _plan: &CallExecutionPlan,
             _at: DateTime<Utc>,
-        ) -> Result<WorkerLease, PlacementError> {
+        ) -> Result<Vec<WorkerLease>, PlacementError> {
             self.entered.wait().await;
             self.release.wait().await;
-            Ok(self.worker)
+            Ok(vec![self.worker])
         }
     }
 
@@ -1213,6 +1354,7 @@ mod tests {
                 max_calls,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1404,6 +1546,7 @@ mod tests {
                 max_calls: 4,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1484,6 +1627,7 @@ mod tests {
                 max_calls: 1,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1551,6 +1695,7 @@ mod tests {
                 max_calls: 1,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1619,6 +1764,7 @@ mod tests {
                 max_calls: 2,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1710,6 +1856,7 @@ mod tests {
                 max_calls: 4,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()
@@ -1769,6 +1916,7 @@ mod tests {
                 max_calls: 2,
                 capabilities: BTreeSet::new(),
                 at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap()

@@ -10,7 +10,7 @@ use bridgefu::call_engine::{
     OutboxCompletion, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
     ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
     ProviderEventState, ProviderPayloadDigest, RegisterWorker, RepositoryError, RequestDigest,
-    StopLegReason, StoredCall, TenantId, WorkerLease,
+    StopLegReason, StoredCall, TenantId, WorkerId, WorkerLease,
 };
 use bridgefu::call_service::{
     AmazonConnectEndpointConfig, CallExecutionPlan, CallServiceRepository, CompletedServiceEffect,
@@ -18,7 +18,7 @@ use bridgefu::call_service::{
     EffectResultOutcome, EffectResultReconciliation, ExternalReferenceBinding,
     ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, OperationIdempotency,
     OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateOutcome,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
     ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
     ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
     WebRtcEndpointConfig,
@@ -79,6 +79,7 @@ async fn register(repository: &MemoryRepository, max_calls: usize) -> WorkerLeas
                 "twilio".to_owned(),
             ]),
             at: at(0),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap()
@@ -143,7 +144,14 @@ fn sip_webrtc_create(
         }],
         at: at(2),
     };
-    (ServiceCreateTransaction { create, plan }, token_digest)
+    (
+        ServiceCreateTransaction {
+            create,
+            plan,
+            alternatives: Vec::new(),
+        },
+        token_digest,
+    )
 }
 
 fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCreateTransaction {
@@ -194,6 +202,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
             at: at(2),
         },
         plan,
+        alternatives: Vec::new(),
     }
 }
 
@@ -504,6 +513,66 @@ async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
             .plan,
         original_plan
     );
+}
+
+#[tokio::test]
+async fn create_atomically_falls_through_capacity_race_to_matching_worker_attachments() {
+    let repository = MemoryRepository::new();
+    let first = register(&repository, 1).await;
+    let second = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 1,
+            capabilities: BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()]),
+            at: at(0),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+    let (occupying, _) = sip_webrtc_create(tenant("occupied-worker"), first, 11);
+    repository.create_with_plan(occupying).await.unwrap();
+
+    let (mut request, _) = sip_webrtc_create(tenant("candidate-owner"), first, 12);
+    let mut second_attachments = request.create.attachments.clone();
+    for (index, attachment) in second_attachments.iter_mut().enumerate() {
+        attachment.attachment_id = AttachmentId::new();
+        attachment.token_digest =
+            AttachmentTokenDigest::new(digest(200 + u8::try_from(index).unwrap()));
+    }
+    request.alternatives.push(ServiceCreateCandidate {
+        worker: second,
+        attachments: second_attachments.clone(),
+    });
+
+    let created = created(repository.create_with_plan(request.clone()).await.unwrap());
+    assert_eq!(created.call.assignment.lease, second);
+    assert_eq!(created.attachments, second_attachments);
+    assert_eq!(
+        repository
+            .worker_snapshot(first.worker_id)
+            .await
+            .unwrap()
+            .reserved_calls,
+        1
+    );
+    assert_eq!(
+        repository
+            .worker_snapshot(second.worker_id)
+            .await
+            .unwrap()
+            .reserved_calls,
+        1
+    );
+
+    repository
+        .set_worker_draining(second, true, at(3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        repository.create_with_plan(request).await.unwrap(),
+        ServiceCreateOutcome::Replayed(replayed) if replayed == created
+    ));
 }
 
 #[tokio::test]
@@ -1044,7 +1113,7 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
 
 #[tokio::test]
 async fn control_operation_replays_expires_and_conflicts_with_other_receipt_kinds() {
-    let (repository, fixture) = active_fixture(31).await;
+    let (repository, mut fixture) = active_fixture(31).await;
     let first_request = dtmf_operation(&fixture, 218, 219, 10, "1");
     let ControlCommandOutcome::Enqueued(original) = repository
         .enqueue_control(first_request.clone())
@@ -1085,6 +1154,28 @@ async fn control_operation_replays_expires_and_conflicts_with_other_receipt_kind
 
     // At the exact 24-hour boundary the old receipt is expired, so the same
     // key may protect a new canonical request and result.
+    let replacement = repository
+        .register_worker(RegisterWorker {
+            worker_id: fixture.worker.worker_id,
+            max_calls: 8,
+            capabilities: BTreeSet::from([
+                "sip".to_owned(),
+                "webrtc".to_owned(),
+                "twilio".to_owned(),
+            ]),
+            at: at(86_409),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+    assert!(repository
+        .claim_restart_calls(replacement, at(86_409), 8)
+        .await
+        .unwrap()
+        .iter()
+        .any(|claim| claim.call.aggregate.id() == fixture.service_call.call.aggregate.id()));
+    fixture.worker = replacement;
     let ControlCommandOutcome::Enqueued(reused) = repository
         .enqueue_control(dtmf_operation(&fixture, 218, 220, 86_410, "2"))
         .await
@@ -1345,6 +1436,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
                 "twilio".to_owned(),
             ]),
             at: at(12),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap()

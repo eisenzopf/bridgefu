@@ -249,6 +249,13 @@ pub enum CoordinationPayload {
     Worker(WorkerCoordinationSnapshot),
     /// Call route hint.
     Route(CallRouteHint),
+    /// Explicitly removes a call route while retaining its sequence tombstone.
+    /// Emit this transactionally when an assignment is released or a call
+    /// reaches terminal cleanup.
+    RouteRemoved {
+        /// Call whose cached assignment must no longer be returned.
+        call_id: CallId,
+    },
     /// Replay digest hint.
     Replay(ReplayMarker),
     /// Wake a worker so it polls authoritative database work.
@@ -561,7 +568,8 @@ pub trait WakeupPublisher: Send + Sync {
     ) -> Result<(), CoordinationError>;
 }
 
-/// Dedicated wakeup consumer. Every poll result requires authoritative DB work claims.
+/// Dedicated wakeup consumer. Every poll result requires an authoritative
+/// active-lease recheck and a coalesced signal to the bounded DB work claimers.
 #[async_trait]
 pub trait WakeupConsumer: Send {
     /// Reads new consumer-group entries with a bounded blocking interval.
@@ -574,7 +582,8 @@ pub trait WakeupConsumer: Send {
         count: usize,
     ) -> Result<Vec<WakeupMessage>, CoordinationError>;
 
-    /// Acknowledges best-effort hints after the consumer has initiated DB fallback/claiming.
+    /// Acknowledges best-effort hints only after the active lease was rechecked
+    /// and the authoritative work-claim signal was published.
     async fn acknowledge(&mut self, entry_ids: &[String]) -> Result<usize, CoordinationError>;
 }
 

@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::call_engine::{
     chrono_ttl, idempotency_expiry, validate_attachment_issue, validate_provider_event,
-    validate_register_worker, AggregateVersion, AttachmentCandidate, AttachmentConsume,
-    AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTokenDigest, AttachmentTransport,
+    validate_register_worker, validate_worker_candidate_limit, validate_worker_lease_ttl,
+    worker_lease_expiry, AggregateVersion, AttachmentCandidate, AttachmentConsume, AttachmentId,
+    AttachmentIssue, AttachmentLookup, AttachmentTokenDigest, AttachmentTransport,
     BindProviderReference, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
     ClaimGeneration, ClaimedDeadline, ClaimedOutbox, ClaimedProviderEvent, CommandCommit,
     CommandCommitOutcome, CommandCommitView, CommandDisposition, CommandId, ConnectionBinding,
@@ -28,9 +29,9 @@ use crate::call_engine::{
     PrincipalFingerprint, ProviderAccountKey, ProviderCallId, ProviderEventCommit,
     ProviderEventCommitOutcome, ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput,
     ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderReceiptSequence,
-    RegisterWorker, RepositoryError, RestartClaim, StoredCall, StoredCommand, TenantId,
-    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, TransferResult,
-    WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
+    RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim, StoredCall, StoredCommand,
+    TenantId, TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome,
+    TransferResult, WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
     CallExecutionPlan, CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect,
@@ -290,6 +291,9 @@ pub(super) enum ProviderCompletionRow {
 
 #[derive(Clone, Default)]
 struct MemoryState {
+    /// Database time for the current SQL transaction. Standalone operations
+    /// use the timestamp carried by their request instead.
+    authority_time: Option<DateTime<Utc>>,
     workers: HashMap<WorkerId, WorkerSnapshot>,
     calls: HashMap<CallId, StoredCall>,
     leg_owners: HashMap<LegId, CallId>,
@@ -490,8 +494,24 @@ impl MemoryRepository {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn from_snapshot(snapshot: MemoryStateSnapshot) -> Result<Self, RepositoryError> {
+        Self::from_snapshot_with_authority_time(snapshot, None)
+    }
+
+    pub(super) fn from_snapshot_at(
+        snapshot: MemoryStateSnapshot,
+        authority_time: DateTime<Utc>,
+    ) -> Result<Self, RepositoryError> {
+        Self::from_snapshot_with_authority_time(snapshot, Some(authority_time))
+    }
+
+    fn from_snapshot_with_authority_time(
+        snapshot: MemoryStateSnapshot,
+        authority_time: Option<DateTime<Utc>>,
+    ) -> Result<Self, RepositoryError> {
         let mut state = MemoryState::default();
+        state.authority_time = authority_time;
 
         for worker in snapshot.workers {
             if state
@@ -1710,6 +1730,8 @@ impl CallRepository for MemoryRepository {
     ) -> Result<WorkerSnapshot, RepositoryError> {
         validate_register_worker(&request)?;
         self.transaction(|state| {
+            let at = authoritative_time(state, request.at);
+            let lease_expires_at = worker_lease_expiry(at, request.lease_ttl)?;
             let snapshot = match state.workers.get(&request.worker_id) {
                 Some(existing) => {
                     if request.max_calls < existing.reserved_calls {
@@ -1726,7 +1748,8 @@ impl CallRepository for MemoryRepository {
                         reserved_calls: existing.reserved_calls,
                         draining: false,
                         capabilities: request.capabilities.clone(),
-                        updated_at: request.at,
+                        updated_at: at,
+                        lease_expires_at,
                     }
                 }
                 None => WorkerSnapshot {
@@ -1738,11 +1761,37 @@ impl CallRepository for MemoryRepository {
                     reserved_calls: 0,
                     draining: false,
                     capabilities: request.capabilities.clone(),
-                    updated_at: request.at,
+                    updated_at: at,
+                    lease_expires_at,
                 },
             };
             state.workers.insert(request.worker_id, snapshot.clone());
             Ok(snapshot)
+        })
+    }
+
+    async fn renew_worker_lease(
+        &self,
+        request: RenewWorkerLease,
+    ) -> Result<WorkerSnapshot, RepositoryError> {
+        validate_worker_lease_ttl(request.lease_ttl)?;
+        self.transaction(|state| {
+            let at = authoritative_time(state, request.at);
+            let snapshot = state
+                .workers
+                .get_mut(&request.worker.worker_id)
+                .filter(|snapshot| snapshot.lease == request.worker)
+                .ok_or(RepositoryError::StaleWorkerFence)?;
+            if at >= snapshot.lease_expires_at {
+                return Err(RepositoryError::StaleWorkerFence);
+            }
+            let lease_expires_at = worker_lease_expiry(at, request.lease_ttl)?;
+            if lease_expires_at <= snapshot.lease_expires_at {
+                return Ok(snapshot.clone());
+            }
+            snapshot.updated_at = at;
+            snapshot.lease_expires_at = lease_expires_at;
+            Ok(snapshot.clone())
         })
     }
 
@@ -1753,12 +1802,19 @@ impl CallRepository for MemoryRepository {
         at: DateTime<Utc>,
     ) -> Result<WorkerSnapshot, RepositoryError> {
         self.transaction(|state| {
+            let at = authoritative_time(state, at);
             let snapshot = state
                 .workers
                 .get_mut(&worker.worker_id)
                 .filter(|snapshot| snapshot.lease == worker)
                 .ok_or(RepositoryError::StaleWorkerFence)?;
-            snapshot.draining = draining;
+            if at >= snapshot.lease_expires_at {
+                return Err(RepositoryError::StaleWorkerFence);
+            }
+            if snapshot.draining && !draining {
+                return Err(RepositoryError::StaleWorkerFence);
+            }
+            snapshot.draining |= draining;
             snapshot.updated_at = at;
             Ok(snapshot.clone())
         })
@@ -1774,6 +1830,63 @@ impl CallRepository for MemoryRepository {
                 .get(&worker_id)
                 .cloned()
                 .ok_or(RepositoryError::NotFound)
+        })
+    }
+
+    async fn active_worker_snapshot(
+        &self,
+        worker: WorkerLease,
+        at: DateTime<Utc>,
+    ) -> Result<WorkerSnapshot, RepositoryError> {
+        self.read(|state| {
+            let at = authoritative_time(state, at);
+            state
+                .workers
+                .get(&worker.worker_id)
+                .filter(|snapshot| {
+                    snapshot.lease == worker && !snapshot.draining && snapshot.lease_expires_at > at
+                })
+                .cloned()
+                .ok_or(RepositoryError::StaleWorkerFence)
+        })
+    }
+
+    async fn worker_candidates(
+        &self,
+        required_capabilities: &std::collections::BTreeSet<String>,
+        at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<WorkerSnapshot>, RepositoryError> {
+        validate_worker_candidate_limit(limit)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.read(|state| {
+            let at = authoritative_time(state, at);
+            let mut candidates = state
+                .workers
+                .values()
+                .filter(|worker| {
+                    !worker.draining
+                        && worker.lease_expires_at > at
+                        && worker.reserved_calls < worker.max_calls
+                        && required_capabilities.is_subset(&worker.capabilities)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                ((left.reserved_calls as u128) * (right.max_calls as u128))
+                    .cmp(&((right.reserved_calls as u128) * (left.max_calls as u128)))
+                    .then_with(|| left.reserved_calls.cmp(&right.reserved_calls))
+                    .then_with(|| {
+                        left.lease
+                            .worker_id
+                            .to_string()
+                            .cmp(&right.lease.worker_id.to_string())
+                    })
+            });
+            candidates.truncate(limit);
+            Ok(candidates)
         })
     }
 
@@ -1799,6 +1912,7 @@ impl CallRepository for MemoryRepository {
                 &request.tenant_id,
                 request.call_id,
                 request.worker,
+                request.at,
             )?;
             commit_command_in_state(state, request)
         })
@@ -1819,7 +1933,7 @@ impl CallRepository for MemoryRepository {
         request: AttachmentLookup,
     ) -> Result<AttachmentCandidate, RepositoryError> {
         self.read(|state| {
-            ensure_worker(state, request.worker, true)
+            ensure_worker(state, request.worker, true, request.at)
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
             let row = state
                 .attachments
@@ -1868,7 +1982,7 @@ impl CallRepository for MemoryRepository {
         request: AttachmentConsume,
     ) -> Result<ConsumedAttachment, RepositoryError> {
         self.transaction(|state| {
-            ensure_worker(state, request.candidate.worker, true)
+            ensure_worker(state, request.candidate.worker, true, request.at)
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
             validate_attachment_consume_command(&request)?;
             if state.commands.contains_key(&request.command_id)
@@ -2024,6 +2138,7 @@ impl CallRepository for MemoryRepository {
                 &request.tenant_id,
                 request.call_id,
                 request.worker,
+                request.at,
             )?;
             bind_provider_reference_in_state(state, request)
         })
@@ -2041,7 +2156,7 @@ impl CallRepository for MemoryRepository {
             return Ok(Vec::new());
         }
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             let mut eligible = state
                 .provider_events
                 .iter()
@@ -2100,7 +2215,7 @@ impl CallRepository for MemoryRepository {
                     "provider completion and command times or workers differ",
                 ));
             }
-            ensure_worker(state, request.worker, true)?;
+            ensure_worker(state, request.worker, true, request.at)?;
             let key = (request.account.clone(), request.event_digest);
             let event = state
                 .provider_events
@@ -2185,7 +2300,7 @@ impl CallRepository for MemoryRepository {
         request: TerminalProviderEventAcknowledge,
     ) -> Result<TerminalProviderEventAcknowledgeOutcome, RepositoryError> {
         self.transaction(|state| {
-            ensure_worker(state, request.worker, true)?;
+            ensure_worker(state, request.worker, true, request.at)?;
             let key = (request.account.clone(), request.event_digest);
             let event = state
                 .provider_events
@@ -2205,7 +2320,7 @@ impl CallRepository for MemoryRepository {
             if event.target.as_ref() != Some(&request.target) {
                 return Err(RepositoryError::ProviderReferenceConflict);
             }
-            ensure_terminal_call_worker(state, &request.target, request.worker)?;
+            ensure_terminal_call_worker(state, &request.target, request.worker, request.at)?;
             match &event.state {
                 ProviderEventState::Claimed {
                     worker,
@@ -2248,7 +2363,7 @@ impl CallRepository for MemoryRepository {
             return Ok(Vec::new());
         }
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             let mut eligible = state
                 .outbox
                 .values()
@@ -2303,7 +2418,7 @@ impl CallRepository for MemoryRepository {
         at: DateTime<Utc>,
     ) -> Result<OutboxRecord, RepositoryError> {
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             if state
                 .outbox
                 .get(&effect_id)
@@ -2349,7 +2464,7 @@ impl CallRepository for MemoryRepository {
             return Ok(Vec::new());
         }
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             let mut eligible = state
                 .deadlines
                 .values()
@@ -2422,7 +2537,7 @@ impl CallRepository for MemoryRepository {
             return Ok(Vec::new());
         }
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             let mut call_ids = state
                 .calls
                 .iter()
@@ -2551,8 +2666,37 @@ impl CallServiceRepository for MemoryRepository {
     ) -> Result<ServiceCreateOutcome, RepositoryError> {
         request.plan.validate_against(&request.create.initial)?;
         self.transaction(|state| {
-            let plan = request.plan;
-            match create_call_in_state(state, request.create)? {
+            let ServiceCreateTransaction {
+                create,
+                plan,
+                alternatives,
+            } = request;
+            let mut candidates = Vec::with_capacity(alternatives.len() + 1);
+            candidates.push(create.clone());
+            candidates.extend(alternatives.into_iter().map(|alternative| {
+                let mut candidate = create.clone();
+                candidate.worker = alternative.worker;
+                candidate.attachments = alternative.attachments;
+                candidate
+            }));
+            let mut outcome = None;
+            let mut last_admission_error = RepositoryError::CapacityExceeded;
+            for candidate in candidates {
+                match create_call_in_state(state, candidate) {
+                    Ok(value) => {
+                        outcome = Some(value);
+                        break;
+                    }
+                    Err(
+                        error @ (RepositoryError::CapacityExceeded
+                        | RepositoryError::StaleWorkerFence),
+                    ) => {
+                        last_admission_error = error;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            match outcome.ok_or(last_admission_error)? {
                 CreateCallOutcome::Created(call) => {
                     let call_id = call.aggregate.id();
                     if !state.service_managed_calls.insert(call_id)
@@ -2666,7 +2810,7 @@ impl CallServiceRepository for MemoryRepository {
             return Ok(Vec::new());
         }
         self.transaction(|state| {
-            ensure_worker(state, worker, true)?;
+            ensure_worker(state, worker, true, at)?;
             let mut eligible = state
                 .control_outbox
                 .values()
@@ -3109,7 +3253,13 @@ fn enqueue_control_in_state(
     {
         return Err(RepositoryError::CommandConflict);
     }
-    ensure_call_worker(state, &request.tenant_id, request.call_id, request.worker)?;
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
     if !state.service_managed_calls.contains(&request.call_id)
         || !state.execution_plans.contains_key(&request.call_id)
     {
@@ -3232,7 +3382,13 @@ fn bind_outbound_connection_in_state(
     {
         return Err(RepositoryError::CommandConflict);
     }
-    ensure_call_worker(state, &request.tenant_id, request.call_id, request.worker)?;
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
     let plan = state
         .execution_plans
         .get(&request.call_id)
@@ -3368,7 +3524,7 @@ fn reconcile_effect_result_in_state(
             Err(RepositoryError::StaleClaim)
         };
     }
-    ensure_worker(state, request.worker, true)?;
+    ensure_worker(state, request.worker, true, request.at)?;
     let core = state.outbox.get(&request.effect_id).cloned();
     let control = state.control_outbox.get(&request.effect_id).cloned();
     let effect = match (core, control) {
@@ -3777,17 +3933,23 @@ fn external_reference_key(value: &ExternalReferenceValue) -> ExternalReferenceKe
     }
 }
 
+fn authoritative_time(state: &MemoryState, requested: DateTime<Utc>) -> DateTime<Utc> {
+    state.authority_time.unwrap_or(requested)
+}
+
 fn ensure_worker(
     state: &MemoryState,
     lease: WorkerLease,
     allow_draining: bool,
+    at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
     let worker = state
         .workers
         .get(&lease.worker_id)
         .filter(|worker| worker.lease == lease)
         .ok_or(RepositoryError::StaleWorkerFence)?;
-    if worker.draining && !allow_draining {
+    let at = authoritative_time(state, at);
+    if worker.lease_expires_at <= at || (worker.draining && !allow_draining) {
         return Err(RepositoryError::StaleWorkerFence);
     }
     Ok(())
@@ -3798,9 +3960,10 @@ fn reject_service_managed_call(
     tenant_id: &TenantId,
     call_id: CallId,
     worker: WorkerLease,
+    at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
     if state.service_managed_calls.contains(&call_id) {
-        ensure_call_worker(state, tenant_id, call_id, worker)?;
+        ensure_call_worker(state, tenant_id, call_id, worker, at)?;
         Err(RepositoryError::InvalidInput(
             "service-managed call requires service repository transaction",
         ))
@@ -3814,8 +3977,9 @@ fn ensure_call_worker(
     tenant_id: &TenantId,
     call_id: CallId,
     worker: WorkerLease,
+    at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
-    ensure_worker(state, worker, true)?;
+    ensure_worker(state, worker, true, at)?;
     let call = state
         .calls
         .get(&call_id)
@@ -3831,8 +3995,9 @@ fn ensure_terminal_call_worker(
     state: &MemoryState,
     target: &ProviderEventTarget,
     worker: WorkerLease,
+    at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
-    ensure_worker(state, worker, true)?;
+    ensure_worker(state, worker, true, at)?;
     let call = state
         .calls
         .get(&target.call_id)
@@ -3869,7 +4034,13 @@ fn bind_provider_reference_in_state(
     state: &mut MemoryState,
     request: BindProviderReference,
 ) -> Result<Vec<ProviderEventEnvelope>, RepositoryError> {
-    ensure_call_worker(state, &request.tenant_id, request.call_id, request.worker)?;
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
     let call = tenant_call(state, &request.tenant_id, request.call_id)?;
     if call.aggregate.leg(request.leg_id).is_none() {
         return Err(RepositoryError::NotFound);
@@ -4031,7 +4202,7 @@ fn create_call_in_state(
             "call or leg identifier already exists",
         ));
     }
-    ensure_worker(state, request.worker, false)?;
+    ensure_worker(state, request.worker, false, request.at)?;
     let worker = state
         .workers
         .get(&request.worker.worker_id)
@@ -4061,12 +4232,13 @@ fn create_call_in_state(
     for leg in aggregate.legs() {
         state.leg_owners.insert(leg.id(), call_id);
     }
+    let worker_updated_at = authoritative_time(state, request.at);
     let worker = state
         .workers
         .get_mut(&request.worker.worker_id)
         .ok_or(RepositoryError::StaleWorkerFence)?;
     worker.reserved_calls += 1;
-    worker.updated_at = request.at;
+    worker.updated_at = worker_updated_at;
 
     let command = StoredCommand {
         command_id: request.command_id,
@@ -4131,7 +4303,7 @@ fn commit_command_in_state(
         return Err(RepositoryError::CommandConflict);
     }
     if let Some(existing) = state.commands.get(&request.command_id) {
-        ensure_worker(state, request.worker, true)?;
+        ensure_worker(state, request.worker, true, request.at)?;
         let call = tenant_call(state, &request.tenant_id, request.call_id)?;
         if call.assignment.lease != request.worker {
             return Err(RepositoryError::StaleWorkerFence);
@@ -4152,7 +4324,13 @@ fn commit_command_in_state(
             existing.clone(),
         )?));
     }
-    ensure_call_worker(state, &request.tenant_id, request.call_id, request.worker)?;
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
     let current = tenant_call(state, &request.tenant_id, request.call_id)?;
     if current.aggregate.version() != request.expected_version {
         return Err(RepositoryError::VersionConflict);
@@ -4676,7 +4854,8 @@ fn release_assignment_in_state(
     worker: WorkerLease,
     at: DateTime<Utc>,
 ) -> Result<bool, RepositoryError> {
-    ensure_worker(state, worker, true)?;
+    ensure_worker(state, worker, true, at)?;
+    let worker_updated_at = authoritative_time(state, at);
     let call = state
         .calls
         .get_mut(&call_id)
@@ -4702,7 +4881,7 @@ fn release_assignment_in_state(
         .reserved_calls
         .checked_sub(1)
         .ok_or(RepositoryError::Unavailable)?;
-    worker.updated_at = at;
+    worker.updated_at = worker_updated_at;
     Ok(true)
 }
 
@@ -4774,6 +4953,7 @@ mod tests {
             max_calls,
             capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
             at: at(0),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap()
@@ -4979,6 +5159,7 @@ mod tests {
             .create_with_plan(ServiceCreateTransaction {
                 create: create_request(aggregate, worker.lease, 1, 2),
                 plan: plan.clone(),
+                alternatives: Vec::new(),
             })
             .await
             .unwrap();
@@ -5084,6 +5265,7 @@ mod tests {
         repo.create_with_plan(ServiceCreateTransaction {
             create: create_request(aggregate, worker.lease, 92, 93),
             plan,
+            alternatives: Vec::new(),
         })
         .await
         .unwrap();
@@ -5164,6 +5346,7 @@ mod tests {
         repo.create_with_plan(ServiceCreateTransaction {
             create: create_request(aggregate, worker.lease, 11, 12),
             plan,
+            alternatives: Vec::new(),
         })
         .await
         .unwrap();
@@ -5301,9 +5484,19 @@ mod tests {
         ));
 
         let retirement_at = idempotency_expiry(at(4)).unwrap();
+        let replacement = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: worker.max_calls,
+                capabilities: worker.capabilities.clone(),
+                at: retirement_at,
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
         repo.create_call(create_request_at(
             new_call(owner.clone()),
-            worker.lease,
+            replacement.lease,
             70,
             91,
             retirement_at,
@@ -5332,6 +5525,12 @@ mod tests {
             Err(RepositoryError::Unavailable)
         ));
 
+        assert!(repo
+            .claim_restart_calls(replacement.lease, retirement_at, 8)
+            .await
+            .unwrap()
+            .iter()
+            .any(|claim| claim.call.aggregate.id() == call_id));
         let current = repo.load_service_call(&owner, call_id).await.unwrap();
         let retirement_command = CommandId::new();
         let retirement_at = retirement_at + chrono::Duration::seconds(1);
@@ -5347,7 +5546,7 @@ mod tests {
                         ending_deadline: Some(retirement_at + chrono::Duration::seconds(30)),
                         reason: StopLegReason::Requested,
                     },
-                    worker: worker.lease,
+                    worker: replacement.lease,
                     attachments: Vec::new(),
                     deadline_claim: None,
                     at: retirement_at,
@@ -5600,6 +5799,17 @@ mod tests {
         // identity, not from the HTTP idempotency key. Reusing an expired
         // HTTP key therefore still produces an independent attachment.
         after_expiry.attachments[0].token_digest = AttachmentTokenDigest::new(digest(212));
+        let replacement = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: worker.max_calls,
+                capabilities: worker.capabilities.clone(),
+                at: after_expiry.at,
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        after_expiry.worker = replacement.lease;
         assert!(matches!(
             repo.create_call(after_expiry).await.unwrap(),
             CreateCallOutcome::Created(_)
@@ -5623,12 +5833,23 @@ mod tests {
             .unwrap();
         }
         assert_eq!(repo.counts().unwrap().idempotency, 2);
+        let replacement_at = at(2 + 24 * 60 * 60 + 1);
+        let replacement = repo
+            .register_worker(RegisterWorker {
+                worker_id: worker.lease.worker_id,
+                max_calls: worker.max_calls,
+                capabilities: worker.capabilities.clone(),
+                at: replacement_at,
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
         repo.create_call(create_request_at(
             new_call(tenant("tenant-a")),
-            worker.lease,
+            replacement.lease,
             10,
             10,
-            at(2 + 24 * 60 * 60 + 1),
+            replacement_at,
         ))
         .await
         .unwrap();
@@ -5897,6 +6118,7 @@ mod tests {
             max_calls: 2,
             capabilities: BTreeSet::from(["sip".into()]),
             at: at(4),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap();
@@ -7046,6 +7268,7 @@ mod tests {
                 max_calls: 2,
                 capabilities: BTreeSet::from(["sip".into()]),
                 at: at(10),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap();
@@ -7183,6 +7406,7 @@ mod tests {
                 max_calls: 1,
                 capabilities: BTreeSet::from(["sip".into()]),
                 at: at(12),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap();
@@ -7451,6 +7675,7 @@ mod tests {
                 max_calls: 2,
                 capabilities: BTreeSet::from(["sip".into()]),
                 at: at(34),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap();
@@ -7522,6 +7747,7 @@ mod tests {
                 max_calls: 1,
                 capabilities: BTreeSet::from(["sip".into()]),
                 at: at(10),
+                lease_ttl: std::time::Duration::from_secs(300),
             })
             .await
             .unwrap();
@@ -7551,6 +7777,158 @@ mod tests {
             .unwrap();
         assert_eq!(cleanup.len(), 1);
         assert_eq!(cleanup[0].record.worker, newer.lease);
+    }
+
+    #[tokio::test]
+    async fn worker_leases_expire_renew_and_drain_one_way_per_fence() {
+        let repo = MemoryRepository::new();
+        let worker_id = WorkerId::new();
+        let registered = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::from(["sip".to_owned()]),
+                at: at(0),
+                lease_ttl: Duration::from_secs(30),
+            })
+            .await
+            .unwrap();
+        assert_eq!(registered.lease_expires_at, at(30));
+        assert_eq!(
+            repo.worker_candidates(&BTreeSet::from(["sip".to_owned()]), at(29), 4)
+                .await
+                .unwrap(),
+            vec![registered.clone()]
+        );
+        assert!(repo
+            .worker_candidates(&BTreeSet::new(), at(30), 4)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let renewed = repo
+            .renew_worker_lease(RenewWorkerLease {
+                worker: registered.lease,
+                lease_ttl: Duration::from_secs(30),
+                at: at(20),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renewed.lease_expires_at, at(50));
+        assert!(
+            repo.set_worker_draining(renewed.lease, true, at(21))
+                .await
+                .unwrap()
+                .draining
+        );
+        assert_eq!(
+            repo.set_worker_draining(renewed.lease, false, at(22)).await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+
+        let replacement = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::from(["sip".to_owned()]),
+                at: at(40),
+                lease_ttl: Duration::from_secs(30),
+            })
+            .await
+            .unwrap();
+        assert!(!replacement.draining);
+        assert!(replacement.lease.fence > renewed.lease.fence);
+        assert_eq!(
+            repo.renew_worker_lease(RenewWorkerLease {
+                worker: renewed.lease,
+                lease_ttl: Duration::from_secs(30),
+                at: at(41),
+            })
+            .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+        assert_eq!(
+            repo.renew_worker_lease(RenewWorkerLease {
+                worker: replacement.lease,
+                lease_ttl: Duration::from_secs(30),
+                at: at(70),
+            })
+            .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_candidate_sort_handles_maximum_values_and_rejects_unbounded_limits() {
+        let repo = MemoryRepository::new();
+        let first = worker(&repo, usize::MAX).await;
+        let second = worker(&repo, usize::MAX - 1).await;
+        repo.transaction(|state| {
+            state
+                .workers
+                .get_mut(&first.lease.worker_id)
+                .unwrap()
+                .reserved_calls = usize::MAX - 1;
+            state
+                .workers
+                .get_mut(&second.lease.worker_id)
+                .unwrap()
+                .reserved_calls = usize::MAX - 2;
+            Ok(())
+        })
+        .unwrap();
+
+        let candidates = repo
+            .worker_candidates(&BTreeSet::new(), at(1), 2)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].lease, second.lease);
+        assert_eq!(
+            repo.worker_candidates(
+                &BTreeSet::new(),
+                at(1),
+                crate::call_engine::MAX_WORKER_CANDIDATE_LIMIT + 1,
+            )
+            .await,
+            Err(RepositoryError::InvalidInput(
+                "worker candidate limit exceeds the repository bound",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_mutations_use_authoritative_worker_update_time() {
+        let initial = MemoryRepository::new();
+        let worker = worker(&initial, 1).await;
+        let repository =
+            MemoryRepository::from_snapshot_at(initial.snapshot().unwrap(), at(100)).unwrap();
+        let owner = tenant("authoritative-worker-time");
+        let call = created(
+            repository
+                .create_call(create_request(
+                    new_call(owner.clone()),
+                    worker.lease,
+                    201,
+                    202,
+                ))
+                .await
+                .unwrap(),
+        );
+        let reserved = repository
+            .worker_snapshot(worker.lease.worker_id)
+            .await
+            .unwrap();
+        assert_eq!(reserved.updated_at, at(100));
+        assert_eq!(reserved.reserved_calls, 1);
+
+        end_call(&repository, &owner, worker.lease, call).await;
+        let released = repository
+            .worker_snapshot(worker.lease.worker_id)
+            .await
+            .unwrap();
+        assert_eq!(released.updated_at, at(100));
+        assert_eq!(released.reserved_calls, 0);
     }
 
     #[tokio::test]

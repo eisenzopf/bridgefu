@@ -78,6 +78,7 @@ where
                 "twilio".to_owned(),
             ]),
             at: at(0),
+            lease_ttl: std::time::Duration::from_secs(300),
         })
         .await
         .unwrap()
@@ -142,7 +143,14 @@ fn sip_webrtc_create(
         }],
         at: at(2),
     };
-    (ServiceCreateTransaction { create, plan }, token_digest)
+    (
+        ServiceCreateTransaction {
+            create,
+            plan,
+            alternatives: Vec::new(),
+        },
+        token_digest,
+    )
 }
 
 fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCreateTransaction {
@@ -193,6 +201,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
             at: at(21),
         },
         plan,
+        alternatives: Vec::new(),
     }
 }
 
@@ -1100,8 +1109,34 @@ async fn assert_postgres_deletion_fails_closed(
 #[tokio::test]
 async fn memory_service_repository_conformance() {
     let repository = MemoryRepository::new();
-    let evidence = assert_service_conformance(&repository).await;
+    let mut evidence = assert_service_conformance(&repository).await;
     assert_restart_replays(&repository, &evidence).await;
+    let current_worker = repository
+        .worker_snapshot(evidence.worker.worker_id)
+        .await
+        .unwrap();
+    let replacement = repository
+        .register_worker(RegisterWorker {
+            worker_id: evidence.worker.worker_id,
+            max_calls: current_worker.max_calls,
+            capabilities: current_worker.capabilities,
+            at: at(89_999),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+    let restarted = repository
+        .claim_restart_calls(replacement, at(89_999), 8)
+        .await
+        .unwrap();
+    assert!(restarted
+        .iter()
+        .any(|claim| claim.call.aggregate.id() == evidence.call_id));
+    assert!(restarted
+        .iter()
+        .any(|claim| claim.call.aggregate.id() == evidence.provider_call_id));
+    evidence.worker = replacement;
     let (request, view) = assert_expiry_and_same_key_reuse(&repository, &evidence).await;
     let effect_id = view.effect.effect_id;
     assert_reused_key_restart(&repository, request, view).await;

@@ -46,3 +46,13 @@ CREATE TABLE coordination_projection_locks (
     deployment_id TEXT PRIMARY KEY,
     generation INTEGER NOT NULL DEFAULT 0
 );
+
+-- v4 makes worker leases explicit. Existing v3 worker rows are deliberately
+-- migrated as expired at their last update so a restarted runtime must
+-- register a fresh fence before accepting work.
+ALTER TABLE workers ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';
+UPDATE workers
+SET lease_expires_at = updated_at,
+    body = json_set(body, '$.lease_expires_at', updated_at);
+CREATE INDEX workers_admission_idx
+    ON workers (draining, lease_expires_at, reserved_calls, max_calls, worker_id);

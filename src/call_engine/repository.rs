@@ -25,6 +25,12 @@ pub const MAX_PROVIDER_EVENT_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_IDENTIFIER_BYTES: usize = 512;
 const MAX_PROVIDER_KIND_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
+/// Default worker lease duration used by production runtime configuration.
+pub const DEFAULT_WORKER_LEASE_TTL: Duration = Duration::from_secs(30);
+/// Shortest supported worker lease.
+pub const MIN_WORKER_LEASE_TTL: Duration = Duration::from_secs(5);
+/// Longest supported worker lease.
+pub const MAX_WORKER_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Monotonic worker incarnation used to reject a stale process.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -164,7 +170,13 @@ pub struct WorkerSnapshot {
     pub capabilities: BTreeSet<String>,
     /// Last repository update.
     pub updated_at: DateTime<Utc>,
+    /// Authoritative expiry for this exact fence.
+    pub lease_expires_at: DateTime<Utc>,
 }
+
+/// Maximum number of authoritative placement candidates returned by one
+/// repository query. Public callers cannot force an unbounded collection.
+pub const MAX_WORKER_CANDIDATE_LIMIT: usize = 1_024;
 
 /// Registration request. Re-registering the same ID advances its fence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +188,19 @@ pub struct RegisterWorker {
     /// Capability identifiers used by later selection layers.
     pub capabilities: BTreeSet<String>,
     /// Registration time.
+    pub at: DateTime<Utc>,
+    /// Requested bounded lease duration.
+    pub lease_ttl: Duration,
+}
+
+/// Same-fence worker heartbeat request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenewWorkerLease {
+    /// Exact current worker incarnation.
+    pub worker: WorkerLease,
+    /// Requested bounded lease duration.
+    pub lease_ttl: Duration,
+    /// Authoritative observation time (replaced with database time by SQL backends).
     pub at: DateTime<Utc>,
 }
 
@@ -1003,6 +1028,12 @@ pub trait CallRepository: Send + Sync {
         request: RegisterWorker,
     ) -> Result<WorkerSnapshot, RepositoryError>;
 
+    /// Renews one unexpired exact fence without changing its identity.
+    async fn renew_worker_lease(
+        &self,
+        request: RenewWorkerLease,
+    ) -> Result<WorkerSnapshot, RepositoryError>;
+
     /// Changes admission state only for the current worker incarnation.
     async fn set_worker_draining(
         &self,
@@ -1014,6 +1045,23 @@ pub trait CallRepository: Send + Sync {
     /// Returns a worker snapshot.
     async fn worker_snapshot(&self, worker_id: WorkerId)
         -> Result<WorkerSnapshot, RepositoryError>;
+
+    /// Re-reads one exact fence and rejects a draining or expired lease. SQL
+    /// implementations replace `at` with authoritative database time.
+    async fn active_worker_snapshot(
+        &self,
+        worker: WorkerLease,
+        at: DateTime<Utc>,
+    ) -> Result<WorkerSnapshot, RepositoryError>;
+
+    /// Returns a bounded authoritative candidate set. Selection is a hint;
+    /// call creation still reserves capacity atomically.
+    async fn worker_candidates(
+        &self,
+        required_capabilities: &BTreeSet<String>,
+        at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<WorkerSnapshot>, RepositoryError>;
 
     /// Atomically reserves capacity and persists the first call decision.
     async fn create_call(&self, request: CreateCall) -> Result<CreateCallOutcome, RepositoryError>;
@@ -1135,7 +1183,33 @@ pub(crate) fn validate_register_worker(request: &RegisterWorker) -> Result<(), R
     }) {
         return Err(RepositoryError::InvalidInput("invalid worker capability"));
     }
-    Ok(())
+    validate_worker_lease_ttl(request.lease_ttl)
+}
+
+pub(crate) fn validate_worker_candidate_limit(limit: usize) -> Result<(), RepositoryError> {
+    if limit > MAX_WORKER_CANDIDATE_LIMIT {
+        Err(RepositoryError::InvalidInput(
+            "worker candidate limit exceeds the repository bound",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_worker_lease_ttl(ttl: Duration) -> Result<(), RepositoryError> {
+    if ttl < MIN_WORKER_LEASE_TTL || ttl > MAX_WORKER_LEASE_TTL {
+        Err(RepositoryError::InvalidInput("invalid worker lease TTL"))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn worker_lease_expiry(
+    at: DateTime<Utc>,
+    ttl: Duration,
+) -> Result<DateTime<Utc>, RepositoryError> {
+    validate_worker_lease_ttl(ttl)?;
+    chrono_ttl(at, ttl)
 }
 
 pub(crate) fn validate_provider_event(request: &ProviderEventInput) -> Result<(), RepositoryError> {

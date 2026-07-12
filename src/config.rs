@@ -9,7 +9,7 @@
 //! (top-level `aws.instance_id`/`aws.contact_flow_id`) is still accepted and
 //! becomes one catch-all tenant named `default`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,8 +21,10 @@ use zeroize::Zeroize;
 
 use bridgefu::call_engine::{TenantId, WorkerId};
 use bridgefu::call_service::{
-    CallRepositoryBackendConfig, MAX_CONTROL_KEY_BYTES, MIN_CONTROL_KEY_BYTES,
+    CallRepositoryBackendConfig, CallServiceCoordinationConfig, MAX_CONTROL_KEY_BYTES,
+    MIN_CONTROL_KEY_BYTES,
 };
+use bridgefu::coordination::{DeploymentId, RedisCoordinationConfig};
 
 use rvoip_amazon_connect::{
     request_uri_user, to_uri_user, AttributeMapping, AwsConnectStarter, ConnectConfig,
@@ -115,6 +117,28 @@ pub struct PersistenceCfg {
     /// Required acknowledgement for the non-durable memory backend.
     #[serde(default)]
     pub allow_ephemeral_memory: bool,
+    /// Deployment namespace shared by coordination outbox rows and Redis keys.
+    #[serde(default = "default_deployment_id")]
+    pub deployment_id: String,
+    /// Bounded database-authoritative lease duration.
+    #[serde(default = "default_worker_lease_ttl")]
+    pub worker_lease_ttl_secs: u64,
+    /// Supervised database renewal cadence.
+    #[serde(default = "default_worker_renew_interval")]
+    pub worker_renew_interval_secs: u64,
+    /// Capabilities advertised by this worker.
+    #[serde(default = "default_worker_capabilities")]
+    pub worker_capabilities: BTreeSet<String>,
+    /// Optional secret-bearing Redis URL for projection and wakeup hints.
+    #[serde(default)]
+    pub redis_url: Option<SecretRef>,
+    /// Require TLS (`rediss://`) for clustered Redis coordination.
+    #[serde(default)]
+    pub redis_clustered: bool,
+    /// Dev/test-only acknowledgement for PostgreSQL without Redis. This is
+    /// valid only in all-in-one mode and is never inferred from a missing URL.
+    #[serde(default)]
+    pub allow_db_only_coordination: bool,
 }
 
 /// Supported transactional repository implementations.
@@ -321,6 +345,33 @@ impl Config {
     }
 
     fn validate_persistence(&self) -> Result<()> {
+        DeploymentId::parse(self.persistence.deployment_id.clone())
+            .map_err(|_| anyhow!("persistence.deployment_id is invalid"))?;
+        if !(5..=300).contains(&self.persistence.worker_lease_ttl_secs) {
+            return Err(anyhow!(
+                "persistence.worker_lease_ttl_secs must be between 5 and 300"
+            ));
+        }
+        if self.persistence.worker_renew_interval_secs == 0
+            || self.persistence.worker_renew_interval_secs >= self.persistence.worker_lease_ttl_secs
+        {
+            return Err(anyhow!(
+                "persistence.worker_renew_interval_secs must be positive and shorter than the lease TTL"
+            ));
+        }
+        if self.persistence.worker_capabilities.len() > 64
+            || self
+                .persistence
+                .worker_capabilities
+                .iter()
+                .any(|capability| {
+                    capability.is_empty()
+                        || capability.len() > 128
+                        || capability.chars().any(char::is_control)
+                })
+        {
+            return Err(anyhow!("persistence.worker_capabilities is invalid"));
+        }
         if let Some(worker_id) = self.persistence.worker_id.as_deref() {
             WorkerId::from_str(worker_id)
                 .map_err(|_| anyhow!("persistence.worker_id must be a non-nil UUID"))?;
@@ -337,11 +388,26 @@ impl Config {
                         "persistence.database_url is not valid for the memory backend"
                     ));
                 }
+                if self.persistence.redis_url.is_some() {
+                    return Err(anyhow!(
+                        "persistence.redis_url requires a durable SQL backend"
+                    ));
+                }
+                if self.persistence.allow_db_only_coordination {
+                    return Err(anyhow!(
+                        "persistence.allow_db_only_coordination is valid only with PostgreSQL"
+                    ));
+                }
             }
             PersistenceBackend::Sqlite => {
                 if self.persistence.allow_ephemeral_memory {
                     return Err(anyhow!(
                         "persistence.allow_ephemeral_memory is valid only with the memory backend"
+                    ));
+                }
+                if self.persistence.allow_db_only_coordination {
+                    return Err(anyhow!(
+                        "persistence.allow_db_only_coordination is valid only with PostgreSQL"
                     ));
                 }
             }
@@ -361,6 +427,32 @@ impl Config {
                         "persistence.allow_ephemeral_memory is valid only with the memory backend"
                     ));
                 }
+                if self.persistence.allow_db_only_coordination
+                    && self.runtime.mode.as_str() != "all-in-one"
+                {
+                    return Err(anyhow!(
+                        "persistence.allow_db_only_coordination is dev/test-only and requires runtime.mode all-in-one"
+                    ));
+                }
+                if self.persistence.allow_db_only_coordination
+                    && self.persistence.redis_url.is_some()
+                {
+                    return Err(anyhow!(
+                        "persistence.allow_db_only_coordination cannot be combined with persistence.redis_url"
+                    ));
+                }
+                if self.persistence.redis_url.is_none()
+                    && !self.persistence.allow_db_only_coordination
+                {
+                    return Err(anyhow!(
+                        "PostgreSQL requires clustered rediss:// coordination or explicit allow_db_only_coordination: true for all-in-one dev/test"
+                    ));
+                }
+                if self.persistence.redis_url.is_some() && !self.persistence.redis_clustered {
+                    return Err(anyhow!(
+                        "PostgreSQL Redis coordination requires redis_clustered: true"
+                    ));
+                }
             }
         }
         if let Some(database_url) = &self.persistence.database_url {
@@ -372,6 +464,30 @@ impl Config {
             if empty {
                 return Err(anyhow!("persistence.database_url must not be empty"));
             }
+        }
+        if let Some(redis_url) = &self.persistence.redis_url {
+            let mut resolved = redis_url
+                .resolve()
+                .map_err(|error| anyhow!("resolving persistence.redis_url: {error}"))?;
+            let valid_scheme =
+                resolved.starts_with("redis://") || resolved.starts_with("rediss://");
+            let valid_clustered =
+                !self.persistence.redis_clustered || resolved.starts_with("rediss://");
+            resolved.zeroize();
+            if !valid_scheme {
+                return Err(anyhow!(
+                    "persistence.redis_url must use redis:// or rediss://"
+                ));
+            }
+            if !valid_clustered {
+                return Err(anyhow!(
+                    "persistence.redis_clustered requires a rediss:// URL"
+                ));
+            }
+        } else if self.persistence.redis_clustered {
+            return Err(anyhow!(
+                "persistence.redis_clustered requires persistence.redis_url"
+            ));
         }
         Ok(())
     }
@@ -413,6 +529,33 @@ impl Config {
             .unwrap_or(DEFAULT_STANDALONE_WORKER_ID);
         WorkerId::from_str(value)
             .map_err(|_| anyhow!("persistence.worker_id must be a non-nil UUID"))
+    }
+
+    /// Explicit worker capabilities used by database-authoritative placement.
+    pub fn call_worker_capabilities(&self) -> BTreeSet<String> {
+        self.persistence.worker_capabilities.clone()
+    }
+
+    /// Resolves lease bounds and the optional zeroizing Redis projection URL.
+    pub fn call_coordination_config(&self) -> Result<CallServiceCoordinationConfig> {
+        let deployment = DeploymentId::parse(self.persistence.deployment_id.clone())
+            .map_err(|_| anyhow!("persistence.deployment_id is invalid"))?;
+        let mut coordination = CallServiceCoordinationConfig::new(deployment.clone());
+        coordination.worker_lease_ttl = Duration::from_secs(self.persistence.worker_lease_ttl_secs);
+        coordination.worker_renew_interval =
+            Duration::from_secs(self.persistence.worker_renew_interval_secs);
+        coordination.allow_db_only_coordination = self.persistence.allow_db_only_coordination;
+        if let Some(redis_url) = &self.persistence.redis_url {
+            let url = redis_url
+                .resolve()
+                .map_err(|error| anyhow!("resolving persistence.redis_url: {error}"))?;
+            coordination.redis = Some(
+                RedisCoordinationConfig::new(url, deployment)
+                    .map_err(|_| anyhow!("persistence.redis_url is invalid"))?
+                    .clustered(self.persistence.redis_clustered),
+            );
+        }
+        Ok(coordination)
     }
 
     /// Resolve the effective routing table: `(user part → route, effective
@@ -642,6 +785,7 @@ fn redact_secrets(value: &mut serde_yaml::Value) {
                             | "bearer_token"
                             | "control_hmac_key"
                             | "database_url"
+                            | "redis_url"
                             | "password"
                     )
                 });
@@ -768,6 +912,25 @@ fn default_setup_timeout() -> u64 {
 fn default_drain_timeout() -> u64 {
     30
 }
+fn default_deployment_id() -> String {
+    "bridgefu".to_owned()
+}
+fn default_worker_lease_ttl() -> u64 {
+    30
+}
+fn default_worker_renew_interval() -> u64 {
+    10
+}
+fn default_worker_capabilities() -> BTreeSet<String> {
+    BTreeSet::from([
+        "amazon_connect".to_owned(),
+        "sip".to_owned(),
+        "telnyx".to_owned(),
+        "twilio".to_owned(),
+        "vonage".to_owned(),
+        "webrtc".to_owned(),
+    ])
+}
 fn default_sqlite_database_url() -> String {
     "sqlite://bridgefu.db".into()
 }
@@ -839,6 +1002,13 @@ impl Default for PersistenceCfg {
             database_url: None,
             worker_id: None,
             allow_ephemeral_memory: false,
+            deployment_id: default_deployment_id(),
+            worker_lease_ttl_secs: default_worker_lease_ttl(),
+            worker_renew_interval_secs: default_worker_renew_interval(),
+            worker_capabilities: default_worker_capabilities(),
+            redis_url: None,
+            redis_clustered: false,
+            allow_db_only_coordination: false,
         }
     }
 }
@@ -1045,7 +1215,7 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
     #[test]
     fn effective_config_redacts_control_hmac_key() {
         let mut value: serde_yaml::Value = serde_yaml::from_str(
-            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\npersistence:\n  database_url: postgres://private-database\n",
+            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\npersistence:\n  database_url: postgres://private-database\n  redis_url: rediss://private-redis\n  allow_db_only_coordination: true\n",
         )
         .unwrap();
         redact_secrets(&mut value);
@@ -1053,7 +1223,9 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
         assert!(!rendered.contains("bearer-private"));
         assert!(!rendered.contains("hmac-private"));
         assert!(!rendered.contains("private-database"));
-        assert_eq!(rendered.matches("[redacted]").count(), 3);
+        assert!(!rendered.contains("private-redis"));
+        assert!(rendered.contains("allow_db_only_coordination: true"));
+        assert_eq!(rendered.matches("[redacted]").count(), 4);
     }
 
     #[test]
@@ -1108,13 +1280,79 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
         }
 
         let valid = parse(&format!(
-            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n"
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n  allow_db_only_coordination: true\n"
         ));
         valid.validate().unwrap();
         let backend = valid.call_repository_backend().unwrap();
         let debug = format!("{backend:?}");
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("private.example"));
+    }
+
+    #[test]
+    fn coordination_bounds_and_clustered_redis_are_validated_and_redacted() {
+        let insecure = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n  redis_url: redis://redis-private.example\n  redis_clustered: true\n"
+        ));
+        let error = insecure.validate().unwrap_err().to_string();
+        assert!(error.contains("requires a rediss:// URL"));
+        assert!(!error.contains("redis-private.example"));
+
+        let invalid_lease = parse(&format!(
+            "{LEGACY}\npersistence:\n  worker_lease_ttl_secs: 4\n"
+        ));
+        assert!(invalid_lease
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("between 5 and 300"));
+
+        let valid = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n  deployment_id: cluster-a\n  worker_lease_ttl_secs: 60\n  worker_renew_interval_secs: 20\n  worker_capabilities: [sip, webrtc]\n  redis_url: rediss://redis-private.example\n  redis_clustered: true\n"
+        ));
+        valid.validate().unwrap();
+        let coordination = valid.call_coordination_config().unwrap();
+        let debug = format!("{coordination:?}");
+        assert!(debug.contains("cluster-a"));
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("redis-private.example"));
+        assert_eq!(valid.call_worker_capabilities().len(), 2);
+
+        let unsafe_mode = parse(&format!(
+            "{LEGACY}\nruntime:\n  mode: worker\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n  allow_db_only_coordination: true\n"
+        ));
+        assert!(unsafe_mode
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires runtime.mode all-in-one"));
+
+        let missing_coordination = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n"
+        ));
+        assert!(missing_coordination
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires clustered rediss:// coordination"));
+    }
+
+    #[test]
+    fn redis_secret_reference_schema_matches_resolved_cluster_validation() {
+        const VARIABLE: &str = "BRIDGEFU_TEST_COORDINATION_REDIS_URL";
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../config/schema.json")).unwrap();
+        assert_eq!(
+            schema["properties"]["persistence"]["properties"]["redis_url"]["pattern"],
+            "^(?:rediss?://|env:[A-Za-z_][A-Za-z0-9_]*)$"
+        );
+
+        std::env::set_var(VARIABLE, "rediss://redis-secret.example");
+        let configured = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n  redis_url: env:{VARIABLE}\n  redis_clustered: true\n"
+        ));
+        configured.validate().unwrap();
+        std::env::remove_var(VARIABLE);
     }
 
     #[test]
