@@ -8,6 +8,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -52,6 +53,44 @@ pub enum ControlCryptoError {
     /// A timestamp calculation overflowed.
     #[error("attachment token expiry is outside the supported range")]
     TimestampOverflow,
+}
+
+/// Indistinguishable failure for a presented inbound attachment proof.
+///
+/// Signaling frontends intentionally receive one public error for missing,
+/// malformed, non-canonical, expired, replayed, or owner-mismatched proofs.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("attachment proof rejected")]
+pub struct AttachmentProofRejected;
+
+/// Parses one canonical 256-bit attachment bearer and returns only its digest.
+///
+/// The public token must be the unpadded URL-safe Base64 encoding of exactly
+/// 32 bytes (43 ASCII characters). The owned input and decoded token bytes are
+/// zeroized on every success and failure path; callers never receive the raw
+/// bearer back.
+pub fn digest_presented_attachment_token(
+    mut token: String,
+) -> Result<AttachmentTokenDigest, AttachmentProofRejected> {
+    let mut raw = [0_u8; 32];
+    let decoded = token.len() == 43
+        && URL_SAFE_NO_PAD
+            .decode_slice(token.as_bytes(), &mut raw)
+            .is_ok_and(|written| written == raw.len());
+
+    // Re-encoding rejects alternate/non-canonical trailing bits even if a
+    // decoder happens to accept them. Constant-time comparison avoids turning
+    // the mismatch position into a useful proof oracle.
+    let mut canonical = URL_SAFE_NO_PAD.encode(raw);
+    let canonical_match = decoded
+        && canonical.len() == token.len()
+        && bool::from(canonical.as_bytes().ct_eq(token.as_bytes()));
+    let digest = canonical_match.then(|| AttachmentTokenDigest::new(Sha256::digest(raw).into()));
+
+    raw.zeroize();
+    canonical.zeroize();
+    token.zeroize();
+    digest.ok_or(AttachmentProofRejected)
 }
 
 /// Validated raw HTTP idempotency key. Debug never exposes the key.
@@ -494,5 +533,37 @@ mod tests {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
         assert_eq!(token.expires_at, created + chrono::Duration::minutes(2));
         assert!(!format!("{token:?}").contains(token.expose_secret()));
+    }
+
+    #[test]
+    fn presented_attachment_token_requires_one_canonical_32_byte_encoding() {
+        let raw = [0x6d_u8; 32];
+        let canonical = URL_SAFE_NO_PAD.encode(raw);
+        let expected = AttachmentTokenDigest::new(Sha256::digest(raw).into());
+        assert_eq!(
+            digest_presented_attachment_token(canonical.clone()),
+            Ok(expected)
+        );
+
+        let mut non_canonical_bits = URL_SAFE_NO_PAD.encode([0_u8; 32]);
+        assert_eq!(non_canonical_bits.pop(), Some('A'));
+        non_canonical_bits.push('B');
+        let mut standard_alphabet = canonical.clone();
+        standard_alphabet.replace_range(..1, "+");
+        for malformed in [
+            String::new(),
+            canonical[..42].to_owned(),
+            format!("{canonical}="),
+            standard_alphabet,
+            "_".repeat(43),
+            non_canonical_bits,
+            "bridgefu.attach.not-a-token".to_owned(),
+            "é".repeat(22),
+        ] {
+            assert_eq!(
+                digest_presented_attachment_token(malformed),
+                Err(AttachmentProofRejected)
+            );
+        }
     }
 }
