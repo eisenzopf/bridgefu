@@ -574,57 +574,85 @@ impl CallService {
                 digest_presented_attachment_token(token)
                     .map_err(|_| InboundAttachmentError::ProofRejected)
             })?;
-        let inspected_at = self.clock.now();
-        let principal = ApiPrincipal::new(request.principal.clone(), inspected_at)
+        let principal = ApiPrincipal::new(request.principal.clone(), self.clock.now())
             .map_err(|_| InboundAttachmentError::ProofRejected)?;
         let tenant = principal.tenant().clone();
         let principal_fingerprint = self.crypto.principal_fingerprint(&principal);
-        let candidate = self
-            .repository
-            .inspect_inbound_attachment(AttachmentLookup {
-                token_digest,
-                tenant_id: tenant,
-                transport: request.transport,
-                principal_fingerprint,
-                worker: request.worker,
-                at: inspected_at,
-            })
-            .await
-            .map_err(map_inbound_attachment_repository_error)?;
+        let command_id = CommandId::new();
 
-        // The inspection await is an attacker-controlled delay at a remote
-        // database boundary. Never reuse its pre-await time observation.
-        let consume_at = self.clock.now();
-        if principal.authenticated().is_expired_at(consume_at)
-            || candidate.expires_at() <= consume_at
-        {
-            return Err(InboundAttachmentError::ProofRejected);
-        }
-        let leg_id = candidate.leg_id();
-        let binding_generation = candidate.binding_generation();
-        let consumed = self
-            .repository
-            .consume_inbound_attachment(AttachmentConsume {
-                candidate,
-                command_id: CommandId::new(),
-                command: CallCommand::SetLegState {
+        // Two valid legs of the same call can arrive concurrently. Their
+        // opaque attachment candidates necessarily observe the same aggregate
+        // version, so one atomic consume may lose the optimistic-version race
+        // even though its proof remains valid. Re-inspect a small bounded
+        // number of times using the already-digested token; every attempt
+        // rechecks both absolute expiries after the database await. The stable
+        // command ID preserves exact replay if a backend loses a response.
+        const MAX_VERSION_RACE_ATTEMPTS: usize = 4;
+        for attempt in 0..MAX_VERSION_RACE_ATTEMPTS {
+            let inspected_at = self.clock.now();
+            if principal.authenticated().is_expired_at(inspected_at) {
+                return Err(InboundAttachmentError::ProofRejected);
+            }
+            let candidate = self
+                .repository
+                .inspect_inbound_attachment(AttachmentLookup {
+                    token_digest,
+                    tenant_id: tenant.clone(),
+                    transport: request.transport,
+                    principal_fingerprint,
+                    worker: request.worker,
+                    at: inspected_at,
+                })
+                .await
+                .map_err(map_inbound_attachment_repository_error)?;
+
+            // The inspection await is an attacker-controlled delay at a remote
+            // database boundary. Never reuse its pre-await time observation.
+            let consume_at = self.clock.now();
+            if principal.authenticated().is_expired_at(consume_at)
+                || candidate.expires_at() <= consume_at
+            {
+                return Err(InboundAttachmentError::ProofRejected);
+            }
+            let leg_id = candidate.leg_id();
+            let binding_generation = candidate.binding_generation();
+            match self
+                .repository
+                .consume_inbound_attachment(AttachmentConsume {
+                    candidate,
+                    command_id,
+                    command: CallCommand::SetLegState {
+                        at: consume_at,
+                        leg_id,
+                        binding_generation,
+                        state: LegState::Signaling,
+                        failure: None,
+                    },
+                    connection_id: request.connection_id.clone(),
+                    principal_fingerprint,
+                    principal_expires_at: principal.authenticated().expires_at,
                     at: consume_at,
-                    leg_id,
-                    binding_generation,
-                    state: LegState::Signaling,
-                    failure: None,
-                },
-                connection_id: request.connection_id.clone(),
-                principal_fingerprint,
-                principal_expires_at: principal.authenticated().expires_at,
-                at: consume_at,
-            })
-            .await
-            .map_err(map_inbound_attachment_repository_error)?;
-        Ok(InboundAttachmentResult {
-            binding: consumed.binding,
-            commit: consumed.commit,
-        })
+                })
+                .await
+            {
+                Ok(consumed) => {
+                    return Ok(InboundAttachmentResult {
+                        binding: consumed.binding,
+                        commit: consumed.commit,
+                    });
+                }
+                Err(RepositoryError::VersionConflict)
+                    if attempt + 1 < MAX_VERSION_RACE_ATTEMPTS =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(RepositoryError::VersionConflict) => {
+                    return Err(InboundAttachmentError::Unavailable);
+                }
+                Err(error) => return Err(map_inbound_attachment_repository_error(error)),
+            }
+        }
+        unreachable!("bounded attachment consume loop always returns")
     }
 
     /// Commits one worker-internal lifecycle observation against the exact
@@ -1364,7 +1392,7 @@ fn provider_label(provider: ProviderKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1522,10 +1550,12 @@ mod tests {
         inner: Arc<MemoryRepository>,
         clock: Arc<TestClock>,
         block_next_inspection: AtomicBool,
+        concurrent_inspections_remaining: AtomicUsize,
         block_next_consumption: AtomicBool,
         unavailable: AtomicBool,
         inspection_entered: tokio::sync::Notify,
         inspection_release: tokio::sync::Notify,
+        concurrent_inspection_barrier: tokio::sync::Barrier,
         consumption_entered: tokio::sync::Notify,
         consumption_release: tokio::sync::Notify,
     }
@@ -1536,10 +1566,12 @@ mod tests {
                 inner,
                 clock,
                 block_next_inspection: AtomicBool::new(false),
+                concurrent_inspections_remaining: AtomicUsize::new(0),
                 block_next_consumption: AtomicBool::new(false),
                 unavailable: AtomicBool::new(false),
                 inspection_entered: tokio::sync::Notify::new(),
                 inspection_release: tokio::sync::Notify::new(),
+                concurrent_inspection_barrier: tokio::sync::Barrier::new(2),
                 consumption_entered: tokio::sync::Notify::new(),
                 consumption_release: tokio::sync::Notify::new(),
             }
@@ -1547,6 +1579,11 @@ mod tests {
 
         fn block_next_inspection(&self) {
             self.block_next_inspection.store(true, Ordering::SeqCst);
+        }
+
+        fn synchronize_next_two_inspections(&self) {
+            self.concurrent_inspections_remaining
+                .store(2, Ordering::SeqCst);
         }
 
         async fn wait_until_inspection(&self) {
@@ -1587,7 +1624,17 @@ mod tests {
                 self.inspection_entered.notify_one();
                 self.inspection_release.notified().await;
             }
-            self.inner.inspect_inbound_attachment(request).await
+            let candidate = self.inner.inspect_inbound_attachment(request).await?;
+            if self
+                .concurrent_inspections_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.concurrent_inspection_barrier.wait().await;
+            }
+            Ok(candidate)
         }
 
         async fn consume_inbound_attachment(
@@ -3128,6 +3175,128 @@ mod tests {
             first_result.binding.connection_id,
             second_result.binding.connection_id
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_legs_of_one_call_retry_the_optimistic_attachment_race() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let creator = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x79; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let owner = principal("tenant-a");
+        let mut created = creator
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("same-call-concurrent-attachments").unwrap(),
+                two_inbound_input(),
+            )
+            .await
+            .unwrap();
+        let blocking = Arc::new(BlockingAttachmentRepository::new(
+            repository.clone(),
+            clock.clone(),
+        ));
+        let service = Arc::new(CallService::new(
+            blocking.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x79; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        ));
+        let call_id = created.value.call.call_id;
+        let first_leg_id = created.value.call.legs[0].leg_id;
+        let second_leg_id = created.value.call.legs[1].leg_id;
+        let first_token = std::mem::take(
+            &mut created.value.call.legs[0]
+                .attachment
+                .as_mut()
+                .unwrap()
+                .token,
+        );
+        let second_token = std::mem::take(
+            &mut created.value.call.legs[1]
+                .attachment
+                .as_mut()
+                .unwrap()
+                .token,
+        );
+        let first_connection = ConnectionId::new();
+        let second_connection = ConnectionId::new();
+
+        clock.set(at(1));
+        blocking.synchronize_next_two_inspections();
+        let first = {
+            let service = service.clone();
+            let connection_id = first_connection.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        None,
+                        Some(first_token),
+                        AttachmentTransport::Sip,
+                        worker,
+                        connection_id,
+                    ))
+                    .await
+            })
+        };
+        let second = {
+            let service = service.clone();
+            let connection_id = second_connection.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        None,
+                        Some(second_token),
+                        AttachmentTransport::WebRtc,
+                        worker,
+                        connection_id,
+                    ))
+                    .await
+            })
+        };
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(first.commit.call.aggregate.id(), call_id);
+        assert_eq!(second.commit.call.aggregate.id(), call_id);
+        assert_eq!(first.binding.leg_id, first_leg_id);
+        assert_eq!(second.binding.leg_id, second_leg_id);
+        assert_eq!(first.binding.connection_id, first_connection);
+        assert_eq!(second.binding.connection_id, second_connection);
+        let stored = repository
+            .load_service_call(&TenantId::parse("tenant-a").unwrap(), call_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.call.bindings.len(), 2);
+        assert!(stored
+            .call
+            .aggregate
+            .legs()
+            .iter()
+            .all(|leg| leg.state() == LegState::Signaling));
     }
 
     #[tokio::test]
