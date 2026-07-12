@@ -56,28 +56,28 @@ enum ExternalReferenceKey {
     Signaling(String, String),
 }
 
-#[derive(Clone)]
-struct StoredServiceCommandResult {
-    request: ServiceCommandTransaction,
-    view: ServiceCommandView,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct StoredServiceCommandResult {
+    pub(super) request: ServiceCommandTransaction,
+    pub(super) view: ServiceCommandView,
 }
 
-#[derive(Clone)]
-struct StoredControlCommandResult {
-    request: ControlCommandTransaction,
-    view: ControlCommandView,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct StoredControlCommandResult {
+    pub(super) request: ControlCommandTransaction,
+    pub(super) view: ControlCommandView,
 }
 
-#[derive(Clone)]
-struct StoredOutboundBindingResult {
-    request: OutboundConnectionBind,
-    binding: ConnectionBinding,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct StoredOutboundBindingResult {
+    pub(super) request: OutboundConnectionBind,
+    pub(super) binding: ConnectionBinding,
 }
 
-#[derive(Clone)]
-struct StoredReconciliationResult {
-    request: EffectResultReconciliation,
-    view: EffectResultView,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct StoredReconciliationResult {
+    pub(super) request: EffectResultReconciliation,
+    pub(super) view: EffectResultView,
 }
 
 /// Aggregate-safe diagnostic counts. No token, provider, or payload material is exposed.
@@ -161,6 +161,50 @@ pub(super) struct PersistedProviderCompletionRow {
     pub(super) row: ProviderCompletionRow,
 }
 
+/// Call ID and immutable service execution plan in a durable snapshot.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedExecutionPlanRow {
+    pub(super) call_id: CallId,
+    pub(super) plan: CallExecutionPlan,
+}
+
+/// Command ID and exact service-command replay row.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedServiceCommandRow {
+    pub(super) command_id: CommandId,
+    pub(super) result: StoredServiceCommandResult,
+}
+
+/// Binding key and last allocated control sequence.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedControlSequenceRow {
+    pub(super) call_id: CallId,
+    pub(super) leg_id: LegId,
+    pub(super) binding_generation: BindingGeneration,
+    pub(super) sequence: ControlSequence,
+}
+
+/// Command ID and exact control-command replay row.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedControlCommandRow {
+    pub(super) command_id: CommandId,
+    pub(super) result: StoredControlCommandResult,
+}
+
+/// Operation ID and exact outbound-binding replay row.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedOutboundBindingRow {
+    pub(super) operation_id: CommandId,
+    pub(super) result: StoredOutboundBindingResult,
+}
+
+/// Exact reconciliation replay row keyed by effect ID.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedReconciliationRow {
+    pub(super) effect_id: EffectId,
+    pub(super) result: StoredReconciliationResult,
+}
+
 /// Authoritative, backend-neutral primary rows persisted by SQL repositories.
 ///
 /// Secondary indexes are deliberately omitted and rebuilt with uniqueness
@@ -180,6 +224,15 @@ pub(super) struct MemoryStateSnapshot {
     pub(super) used_connection_ids: Vec<ConnectionId>,
     pub(super) outbox: Vec<OutboxRecord>,
     pub(super) deadlines: Vec<DeadlineRecord>,
+    pub(super) execution_plans: Vec<PersistedExecutionPlanRow>,
+    pub(super) service_effect_payloads: Vec<StoredServiceEffectPayload>,
+    pub(super) service_command_results: Vec<PersistedServiceCommandRow>,
+    pub(super) control_sequences: Vec<PersistedControlSequenceRow>,
+    pub(super) control_commands: Vec<PersistedControlCommandRow>,
+    pub(super) control_outbox: Vec<ControlOutboxRecord>,
+    pub(super) outbound_binding_results: Vec<PersistedOutboundBindingRow>,
+    pub(super) external_references: Vec<StoredExternalReference>,
+    pub(super) reconciliation_results: Vec<PersistedReconciliationRow>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -331,6 +384,61 @@ impl MemoryRepository {
             used_connection_ids: state.used_connection_ids.iter().cloned().collect(),
             outbox: state.outbox.values().cloned().collect(),
             deadlines: state.deadlines.values().cloned().collect(),
+            execution_plans: state
+                .execution_plans
+                .iter()
+                .map(|(call_id, plan)| PersistedExecutionPlanRow {
+                    call_id: *call_id,
+                    plan: plan.clone(),
+                })
+                .collect(),
+            service_effect_payloads: state.service_effect_payloads.values().cloned().collect(),
+            service_command_results: state
+                .service_command_results
+                .iter()
+                .map(|(command_id, result)| PersistedServiceCommandRow {
+                    command_id: *command_id,
+                    result: result.clone(),
+                })
+                .collect(),
+            control_sequences: state
+                .control_sequences
+                .iter()
+                .map(|((call_id, leg_id, binding_generation), sequence)| {
+                    PersistedControlSequenceRow {
+                        call_id: *call_id,
+                        leg_id: *leg_id,
+                        binding_generation: *binding_generation,
+                        sequence: *sequence,
+                    }
+                })
+                .collect(),
+            control_commands: state
+                .control_command_results
+                .iter()
+                .map(|(command_id, result)| PersistedControlCommandRow {
+                    command_id: *command_id,
+                    result: result.clone(),
+                })
+                .collect(),
+            control_outbox: state.control_outbox.values().cloned().collect(),
+            outbound_binding_results: state
+                .outbound_binding_results
+                .iter()
+                .map(|(operation_id, result)| PersistedOutboundBindingRow {
+                    operation_id: *operation_id,
+                    result: result.clone(),
+                })
+                .collect(),
+            external_references: state.external_references.values().cloned().collect(),
+            reconciliation_results: state
+                .reconciliation_results
+                .iter()
+                .map(|(effect_id, result)| PersistedReconciliationRow {
+                    effect_id: *effect_id,
+                    result: result.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -485,6 +593,27 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
+        let mut referenced_outbox = HashSet::new();
+        for result in state.command_results.values() {
+            for original in &result.outbox {
+                if !referenced_outbox.insert(original.effect_id)
+                    || state
+                        .outbox
+                        .get(&original.effect_id)
+                        .is_none_or(|current| !same_outbox_identity(original, current))
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+        }
+        if referenced_outbox.len() != state.outbox.len()
+            || state
+                .outbox
+                .keys()
+                .any(|effect_id| !referenced_outbox.contains(effect_id))
+        {
+            return Err(RepositoryError::Unavailable);
+        }
         for record in snapshot.deadlines {
             let key = (record.call_id, record.kind, record.generation);
             if state.deadlines.insert(key, record).is_some() {
@@ -507,6 +636,418 @@ impl MemoryRepository {
             }
         }
 
+        for persisted in snapshot.execution_plans {
+            let call = state
+                .calls
+                .get(&persisted.call_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            persisted
+                .plan
+                .validate_against(&call.aggregate)
+                .map_err(|_| RepositoryError::Unavailable)?;
+            if state
+                .execution_plans
+                .insert(persisted.call_id, persisted.plan)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for payload in snapshot.service_effect_payloads {
+            payload
+                .payload
+                .validate()
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let effect = state
+                .outbox
+                .get(&payload.effect_id)
+                .filter(|effect| {
+                    effect.command_id == payload.command_id && effect.ordinal == payload.ordinal
+                })
+                .ok_or(RepositoryError::Unavailable)?;
+            if !matches!(
+                (&effect.intent, &payload.payload),
+                (
+                    EffectIntent::ExecuteTransfer { .. },
+                    ServiceEffectPayload::Transfer { .. }
+                )
+            ) || state
+                .service_effect_payloads
+                .insert(payload.effect_id, payload)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.service_command_results {
+            let result = persisted.result;
+            let request = &result.request.command;
+            let stored = &result.view.command.command;
+            let request_matches = request.command_id == stored.command_id
+                && request.tenant_id == stored.tenant_id
+                && request.call_id == stored.call_id
+                && request.expected_version == stored.observed_version
+                && request.command == stored.command
+                && request.worker == stored.worker
+                && request.attachments == stored.attachments
+                && request.deadline_claim == stored.deadline_claim
+                && request.at == stored.recorded_at;
+            let payloads_match = result
+                .request
+                .effect_payloads
+                .iter()
+                .zip(&result.view.effect_payloads)
+                .all(|(requested, stored)| {
+                    requested.ordinal == stored.ordinal
+                        && requested.payload == stored.payload
+                        && stored.command_id == persisted.command_id
+                        && result.view.command.outbox.iter().any(|effect| {
+                            effect.effect_id == stored.effect_id
+                                && effect.command_id == stored.command_id
+                                && effect.ordinal == stored.ordinal
+                        })
+                });
+            if persisted.command_id != result.request.command.command_id
+                || !request_matches
+                || result.view.command
+                    != *state
+                        .command_results
+                        .get(&persisted.command_id)
+                        .ok_or(RepositoryError::Unavailable)?
+                || normalize_service_command(result.request.clone())
+                    .map_err(|_| RepositoryError::Unavailable)?
+                    != result.request
+                || !state
+                    .execution_plans
+                    .contains_key(&result.request.command.call_id)
+                || result.view.effect_payloads.iter().any(|payload| {
+                    state.service_effect_payloads.get(&payload.effect_id) != Some(payload)
+                })
+                || result.view.effect_payloads.len() != result.request.effect_payloads.len()
+                || !payloads_match
+                || state
+                    .service_command_results
+                    .insert(persisted.command_id, result)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        let referenced_payloads = state
+            .service_command_results
+            .values()
+            .flat_map(|result| {
+                result
+                    .view
+                    .effect_payloads
+                    .iter()
+                    .map(|payload| payload.effect_id)
+            })
+            .collect::<HashSet<_>>();
+        if referenced_payloads.len() != state.service_effect_payloads.len()
+            || state
+                .service_effect_payloads
+                .keys()
+                .any(|effect_id| !referenced_payloads.contains(effect_id))
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        for record in snapshot.control_outbox {
+            record
+                .intent
+                .validate()
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let call = state
+                .calls
+                .get(&record.call_id)
+                .filter(|call| call.aggregate.tenant_id() == &record.tenant_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            if call.aggregate.leg(record.leg_id).is_none()
+                || !state.execution_plans.contains_key(&record.call_id)
+                || state.outbox.contains_key(&record.effect_id)
+                || state
+                    .control_outbox
+                    .insert(record.effect_id, record)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.control_sequences {
+            let key = (
+                persisted.call_id,
+                persisted.leg_id,
+                persisted.binding_generation,
+            );
+            let maximum = state
+                .control_outbox
+                .values()
+                .filter(|record| (record.call_id, record.leg_id, record.binding_generation) == key)
+                .map(|record| record.sequence)
+                .max()
+                .ok_or(RepositoryError::Unavailable)?;
+            if maximum != persisted.sequence
+                || state
+                    .control_sequences
+                    .insert(key, persisted.sequence)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        if state.control_outbox.values().any(|record| {
+            state
+                .control_sequences
+                .get(&(record.call_id, record.leg_id, record.binding_generation))
+                .is_none_or(|sequence| *sequence < record.sequence)
+        }) {
+            return Err(RepositoryError::Unavailable);
+        }
+        for persisted in snapshot.control_commands {
+            let result = persisted.result;
+            if persisted.command_id != result.request.command_id
+                || result.view.command.command_id != persisted.command_id
+                || result.view.command
+                    != *state
+                        .control_commands
+                        .entry(persisted.command_id)
+                        .or_insert_with(|| result.view.command.clone())
+                || result.view.effect.command_id != persisted.command_id
+                || state
+                    .control_outbox
+                    .get(&result.view.effect.effect_id)
+                    .is_none_or(|current| {
+                        !Self::control_effect_identity_matches(current, &result.view.effect)
+                    })
+                || result.request.tenant_id != result.view.command.tenant_id
+                || result.request.call_id != result.view.command.call_id
+                || result.request.leg_id != result.view.command.leg_id
+                || result.request.binding_generation != result.view.command.binding_generation
+                || result.request.worker != result.view.command.worker
+                || result.request.intent != result.view.command.intent
+                || result.request.at != result.view.command.recorded_at
+                || state
+                    .control_command_results
+                    .insert(persisted.command_id, result)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        if state
+            .control_outbox
+            .values()
+            .any(|record| !state.control_commands.contains_key(&record.command_id))
+            || state.control_commands.values().any(|command| {
+                state
+                    .control_outbox
+                    .values()
+                    .filter(|record| record.command_id == command.command_id)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        let mut outbound_connection_ids = HashSet::new();
+        for persisted in snapshot.outbound_binding_results {
+            let result = persisted.result;
+            let request = &result.request;
+            let call = state
+                .calls
+                .get(&request.call_id)
+                .filter(|call| call.aggregate.tenant_id() == &request.tenant_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            if persisted.operation_id != request.operation_id
+                || result.binding.connection_id != request.connection_id
+                || result.binding.leg_id != request.leg_id
+                || result.binding.binding_generation != request.binding_generation
+                || result.binding.transport != request.transport
+                || result.binding.principal_fingerprint != request.principal_fingerprint
+                || result.binding.bound_at != request.at
+                || !state.used_connection_ids.contains(&request.connection_id)
+                || call.aggregate.leg(request.leg_id).is_none()
+                || call.bindings.get(&request.leg_id).is_some_and(|binding| {
+                    binding.binding_generation == request.binding_generation
+                        && binding != &result.binding
+                })
+                || !state.execution_plans.contains_key(&request.call_id)
+                || !outbound_connection_ids.insert(request.connection_id.clone())
+                || state
+                    .outbound_binding_results
+                    .insert(persisted.operation_id, result)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+
+        for reference in snapshot.external_references {
+            reference
+                .value
+                .validate()
+                .map_err(|_| RepositoryError::Unavailable)?;
+            validate_external_reference_plan(
+                &state,
+                reference.call_id,
+                reference.leg_id,
+                &reference.value,
+            )
+            .map_err(|_| RepositoryError::Unavailable)?;
+            let call = state
+                .calls
+                .get(&reference.call_id)
+                .filter(|call| call.aggregate.tenant_id() == &reference.tenant_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            if call.aggregate.leg(reference.leg_id).is_none() {
+                return Err(RepositoryError::Unavailable);
+            }
+            let binding_key = (
+                reference.call_id,
+                reference.leg_id,
+                reference.binding_generation,
+            );
+            let reference_key = external_reference_key(&reference.value);
+            if state
+                .external_reference_bindings
+                .insert(binding_key, reference_key.clone())
+                .is_some()
+                || state
+                    .external_references
+                    .insert(reference_key.clone(), reference.clone())
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+            if let ExternalReferenceKey::Provider(account, provider_call_id) = reference_key {
+                let provider = state
+                    .provider_references
+                    .get(&(account, provider_call_id))
+                    .ok_or(RepositoryError::Unavailable)?;
+                if provider.target.tenant_id != reference.tenant_id
+                    || provider.target.call_id != reference.call_id
+                    || provider.target.leg_id != reference.leg_id
+                    || provider.bound_at != reference.bound_at
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+        }
+
+        for persisted in snapshot.reconciliation_results {
+            let result = persisted.result;
+            let normalized = normalize_reconciliation(result.request.clone())
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let request_matches_effect =
+                Self::reconciliation_request_matches_effect(&result.request, &result.view.effect);
+            let follow_up_matches = match (&result.request.follow_up, &result.view.follow_up) {
+                (None, None) => true,
+                (Some(request), Some(view)) => state
+                    .service_command_results
+                    .get(&view.command.command.command_id)
+                    .is_some_and(|stored| &stored.request == request && &stored.view == view),
+                _ => false,
+            };
+            let reference_matches = Self::reconciliation_reference_matches(
+                &state,
+                &result.request,
+                result.view.external_reference.as_ref(),
+            );
+            if persisted.effect_id != result.request.effect_id
+                || Self::completed_effect_id(&result.view.effect) != persisted.effect_id
+                || normalized != result.request
+                || !Self::completed_effect_matches(&state, persisted.effect_id, &result.view.effect)
+                || !request_matches_effect
+                || !reference_matches
+                || !follow_up_matches
+                || !Self::released_provider_events_match(&state, &result.view)
+                || state
+                    .reconciliation_results
+                    .insert(persisted.effect_id, result)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        if state.external_references.values().any(|reference| {
+            state
+                .reconciliation_results
+                .get(&reference.effect_id)
+                .is_none_or(|result| {
+                    result.view.external_reference.as_ref() != Some(reference)
+                        || result.request.at != reference.bound_at
+                })
+        }) {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        if state
+            .idempotency
+            .iter()
+            .any(|((tenant_id, key_digest), row)| {
+                !Self::idempotency_receipt_crosslinks(&state, tenant_id, *key_digest, row)
+            })
+            || state.service_command_results.values().any(|result| {
+                result
+                    .request
+                    .operation_idempotency
+                    .as_ref()
+                    .is_some_and(|claim| {
+                        state
+                            .idempotency
+                            .get(&(result.request.command.tenant_id.clone(), claim.key_digest))
+                            .is_none_or(|row| {
+                                row.request_digest != claim.request_digest
+                                    || row.call_id != result.request.command.call_id
+                                    || !matches!(
+                                        &row.receipt,
+                                        OperationIdempotencyReceipt::ServiceCommand {
+                                            operation,
+                                            view,
+                                        } if *operation == claim.operation && **view == result.view
+                                    )
+                            })
+                    })
+            })
+            || state.control_command_results.values().any(|result| {
+                result
+                    .request
+                    .operation_idempotency
+                    .as_ref()
+                    .is_some_and(|claim| {
+                        state
+                            .idempotency
+                            .get(&(result.request.tenant_id.clone(), claim.key_digest))
+                            .is_none_or(|row| {
+                                row.request_digest != claim.request_digest
+                                    || row.call_id != result.request.call_id
+                                    || !matches!(
+                                        &row.receipt,
+                                        OperationIdempotencyReceipt::ControlCommand {
+                                            operation,
+                                            view,
+                                        } if *operation == claim.operation && **view == result.view
+                                    )
+                            })
+                    })
+            })
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+
+        if state.commands.keys().any(|command_id| {
+            state.control_commands.contains_key(command_id)
+                || state.outbound_binding_results.contains_key(command_id)
+        }) || state
+            .control_commands
+            .keys()
+            .any(|command_id| state.outbound_binding_results.contains_key(command_id))
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+
         for call in state.calls.values() {
             let worker = state
                 .workers
@@ -519,6 +1060,195 @@ impl MemoryRepository {
 
         Ok(Self {
             state: Mutex::new(state),
+        })
+    }
+
+    fn completed_effect_id(effect: &CompletedServiceEffect) -> EffectId {
+        match effect {
+            CompletedServiceEffect::Call(record) => record.effect_id,
+            CompletedServiceEffect::Control(record) => record.effect_id,
+        }
+    }
+
+    fn completed_effect_matches(
+        state: &MemoryState,
+        effect_id: EffectId,
+        expected: &CompletedServiceEffect,
+    ) -> bool {
+        match expected {
+            CompletedServiceEffect::Call(record) => state.outbox.get(&effect_id) == Some(record),
+            CompletedServiceEffect::Control(record) => {
+                state.control_outbox.get(&effect_id) == Some(record)
+            }
+        }
+    }
+
+    fn control_effect_identity_matches(
+        current: &ControlOutboxRecord,
+        original: &ControlOutboxRecord,
+    ) -> bool {
+        current.effect_id == original.effect_id
+            && current.command_id == original.command_id
+            && current.tenant_id == original.tenant_id
+            && current.call_id == original.call_id
+            && current.leg_id == original.leg_id
+            && current.binding_generation == original.binding_generation
+            && current.sequence == original.sequence
+            && current.intent == original.intent
+            && current.available_at == original.available_at
+    }
+
+    fn idempotency_receipt_crosslinks(
+        state: &MemoryState,
+        tenant_id: &TenantId,
+        key_digest: IdempotencyKeyDigest,
+        row: &IdempotencyRow,
+    ) -> bool {
+        match &row.receipt {
+            OperationIdempotencyReceipt::CreateCall => true,
+            OperationIdempotencyReceipt::ServiceCommand { operation, view } => state
+                .service_command_results
+                .get(&view.command.command.command_id)
+                .is_some_and(|stored| {
+                    stored.view == **view
+                        && stored
+                            .request
+                            .operation_idempotency
+                            .as_ref()
+                            .is_some_and(|claim| {
+                                claim.key_digest == key_digest
+                                    && claim.request_digest == row.request_digest
+                                    && claim.operation == *operation
+                                    && stored.request.command.tenant_id == *tenant_id
+                                    && stored.request.command.call_id == row.call_id
+                            })
+                }),
+            OperationIdempotencyReceipt::ControlCommand { operation, view } => state
+                .control_command_results
+                .get(&view.command.command_id)
+                .is_some_and(|stored| {
+                    stored.view == **view
+                        && stored
+                            .request
+                            .operation_idempotency
+                            .as_ref()
+                            .is_some_and(|claim| {
+                                claim.key_digest == key_digest
+                                    && claim.request_digest == row.request_digest
+                                    && claim.operation == *operation
+                                    && stored.request.tenant_id == *tenant_id
+                                    && stored.request.call_id == row.call_id
+                            })
+                        && state
+                            .control_outbox
+                            .get(&view.effect.effect_id)
+                            .is_some_and(|current| {
+                                Self::control_effect_identity_matches(current, &view.effect)
+                            })
+                }),
+        }
+    }
+
+    fn reconciliation_request_matches_effect(
+        request: &EffectResultReconciliation,
+        completed: &CompletedServiceEffect,
+    ) -> bool {
+        let (tenant_id, call_id, worker, available_at, state) = match completed {
+            CompletedServiceEffect::Call(record) => (
+                &record.tenant_id,
+                record.call_id,
+                record.worker,
+                record.available_at,
+                &record.state,
+            ),
+            CompletedServiceEffect::Control(record) => (
+                &record.tenant_id,
+                record.call_id,
+                record.worker,
+                record.available_at,
+                &record.state,
+            ),
+        };
+        tenant_id == &request.tenant_id
+            && call_id == request.call_id
+            && worker == request.worker
+            && available_at <= request.at
+            && match (&request.result, state) {
+                (ServiceEffectResult::Succeeded, OutboxState::Succeeded { at }) => {
+                    *at == request.at
+                }
+                (
+                    ServiceEffectResult::Failed(expected),
+                    OutboxState::Failed {
+                        at,
+                        failure: actual,
+                    },
+                ) => *at == request.at && expected == actual,
+                _ => false,
+            }
+    }
+
+    fn reconciliation_reference_matches(
+        state: &MemoryState,
+        request: &EffectResultReconciliation,
+        stored: Option<&StoredExternalReference>,
+    ) -> bool {
+        match (&request.external_reference, stored) {
+            (None, None) => true,
+            (Some(binding), Some(stored)) => {
+                stored.tenant_id == request.tenant_id
+                    && stored.call_id == request.call_id
+                    && stored.leg_id == binding.leg_id
+                    && stored.binding_generation == binding.binding_generation
+                    && stored.effect_id == request.effect_id
+                    && stored.value == binding.value
+                    && stored.bound_at == request.at
+                    && state
+                        .external_references
+                        .get(&external_reference_key(&binding.value))
+                        == Some(stored)
+            }
+            _ => false,
+        }
+    }
+
+    fn released_provider_events_match(state: &MemoryState, view: &EffectResultView) -> bool {
+        if view
+            .released_provider_events
+            .windows(2)
+            .any(|events| events[0].receipt_sequence >= events[1].receipt_sequence)
+        {
+            return false;
+        }
+        let Some(StoredExternalReference {
+            value:
+                ExternalReferenceValue::ProviderCall {
+                    account,
+                    provider_call_id,
+                },
+            ..
+        }) = view.external_reference.as_ref()
+        else {
+            return view.released_provider_events.is_empty();
+        };
+        let mut seen = HashSet::new();
+        view.released_provider_events.iter().all(|released| {
+            let key = (released.account.clone(), released.event_digest);
+            let Some(current) = state.provider_events.get(&key) else {
+                return false;
+            };
+            seen.insert(key)
+                && &released.account == account
+                && &released.provider_call_id == provider_call_id
+                && released.event_digest == current.event_digest
+                && released.payload_digest == current.payload_digest
+                && released.provider_call_id == current.provider_call_id
+                && released.kind == current.kind
+                && released.payload == current.payload
+                && released.occurred_at == current.occurred_at
+                && released.received_at == current.received_at
+                && released.receipt_sequence == current.receipt_sequence
+                && released.target == current.target
         })
     }
 
@@ -669,7 +1399,6 @@ fn same_outbox_identity(left: &OutboxRecord, right: &OutboxRecord) -> bool {
         && left.tenant_id == right.tenant_id
         && left.call_id == right.call_id
         && left.aggregate_version == right.aggregate_version
-        && left.worker == right.worker
         && left.intent == right.intent
         && left.available_at == right.available_at
 }
@@ -3574,6 +4303,10 @@ mod tests {
     use crate::call_engine::{
         CallAggregate, CallState, LegDirection, LegKind, LegSpec, StopLegReason,
     };
+    use crate::call_service::{
+        ControlIntent, DtmfSequence, LegEndpointConfig, LegExecutionSpec, ServiceOperationKind,
+        SipEndpointConfig, WebRtcEndpointConfig,
+    };
 
     fn at(second: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_800_000_000 + second, 0).unwrap()
@@ -3774,6 +4507,302 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn service_snapshot_reconstructs_plan_and_exact_command_replay() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-service-snapshot");
+        let aggregate = new_call(owner.clone());
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[0].id(),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                },
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[1].id(),
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/call".into()),
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+        let created = repo
+            .create_with_plan(ServiceCreateTransaction {
+                create: create_request(aggregate, worker.lease, 1, 2),
+                plan: plan.clone(),
+            })
+            .await
+            .unwrap();
+        let stored = match created {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh service call replayed"),
+        };
+        let command = ServiceCommandTransaction {
+            command: CommandCommit {
+                tenant_id: owner.clone(),
+                call_id: stored.call.aggregate.id(),
+                expected_version: stored.call.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: stored.call.aggregate.legs()[0].id(),
+                    binding_generation: stored.call.aggregate.legs()[0].binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                worker: worker.lease,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(3),
+            },
+            effect_payloads: Vec::new(),
+            operation_idempotency: None,
+        };
+        let committed = match repo
+            .commit_with_effect_payloads(command.clone())
+            .await
+            .unwrap()
+        {
+            ServiceCommandOutcome::Committed(view) => view,
+            ServiceCommandOutcome::Replayed(_) => panic!("fresh service command replayed"),
+        };
+
+        let snapshot = repo.snapshot().unwrap();
+        assert_eq!(snapshot.execution_plans.len(), 1);
+        assert_eq!(snapshot.service_command_results.len(), 1);
+        let recovered = MemoryRepository::from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            recovered
+                .load_service_call(&owner, stored.call.aggregate.id())
+                .await
+                .unwrap()
+                .plan,
+            plan
+        );
+        assert_eq!(
+            recovered
+                .commit_with_effect_payloads(command)
+                .await
+                .unwrap(),
+            ServiceCommandOutcome::Replayed(committed)
+        );
+        assert_eq!(
+            recovered.snapshot().unwrap().service_command_results.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn control_idempotency_snapshot_requires_current_rows_but_allows_state_progress() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-control-receipt-snapshot");
+        let aggregate = new_call(owner.clone());
+        let call_id = aggregate.id();
+        let leg_id = aggregate.legs()[0].id();
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id,
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                },
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[1].id(),
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/call".into()),
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+        repo.create_with_plan(ServiceCreateTransaction {
+            create: create_request(aggregate, worker.lease, 11, 12),
+            plan,
+        })
+        .await
+        .unwrap();
+
+        let key_digest = IdempotencyKeyDigest::new(digest(70));
+        let request_digest = crate::call_engine::RequestDigest::new(digest(71));
+        let operation = OperationIdempotency {
+            key_digest,
+            request_digest,
+            operation: ServiceOperationKind::DtmfCall,
+        };
+        let intent = ControlIntent::Dtmf {
+            sequence: DtmfSequence {
+                digits: "1#".into(),
+                duration_ms: 100,
+                gap_ms: 50,
+            },
+        };
+        let command_id = CommandId::new();
+        let effect_id = EffectId::new();
+        let request = ControlCommandTransaction {
+            command_id,
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: worker.lease,
+            intent: intent.clone(),
+            at: at(4),
+            operation_idempotency: Some(operation),
+        };
+        let command = StoredControlCommand {
+            command_id,
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: worker.lease,
+            intent: intent.clone(),
+            recorded_at: at(4),
+        };
+        let ready = ControlOutboxRecord {
+            effect_id,
+            command_id,
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: worker.lease,
+            sequence: ControlSequence::INITIAL,
+            intent,
+            available_at: at(4),
+            state: OutboxState::Ready,
+        };
+        let view = ControlCommandView {
+            command: command.clone(),
+            effect: ready.clone(),
+        };
+        repo.transaction(|state| {
+            let mut current = ready.clone();
+            current.state = OutboxState::Claimed {
+                worker: worker.lease,
+                generation: ClaimGeneration::default().next()?,
+                claimed_at: at(5),
+                expires_at: at(15),
+            };
+            state.control_commands.insert(command_id, command);
+            state.control_command_results.insert(
+                command_id,
+                StoredControlCommandResult {
+                    request,
+                    view: view.clone(),
+                },
+            );
+            state.control_outbox.insert(effect_id, current);
+            state.control_sequences.insert(
+                (call_id, leg_id, BindingGeneration::INITIAL),
+                ControlSequence::INITIAL,
+            );
+            state.idempotency.insert(
+                (owner.clone(), key_digest),
+                IdempotencyRow {
+                    request_digest,
+                    call_id,
+                    expires_at: at(1_000),
+                    receipt: OperationIdempotencyReceipt::ControlCommand {
+                        operation: ServiceOperationKind::DtmfCall,
+                        view: Box::new(view),
+                    },
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let snapshot = repo.snapshot().unwrap();
+        MemoryRepository::from_snapshot(snapshot.clone()).unwrap();
+
+        let mut missing_result = snapshot.clone();
+        missing_result.control_commands.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_result),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut missing_outbox = snapshot.clone();
+        missing_outbox.control_outbox.clear();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing_outbox),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut mismatched_outbox = snapshot.clone();
+        mismatched_outbox.control_outbox[0].available_at = at(6);
+        assert!(matches!(
+            MemoryRepository::from_snapshot(mismatched_outbox),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut mismatched_receipt = snapshot;
+        let receipt = &mut mismatched_receipt
+            .idempotency
+            .iter_mut()
+            .find(|row| row.key_digest == key_digest)
+            .unwrap()
+            .row
+            .receipt;
+        let OperationIdempotencyReceipt::ControlCommand { view, .. } = receipt else {
+            panic!("expected control receipt")
+        };
+        view.command.recorded_at = at(6);
+        assert!(matches!(
+            MemoryRepository::from_snapshot(mismatched_receipt),
+            Err(RepositoryError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn core_outbox_snapshot_is_bidirectionally_owned_but_allows_state_progress() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-core-outbox-snapshot");
+        repo.create_call(create_request(new_call(owner), worker.lease, 72, 73))
+            .await
+            .unwrap();
+        let snapshot = repo.snapshot().unwrap();
+        assert!(!snapshot.outbox.is_empty());
+
+        let mut progressed = snapshot.clone();
+        progressed.outbox[0].state = OutboxState::Claimed {
+            worker: worker.lease,
+            generation: ClaimGeneration::default().next().unwrap(),
+            claimed_at: at(5),
+            expires_at: at(15),
+        };
+        MemoryRepository::from_snapshot(progressed).unwrap();
+
+        let mut missing = snapshot.clone();
+        missing.outbox.pop();
+        assert!(matches!(
+            MemoryRepository::from_snapshot(missing),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut orphaned = snapshot.clone();
+        let mut orphan = orphaned.outbox[0].clone();
+        orphan.effect_id = EffectId::new();
+        orphaned.outbox.push(orphan);
+        assert!(matches!(
+            MemoryRepository::from_snapshot(orphaned),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let mut mismatched = snapshot;
+        mismatched.outbox[0].available_at = at(99);
+        assert!(matches!(
+            MemoryRepository::from_snapshot(mismatched),
+            Err(RepositoryError::Unavailable)
+        ));
     }
 
     #[tokio::test]

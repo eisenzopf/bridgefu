@@ -333,7 +333,7 @@ pub struct ClaimedControlEffect {
 }
 
 /// Idempotent outbound rvoip connection binding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutboundConnectionBind {
     /// Operation replay identifier.
     pub operation_id: CommandId,

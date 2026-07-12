@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -484,6 +485,349 @@ async fn sqlite_repository_shared_conformance_and_schema() {
         1
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() {
+    let (source_url, source_path) = sqlite_database("v2-upgrade-source");
+    let source = SqliteRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("v1-upgrade-owner");
+    let request = create_request(new_call(owner.clone()), worker.lease, 91, 92);
+    let call_id = request.initial.id();
+    source_repository.create_call(request).await.unwrap();
+    let claimed = source_repository
+        .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 64)
+        .await
+        .unwrap();
+    assert!(!claimed.is_empty());
+    source.pool().close().await;
+
+    let (target_url, target_path) = sqlite_database("v1-upgrade-target");
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v1-sqlite-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    std::fs::copy(
+        "migrations/sqlite/0001_call_repository.sql",
+        migration_dir.join("0001_call_repository.sql"),
+    )
+    .unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&target_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let target = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS source")
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(&target)
+        .await
+        .unwrap();
+    for statement in [
+        "INSERT INTO workers SELECT * FROM source.workers",
+        "INSERT INTO calls SELECT * FROM source.calls",
+        "INSERT INTO legs SELECT * FROM source.legs",
+        "INSERT INTO worker_assignments SELECT * FROM source.worker_assignments",
+        "INSERT INTO commands SELECT * FROM source.commands",
+        "INSERT INTO idempotency(tenant_id, key_digest, request_digest, call_id, expires_at, body) SELECT tenant_id, key_digest, request_digest, call_id, expires_at, body FROM source.idempotency",
+        "INSERT INTO attachments SELECT * FROM source.attachments",
+        "INSERT INTO outbox SELECT * FROM source.outbox",
+        "INSERT INTO deadlines SELECT * FROM source.deadlines",
+    ] {
+        sqlx::query(statement).execute(&target).await.unwrap();
+    }
+    sqlx::query("UPDATE idempotency SET body = json_remove(body, '$.row.receipt')")
+        .execute(&target)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET body = json_remove(body, '$.state.claimed_at') WHERE outbox_state = 'claimed'")
+        .execute(&target)
+        .await
+        .unwrap();
+    sqlx::query("DETACH DATABASE source")
+        .execute(&target)
+        .await
+        .unwrap();
+    target.close().await;
+
+    let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    let idempotency =
+        sqlx::query("SELECT receipt_kind, operation_kind, body FROM idempotency WHERE call_id = ?")
+            .bind(call_id.to_string())
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(idempotency.get::<String, _>("receipt_kind"), "create_call");
+    assert_eq!(
+        idempotency.get::<String, _>("operation_kind"),
+        "create_call"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&idempotency.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/row/receipt/receipt")
+            .and_then(serde_json::Value::as_str),
+        Some("create_call")
+    );
+    let claimed =
+        sqlx::query("SELECT available_at, body FROM outbox WHERE outbox_state = 'claimed' LIMIT 1")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    let available_at = claimed.get::<String, _>("available_at");
+    let body: serde_json::Value = serde_json::from_str(&claimed.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/state/claimed_at")
+            .and_then(serde_json::Value::as_str),
+        Some(available_at.as_str())
+    );
+    assert_eq!(
+        upgraded
+            .load_call(&owner, call_id)
+            .await
+            .unwrap()
+            .aggregate
+            .id(),
+        call_id
+    );
+    upgraded.pool().close().await;
+    std::fs::remove_file(source_path).unwrap();
+    std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v1 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source_schema = format!("bridgefu_v2_source_{suffix}");
+    let target_schema = format!("bridgefu_v1_target_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {target_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let scoped_url = |schema: &str| {
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    };
+    let source_url = scoped_url(&source_schema);
+    let source = PostgresRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("postgres-v1-upgrade-owner");
+    let request = create_request(new_call(owner.clone()), worker.lease, 93, 94);
+    let call_id = request.initial.id();
+    source_repository.create_call(request).await.unwrap();
+    let claimed = source_repository
+        .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 64)
+        .await
+        .unwrap();
+    assert!(!claimed.is_empty());
+
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v1-postgres-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    std::fs::copy(
+        "migrations/postgres/0001_call_repository.sql",
+        migration_dir.join("0001_call_repository.sql"),
+    )
+    .unwrap();
+    let target_url = scoped_url(&target_schema);
+    let target = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    for statement in [
+        format!("INSERT INTO {target_schema}.workers SELECT * FROM {source_schema}.workers"),
+        format!("INSERT INTO {target_schema}.calls SELECT * FROM {source_schema}.calls"),
+        format!("INSERT INTO {target_schema}.legs SELECT * FROM {source_schema}.legs"),
+        format!("INSERT INTO {target_schema}.worker_assignments SELECT * FROM {source_schema}.worker_assignments"),
+        format!("INSERT INTO {target_schema}.commands SELECT * FROM {source_schema}.commands"),
+        format!("INSERT INTO {target_schema}.idempotency(tenant_id, key_digest, request_digest, call_id, expires_at, body) SELECT tenant_id, key_digest, request_digest, call_id, expires_at, body FROM {source_schema}.idempotency"),
+        format!("INSERT INTO {target_schema}.attachments SELECT * FROM {source_schema}.attachments"),
+        format!("INSERT INTO {target_schema}.outbox SELECT * FROM {source_schema}.outbox"),
+        format!("INSERT INTO {target_schema}.deadlines SELECT * FROM {source_schema}.deadlines"),
+    ] {
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.idempotency SET body = body #- '{{row,receipt}}'"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.outbox SET body = body #- '{{state,claimed_at}}' WHERE outbox_state = 'claimed'"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    target.close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    let idempotency = sqlx::query(
+        "SELECT receipt_kind, operation_kind, body::text AS body FROM idempotency WHERE call_id = $1",
+    )
+    .bind(call_id.as_uuid())
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(idempotency.get::<String, _>("receipt_kind"), "create_call");
+    assert_eq!(
+        idempotency.get::<String, _>("operation_kind"),
+        "create_call"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&idempotency.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/row/receipt/receipt")
+            .and_then(serde_json::Value::as_str),
+        Some("create_call")
+    );
+    let claimed = sqlx::query(
+        "SELECT available_at, body::text AS body FROM outbox WHERE outbox_state = 'claimed' LIMIT 1",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    let available_at = claimed.get::<DateTime<Utc>, _>("available_at");
+    let body: serde_json::Value = serde_json::from_str(&claimed.get::<String, _>("body")).unwrap();
+    let claimed_at = DateTime::parse_from_rfc3339(
+        body.pointer("/state/claimed_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap(),
+    )
+    .unwrap()
+    .with_timezone(&Utc);
+    assert_eq!(claimed_at, available_at);
+    assert_eq!(
+        upgraded
+            .load_call(&owner, call_id)
+            .await
+            .unwrap()
+            .aggregate
+            .id(),
+        call_id
+    );
+    upgraded.pool().close().await;
+    source.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {source_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_migration_checksum_drift_fails_closed_and_recovers_after_restore() {
+    let (url, path) = sqlite_database("migration-checksum");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 2")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get::<Vec<u8>, _>("checksum");
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 2")
+        .bind(vec![0_u8; checksum.len()])
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        SqliteRepository::connect(&url).await.err(),
+        Some(RepositoryError::Unavailable)
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 2")
+        .bind(checksum)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let reconnected = SqliteRepository::connect(&url).await.unwrap();
+    reconnected.pool().close().await;
+    repository.pool().close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_migration_checksum_drift_fails_closed_and_recovers_after_restore() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL checksum test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("bridgefu_checksum_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let scoped = scoped.to_string();
+    let repository = PostgresRepository::connect(&scoped).await.unwrap();
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 2")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get::<Vec<u8>, _>("checksum");
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
+        .bind(vec![0_u8; checksum.len()])
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        PostgresRepository::connect(&scoped).await.err(),
+        Some(RepositoryError::Unavailable)
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
+        .bind(checksum)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let reconnected = PostgresRepository::connect(&scoped).await.unwrap();
+    reconnected.pool().close().await;
+    repository.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
 }
 
 #[tokio::test]
@@ -1215,17 +1559,26 @@ async fn postgres_epoch(repository: &PostgresRepository) -> i64 {
 
 const REQUIRED_TABLES: &[&str] = &[
     "attachments",
+    "call_execution_plans",
     "calls",
     "commands",
     "connection_bindings",
+    "control_commands",
+    "control_outbox",
+    "control_sequences",
     "deadlines",
+    "external_references",
     "idempotency",
     "legs",
     "outbox",
+    "outbound_binding_results",
     "provider_completions",
     "provider_events",
     "provider_references",
+    "reconciliation_results",
     "repository_metadata",
+    "service_command_results",
+    "service_effect_payloads",
     "used_connection_ids",
     "worker_assignments",
     "workers",
@@ -1257,16 +1610,18 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 1);
+    assert_eq!(migrations.len(), 2);
     assert_eq!(migrations[0].get::<i64, _>("version"), 1);
     assert!(migrations[0].get::<bool, _>("success"));
+    assert_eq!(migrations[1].get::<i64, _>("version"), 2);
+    assert!(migrations[1].get::<bool, _>("success"));
     assert_eq!(
         sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = 1")
             .fetch_one(repository.pool())
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        1
+        2
     );
 }
 
@@ -1291,16 +1646,18 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 1);
+    assert_eq!(migrations.len(), 2);
     assert_eq!(migrations[0].get::<i64, _>("version"), 1);
     assert!(migrations[0].get::<bool, _>("success"));
+    assert_eq!(migrations[1].get::<i64, _>("version"), 2);
+    assert!(migrations[1].get::<bool, _>("success"));
     assert_eq!(
         sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = TRUE")
             .fetch_one(repository.pool())
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        1
+        2
     );
 }
 

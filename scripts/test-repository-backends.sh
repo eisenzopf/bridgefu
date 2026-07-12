@@ -37,3 +37,4 @@ port="$(docker port "${container}" 5432/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
 export BRIDGEFU_TEST_POSTGRES_URL="postgres://bridgefu:bridgefu-test-only@127.0.0.1:${port}/bridgefu_repository_test"
 
 cargo test --locked --test repository_conformance -- --nocapture --test-threads=1
+cargo test --locked --test call_service_repository_conformance -- --nocapture --test-threads=1
