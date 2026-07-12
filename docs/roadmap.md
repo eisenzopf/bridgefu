@@ -516,6 +516,27 @@ hint for SIP and WebRTC connections.
    peer teardown, stale generation rejection, worker drain, and fenced restart
    recovery. Active media is ended and cleaned after worker loss, never
    migrated.
+   - Add an rvoip-owned bounded, single-consumer operational lifecycle stream
+     for connected, terminal, DTMF, and `DataMessage` events. The existing
+     broadcast event bus remains observability-only; lag on it must never lose
+     a durable state transition or cleanup decision.
+   - Add an opaque two-phase `PreparedOutboundConnection` seam in rvoip. The
+     adapter creates an event-dormant route, Bridgefu transactionally binds its
+     exact Connection ID, and only then may core activate signaling/events.
+     Abort, drop, timeout, or durable-bind failure closes the provisional route
+     and permanently retires the ID.
+   - Construct one `CallExecutionSupervisor` after the durable worker runtime
+     and before opening public signaling listeners. It owns bounded claim loops
+     for call effects, controls, deadlines, provider events, and restart work,
+     plus capacity-bounded per-call actors and all adapter/bridge child tasks.
+   - Each call actor serializes attachment, originate, connect, media-bridge,
+     DTMF, transfer, terminal, and compensation work against the exact worker
+     fence and connection binding generation. It owns the conversation,
+     session, connections, managed media-graph routes, cancellation, and child
+     `JoinSet`; no correctness task is detached.
+   - Drain in dependency order: stop admission/listeners, stop new claims,
+     drain or end call actors, close graphs/connections/adapters, join core
+     lifecycle tasks, then stop coordination and lease renewal.
 
 Gate 6 progress evidence recorded on 2026-07-12:
 
@@ -657,17 +678,32 @@ cross-connect.
 
 - [ ] Support inbound and outbound SIP and WebRTC through one call engine.
 - [ ] Separate logical media direction from signaling initiation/attachment
-  role. Add an authenticated attachable-outbound connection seam for WHEP:
+  role with persisted `SignalingInitiator` and `MediaFlow` fields; derive SDP
+  offerer/answerer role per protocol rather than from media direction. Add an
+  authenticated attachable-outbound connection seam for WHEP:
   authenticate and validate its resource tag, allocate the connection, bind
   the exact Connection ID transactionally before returning `201`, then emit
   the outbound event. A rejected, expired, replayed, or abandoned request must
   close the provisional connection and erase its context.
+- [ ] Integrate rvoip's normal WebRTC client/signaler behind the outbound
+  adapter path so a target WS/WSS/WHIP endpoint is actually contacted; local
+  offer creation alone is not an outbound signaling implementation.
 - [ ] Support G.711, Opus, DTMF, arbitrary DataChannels, context translation,
   transfer, and teardown in both directions.
+- [ ] Rename the context channel contract to `bridgefu.context.v1`, add bounded
+  initial signaling metadata to rvoip origination, map it to allowlisted SIP
+  INVITE headers, and implement later messages through `SipAdapter` SIP
+  MESSAGE. Validate envelope tenant/call/leg fields against the durable
+  connection binding before forwarding.
 - [ ] Integrate Amazon through reusable rvoip interfaces while preserving the
-  frozen StandardCharter contract.
+  frozen StandardCharter contract. The adapter must use staged lifecycle and
+  a typed per-call target/attributes/display-name/idempotency context; empty
+  default attributes are not compatible evidence.
 - [ ] Add STUN/TURN, symmetric RTP, advertised-address, `rport`, and NAT
   traversal configuration.
+- [ ] Prove real PCMU and PCMA SIP/RTP to Opus WebRTC media in both directions,
+  real RFC 4733 DTMF, context translation, terminal cleanup, and no media after
+  teardown. Mock-adapter bridge tests alone do not satisfy this gate.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
