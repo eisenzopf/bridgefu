@@ -351,7 +351,7 @@ hint for SIP and WebRTC connections.
    must not mutate storage, SQL mutations write only changed rows, normalized
    call/leg ownership must be database-enforced, and mandatory CI must exercise
    a real disposable PostgreSQL service plus two-instance races.
-5. [ ] Add a transactional call service and authenticated API principal. Read
+5. [x] Add a transactional call service and authenticated API principal. Read
    `Idempotency-Key` from the header, bind it to tenant plus canonical request
    hash, persist state/command/effect intents before external I/O, and reconcile
    provider or rvoip outcomes afterward. Tenant override requires a dedicated
@@ -569,6 +569,41 @@ Gate 6 progress evidence recorded on 2026-07-12:
   key reuse after 24 hours, ignored-command tampering, and direct deletion of
   every required evidence row. The full locked suite passes 136 tests with
   strict Clippy, rustdoc, formatting, and checksum validation.
+- Bridgefu revisions
+  `89471ed673afc139ec40d6227b2562413199581a`,
+  `2114ed4784e7d5ab659ee57900ea93cec8951180`, and
+  `2fe5e5d7d92847c5f49e3a966c3723d737589292` complete the authenticated
+  transactional call boundary: tenant/scoped principals, canonical HMAC
+  idempotency, immutable execution plans, exact original create snapshots and
+  attachment-token replay, durable transfer/DTMF/control receipts, bounded
+  dependency setup, explicit capability/transition errors, and tenant-scoped
+  legacy API isolation. The frozen StandardCharter runtime is not called or
+  replaced by this path.
+- Bridgefu revision `42fe5701979179c5dee98e6cc96e3159bedb802f`
+  makes Gate 6 item 5 durable at process startup. A public shared construction
+  seam opens the exact Memory, SQLite, or PostgreSQL repository used by the API
+  and future worker runtime. SQLite is the standalone default only when the
+  transactional API has complete authentication; PostgreSQL requires a stable
+  explicit worker UUID; memory requires a dev/test acknowledgement. Requested
+  SQL failures abort startup without an in-memory fallback. URLs and control
+  keys are redacted and zeroized, invalid keys are rejected before repository
+  mutation, and the non-root read-only Compose profile mounts writable SQLite
+  state explicitly.
+- SQL create-replay lookup is now a read-only snapshot operation that never
+  advances the repository epoch. `StoredServiceCall.attachments` is rebuilt
+  from the immutable original create command, and snapshot reconstruction
+  cross-links every descriptor, attachment row, digest, row ID, owner, leg,
+  generation, transport, principal, worker fence, and expiry. Missing, orphan,
+  duplicate, or mismatched evidence fails closed without weakening schema-v3
+  service markers, tombstones, or reverse reconciliation evidence.
+- The final locked all-target/all-feature suite passes 178 tests, including 20
+  unchanged StandardCharter contract tests. The digest-pinned disposable
+  PostgreSQL runner executes 16 repository, 3 service-repository, and 5 runtime
+  tests. Memory, SQLite, and real PostgreSQL cover dependency outage, exhausted
+  capacity, restart fencing, retained reservations, and exact replay after an
+  attachment is consumed and expired. Strict changed-surface Clippy,
+  warning-free rustdoc, rustfmt, schema parsing, Compose validation, and diff
+  checks pass.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
