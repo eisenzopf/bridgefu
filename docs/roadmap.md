@@ -570,16 +570,14 @@ Gate 6 progress evidence recorded on 2026-07-12:
   every required evidence row. The full locked suite passes 136 tests with
   strict Clippy, rustdoc, formatting, and checksum validation.
 - Bridgefu revisions
-  `89471ed673afc139ec40d6227b2562413199581a`,
-  `2114ed4784e7d5ab659ee57900ea93cec8951180`, and
-  `2fe5e5d7d92847c5f49e3a966c3723d737589292` complete the authenticated
+  `e0e45f2`, `3ddb0d0`, and `daa7723` complete the authenticated
   transactional call boundary: tenant/scoped principals, canonical HMAC
   idempotency, immutable execution plans, exact original create snapshots and
   attachment-token replay, durable transfer/DTMF/control receipts, bounded
   dependency setup, explicit capability/transition errors, and tenant-scoped
   legacy API isolation. The frozen StandardCharter runtime is not called or
   replaced by this path.
-- Bridgefu revision `42fe5701979179c5dee98e6cc96e3159bedb802f`
+- Bridgefu revision `dda3288`
   makes Gate 6 item 5 durable at process startup. A public shared construction
   seam opens the exact Memory, SQLite, or PostgreSQL repository used by the API
   and future worker runtime. SQLite is the standalone default only when the
