@@ -861,9 +861,10 @@ not hide an earlier adapter side effect behind a nominally staged API.
      tests for every validation failure. Bound and control-check Digest,
      Basic, Bearer, and non-nested composite auth before reserving a route;
      redact every retaining diagnostic container. SIP tracing must be
-     credential/context-safe by default, and folded continuation lines must
-     inherit the preceding header's keep/redact/drop decision. Verbatim trace
-     output requires an explicit development opt-in.
+     credential/context-safe by default across headers and SIP bodies, and
+     folded continuation lines must inherit the preceding header's
+     keep/redact/drop decision. Verbatim header or body trace output requires
+     an explicit development opt-in.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
