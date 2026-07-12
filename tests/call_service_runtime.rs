@@ -372,7 +372,7 @@ async fn sqlite_supervisor_projects_wakes_falls_back_and_restarts_cleanly() {
 
     let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     wait_for_sqlite_coordination_drain(&pool).await;
-    runtime.shutdown().await.unwrap();
+    runtime.shutdown(Duration::from_secs(5)).await.unwrap();
 
     let restarted = build(
         CallRepositoryBackendConfig::Sqlite {
@@ -397,7 +397,7 @@ async fn sqlite_supervisor_projects_wakes_falls_back_and_restarts_cleanly() {
     })
     .await
     .unwrap();
-    restarted.shutdown().await.unwrap();
+    restarted.shutdown(Duration::from_secs(5)).await.unwrap();
     pool.close().await;
     std::fs::remove_file(path).unwrap();
 }
@@ -506,7 +506,7 @@ async fn explicit_shutdown_drains_worker_and_joins_supervisor() {
     )
     .await;
     let repository = runtime.repository();
-    runtime.shutdown().await.unwrap();
+    runtime.shutdown(Duration::from_secs(5)).await.unwrap();
     assert!(
         repository
             .worker_snapshot(worker_id)

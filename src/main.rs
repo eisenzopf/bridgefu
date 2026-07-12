@@ -144,11 +144,16 @@ async fn main() -> Result<()> {
     }
 
     let _ = shutdown_tx.send(true);
+    let shutdown_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(cfg.runtime.drain_timeout_secs);
     // The lifecycle consumer must stop before its store and API state are
     // dropped. Abort only as a bounded fallback for a runtime bug.
-    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut lifecycle_task)
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        shutdown_budget(shutdown_deadline).min(std::time::Duration::from_secs(3)),
+        &mut lifecycle_task,
+    )
+    .await
+    .is_err()
     {
         tracing::warn!("screen-pop lifecycle consumer did not stop; aborting task");
         lifecycle_task.abort();
@@ -156,28 +161,28 @@ async fn main() -> Result<()> {
     }
 
     // Give the HTTP server a moment to drain from the shared shutdown signal.
-    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut http)
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        shutdown_budget(shutdown_deadline).min(std::time::Duration::from_secs(3)),
+        &mut http,
+    )
+    .await
+    .is_err()
     {
         tracing::warn!("HTTP API did not drain; aborting task");
         http.abort();
         let _ = http.await;
     }
     if let Some(runtime) = generic_runtime {
-        runtime
-            .shutdown(std::time::Duration::from_secs(
-                cfg.runtime.drain_timeout_secs,
-            ))
-            .await;
+        runtime.shutdown(shutdown_budget(shutdown_deadline)).await;
     }
-    shutdown_call_runtime(call_runtime_owner).await?;
+    shutdown_call_runtime(call_runtime_owner, shutdown_deadline).await?;
     tracing::info!("bridgefu stopped");
     Ok(())
 }
 
 async fn shutdown_call_runtime(
     runtime: Option<Arc<bridgefu::call_service::CallServiceRuntime>>,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
     let Some(runtime) = runtime else {
         return Ok(());
@@ -189,9 +194,13 @@ async fn shutdown_call_runtime(
         )
     })?;
     runtime
-        .shutdown()
+        .shutdown(shutdown_budget(deadline))
         .await
         .context("shutting down durable call-service worker")
+}
+
+fn shutdown_budget(deadline: tokio::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
 }
 
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -272,9 +281,12 @@ mod tests {
         .unwrap();
         let repository = runtime.repository();
         let worker_id = runtime.worker().lease.worker_id;
-        shutdown_call_runtime(Some(Arc::new(runtime)))
-            .await
-            .unwrap();
+        shutdown_call_runtime(
+            Some(Arc::new(runtime)),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         let worker = repository.worker_snapshot(worker_id).await.unwrap();
         assert!(worker.draining);
     }

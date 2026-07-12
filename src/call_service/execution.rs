@@ -5,7 +5,7 @@
 //! actors all use bounded single-consumer channels whose tasks are owned by
 //! [`CallExecutionSupervisor`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +57,7 @@ const WORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WORK_CLAIM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const WORK_BATCH_SIZE: usize = 64;
 const EXTERNAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTHORITY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const TERMINAL_RETIRE_QUIET: Duration = Duration::from_secs(1);
 
 /// Installation or lifecycle failure for the call execution owner.
@@ -300,6 +301,12 @@ struct ProvenAdmission {
     consumed: InboundAttachmentResult,
 }
 
+struct AdmissionProofResult {
+    connection_id: ConnectionId,
+    proven: Option<ProvenAdmission>,
+    panicked: bool,
+}
+
 #[derive(Clone)]
 struct ConnectionOwner {
     call_id: CallId,
@@ -402,6 +409,7 @@ async fn run_supervisor(
     mut operational_health: OperationalEventStreamHealthSubscription,
 ) {
     let mut proof_tasks = JoinSet::new();
+    let mut inflight_admissions = HashSet::<ConnectionId>::new();
     let mut actors = JoinSet::<ActorExit>::new();
     let mut work_claims = JoinSet::<WorkClaimBatch>::new();
     let mut actor_slots = HashMap::<CallId, ActorSlot>::new();
@@ -436,6 +444,23 @@ async fn run_supervisor(
             admissions.close();
             let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
         }
+    }
+    if lease_lost {
+        enter_authority_loss(
+            &mut admissions,
+            &mut proof_tasks,
+            &mut inflight_admissions,
+            &mut work_claims,
+            &mut actors,
+            &mut actor_slots,
+            &mut connection_owners,
+            &mut leg_owners,
+            &mut pending_work,
+            &actor_shutdown,
+            &orchestrator,
+        )
+        .await;
+        return;
     }
 
     loop {
@@ -481,32 +506,40 @@ async fn run_supervisor(
                     }
                 }
                 if lease_lost {
-                    accepting_admission = false;
-                    accepting_work = false;
-                    admissions.close();
-                    proof_tasks.abort_all();
-                    work_claims.abort_all();
-                    pending_work.clear();
-                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
-                    while let Ok(admission) = admissions.try_recv() {
-                        let _ = admission.reject(RejectReason::ServerError).await;
-                    }
+                    enter_authority_loss(
+                        &mut admissions,
+                        &mut proof_tasks,
+                        &mut inflight_admissions,
+                        &mut work_claims,
+                        &mut actors,
+                        &mut actor_slots,
+                        &mut connection_owners,
+                        &mut leg_owners,
+                        &mut pending_work,
+                        &actor_shutdown,
+                        &orchestrator,
+                    ).await;
+                    break;
                 }
             }
             health = operational_health.changed(), if !lease_lost => {
                 if health != OperationalEventStreamHealth::Healthy {
                     tracing::error!("authoritative operational stream degraded");
                     lease_lost = true;
-                    accepting_admission = false;
-                    accepting_work = false;
-                    admissions.close();
-                    proof_tasks.abort_all();
-                    work_claims.abort_all();
-                    pending_work.clear();
-                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
-                    while let Ok(admission) = admissions.try_recv() {
-                        let _ = admission.reject(RejectReason::ServerError).await;
-                    }
+                    enter_authority_loss(
+                        &mut admissions,
+                        &mut proof_tasks,
+                        &mut inflight_admissions,
+                        &mut work_claims,
+                        &mut actors,
+                        &mut actor_slots,
+                        &mut connection_owners,
+                        &mut leg_owners,
+                        &mut pending_work,
+                        &actor_shutdown,
+                        &orchestrator,
+                    ).await;
+                    break;
                 }
             }
             changed = drain.changed() => {
@@ -514,7 +547,10 @@ async fn run_supervisor(
                     accepting_admission = false;
                     admissions.close();
                     while let Ok(admission) = admissions.try_recv() {
-                        let _ = admission.reject(RejectReason::ServerError).await;
+                        let _ = tokio::time::timeout(
+                            AUTHORITY_TEARDOWN_TIMEOUT,
+                            admission.reject(RejectReason::ServerError),
+                        ).await;
                     }
                 }
             }
@@ -543,30 +579,35 @@ async fn run_supervisor(
             }
             result = proof_tasks.join_next(), if !proof_tasks.is_empty() => {
                 match result {
-                    Some(Ok(Some(proven))) => {
-                        if !accepting_admission {
-                            fail_unowned_proven_admission(
-                                proven,
-                                &orchestrator,
-                                &runtime,
-                                !lease_lost,
-                            ).await;
-                        } else {
-                            register_proven_admission(
-                                proven,
-                                &orchestrator,
-                                &runtime,
-                                &mut actor_slots,
-                                &mut connection_owners,
-                                &mut leg_owners,
-                                &mut actors,
-                                actor_task_capacity,
-                                drain.clone(),
-                                actor_shutdown_rx.clone(),
-                            ).await;
+                    Some(Ok(result)) => {
+                        if result.panicked {
+                            tracing::error!(connection_id = %result.connection_id, "attachment proof task panicked");
                         }
+                        if let Some(proven) = result.proven {
+                            if !accepting_admission {
+                                fail_unowned_proven_admission(
+                                    proven,
+                                    &orchestrator,
+                                    &runtime,
+                                    !lease_lost,
+                                ).await;
+                            } else {
+                                register_proven_admission(
+                                    proven,
+                                    &orchestrator,
+                                    &runtime,
+                                    &mut actor_slots,
+                                    &mut connection_owners,
+                                    &mut leg_owners,
+                                    &mut actors,
+                                    actor_task_capacity,
+                                    drain.clone(),
+                                    actor_shutdown_rx.clone(),
+                                ).await;
+                            }
+                        }
+                        inflight_admissions.remove(&result.connection_id);
                     }
-                    Some(Ok(None)) => {}
                     Some(Err(error)) => tracing::error!(%error, "attachment proof task panicked"),
                     None => {}
                 }
@@ -610,11 +651,19 @@ async fn run_supervisor(
                 let Some(event) = event else {
                     tracing::error!("authoritative operational receiver closed");
                     lease_lost = true;
-                    admissions.close();
-                    proof_tasks.abort_all();
-                    work_claims.abort_all();
-                    pending_work.clear();
-                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+                    enter_authority_loss(
+                        &mut admissions,
+                        &mut proof_tasks,
+                        &mut inflight_admissions,
+                        &mut work_claims,
+                        &mut actors,
+                        &mut actor_slots,
+                        &mut connection_owners,
+                        &mut leg_owners,
+                        &mut pending_work,
+                        &actor_shutdown,
+                        &orchestrator,
+                    ).await;
                     break;
                 };
                 pending_operational = try_route_operational_event(
@@ -631,8 +680,20 @@ async fn run_supervisor(
                     continue;
                 };
                 let runtime = Arc::clone(&runtime);
+                let connection_id = admission.connection_id().clone();
+                inflight_admissions.insert(connection_id.clone());
                 proof_tasks.spawn(async move {
-                    prove_admission(admission, runtime, setup_timeout).await
+                    match AssertUnwindSafe(prove_admission(admission, runtime, setup_timeout))
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => AdmissionProofResult {
+                            connection_id,
+                            proven: None,
+                            panicked: true,
+                        },
+                    }
                 });
             }
             changed = work_wakeups.changed(), if accepting_work && pending_work.is_empty() && work_claims.is_empty() => {
@@ -647,11 +708,18 @@ async fn run_supervisor(
     }
 
     while let Ok(admission) = admissions.try_recv() {
-        let _ = admission.reject(RejectReason::ServerError).await;
+        let _ = tokio::time::timeout(
+            AUTHORITY_TEARDOWN_TIMEOUT,
+            admission.reject(RejectReason::ServerError),
+        )
+        .await;
     }
     while let Some(result) = proof_tasks.join_next().await {
-        if let Ok(Some(proven)) = result {
-            fail_unowned_proven_admission(proven, &orchestrator, &runtime, !lease_lost).await;
+        if let Ok(result) = result {
+            if let Some(proven) = result.proven {
+                fail_unowned_proven_admission(proven, &orchestrator, &runtime, !lease_lost).await;
+            }
+            inflight_admissions.remove(&result.connection_id);
         }
     }
     work_claims.abort_all();
@@ -667,6 +735,82 @@ async fn run_supervisor(
             tracing::warn!(%error, "call actor panicked while draining");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enter_authority_loss(
+    admissions: &mut mpsc::Receiver<InboundAdmission>,
+    proof_tasks: &mut JoinSet<AdmissionProofResult>,
+    inflight_admissions: &mut HashSet<ConnectionId>,
+    work_claims: &mut JoinSet<WorkClaimBatch>,
+    actors: &mut JoinSet<ActorExit>,
+    actor_slots: &mut HashMap<CallId, ActorSlot>,
+    connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
+    leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
+    pending_work: &mut VecDeque<ActorWork>,
+    actor_shutdown: &watch::Sender<ActorShutdown>,
+    orchestrator: &Arc<Orchestrator>,
+) {
+    admissions.close();
+    proof_tasks.abort_all();
+    work_claims.abort_all();
+    pending_work.clear();
+    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+    actors.abort_all();
+
+    let owned_connections = take_authority_loss_connections(connection_owners, inflight_admissions);
+    actor_slots.clear();
+    connection_owners.clear();
+    leg_owners.clear();
+
+    let mut rejections = JoinSet::new();
+    while let Ok(admission) = admissions.try_recv() {
+        rejections.spawn(async move {
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                admission.reject(RejectReason::ServerError),
+            )
+            .await;
+        });
+    }
+    while rejections.join_next().await.is_some() {}
+    while proof_tasks.join_next().await.is_some() {}
+    while work_claims.join_next().await.is_some() {}
+    while actors.join_next().await.is_some() {}
+    bounded_end_connections(orchestrator, owned_connections, "execution authority lost").await;
+}
+
+fn take_authority_loss_connections(
+    connection_owners: &HashMap<ConnectionId, ConnectionOwner>,
+    inflight_admissions: &mut HashSet<ConnectionId>,
+) -> Vec<ConnectionId> {
+    let mut owned = connection_owners.keys().cloned().collect::<HashSet<_>>();
+    owned.extend(inflight_admissions.drain());
+    owned.into_iter().collect()
+}
+
+async fn bounded_end_connections(
+    orchestrator: &Arc<Orchestrator>,
+    connection_ids: Vec<ConnectionId>,
+    detail: &'static str,
+) {
+    let mut teardowns = JoinSet::new();
+    for connection_id in connection_ids {
+        let orchestrator = Arc::clone(orchestrator);
+        teardowns.spawn(async move {
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.end_connection(
+                    connection_id,
+                    EndReason::Failed {
+                        detail: detail.into(),
+                    },
+                ),
+            )
+            .await;
+        });
+    }
+    while teardowns.join_next().await.is_some() {}
 }
 
 fn spawn_work_claim(claims: &mut JoinSet<WorkClaimBatch>, runtime: Arc<CallServiceRuntime>) {
@@ -731,6 +875,20 @@ async fn claim_durable_work(runtime: Arc<CallServiceRuntime>) -> WorkClaimBatch 
 }
 
 async fn prove_admission(
+    admission: InboundAdmission,
+    runtime: Arc<CallServiceRuntime>,
+    setup_timeout: Duration,
+) -> AdmissionProofResult {
+    let connection_id = admission.connection_id().clone();
+    let proven = prove_admission_inner(admission, runtime, setup_timeout).await;
+    AdmissionProofResult {
+        connection_id,
+        proven,
+        panicked: false,
+    }
+}
+
+async fn prove_admission_inner(
     mut admission: InboundAdmission,
     runtime: Arc<CallServiceRuntime>,
     setup_timeout: Duration,
@@ -850,10 +1008,7 @@ async fn register_proven_admission(
             fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
             return;
         }
-        let stored = match runtime
-            .service_repository()
-            .load_service_call(&tenant_id, call_id)
-            .await
+        let stored = match load_service_call_while_runtime_owned(runtime, &tenant_id, call_id).await
         {
             Ok(stored) => stored,
             Err(_) => {
@@ -1046,10 +1201,7 @@ async fn route_claimed_work(
             tracing::error!(%call_id, "durable work could not allocate its reserved call actor");
             return Some(item);
         }
-        let stored = match runtime
-            .service_repository()
-            .load_service_call(tenant_id, call_id)
-            .await
+        let stored = match load_service_call_while_runtime_owned(runtime, tenant_id, call_id).await
         {
             Ok(stored) => stored,
             Err(error) => {
@@ -1099,14 +1251,19 @@ async fn fail_unowned_proven_admission(
     allow_durable_write: bool,
 ) {
     let connection_id = proven.consumed.binding.connection_id.clone();
-    let _ = proven.admission.reject(RejectReason::ServerError).await;
+    let _ = tokio::time::timeout(
+        AUTHORITY_TEARDOWN_TIMEOUT,
+        proven.admission.reject(RejectReason::ServerError),
+    )
+    .await;
     if allow_durable_write {
         let failure = FailureDetails::sanitized(
             "execution_unavailable",
             "call execution owner unavailable after durable attachment",
             true,
         );
-        let _ = tokio::time::timeout(
+        let mut runtime_health = runtime.subscribe_supervisor_health();
+        let compensation = tokio::time::timeout(
             Duration::from_secs(2),
             commit_binding_state(
                 runtime,
@@ -1118,11 +1275,11 @@ async fn fail_unowned_proven_admission(
                 runtime.observation_time(),
                 None,
             ),
-        )
-        .await;
+        );
+        let _ = await_while_runtime_owned(compensation, &mut runtime_health).await;
     }
     let _ = tokio::time::timeout(
-        EXTERNAL_OPERATION_TIMEOUT,
+        AUTHORITY_TEARDOWN_TIMEOUT,
         orchestrator.end_connection(
             connection_id,
             EndReason::Failed {
@@ -1142,14 +1299,16 @@ async fn try_route_operational_event(
     let Some(owner) = owners.get(&event.connection_id) else {
         if matches!(event.kind, OperationalEventKind::Connected) {
             tracing::error!(connection_id = %event.connection_id, sequence = event.sequence, "unowned operational connection event");
-            let _ = orchestrator
-                .end_connection(
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.end_connection(
                     event.connection_id,
                     EndReason::Failed {
                         detail: "operational event has no durable owner".into(),
                     },
-                )
-                .await;
+                ),
+            )
+            .await;
         }
         return None;
     };
@@ -1162,14 +1321,16 @@ async fn try_route_operational_event(
         Err(mpsc::error::TrySendError::Full(event)) => Some(event),
         Err(mpsc::error::TrySendError::Closed(event)) => {
             tracing::error!(call_id = %owner.call_id, leg_id = %owner.leg_id, "operational event owner actor closed");
-            let _ = orchestrator
-                .end_connection(
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.end_connection(
                     event.connection_id,
                     EndReason::Failed {
                         detail: "operational event owner closed".into(),
                     },
-                )
-                .await;
+                ),
+            )
+            .await;
             None
         }
     }
@@ -1188,23 +1349,11 @@ async fn fail_panicked_actor(
         .filter(|(_, owner)| owner.call_id == call_id)
         .map(|(connection_id, _)| connection_id.clone())
         .collect::<Vec<_>>();
-    for connection_id in connections {
-        let _ = orchestrator
-            .end_connection(
-                connection_id,
-                EndReason::Failed {
-                    detail: "call actor panicked".into(),
-                },
-            )
-            .await;
-    }
+    bounded_end_connections(orchestrator, connections, "call actor panicked").await;
     if !allow_durable_write {
         return;
     }
-    let Ok(stored) = runtime
-        .service_repository()
-        .load_service_call(tenant_id, call_id)
-        .await
+    let Ok(stored) = load_service_call_while_runtime_owned(runtime, tenant_id, call_id).await
     else {
         return;
     };
@@ -1214,7 +1363,8 @@ async fn fail_panicked_actor(
             "the process-owned call actor stopped unexpectedly",
             true,
         );
-        let _ = tokio::time::timeout(
+        let mut runtime_health = runtime.subscribe_supervisor_health();
+        let compensation = tokio::time::timeout(
             Duration::from_secs(2),
             commit_binding_state(
                 runtime,
@@ -1226,9 +1376,24 @@ async fn fail_panicked_actor(
                 runtime.observation_time(),
                 None,
             ),
-        )
-        .await;
+        );
+        let _ = await_while_runtime_owned(compensation, &mut runtime_health).await;
     }
+}
+
+async fn load_service_call_while_runtime_owned(
+    runtime: &Arc<CallServiceRuntime>,
+    tenant_id: &crate::call_engine::TenantId,
+    call_id: CallId,
+) -> Result<StoredServiceCall, RepositoryError> {
+    let mut health = runtime.subscribe_supervisor_health();
+    let repository = runtime.service_repository();
+    await_while_runtime_owned(
+        repository.load_service_call(tenant_id, call_id),
+        &mut health,
+    )
+    .await
+    .map_err(|()| RepositoryError::Unavailable)?
 }
 
 async fn activate_admission(
@@ -1236,6 +1401,7 @@ async fn activate_admission(
     orchestrator: Arc<Orchestrator>,
     tenant_id: crate::call_engine::TenantId,
     existing_session: Option<SessionId>,
+    mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> AdmissionOperationResult {
     let ProvenAdmission {
         admission,
@@ -1244,7 +1410,7 @@ async fn activate_admission(
     let connection_id = consumed.binding.connection_id;
     let mut created_conversation = None;
     let mut created_session = None;
-    let result = supervise_rvoip_operation(async {
+    let operation = supervise_rvoip_operation(async {
         let session_id = if let Some(session_id) = existing_session {
             session_id
         } else {
@@ -1290,16 +1456,27 @@ async fn activate_admission(
         .await
         .map_err(|_| rvoip_core::RvoipError::InvalidState("inbound routing timed out"))??;
         Ok(())
-    })
-    .await;
+    });
+    let result = match await_while_execution_owned(operation, &mut shutdown).await {
+        Ok(result) => result,
+        Err(()) => Err(rvoip_core::RvoipError::InvalidState(
+            "admission activation lost execution authority",
+        )),
+    };
     if result.is_err() {
         if let Some(session_id) = created_session.take() {
-            let _ = orchestrator
-                .end_session(session_id, EndReason::Cancelled)
-                .await;
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.end_session(session_id, EndReason::Cancelled),
+            )
+            .await;
         }
         if let Some(conversation_id) = created_conversation.take() {
-            let _ = orchestrator.close_conversation(conversation_id, true).await;
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.close_conversation(conversation_id, true),
+            )
+            .await;
         }
     }
     AdmissionOperationResult {
@@ -1539,8 +1716,9 @@ impl CallActor {
         let orchestrator = Arc::clone(&self.orchestrator);
         let tenant_id = self.tenant_id.clone();
         let session_id = self.session_id.clone();
+        let shutdown = self.shutdown.clone();
         self.admission_operation.spawn(async move {
-            activate_admission(proven, orchestrator, tenant_id, session_id).await
+            activate_admission(proven, orchestrator, tenant_id, session_id, shutdown).await
         });
     }
 
@@ -1604,7 +1782,8 @@ impl CallActor {
         let panic_bindings = bindings.clone();
         let panic_shutdown = shutdown.clone();
         self.work_operation.spawn(async move {
-            supervise_work_operation(
+            let mut authority = shutdown.clone();
+            let operation = supervise_work_operation(
                 execute_actor_work(work, orchestrator, runtime, bindings, bridge_id, shutdown),
                 recover_panicked_actor_work(
                     panic_work,
@@ -1613,8 +1792,15 @@ impl CallActor {
                     panic_bindings,
                     panic_shutdown,
                 ),
-            )
-            .await
+            );
+            match await_while_execution_owned(operation, &mut authority).await {
+                Ok(result) => result,
+                Err(()) => WorkOperationResult {
+                    effect_id: None,
+                    bridge_update: None,
+                    result: Err(RepositoryError::Unavailable),
+                },
+            }
         });
     }
 
@@ -3371,6 +3557,29 @@ mod tests {
     }
 
     #[test]
+    fn authority_loss_tears_down_owned_and_not_yet_joined_proof_connections() {
+        let call_id = CallId::new();
+        let leg_id = LegId::new();
+        let owned_connection = ConnectionId::new();
+        let committed_proof_not_joined = ConnectionId::new();
+        let mut owners = HashMap::from([(
+            owned_connection.clone(),
+            ConnectionOwner { call_id, leg_id },
+        )]);
+        let mut inflight =
+            HashSet::from([owned_connection.clone(), committed_proof_not_joined.clone()]);
+        let collected = take_authority_loss_connections(&owners, &mut inflight)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            collected,
+            HashSet::from([owned_connection, committed_proof_not_joined])
+        );
+        assert!(inflight.is_empty());
+        owners.clear();
+    }
+
+    #[test]
     fn retiring_actors_release_active_capacity_but_total_tasks_remain_bounded() {
         let mut actors = HashMap::new();
         actors.insert(CallId::new(), actor_slot(true));
@@ -3563,7 +3772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_loss_stops_execution_without_dropping_operational_receiver() {
+    async fn lease_loss_stops_execution_and_retires_the_operational_receiver() {
         let mut coordination = CallServiceCoordinationConfig::new(
             DeploymentId::parse("execution-lease-loss-test").unwrap(),
         );
@@ -3604,7 +3813,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             orchestrator.operational_event_stream_health(),
-            OperationalEventStreamHealth::Healthy
+            OperationalEventStreamHealth::Degraded,
+            "authority loss tears down owned routes and then retires the correctness receiver"
         );
         supervisor.shutdown(Duration::from_secs(2)).await;
         drop(orchestrator);
@@ -3612,7 +3822,7 @@ mod tests {
         let worker_id = runtime.worker().lease.worker_id;
         Arc::try_unwrap(runtime)
             .expect("execution supervisor released the runtime")
-            .shutdown()
+            .shutdown(Duration::from_secs(2))
             .await
             .unwrap();
         assert!(
@@ -3669,7 +3879,7 @@ mod tests {
         drop(orchestrator);
         Arc::try_unwrap(runtime)
             .expect("failed installation retained no runtime owner")
-            .shutdown()
+            .shutdown(Duration::from_secs(2))
             .await
             .unwrap();
     }

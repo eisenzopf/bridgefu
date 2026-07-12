@@ -453,7 +453,8 @@ impl CallServiceRuntime {
     /// Marks this fence draining, cancels supervised background work, and
     /// joins every owned task. Active calls remain pinned for the normal
     /// worker drain path; no task is detached.
-    pub async fn shutdown(mut self) -> Result<(), CallServiceRuntimeError> {
+    pub async fn shutdown(mut self, deadline: Duration) -> Result<(), CallServiceRuntimeError> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
         let lost_lease = matches!(
             *self.supervisor_health.borrow(),
             RuntimeSupervisorHealth::LeaseLost | RuntimeSupervisorHealth::Stopped
@@ -466,13 +467,21 @@ impl CallServiceRuntime {
         } else {
             self.supervisor_health
                 .send_replace(RuntimeSupervisorHealth::Draining);
-            self.repository
-                .set_worker_draining(self.worker.lease, true, self.clock.now())
-                .await
-                .map(|_| ())
+            if let Some(supervisor) = self.supervisor.as_ref() {
+                supervisor.begin_shutdown();
+            }
+            bounded_repository_write(
+                self.repository
+                    .set_worker_draining(self.worker.lease, true, self.clock.now()),
+                deadline_at,
+            )
+            .await
+            .map(|_| ())
         };
         if let Some(supervisor) = self.supervisor.take() {
-            supervisor.shutdown().await;
+            supervisor
+                .shutdown(runtime_shutdown_budget(deadline_at))
+                .await;
         }
         drain_result.map_err(CallServiceRuntimeError::Repository)
     }
@@ -607,10 +616,21 @@ impl RuntimeSupervisor {
         }
     }
 
-    async fn shutdown(self) {
+    fn begin_shutdown(&self) {
         let _ = self.cancel.send(true);
-        for task in self.tasks {
-            let _ = task.await;
+    }
+
+    async fn shutdown(self, deadline: Duration) {
+        self.begin_shutdown();
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        for mut task in self.tasks {
+            if tokio::time::timeout(runtime_shutdown_budget(deadline_at), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 
@@ -621,6 +641,22 @@ impl RuntimeSupervisor {
             task.abort();
         }
     }
+}
+
+fn runtime_shutdown_budget(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+async fn bounded_repository_write<F, T>(
+    future: F,
+    deadline: tokio::time::Instant,
+) -> Result<T, RepositoryError>
+where
+    F: std::future::Future<Output = Result<T, RepositoryError>>,
+{
+    tokio::time::timeout(runtime_shutdown_budget(deadline), future)
+        .await
+        .map_err(|_| RepositoryError::Unavailable)?
 }
 
 async fn run_work_wakeup_consumer(
@@ -1110,6 +1146,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -1156,6 +1193,44 @@ mod tests {
 
     fn at(second: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_900_000_000 + second, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_drain_write_cannot_exceed_shutdown_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = bounded_repository_write(
+            std::future::pending::<Result<(), RepositoryError>>(),
+            started + Duration::from_millis(25),
+        )
+        .await;
+        assert_eq!(result, Err(RepositoryError::Unavailable));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn runtime_supervisor_aborts_a_task_that_stalls_after_cancellation() {
+        let (cancel, mut cancelled) = watch::channel(false);
+        let (health, _) = watch::channel(RuntimeSupervisorHealth::Healthy);
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_cancel);
+        let task = tokio::spawn(async move {
+            while !*cancelled.borrow() {
+                if cancelled.changed().await.is_err() {
+                    return;
+                }
+            }
+            observed.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        let supervisor = RuntimeSupervisor {
+            cancel,
+            health,
+            tasks: vec![task],
+        };
+        let started = tokio::time::Instant::now();
+        supervisor.shutdown(Duration::from_millis(25)).await;
+        assert!(observed_cancel.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     async fn registered_worker(
