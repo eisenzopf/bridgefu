@@ -17,7 +17,7 @@ use rvoip_auth_core::{
     MAX_BEARER_ISSUER_BYTES, MAX_BEARER_SUBJECT_BYTES,
 };
 use rvoip_core::{IdentityAssurance, Jwk};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -66,6 +66,8 @@ pub enum ApiPrincipalError {
     MalformedCredential,
     #[error("bearer credential is invalid")]
     InvalidCredential,
+    #[error("authentication service is unavailable")]
+    AuthenticationUnavailable,
     #[error("bearer credential is expired")]
     ExpiredCredential,
     #[error("authenticated principal has no tenant")]
@@ -153,7 +155,12 @@ impl ApiPrincipal {
         if self.inner.is_expired_at(now) {
             return Err(ApiPrincipalError::ExpiredCredential);
         }
-        if !self.inner.has_scope(scope.as_str()) {
+        let authorized = if scope == CallScope::TenantOverride {
+            self.has_literal_scope(scope)
+        } else {
+            self.inner.has_scope(scope.as_str())
+        };
+        if !authorized {
             return Err(ApiPrincipalError::MissingScope(scope.as_str()));
         }
         Ok(())
@@ -175,10 +182,17 @@ impl ApiPrincipal {
         if requested == self.tenant {
             return Ok(requested);
         }
-        if !self.inner.has_scope(CallScope::TenantOverride.as_str()) {
+        if !self.has_literal_scope(CallScope::TenantOverride) {
             return Err(ApiPrincipalError::TenantOverrideForbidden);
         }
         Ok(requested)
+    }
+
+    fn has_literal_scope(&self, scope: CallScope) -> bool {
+        self.inner
+            .scopes
+            .iter()
+            .any(|candidate| candidate == scope.as_str())
     }
 }
 
@@ -210,11 +224,15 @@ impl ApiBearerAuthenticator {
         now: DateTime<Utc>,
     ) -> Result<ApiPrincipal, ApiPrincipalError> {
         let credential = parse_bearer(headers)?;
-        let principal = self
-            .validator
-            .validate_principal(credential)
-            .await
-            .map_err(|_| ApiPrincipalError::InvalidCredential)?;
+        let principal = match self.validator.validate_principal(credential).await {
+            Ok(principal) => principal,
+            Err(BearerAuthError::Unavailable(_)) => {
+                return Err(ApiPrincipalError::AuthenticationUnavailable);
+            }
+            Err(BearerAuthError::Empty | BearerAuthError::Invalid(_)) => {
+                return Err(ApiPrincipalError::InvalidCredential);
+            }
+        };
         ApiPrincipal::new(principal, now)
     }
 }
@@ -262,8 +280,9 @@ impl Drop for PrincipalFingerprintKey {
 }
 
 impl PrincipalFingerprintKey {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, ApiPrincipalError> {
+    pub fn new(mut bytes: Vec<u8>) -> Result<Self, ApiPrincipalError> {
         if !(MIN_FINGERPRINT_KEY_BYTES..=MAX_FINGERPRINT_KEY_BYTES).contains(&bytes.len()) {
+            bytes.zeroize();
             return Err(ApiPrincipalError::InvalidFingerprintKey);
         }
         Ok(Self(bytes))
@@ -300,7 +319,7 @@ fn update_field(mac: &mut Hmac<Sha256>, value: &str) {
 
 /// Source-compatible validator for the existing configured shared API key.
 pub struct ConfiguredApiKeyValidator {
-    key: Vec<u8>,
+    key_digest: [u8; 32],
     principal: AuthenticatedPrincipal,
 }
 
@@ -316,13 +335,13 @@ impl fmt::Debug for ConfiguredApiKeyValidator {
 
 impl Drop for ConfiguredApiKeyValidator {
     fn drop(&mut self) {
-        self.key.zeroize();
+        self.key_digest.zeroize();
     }
 }
 
 impl ConfiguredApiKeyValidator {
     /// Creates a compatibility validator only when one tenant is unambiguous.
-    pub fn new<I, S>(key: String, tenants: I) -> Result<Self, ApiPrincipalError>
+    pub fn new<I, S>(mut key: String, tenants: I) -> Result<Self, ApiPrincipalError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -332,6 +351,7 @@ impl ConfiguredApiKeyValidator {
             || key.contains(',')
             || key.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
         {
+            key.zeroize();
             return Err(ApiPrincipalError::InvalidStaticApiKey);
         }
         let tenants = tenants
@@ -339,13 +359,19 @@ impl ConfiguredApiKeyValidator {
             .map(|tenant| tenant.as_ref().to_owned())
             .collect::<BTreeSet<_>>();
         if tenants.len() != 1 {
+            key.zeroize();
             return Err(ApiPrincipalError::AmbiguousStaticTenant);
         }
         let tenant = tenants
             .into_iter()
             .next()
             .expect("one tenant was validated");
-        TenantId::parse(&tenant).map_err(|_| ApiPrincipalError::InvalidTenant)?;
+        if TenantId::parse(&tenant).is_err() {
+            key.zeroize();
+            return Err(ApiPrincipalError::InvalidTenant);
+        }
+        let key_digest = Sha256::digest(key.as_bytes()).into();
+        key.zeroize();
         let assurance = IdentityAssurance::Pseudonymous {
             ephemeral_key: Jwk(serde_json::json!({
                 "kty": "oct",
@@ -353,11 +379,17 @@ impl ConfiguredApiKeyValidator {
             })),
         };
         Ok(Self {
-            key: key.into_bytes(),
+            key_digest,
             principal: AuthenticatedPrincipal {
                 subject: "bridgefu-static-api-key".into(),
                 tenant: Some(tenant),
-                scopes: vec!["*".into()],
+                scopes: vec![
+                    CallScope::Create.as_str().into(),
+                    CallScope::Read.as_str().into(),
+                    CallScope::Hangup.as_str().into(),
+                    CallScope::Transfer.as_str().into(),
+                    CallScope::Dtmf.as_str().into(),
+                ],
                 issuer: Some("bridgefu:configured-api-key".into()),
                 expires_at: None,
                 method: AuthenticationMethod::ApiKey,
@@ -367,7 +399,13 @@ impl ConfiguredApiKeyValidator {
     }
 
     fn matches(&self, candidate: &str) -> bool {
-        candidate.as_bytes().ct_eq(self.key.as_slice()).into()
+        if candidate.is_empty() || candidate.len() > MAX_API_BEARER_BYTES {
+            return false;
+        }
+        let mut candidate_digest: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+        let matched = bool::from(candidate_digest.ct_eq(&self.key_digest));
+        candidate_digest.zeroize();
+        matched
     }
 }
 
@@ -425,6 +463,8 @@ mod tests {
 
     struct FixedValidator(AuthenticatedPrincipal);
 
+    struct UnavailableValidator;
+
     #[async_trait]
     impl BearerValidator for FixedValidator {
         async fn validate(&self, token: &str) -> Result<IdentityAssurance, BearerAuthError> {
@@ -444,6 +484,24 @@ mod tests {
             } else {
                 Err(BearerAuthError::Invalid("invalid".into()))
             }
+        }
+    }
+
+    #[async_trait]
+    impl BearerValidator for UnavailableValidator {
+        async fn validate(&self, _token: &str) -> Result<IdentityAssurance, BearerAuthError> {
+            Err(BearerAuthError::Unavailable(
+                "sensitive backend detail".into(),
+            ))
+        }
+
+        async fn validate_principal(
+            &self,
+            _token: &str,
+        ) -> Result<AuthenticatedPrincipal, BearerAuthError> {
+            Err(BearerAuthError::Unavailable(
+                "sensitive backend detail".into(),
+            ))
         }
     }
 
@@ -533,6 +591,18 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn validator_outage_is_retryable_and_redacted() {
+        let authenticator = ApiBearerAuthenticator::new(Arc::new(UnavailableValidator));
+        let error = authenticator
+            .authenticate(&bearer("Bearer syntactically-valid"), now())
+            .await
+            .unwrap_err();
+        assert_eq!(error, ApiPrincipalError::AuthenticationUnavailable);
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("sensitive backend detail"));
+    }
+
     #[test]
     fn scopes_tenant_and_override_are_fail_closed() {
         let scoped = ApiPrincipal::new(
@@ -585,10 +655,17 @@ mod tests {
             CallScope::Hangup,
             CallScope::Transfer,
             CallScope::Dtmf,
-            CallScope::TenantOverride,
         ] {
             wildcard.authorize(scope, now()).unwrap();
         }
+        assert_eq!(
+            wildcard.authorize(CallScope::TenantOverride, now()),
+            Err(ApiPrincipalError::MissingScope("calls:tenant-override"))
+        );
+        assert_eq!(
+            wildcard.resolve_tenant(Some("tenant-b"), CallScope::Read, now()),
+            Err(ApiPrincipalError::TenantOverrideForbidden)
+        );
     }
 
     #[test]
@@ -710,6 +787,26 @@ mod tests {
                 .as_deref(),
             Some("tenant-a")
         );
-        assert!(validator.validate_principal("wrong").await.is_err());
+        for wrong in ["extremely-secret-keY", "wrong", "a-much-longer-wrong-key"] {
+            assert!(validator.validate_principal(wrong).await.is_err());
+        }
+
+        let static_principal = ApiBearerAuthenticator::new(Arc::new(validator))
+            .authenticate(&bearer("Bearer extremely-secret-key"), now())
+            .await
+            .unwrap();
+        for scope in [
+            CallScope::Create,
+            CallScope::Read,
+            CallScope::Hangup,
+            CallScope::Transfer,
+            CallScope::Dtmf,
+        ] {
+            static_principal.authorize(scope, now()).unwrap();
+        }
+        assert_eq!(
+            static_principal.resolve_tenant(Some("tenant-b"), CallScope::Read, now()),
+            Err(ApiPrincipalError::TenantOverrideForbidden)
+        );
     }
 }
