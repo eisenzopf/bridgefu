@@ -251,7 +251,7 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
    `5295993480c3d19f6057d0bb3c8b0b394ad1df62` plus the draft-18 port base.
    Keep every patch private to the fork until user review; do not open upstream
    issues or pull requests.
-2. [ ] Add serializable `MoqProtocolVersion` and `MoqCompatibility` types and
+2. [x] Add serializable `MoqProtocolVersion` and `MoqCompatibility` types and
    make the published MOQT-19/MSF-01/LOC-03 tuple authoritative across ALPN,
    negotiation, descriptors, diagnostics, logs, and metrics. Reject mismatches
    explicitly and remove the current runtime/target split.
@@ -284,26 +284,31 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
 Gate 5 implementation checkpoint recorded on 2026-07-11:
 
 - The private `eisenzopf/moq-rs` fork is pinned at
-  `f6159d2daf4e7aa6caccefbaf225070ff55bd869`. It implements draft-19-only
-  ALPN/version negotiation, control and data codecs, PUBLISH request/update and
-  cancellation flow, same-alias filtered fanout, bounded per-publication and
-  per-session admission, deterministic task cleanup, session draining, and
-  golden vectors. The reviewed matrix passes 264 transport tests, 42 relay
-  library tests, two relay binary tests, strict clippy, and a workspace check.
-- rvoip revision `6492ec1d4638323aeb52cfc66fa7feea0b180e0f`
+  `612cc6fe4550a02092c932c3bdfbe4da8fed8694`. It implements draft-19 request
+  placement, data and PUBLISH codecs, canonical session targets, and explicit
+  session and namespace acceptance. The bounded retention-cache foundation,
+  Joining subscription state and typed options, and subgroup `END_OF_GROUP`
+  handling are present. The relay verifies mTLS peer identity, applies scoped
+  admission, enables stateless retry, redacts secrets from diagnostics, and
+  defaults to a production-safe posture. The full workspace passed 431 tests
+  before the final user-information hardening change; the final affected
+  package rerun passed 347 transport, 20 native-IETF, and 67 relay-IETF tests.
+- rvoip revision `a3eed0d730502093384a90680d15f0e64665f9f6`
   exact-pins that fork and provides rvoip-owned protocol compatibility,
   authorization/replay, namespace validation, MSF catalog, monotonic LOC Opus
   packaging, health, and managed publication/relay lifecycle APIs without
-  exposing moq-rs types. Production paths require mTLS and implement bounded
-  reconnect, graceful drain, task-failure propagation, and deterministic
-  cleanup. The scoped `rvoip-moq` matrix passes 53 default unit tests plus its
-  public API test, 54 `insecure-development` unit tests plus its public API
-  test, and strict clippy/rustdoc in both configurations.
-- This is an integration checkpoint, not Gate 5 completion. Remaining work is
-  control-stream request confinement; subgroup `END_OF_GROUP` and one stream
-  per MSF Object; Joining FETCH and its bounded cache; URI handling,
-  WebTransport, and end-to-end relay traversal; and interoperability with an
-  independently maintained draft-19 implementation.
+  exposing moq-rs types. It now integrates the transport's opaque,
+  credential-free peer identity and requires explicit namespace publication
+  acceptance while preserving the production mTLS posture. The scoped
+  `rvoip-moq` matrix passes 68 default unit tests plus one public API test and
+  69 `insecure-development` unit tests plus one public API test.
+- This is an integration checkpoint, not Gate 5 completion. Release blockers
+  are complete enforced logical retained-state bounds and cleanup; the FETCH
+  state machine and cache handoff; MSF one-stream-per-Object and catalog
+  completion; rvoip
+  `SessionAdmission` plus an awaited replay tombstone; production token
+  subscriber authorization and a real-browser end-to-end test; and full relay
+  traversal plus independent draft-19 interoperability.
 - No upstream issue, pull request, or maintainer message has been created. The
   fork remains private pending project-owner review of any proposed submission.
 

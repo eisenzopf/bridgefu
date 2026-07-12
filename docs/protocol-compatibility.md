@@ -6,32 +6,45 @@
 | WebRTC | Opus, WHIP/WHEP, WS/WSS signaling, arbitrary labeled DataChannels |
 | Context | `bridgefu.control.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
 | UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet |
-| MOQT wire library | Private `eisenzopf/moq-rs` draft-19 port pinned at `f6159d2daf4e7aa6caccefbaf225070ff55bd869`; control/data/PUBLISH/session hardening complete, Gate 5 interoperability in progress |
+| MOQT wire library | Private `eisenzopf/moq-rs` draft-19 port pinned at `612cc6fe4550a02092c932c3bdfbe4da8fed8694`; request placement, data/PUBLISH codecs, canonical targets, explicit acceptance, and secure relay admission are implemented; Gate 5 remains in progress |
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
 MOQT draft churn is isolated in `rvoip-moq`. The reviewed private fork now
-implements the draft-19 control and data codecs plus hardened PUBLISH and
-session lifecycles, including bounded admission, cancellation, cleanup, and
-same-alias fanout. Its reviewed matrix passes 264 transport tests, 42 relay
-library tests, two relay binary tests, strict clippy, and a workspace check.
+implements draft-19 request-stream placement, data and PUBLISH codecs,
+canonical raw-QUIC/WebTransport session targets, and explicit session and
+namespace acceptance. It also has the bounded retention-cache foundation,
+Joining subscription state and typed options, and subgroup `END_OF_GROUP`
+handling. The relay path verifies mTLS identities, enforces scoped admission,
+uses stateless retry, redacts secrets from diagnostics, and defaults to a
+production-safe posture.
+
+The fork's full workspace passed 431 tests before the final user-information
+hardening change. The final affected-package rerun passed 347 transport tests,
+20 native-IETF tests, and 67 relay-IETF tests. These are checkpoint counts, not
+the Gate 5 interoperability exit evidence.
 
 The matching rvoip revision is
-`6492ec1d4638323aeb52cfc66fa7feea0b180e0f`. It exposes rvoip-owned
+`a3eed0d730502093384a90680d15f0e64665f9f6`. It exposes rvoip-owned
 authorization, catalog, LOC, compatibility, health, and lifecycle types without
-leaking moq-rs types. Managed publication/relay lifecycles use production mTLS,
-bounded reconnect, health reporting, graceful drain, and deterministic cleanup.
-The scoped `rvoip-moq` matrix passes 53 default unit tests plus its public API
-test, 54 `insecure-development` unit tests plus its public API test, and strict
-clippy and rustdoc in both configurations.
+leaking moq-rs types. The integration accepts an opaque, credential-free relay
+peer identity from the transport, requires explicit publication acceptance,
+and retains production mTLS, bounded reconnect, health reporting, graceful
+drain, and deterministic cleanup. The scoped `rvoip-moq` matrix passes 68
+default unit tests plus one public API test and 69 `insecure-development` unit
+tests plus one public API test.
 
 Gate 5 remains in progress. The remaining wire and interoperability work is:
 
-- confine every request to its request stream instead of accepting or emitting
-  requests on the control stream;
-- emit subgroup `END_OF_GROUP` and use one stream per MSF Object;
-- implement Joining FETCH backed by the bounded retention cache;
-- complete URI handling, WebTransport, and end-to-end relay traversal; and
-- pass the recorded matrix against an independent draft-19 implementation.
+- complete enforced logical retained-state bounds, cleanup, and eviction or
+  backpressure;
+- complete the FETCH state machine and cache-to-request handoff;
+- emit one stream per MSF Object and complete catalog publication semantics;
+- add rvoip `SessionAdmission` and await replay-tombstone persistence before
+  reporting admission success;
+- authorize production token subscribers and pass a real-browser WebTransport
+  end-to-end test; and
+- complete relay traversal and pass the recorded matrix against an independent
+  draft-19 implementation.
 
 Bridgefu must not be called GA for draft-19 until those checks pass. No upstream
 issue, pull request, or maintainer contact has been made; any proposed upstream

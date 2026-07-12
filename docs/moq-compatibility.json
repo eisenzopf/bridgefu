@@ -22,22 +22,23 @@
     "upstream": "cloudflare/moq-rs",
     "fork": "eisenzopf/moq-rs",
     "portBaseRevision": "c7e80e49f4189efd1e55e2533eab36adf0e8f4b4",
-    "reviewedForkRevision": "f6159d2daf4e7aa6caccefbaf225070ff55bd869",
-    "status": "draft-19-codecs-publish-and-session-hardening-checkpoint"
+    "reviewedForkRevision": "612cc6fe4550a02092c932c3bdfbe4da8fed8694",
+    "status": "draft-19-request-data-publish-retention-and-secure-relay-checkpoint"
   },
   "rvoipIntegration": {
-    "revision": "6492ec1d4638323aeb52cfc66fa7feea0b180e0f",
-    "wireRevision": "f6159d2daf4e7aa6caccefbaf225070ff55bd869",
-    "status": "auth-catalog-loc-and-managed-lifecycle-api-complete"
+    "revision": "a3eed0d730502093384a90680d15f0e64665f9f6",
+    "wireRevision": "612cc6fe4550a02092c932c3bdfbe4da8fed8694",
+    "status": "opaque-peer-identity-and-explicit-publication-acceptance-integrated"
   },
   "gate5": {
     "status": "in-progress",
     "remaining": [
-      "confine requests to their request streams instead of the control stream",
-      "emit subgroup END_OF_GROUP and use one stream per MSF object",
-      "implement Joining FETCH and the bounded retention cache",
-      "complete URI handling, WebTransport, and relay traversal",
-      "pass interoperability against an independent draft-19 implementation"
+      "complete enforced logical retained-state bounds, cleanup, and eviction or backpressure",
+      "complete the FETCH state machine and hand objects off from the bounded retention cache",
+      "use one stream per MSF object and complete catalog publication semantics",
+      "add rvoip SessionAdmission and await replay-tombstone persistence before successful admission",
+      "authorize production token subscribers and pass a real-browser WebTransport end-to-end test",
+      "complete raw-QUIC and WebTransport relay traversal and pass interoperability against an independent draft-19 implementation"
     ],
     "upstreamContact": "none-pending-user-review"
   },
