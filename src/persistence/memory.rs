@@ -1031,11 +1031,21 @@ impl MemoryRepository {
                 .aggregate
                 .leg(request.leg_id)
                 .ok_or(RepositoryError::Unavailable)?;
-            let authorization_matches = state
-                .execution_plans
-                .get(&request.call_id)
-                .and_then(|plan| plan.authorization_principal_fingerprint().ok())
-                == Some(request.principal_fingerprint);
+            // Schema-v5 plans predate the durable authority column. Their
+            // already-persisted binding still has to survive restart so the
+            // call can be inspected and terminated. New binds continue to
+            // fail closed in `bind_outbound_connection_in_state`; current
+            // plans must retain the exact authorizing fingerprint here.
+            let authorization_matches =
+                state
+                    .execution_plans
+                    .get(&request.call_id)
+                    .is_some_and(|plan| {
+                        plan.authorization_principal_fingerprint()
+                            .map_or(plan.version == 1, |fingerprint| {
+                                fingerprint == request.principal_fingerprint
+                            })
+                    });
             if persisted.operation_id != request.operation_id
                 || result.binding.connection_id != request.connection_id
                 || result.binding.leg_id != request.leg_id

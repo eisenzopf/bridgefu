@@ -6,18 +6,22 @@ use std::time::Duration;
 
 use bridgefu::call_engine::{
     AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTokenDigest,
-    AttachmentTransport, BindProviderReference, CallAggregate, CallCommand, CallRepository,
-    CommandCommit, CommandCommitOutcome, CommandId, CreateCall, CreateCallOutcome, DeadlineKind,
-    IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState, OutboxCompletion,
-    PrincipalFingerprint, ProviderAccountKey, ProviderCallId, ProviderEventCommit,
-    ProviderEventDigest, ProviderEventInput, ProviderEventOutcome, ProviderEventState,
-    ProviderEventTarget, ProviderPayloadDigest, RegisterWorker, RepositoryError, RequestDigest,
-    StoredCall, TenantId, TerminalProviderEventAcknowledge,
+    AttachmentTransport, BindProviderReference, BindingGeneration, CallAggregate, CallCommand,
+    CallRepository, CommandCommit, CommandCommitOutcome, CommandId, CreateCall, CreateCallOutcome,
+    DeadlineKind, EffectIntent, IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState,
+    OutboxCompletion, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
+    ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
+    ProviderEventState, ProviderEventTarget, ProviderPayloadDigest, RegisterWorker,
+    RepositoryError, RequestDigest, StoredCall, TenantId, TerminalProviderEventAcknowledge,
     TerminalProviderEventAcknowledgeOutcome, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use bridgefu::call_service::{
-    CallExecutionPlan, CallServiceRepository, LegEndpointConfig, LegExecutionSpec,
-    ServiceCreateTransaction, SipEndpointConfig, WebRtcEndpointConfig,
+    CallExecutionPlan, CallServiceRepository, EffectResultOutcome, EffectResultReconciliation,
+    ExternalReferenceBinding, ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec,
+    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEndpointConfig,
+    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction,
+    ProviderEventReconciliationView, ProviderKind, ServiceCommandTransaction, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectResult, SipEndpointConfig, WebRtcEndpointConfig,
 };
 use bridgefu::coordination::{CoordinationPayload, DeploymentId};
 use bridgefu::persistence::{
@@ -98,6 +102,280 @@ fn service_create_request(
         plan,
         alternatives: Vec::new(),
     }
+}
+
+fn provider_service_create_request(
+    owner: TenantId,
+    worker: WorkerLease,
+) -> ServiceCreateTransaction {
+    let aggregate = CallAggregate::new(
+        owner,
+        [
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::Twilio,
+            },
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::Sip,
+            },
+        ],
+        at(20),
+    );
+    let plan = CallExecutionPlan::new(
+        &aggregate,
+        [
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[0].id(),
+                endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                    provider: ProviderKind::Twilio,
+                    account_profile: "twilio-schema-upgrade".to_owned(),
+                    destination: Some("+12065550123".to_owned()),
+                }),
+            },
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[1].id(),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+            },
+        ],
+        principal(),
+    )
+    .unwrap();
+    ServiceCreateTransaction {
+        create: CreateCall {
+            initial: aggregate,
+            command_id: CommandId::new(),
+            command: CallCommand::StartConnecting {
+                at: at(21),
+                setup_deadline: at(51),
+            },
+            worker,
+            idempotency_key: IdempotencyKeyDigest::new(digest(0xd0)),
+            request_digest: RequestDigest::new(digest(0xd1)),
+            attachments: Vec::new(),
+            at: at(21),
+        },
+        plan,
+        alternatives: Vec::new(),
+    }
+}
+
+#[derive(Clone)]
+struct LegacyV5ProviderEvidence {
+    owner: TenantId,
+    call_id: bridgefu::call_engine::CallId,
+    provider_leg_id: bridgefu::call_engine::LegId,
+    worker: WorkerLease,
+    reconciliation: ProviderEventReconciliationTransaction,
+    reconciliation_view: ProviderEventReconciliationView,
+}
+
+async fn seed_service_provider_reconciliation<R>(repository: &R) -> LegacyV5ProviderEvidence
+where
+    R: CallRepository + CallServiceRepository + Sync,
+{
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 4,
+            capabilities: BTreeSet::from(["sip".to_owned(), "twilio".to_owned()]),
+            at: at(0),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+    let owner = tenant("provider-schema-upgrade");
+    let call = match repository
+        .create_with_plan(provider_service_create_request(owner.clone(), worker))
+        .await
+        .unwrap()
+    {
+        ServiceCreateOutcome::Created(call) => call,
+        ServiceCreateOutcome::Replayed(_) => panic!("fresh provider fixture replayed"),
+    };
+    let call_id = call.call.aggregate.id();
+    let provider_leg_id = call.call.aggregate.legs()[0].id();
+    let account = ProviderAccountKey::parse("twilio-schema-upgrade").unwrap();
+    let provider_call_id = ProviderCallId::parse("CA-schema-v5-upgrade").unwrap();
+    let event_digest = ProviderEventDigest::new(digest(0xd2));
+    assert!(matches!(
+        repository
+            .ingest_provider_event(ProviderEventInput {
+                account: account.clone(),
+                event_digest,
+                payload_digest: ProviderPayloadDigest::new(digest(0xd3)),
+                provider_call_id: provider_call_id.clone(),
+                kind: "ringing".to_owned(),
+                payload: json!({"state": "ringing"}),
+                occurred_at: Some(at(21)),
+                received_at: at(22),
+            })
+            .await
+            .unwrap(),
+        ProviderEventOutcome::Accepted(event)
+            if event.state == ProviderEventState::PendingReference
+    ));
+
+    let outbound = OutboundConnectionBind {
+        operation_id: CommandId::new(),
+        tenant_id: owner.clone(),
+        call_id,
+        leg_id: provider_leg_id,
+        binding_generation: BindingGeneration::INITIAL,
+        worker,
+        connection_id: ConnectionId::from_string("provider-schema-v5-history"),
+        transport: AttachmentTransport::Sip,
+        principal_fingerprint: principal(),
+        at: at(22),
+    };
+    assert!(matches!(
+        repository.bind_outbound_connection(outbound).await.unwrap(),
+        OutboundConnectionBindOutcome::Bound(_)
+    ));
+
+    let claimed_start = repository
+        .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| {
+            claimed.record.call_id == call_id
+                && matches!(
+                    claimed.record.intent,
+                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg_id
+                )
+        })
+        .expect("provider start effect was not claimable");
+    let EffectResultOutcome::Reconciled(effect_view) = repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id,
+            effect_id: claimed_start.record.effect_id,
+            worker,
+            claim_generation: claimed_start.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: Some(ExternalReferenceBinding {
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                value: ExternalReferenceValue::ProviderCall {
+                    account: account.clone(),
+                    provider_call_id: provider_call_id.clone(),
+                },
+            }),
+            follow_up: None,
+            at: at(23),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fresh provider start reconciliation replayed")
+    };
+    assert_eq!(effect_view.released_provider_events.len(), 1);
+
+    let claimed_event = repository
+        .claim_provider_events(worker, at(24), Duration::from_secs(30), 8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| claimed.event.event_digest == event_digest)
+        .expect("released provider event was not claimable");
+    let current = repository.load_service_call(&owner, call_id).await.unwrap();
+    let follow_up = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: owner.clone(),
+            call_id,
+            expected_version: current.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(25),
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(25),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: None,
+    };
+    let reconciliation = ProviderEventReconciliationTransaction {
+        account,
+        event_digest,
+        claim_generation: claimed_event.claim_generation,
+        worker,
+        target: ProviderEventTarget {
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id: provider_leg_id,
+        },
+        follow_up: Some(follow_up),
+        at: at(25),
+    };
+    let ProviderEventReconciliationOutcome::Reconciled(reconciliation_view) = repository
+        .reconcile_provider_event(reconciliation.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh provider event reconciliation replayed")
+    };
+
+    LegacyV5ProviderEvidence {
+        owner,
+        call_id,
+        provider_leg_id,
+        worker,
+        reconciliation,
+        reconciliation_view,
+    }
+}
+
+async fn assert_legacy_v5_history_after_v6<R>(repository: &R, evidence: &LegacyV5ProviderEvidence)
+where
+    R: CallRepository + CallServiceRepository + Sync,
+{
+    let stored = repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.plan.version, 1);
+    assert_eq!(
+        stored.plan.authorization_principal_fingerprint(),
+        Err(RepositoryError::InvalidInput(
+            "execution plan has no durable outbound authorization"
+        ))
+    );
+    assert_eq!(
+        repository
+            .reconcile_provider_event(evidence.reconciliation.clone())
+            .await
+            .unwrap(),
+        ProviderEventReconciliationOutcome::Replayed(evidence.reconciliation_view.clone())
+    );
+    assert_eq!(
+        repository
+            .bind_outbound_connection(OutboundConnectionBind {
+                operation_id: CommandId::new(),
+                tenant_id: evidence.owner.clone(),
+                call_id: evidence.call_id,
+                leg_id: evidence.provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                worker: evidence.worker,
+                connection_id: ConnectionId::from_string("provider-schema-v6-new-bind"),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: principal(),
+                at: at(26),
+            })
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "execution plan has no durable outbound authorization"
+        ))
+    );
 }
 
 fn create_request_at(
@@ -491,6 +769,49 @@ fn sqlite_database(label: &str) -> (String, PathBuf) {
         uuid::Uuid::new_v4()
     ));
     (format!("sqlite://{}", path.display()), path)
+}
+
+const V5_FIXTURE_PRE_PLAN_TABLES: &[&str] = &[
+    "workers",
+    "calls",
+    "legs",
+    "worker_assignments",
+    "commands",
+    "idempotency",
+    "provider_references",
+    "provider_events",
+    "used_connection_ids",
+    "connection_bindings",
+    "outbox",
+    "deadlines",
+];
+
+const V5_FIXTURE_POST_PLAN_TABLES: &[&str] = &[
+    "outbound_binding_results",
+    "external_references",
+    "reconciliation_results",
+];
+
+fn migration_subset(backend: &str, through: u8, label: &str) -> PathBuf {
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-{label}-{backend}-migrations-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for version in 1..=through {
+        let prefix = format!("{version:04}_");
+        let source = std::fs::read_dir(format!("migrations/{backend}"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .unwrap_or_else(|| panic!("missing {backend} migration {version}"));
+        std::fs::copy(&source, migration_dir.join(source.file_name().unwrap())).unwrap();
+    }
+    migration_dir
 }
 
 #[tokio::test]
@@ -888,6 +1209,159 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
 }
 
 #[tokio::test]
+async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
+    let (source_url, source_path) = sqlite_database("v5-provider-source");
+    let source = SqliteRepository::connect(&source_url).await.unwrap();
+    let evidence = seed_service_provider_reconciliation(&source).await;
+    source.pool().close().await;
+
+    let (target_url, target_path) = sqlite_database("v5-provider-target");
+    let migration_dir = migration_subset("sqlite", 5, "v5-provider");
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&target_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let target = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS source")
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(&target)
+        .await
+        .unwrap();
+    for table in V5_FIXTURE_PRE_PLAN_TABLES {
+        sqlx::query(&format!("INSERT INTO {table} SELECT * FROM source.{table}"))
+            .execute(&target)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO call_execution_plans(\
+             call_id, plan_version, first_leg_id, first_endpoint_kind, \
+             second_leg_id, second_endpoint_kind, body\
+         ) \
+         SELECT call_id, 1, first_leg_id, first_endpoint_kind, \
+                second_leg_id, second_endpoint_kind, \
+                json_remove(\
+                    json_set(body, '$.plan.version', 1), \
+                    '$.plan.authorization_principal_fingerprint'\
+                ) \
+         FROM source.call_execution_plans",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO service_command_results(\
+             command_id, tenant_id, call_id, recorded_at, body\
+         ) \
+         SELECT command_id, tenant_id, call_id, recorded_at, \
+                json_remove(body, '$.result.request.media_activity') \
+         FROM source.service_command_results",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    for table in V5_FIXTURE_POST_PLAN_TABLES {
+        sqlx::query(&format!("INSERT INTO {table} SELECT * FROM source.{table}"))
+            .execute(&target)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO provider_completions(\
+             account_key, event_digest, completion_kind, body\
+         ) \
+         SELECT account_key, event_digest, completion_kind, \
+                json_remove(\
+                    body, \
+                    '$.row.ServiceReconciliation.request.follow_up.media_activity'\
+                ) \
+         FROM source.provider_completions",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE repository_metadata \
+         SET epoch = (\
+                 SELECT epoch FROM source.repository_metadata WHERE singleton = 1\
+             ), \
+             provider_receipt_sequence = (\
+                 SELECT provider_receipt_sequence \
+                 FROM source.repository_metadata WHERE singleton = 1\
+             ) \
+         WHERE singleton = 1",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    let before = sqlx::query(
+        "SELECT completion_kind, body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(&target)
+    .await
+    .unwrap();
+    let before_body: serde_json::Value =
+        serde_json::from_str(&before.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        before.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&target)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DETACH DATABASE source")
+        .execute(&target)
+        .await
+        .unwrap();
+    target.close().await;
+
+    let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT schema_version FROM repository_metadata WHERE singleton = 1"
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap(),
+        6
+    );
+    let after = sqlx::query(
+        "SELECT completion_kind, body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.get::<String, _>("body")).unwrap(),
+        before_body
+    );
+    assert_legacy_v5_history_after_v6(&upgraded, &evidence).await;
+    upgraded.pool().close().await;
+
+    std::fs::remove_file(source_path).unwrap();
+    std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
 async fn postgres_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
     let Some(url) = postgres_test_url() else {
         eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v3 upgrade test skipped");
@@ -1209,6 +1683,165 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
     assert!(legacy.plan.authorization_principal_fingerprint().is_err());
     upgraded.pool().close().await;
     source.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {source_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v5 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source_schema = format!("bridgefu_v5_provider_source_{suffix}");
+    let target_schema = format!("bridgefu_v5_provider_target_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {target_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let scoped_url = |schema: &str| {
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    };
+
+    let source_url = scoped_url(&source_schema);
+    let source = PostgresRepository::connect(&source_url).await.unwrap();
+    let evidence = seed_service_provider_reconciliation(&source).await;
+
+    let migration_dir = migration_subset("postgres", 5, "v5-provider");
+    let target_url = scoped_url(&target_schema);
+    let target = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    for table in V5_FIXTURE_PRE_PLAN_TABLES {
+        sqlx::query(&format!(
+            "INSERT INTO {target_schema}.{table} \
+             SELECT * FROM {source_schema}.{table}"
+        ))
+        .execute(&administration)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.call_execution_plans(\
+             call_id, plan_version, first_leg_id, first_endpoint_kind, \
+             second_leg_id, second_endpoint_kind, body\
+         ) \
+         SELECT call_id, 1, first_leg_id, first_endpoint_kind, \
+                second_leg_id, second_endpoint_kind, \
+                jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) \
+                    #- '{{plan,authorization_principal_fingerprint}}' \
+         FROM {source_schema}.call_execution_plans"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.service_command_results(\
+             command_id, tenant_id, call_id, recorded_at, body\
+         ) \
+         SELECT command_id, tenant_id, call_id, recorded_at, \
+                body #- '{{result,request,media_activity}}' \
+         FROM {source_schema}.service_command_results"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    for table in V5_FIXTURE_POST_PLAN_TABLES {
+        sqlx::query(&format!(
+            "INSERT INTO {target_schema}.{table} \
+             SELECT * FROM {source_schema}.{table}"
+        ))
+        .execute(&administration)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.provider_completions(\
+             account_key, event_digest, completion_kind, body\
+         ) \
+         SELECT account_key, event_digest, completion_kind, \
+                body #- '{{row,ServiceReconciliation,request,follow_up,media_activity}}' \
+         FROM {source_schema}.provider_completions"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.repository_metadata AS target \
+         SET epoch = source.epoch, \
+             provider_receipt_sequence = source.provider_receipt_sequence \
+         FROM {source_schema}.repository_metadata AS source \
+         WHERE target.singleton = TRUE AND source.singleton = TRUE"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    let before = sqlx::query(
+        "SELECT completion_kind, body::text AS body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(&target)
+    .await
+    .unwrap();
+    let before_body: serde_json::Value =
+        serde_json::from_str(&before.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        before.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    target.close().await;
+    source.pool().close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT schema_version FROM repository_metadata WHERE singleton = TRUE"
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap(),
+        6
+    );
+    let after = sqlx::query(
+        "SELECT completion_kind, body::text AS body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.get::<String, _>("body")).unwrap(),
+        before_body
+    );
+    assert_legacy_v5_history_after_v6(&upgraded, &evidence).await;
+    upgraded.pool().close().await;
+
     sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
         .execute(&administration)
         .await

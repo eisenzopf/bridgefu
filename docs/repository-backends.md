@@ -23,6 +23,16 @@ PostgreSQL's widened constraint. The service receipt cross-links the claimed
 event, provider account/reference, execution-plan leg, worker fence, and exact
 service follow-up so restart replay cannot bypass the service-owned transaction.
 
+Schema version 6 adds the nullable, 32-byte
+`authorization_principal_fingerprint` column to `call_execution_plans` and
+cross-checks it against the versioned plan body. New version-2 plans must carry
+the exact principal that authorized outbound work. Plans migrated from schema 5
+remain version 1 with a null fingerprint because authority cannot be inferred
+safely. Their already-persisted bindings and provider reconciliation receipts
+remain readable and replayable so operators can inspect and terminate those
+calls, while every new outbound bind fails closed until the call is recreated
+under a version-2 plan.
+
 Gate 6 deliberately chooses correctness before maximum write concurrency. A
 mutation loads a consistent normalized snapshot, applies one transition through
 the shared evaluator, diffs the snapshots, and writes only inserted, changed,
