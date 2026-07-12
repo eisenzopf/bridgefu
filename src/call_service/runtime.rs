@@ -454,21 +454,27 @@ impl CallServiceRuntime {
     /// joins every owned task. Active calls remain pinned for the normal
     /// worker drain path; no task is detached.
     pub async fn shutdown(mut self) -> Result<(), CallServiceRuntimeError> {
-        self.supervisor_health
-            .send_replace(RuntimeSupervisorHealth::Draining);
-        if let Err(error) = self
-            .repository
-            .set_worker_draining(self.worker.lease, true, self.clock.now())
-            .await
-        {
+        let lost_lease = matches!(
+            *self.supervisor_health.borrow(),
+            RuntimeSupervisorHealth::LeaseLost | RuntimeSupervisorHealth::Stopped
+        );
+        let drain_result = if lost_lease {
+            // The monotonic lease deadline is a hard write fence. Local tasks
+            // still must be cancelled and joined, but this process no longer
+            // has authority to mutate the durable worker row.
+            Ok(())
+        } else {
             self.supervisor_health
-                .send_replace(RuntimeSupervisorHealth::Degraded);
-            return Err(CallServiceRuntimeError::Repository(error));
-        }
+                .send_replace(RuntimeSupervisorHealth::Draining);
+            self.repository
+                .set_worker_draining(self.worker.lease, true, self.clock.now())
+                .await
+                .map(|_| ())
+        };
         if let Some(supervisor) = self.supervisor.take() {
             supervisor.shutdown().await;
         }
-        Ok(())
+        drain_result.map_err(CallServiceRuntimeError::Repository)
     }
 }
 

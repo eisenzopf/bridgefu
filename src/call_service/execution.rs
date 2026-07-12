@@ -280,12 +280,13 @@ enum ActorCommand {
     Admit(ProvenAdmission),
 }
 
+#[derive(Clone)]
 enum ActorWork {
     Call(ClaimedOutbox),
     Control(ClaimedControlEffect),
     Provider(crate::call_engine::ClaimedProviderEvent),
     Deadline(ClaimedDeadline),
-    Restart(RestartClaim),
+    Restart(Box<RestartClaim>),
 }
 
 #[derive(Default)]
@@ -349,6 +350,7 @@ struct CallActor {
     terminal: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     mut admissions: mpsc::Receiver<InboundAdmission>,
     mut operational: mpsc::Receiver<OperationalEvent>,
@@ -636,9 +638,11 @@ async fn claim_durable_work(runtime: Arc<CallServiceRuntime>) -> WorkClaimBatch 
         .claim_restart_calls(worker, at, WORK_BATCH_SIZE)
         .await
     {
-        Ok(claims) => batch
-            .items
-            .extend(claims.into_iter().map(ActorWork::Restart)),
+        Ok(claims) => batch.items.extend(
+            claims
+                .into_iter()
+                .map(|claim| ActorWork::Restart(Box::new(claim))),
+        ),
         Err(error) => tracing::warn!(%error, "claiming restart call work failed"),
     }
     batch
@@ -857,6 +861,7 @@ fn spawn_call_actor(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_claimed_work(
     item: ActorWork,
     orchestrator: &Arc<Orchestrator>,
@@ -1082,7 +1087,7 @@ async fn activate_admission(
     let connection_id = consumed.binding.connection_id;
     let mut created_conversation = None;
     let mut created_session = None;
-    let result = async {
+    let result = supervise_rvoip_operation(async {
         let session_id = if let Some(session_id) = existing_session {
             session_id
         } else {
@@ -1128,7 +1133,7 @@ async fn activate_admission(
         .await
         .map_err(|_| rvoip_core::RvoipError::InvalidState("inbound routing timed out"))??;
         Ok(())
-    }
+    })
     .await;
     if result.is_err() {
         if let Some(session_id) = created_session.take() {
@@ -1148,7 +1153,20 @@ async fn activate_admission(
     }
 }
 
+async fn supervise_rvoip_operation<F, T>(future: F) -> Result<T, rvoip_core::RvoipError>
+where
+    F: std::future::Future<Output = Result<T, rvoip_core::RvoipError>>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => Err(rvoip_core::RvoipError::InvalidState(
+            "owned call operation panicked",
+        )),
+    }
+}
+
 impl CallActor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stored: StoredServiceCall,
         orchestrator: Arc<Orchestrator>,
@@ -1416,8 +1434,23 @@ impl CallActor {
         let bindings = self.bindings.clone();
         let bridge_id = self.bridge_id.clone();
         let shutdown = self.shutdown.clone();
+        let panic_work = work.clone();
+        let panic_orchestrator = Arc::clone(&orchestrator);
+        let panic_runtime = Arc::clone(&runtime);
+        let panic_bindings = bindings.clone();
+        let panic_shutdown = shutdown.clone();
         self.work_operation.spawn(async move {
-            execute_actor_work(work, orchestrator, runtime, bindings, bridge_id, shutdown).await
+            supervise_work_operation(
+                execute_actor_work(work, orchestrator, runtime, bindings, bridge_id, shutdown),
+                recover_panicked_actor_work(
+                    panic_work,
+                    panic_orchestrator,
+                    panic_runtime,
+                    panic_bindings,
+                    panic_shutdown,
+                ),
+            )
+            .await
         });
     }
 
@@ -1741,6 +1774,132 @@ enum FollowUpPlan {
     },
 }
 
+async fn supervise_work_operation<F, R>(operation: F, recovery: R) -> WorkOperationResult
+where
+    F: std::future::Future<Output = WorkOperationResult>,
+    R: std::future::Future<Output = WorkOperationResult>,
+{
+    match AssertUnwindSafe(operation).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => recovery.await,
+    }
+}
+
+async fn recover_panicked_actor_work(
+    work: ActorWork,
+    orchestrator: Arc<Orchestrator>,
+    runtime: Arc<CallServiceRuntime>,
+    bindings: HashMap<LegId, ActorBinding>,
+    shutdown: watch::Receiver<ActorShutdown>,
+) -> WorkOperationResult {
+    let failure = FailureDetails::sanitized(
+        "execution_panicked",
+        "the owned external operation stopped unexpectedly",
+        true,
+    );
+    for binding in bindings.values() {
+        let _ = tokio::time::timeout(
+            EXTERNAL_OPERATION_TIMEOUT,
+            orchestrator.end_connection(
+                binding.connection_id.clone(),
+                EndReason::Failed {
+                    detail: "owned call operation panicked".into(),
+                },
+            ),
+        )
+        .await;
+    }
+    match work {
+        ActorWork::Call(claim) => {
+            let effect_id = claim.record.effect_id;
+            let meta = ClaimedEffectMeta {
+                tenant_id: claim.record.tenant_id.clone(),
+                call_id: claim.record.call_id,
+                effect_id,
+                claim_generation: claim.claim_generation,
+            };
+            let follow_up = match claim.record.intent {
+                EffectIntent::StartLeg {
+                    leg_id,
+                    binding_generation,
+                    ..
+                }
+                | EffectIntent::StopLeg {
+                    leg_id,
+                    binding_generation,
+                    ..
+                } => FollowUpPlan::FailLeg {
+                    leg_id,
+                    binding_generation,
+                    failure: failure.clone(),
+                },
+                EffectIntent::BridgeMedia {
+                    left_leg_id,
+                    right_leg_id,
+                } => bindings
+                    .get(&left_leg_id)
+                    .or_else(|| bindings.get(&right_leg_id))
+                    .map_or(FollowUpPlan::None, |binding| FollowUpPlan::FailLeg {
+                        leg_id: binding.leg_id,
+                        binding_generation: binding.binding_generation,
+                        failure: failure.clone(),
+                    }),
+                EffectIntent::ExecuteTransfer {
+                    deadline_generation,
+                } => FollowUpPlan::FinishTransfer {
+                    deadline_generation,
+                    result: TransferResult::Rejected(failure.clone()),
+                },
+                _ => FollowUpPlan::None,
+            };
+            WorkOperationResult {
+                effect_id: Some(effect_id),
+                bridge_update: None,
+                result: reconcile_effect(
+                    meta,
+                    ServiceEffectResult::Failed(failure),
+                    follow_up,
+                    runtime,
+                    shutdown,
+                )
+                .await,
+            }
+        }
+        ActorWork::Control(claim) => {
+            let effect_id = claim.record.effect_id;
+            let meta = ClaimedEffectMeta {
+                tenant_id: claim.record.tenant_id,
+                call_id: claim.record.call_id,
+                effect_id,
+                claim_generation: claim.claim_generation,
+            };
+            WorkOperationResult {
+                effect_id: Some(effect_id),
+                bridge_update: None,
+                result: reconcile_effect(
+                    meta,
+                    ServiceEffectResult::Failed(failure),
+                    FollowUpPlan::None,
+                    runtime,
+                    shutdown,
+                )
+                .await,
+            }
+        }
+        ActorWork::Provider(claim) => execute_provider_event(claim, runtime, shutdown).await,
+        ActorWork::Deadline(claim) => WorkOperationResult {
+            effect_id: None,
+            bridge_update: None,
+            result: commit_deadline(claim, runtime, shutdown).await,
+        },
+        ActorWork::Restart(claim) => WorkOperationResult {
+            effect_id: None,
+            bridge_update: None,
+            result: recover_restarted_call(*claim, runtime, shutdown).await,
+        },
+    }
+}
+
 async fn execute_actor_work(
     work: ActorWork,
     orchestrator: Arc<Orchestrator>,
@@ -1765,7 +1924,7 @@ async fn execute_actor_work(
         ActorWork::Restart(claim) => WorkOperationResult {
             effect_id: None,
             bridge_update: None,
-            result: recover_restarted_call(claim, runtime, shutdown).await,
+            result: recover_restarted_call(*claim, runtime, shutdown).await,
         },
     }
 }
@@ -2095,14 +2254,7 @@ async fn reconcile_provider_event(
             .load_service_call(&target.tenant_id, target.call_id)
             .await?;
         let observed_at = runtime.observation_time();
-        let skew_bound = chrono::Duration::minutes(5);
-        let received_at = if claim.event.received_at < observed_at - skew_bound
-            || claim.event.received_at > observed_at + skew_bound
-        {
-            observed_at
-        } else {
-            claim.event.received_at
-        };
+        let received_at = bounded_provider_received_at(observed_at, claim.event.received_at);
         let at = [observed_at, stored.call.aggregate.updated_at(), received_at]
             .into_iter()
             .max()
@@ -2147,6 +2299,24 @@ async fn reconcile_provider_event(
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn bounded_provider_received_at(
+    observed_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let skew_bound = chrono::Duration::minutes(5);
+    let Some(lower) = observed_at.checked_sub_signed(skew_bound) else {
+        return observed_at;
+    };
+    let Some(upper) = observed_at.checked_add_signed(skew_bound) else {
+        return observed_at;
+    };
+    if received_at < lower || received_at > upper {
+        observed_at
+    } else {
+        received_at
     }
 }
 
@@ -2277,7 +2447,8 @@ fn classify_provider_lifecycle(provider: ProviderKind, kind: &str) -> ProviderLi
             "started" | "ringing" => ProviderLifecycle::Progress,
             "answered" => ProviderLifecycle::Connected,
             "completed" => ProviderLifecycle::Ended,
-            "busy" | "unanswered" | "rejected" | "timeout" | "failed" => ProviderLifecycle::Failed,
+            "busy" | "unanswered" | "rejected" | "timeout" | "failed" | "cancelled"
+            | "canceled" => ProviderLifecycle::Failed,
             _ => ProviderLifecycle::Ignore,
         },
     }
@@ -2720,6 +2891,7 @@ async fn commit_unbound_restart_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_binding_state(
     runtime: &Arc<CallServiceRuntime>,
     tenant_id: &crate::call_engine::TenantId,
@@ -2956,6 +3128,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn admission_child_panic_is_converted_to_owned_failure() {
+        let result = supervise_rvoip_operation(async {
+            panic!("injected admission child panic");
+            #[allow(unreachable_code)]
+            Ok::<(), rvoip_core::RvoipError>(())
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(rvoip_core::RvoipError::InvalidState(
+                "owned call operation panicked"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn work_child_panic_runs_the_retained_recovery_future() {
+        let result = supervise_work_operation(
+            async {
+                panic!("injected durable work panic");
+                #[allow(unreachable_code)]
+                WorkOperationResult {
+                    effect_id: None,
+                    bridge_update: None,
+                    result: Err(RepositoryError::Unavailable),
+                }
+            },
+            async {
+                WorkOperationResult {
+                    effect_id: None,
+                    bridge_update: None,
+                    result: Ok(()),
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.result, Ok(()));
+    }
+
     #[test]
     fn provider_lifecycle_normalization_is_conservative_and_provider_neutral() {
         assert_eq!(
@@ -2990,6 +3202,25 @@ mod tests {
             classify_provider_lifecycle(ProviderKind::Vonage, "new-provider-state"),
             ProviderLifecycle::Ignore
         );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Vonage, "cancelled"),
+            ProviderLifecycle::Failed
+        );
+    }
+
+    #[test]
+    fn provider_receive_skew_bound_cannot_overflow_at_datetime_edges() {
+        assert_eq!(
+            bounded_provider_received_at(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC),
+            DateTime::<Utc>::MIN_UTC
+        );
+        assert_eq!(
+            bounded_provider_received_at(DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MIN_UTC),
+            DateTime::<Utc>::MAX_UTC
+        );
+        let observed = Utc::now();
+        let received = observed + chrono::Duration::seconds(30);
+        assert_eq!(bounded_provider_received_at(observed, received), received);
     }
 
     #[test]
@@ -3048,6 +3279,22 @@ mod tests {
             OperationalEventStreamHealth::Healthy
         );
         supervisor.shutdown(Duration::from_secs(2)).await;
+        drop(orchestrator);
+        let repository = runtime.repository();
+        let worker_id = runtime.worker().lease.worker_id;
+        Arc::try_unwrap(runtime)
+            .expect("execution supervisor released the runtime")
+            .shutdown()
+            .await
+            .unwrap();
+        assert!(
+            !repository
+                .worker_snapshot(worker_id)
+                .await
+                .unwrap()
+                .draining,
+            "LeaseLost shutdown must perform no stale worker-row mutation"
+        );
     }
 
     fn media_principal() -> AuthenticatedPrincipal {

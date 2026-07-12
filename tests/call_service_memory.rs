@@ -1472,7 +1472,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
         panic!("expected control effect")
     };
     let old_claim = repository
-        .claim_control_effects(fixture.worker, at(11), Duration::from_secs(30), 1)
+        .claim_control_effects(fixture.worker, at(11), Duration::from_secs(24 * 60 * 60), 1)
         .await
         .unwrap()
         .remove(0);
@@ -1521,6 +1521,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
         .unwrap()
         .remove(0);
     assert_eq!(recovered.record.effect_id, view.effect.effect_id);
+    assert!(recovered.claim_generation > old_claim.claim_generation);
     assert!(matches!(
         repository
             .reconcile_effect_result(EffectResultReconciliation {

@@ -2743,8 +2743,19 @@ impl CallRepository for MemoryRepository {
                     .filter(|row| row.call_id == call_id && outbox_is_unfinished(row))
                 {
                     record.worker = worker;
-                    if matches!(record.state, OutboxState::Claimed { .. }) {
-                        record.state = OutboxState::Ready;
+                    if let OutboxState::Claimed {
+                        worker: claim_worker,
+                        generation,
+                        claimed_at,
+                        ..
+                    } = record.state.clone()
+                    {
+                        record.state = OutboxState::Claimed {
+                            worker: claim_worker,
+                            generation,
+                            claimed_at: claimed_at.min(at),
+                            expires_at: at,
+                        };
                     }
                 }
                 for record in state
@@ -2753,8 +2764,19 @@ impl CallRepository for MemoryRepository {
                     .filter(|row| row.call_id == call_id && control_outbox_is_unfinished(row))
                 {
                     record.worker = worker;
-                    if matches!(record.state, OutboxState::Claimed { .. }) {
-                        record.state = OutboxState::Ready;
+                    if let OutboxState::Claimed {
+                        worker: claim_worker,
+                        generation,
+                        claimed_at,
+                        ..
+                    } = record.state.clone()
+                    {
+                        record.state = OutboxState::Claimed {
+                            worker: claim_worker,
+                            generation,
+                            claimed_at: claimed_at.min(at),
+                            expires_at: at,
+                        };
                     }
                 }
                 for record in state
@@ -2762,8 +2784,17 @@ impl CallRepository for MemoryRepository {
                     .values_mut()
                     .filter(|row| row.call_id == call_id)
                 {
-                    if matches!(record.state, DeadlineState::Claimed { .. }) {
-                        record.state = DeadlineState::Pending;
+                    if let DeadlineState::Claimed {
+                        worker: claim_worker,
+                        generation,
+                        ..
+                    } = record.state.clone()
+                    {
+                        record.state = DeadlineState::Claimed {
+                            worker: claim_worker,
+                            generation,
+                            expires_at: at,
+                        };
                     }
                 }
                 for event in state.provider_events.values_mut().filter(|event| {
@@ -2772,8 +2803,19 @@ impl CallRepository for MemoryRepository {
                         .as_ref()
                         .is_some_and(|target| target.call_id == call_id)
                 }) {
-                    if matches!(event.state, ProviderEventState::Claimed { .. }) {
-                        event.state = ProviderEventState::Ready;
+                    if let ProviderEventState::Claimed {
+                        worker: claim_worker,
+                        generation,
+                        claimed_at,
+                        ..
+                    } = event.state.clone()
+                    {
+                        event.state = ProviderEventState::Claimed {
+                            worker: claim_worker,
+                            generation,
+                            claimed_at: claimed_at.min(at),
+                            expires_at: at,
+                        };
                     }
                 }
                 for attachment in state
@@ -8714,7 +8756,7 @@ mod tests {
         .await
         .unwrap();
         let old_claim = repo
-            .claim_provider_events(worker.lease, at(9), Duration::from_secs(30), 1)
+            .claim_provider_events(worker.lease, at(9), Duration::from_secs(24 * 60 * 60), 1)
             .await
             .unwrap()
             .remove(0);
@@ -8770,6 +8812,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].claim_generation > old_claim.claim_generation);
         let command = CommandCommit {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
@@ -9098,32 +9141,11 @@ mod tests {
             .unwrap(),
         );
         let claimed = repo
-            .claim_due_deadlines(worker.lease, at(33), Duration::from_secs(10), 10)
+            .claim_due_deadlines(worker.lease, at(33), Duration::from_secs(24 * 60 * 60), 10)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-        let timer = &claimed[0];
-        let current = repo.load_call(&owner, call.aggregate.id()).await.unwrap();
-        let committed = repo
-            .commit_command(CommandCommit {
-                tenant_id: owner.clone(),
-                call_id: call.aggregate.id(),
-                expected_version: current.aggregate.version(),
-                command_id: CommandId::new(),
-                command: CallCommand::DeadlineElapsed {
-                    at: at(33),
-                    kind: timer.record.kind,
-                    generation: timer.record.generation,
-                    ending_deadline: Some(at(43)),
-                },
-                worker: worker.lease,
-                attachments: Vec::new(),
-                deadline_claim: Some(timer.guard(worker.lease)),
-                at: at(33),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(committed, CommandCommitOutcome::Committed(_)));
+        let timer = claimed[0].clone();
 
         let newer = repo
             .register_worker(RegisterWorker {
@@ -9166,6 +9188,38 @@ mod tests {
         assert_eq!(restart.len(), 1);
         assert_eq!(restart[0].previous_fence, worker.lease.fence);
         assert_eq!(restart[0].call.assignment.lease, newer.lease);
+        let recovered_timer = repo
+            .claim_due_deadlines(newer.lease, at(35), Duration::from_secs(10), 10)
+            .await
+            .unwrap();
+        assert_eq!(recovered_timer.len(), 1);
+        assert_eq!(recovered_timer[0].record.kind, timer.record.kind);
+        assert_eq!(
+            recovered_timer[0].record.generation,
+            timer.record.generation
+        );
+        assert!(recovered_timer[0].claim_generation > timer.claim_generation);
+        let current = repo.load_call(&owner, call.aggregate.id()).await.unwrap();
+        let committed = repo
+            .commit_command(CommandCommit {
+                tenant_id: owner,
+                call_id: call.aggregate.id(),
+                expected_version: current.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::DeadlineElapsed {
+                    at: at(35),
+                    kind: recovered_timer[0].record.kind,
+                    generation: recovered_timer[0].record.generation,
+                    ending_deadline: Some(at(45)),
+                },
+                worker: newer.lease,
+                attachments: Vec::new(),
+                deadline_claim: Some(recovered_timer[0].guard(newer.lease)),
+                at: at(35),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(committed, CommandCommitOutcome::Committed(_)));
     }
 
     #[tokio::test]
@@ -9196,6 +9250,11 @@ mod tests {
         assert!(repo
             .read(|state| Ok(has_unfinished_outbox(state, terminal.aggregate.id())))
             .unwrap());
+        let old_cleanup_claim = repo
+            .claim_outbox(worker.lease, at(9), Duration::from_secs(24 * 60 * 60), 1)
+            .await
+            .unwrap();
+        assert_eq!(old_cleanup_claim.len(), 1);
 
         let newer = repo
             .register_worker(RegisterWorker {
@@ -9233,6 +9292,11 @@ mod tests {
             .unwrap();
         assert_eq!(cleanup.len(), 1);
         assert_eq!(cleanup[0].record.worker, newer.lease);
+        assert_eq!(
+            cleanup[0].record.effect_id,
+            old_cleanup_claim[0].record.effect_id
+        );
+        assert!(cleanup[0].claim_generation > old_cleanup_claim[0].claim_generation);
     }
 
     #[tokio::test]

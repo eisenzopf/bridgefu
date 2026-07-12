@@ -94,8 +94,9 @@ async fn main() -> Result<()> {
     // validator, and cryptographic policy.
     let mut api_state =
         api::ApiState::from_config(&cfg, server.clone(), prom, tenants, None).await?;
+    let call_runtime_owner = api_state.call_runtime();
     let generic_runtime = if cfg.generic_bridge.enabled {
-        let call_runtime = api_state.call_runtime().ok_or_else(|| {
+        let call_runtime = call_runtime_owner.as_ref().map(Arc::clone).ok_or_else(|| {
             anyhow::anyhow!("generic_bridge requires the authenticated transactional call runtime")
         })?;
         let bearer_validator = api_state.bearer_validator().ok_or_else(|| {
@@ -170,8 +171,27 @@ async fn main() -> Result<()> {
             ))
             .await;
     }
+    shutdown_call_runtime(call_runtime_owner).await?;
     tracing::info!("bridgefu stopped");
     Ok(())
+}
+
+async fn shutdown_call_runtime(
+    runtime: Option<Arc<bridgefu::call_service::CallServiceRuntime>>,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let strong_count = Arc::strong_count(&runtime);
+    let runtime = Arc::try_unwrap(runtime).map_err(|_| {
+        anyhow::anyhow!(
+            "call-service runtime still has {strong_count} owners after HTTP and media drain"
+        )
+    })?;
+    runtime
+        .shutdown()
+        .await
+        .context("shutting down durable call-service worker")
 }
 
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -207,5 +227,55 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = term => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use bridgefu::call_engine::WorkerId;
+    use bridgefu::call_service::{
+        build_call_service_runtime, CallRepositoryBackendConfig, CallServiceCoordinationConfig,
+        CallServiceRuntimeConfig, CallTimeoutPolicy, SamePrincipalAttachmentResolver,
+        SystemCallServiceClock,
+    };
+    use bridgefu::coordination::DeploymentId;
+
+    #[tokio::test]
+    async fn owned_call_runtime_shutdown_marks_worker_draining_and_joins() {
+        let mut coordination = CallServiceCoordinationConfig::new(
+            DeploymentId::parse("main-runtime-shutdown-test").unwrap(),
+        );
+        coordination.worker_lease_ttl = std::time::Duration::from_secs(300);
+        coordination.worker_renew_interval = std::time::Duration::from_secs(100);
+        let runtime = build_call_service_runtime(
+            CallServiceRuntimeConfig {
+                backend: CallRepositoryBackendConfig::Memory,
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                worker_capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+                control_key: vec![0x38; 32],
+                timeouts: CallTimeoutPolicy {
+                    setup: std::time::Duration::from_secs(30),
+                    media_idle: std::time::Duration::from_secs(30),
+                    transfer: std::time::Duration::from_secs(30),
+                    ending: std::time::Duration::from_secs(30),
+                },
+                coordination,
+            },
+            Arc::new(SamePrincipalAttachmentResolver),
+            Arc::new(SystemCallServiceClock),
+        )
+        .await
+        .unwrap();
+        let repository = runtime.repository();
+        let worker_id = runtime.worker().lease.worker_id;
+        shutdown_call_runtime(Some(Arc::new(runtime)))
+            .await
+            .unwrap();
+        let worker = repository.worker_snapshot(worker_id).await.unwrap();
+        assert!(worker.draining);
     }
 }
