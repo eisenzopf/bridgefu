@@ -6,4 +6,5 @@
 
 pub mod api_principal;
 pub mod call_engine;
+pub mod call_service;
 pub mod persistence;
