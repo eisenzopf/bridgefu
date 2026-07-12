@@ -867,8 +867,17 @@ not hide an earlier adapter side effect behind a nominally staged API.
      an explicit development opt-in. Before this slice can close, the combined
      security audit must also prove that every generated or precomputed raw
      authentication value is bounded and control-free at its final insertion
-     point; request start lines redact the complete Request-URI in both the raw
-     trace and the separate event field; the public lower-level trace API uses
+     point and at every public typed transport `send_message` boundary; the
+     explicitly raw transport escape hatch remains the only verbatim bypass.
+     Authorization-bearing raw values, their enclosing typed headers, and
+     complete requests must also redact secrets from diagnostics regardless of
+     whether the header name uses a canonical variant or a case-insensitive
+     `Other` alias. Request start lines redact the complete Request-URI and
+     response start lines redact untrusted reason text in both the raw trace and
+     the separate event field. A custom Call-ID decision must also govern the
+     separately retained `sip_call_id`; no parallel event field may bypass the
+     policy. Malformed or orphan trace lines fail closed instead of passing
+     verbatim. The public lower-level trace API uses
      a continuation-aware, body-safe default when no application policy is
      installed; and the default typed-header policy is a deliberate safe
      allowlist rather than an `_ => Keep` fallback.
