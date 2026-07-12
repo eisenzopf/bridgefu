@@ -722,6 +722,52 @@ Gate 6 progress evidence recorded on 2026-07-12:
   arrival order cannot cross-connect calls. Gate 6 item 7 remains open until
   the WebRTC listener consumes protocol confirmation and terminal compensation
   is driven by the strong lifecycle supervisor.
+- Bridgefu revision `c72bed3` adds exact, fenced connection-lifecycle commits
+  across the memory, SQLite, and PostgreSQL repositories. Durable connection
+  ownership, binding generation, worker fence, state mutation, replay, and
+  snapshot cross-links are validated atomically; adversarial tamper tests fail
+  closed. This is an item-7 prerequisite, not the lifecycle supervisor itself.
+- Bridgefu revision `e244275` adds bounded optimistic retry for simultaneous
+  attachments to different legs of one call. Retries retain the original
+  token digest and command ID and recheck expiry after every database await;
+  a deterministic two-inspection barrier test proves the calls cannot
+  cross-bind through a shared aggregate-version race.
+- Bridgefu revision `a2c20e6` makes the worker lease a monotonic local safety
+  deadline measured from the last confirmed registration or renewal attempt.
+  A coordination outage can report `Degraded` only until that deadline, then
+  becomes `LeaseLost` and cancels the existing runtime supervisor. Full
+  admission, claim, and local-media behavior after lease loss remains item 8
+  work.
+- Bridgefu revision `03ddce7` adds the service-owned provider-event
+  reconciliation transaction required before item 8 can claim callbacks. It
+  validates the execution plan, account, target, external reference, binding
+  generation, follow-up, terminal acknowledgement, exact replay, and snapshot
+  cross-links, while the raw managed-call completion path remains rejected.
+  Schema version 5 and memory, SQLite, and PostgreSQL tamper tests cover the
+  transaction; the supervisor claim/normalization loop remains open.
+- Bridgefu revision `a455717` persists execution-plan version 2 authorization
+  fingerprints, explicit transfer target leg and binding generation, and the
+  configured media-idle policy with exact consecutive activity generations.
+  Migrated version-1 plans deliberately have no inferred authority and cannot
+  start new outbound work. Provider reconciliation remains schema version 5;
+  execution authority is the ordered schema-version-6 migration. The isolated
+  locked suite passes 114 library, 40 binary, all repository/runtime suites,
+  and 24 unchanged StandardCharter contract tests.
+- Bridgefu revision `09d92fa` adds explicit SQLite and PostgreSQL schema-5 to
+  schema-6 fixtures containing a legacy version-1 execution plan, historical
+  outbound binding, and service-reconciliation receipt. Upgrade preserves
+  inspect/terminate/replay history while every new outbound bind still fails
+  closed. The digest-pinned disposable PostgreSQL run passes 21 repository,
+  5 service-repository, 8 runtime, and 2 coordination tests; the focused
+  SQLite boundary, 114 library tests, and strict repository Clippy also pass.
+- rvoip revisions `c353b4d6`, `c04737c6`, `78b0b370`, and `53fa66cb` add
+  admission confirmation before WHIP/WS protocol success, two-phase prepared
+  outbound connections, the bounded authoritative operational stream, and
+  owned lifecycle activation/normalizer/DTMF tasks with exact terminal,
+  cancellation, timeout, and drain behavior. These local revisions are item-7
+  and item-8 prerequisites. Bridgefu CI remains on the last reviewed pushed
+  rvoip revision until the remaining local rvoip work is qualified and its
+  exact final revision is reviewed.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
