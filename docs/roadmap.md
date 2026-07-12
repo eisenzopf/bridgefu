@@ -281,6 +281,25 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
 9. [ ] Prepare the fork delta, interoperability report, and proposed upstream
    patch for user review. Submission remains a separately authorized action.
 
+Gate 5 implementation checkpoint recorded on 2026-07-11:
+
+- The private `eisenzopf/moq-rs` fork is pinned at
+  `f3c29d319766061b013ed683552a26ff8b7e5a2f`. It implements draft-19-only
+  ALPN/version negotiation, the changed discovery/request messages,
+  stream-owned request updates with receiver credit enforcement, redirect and
+  Track Property encoding, session-fatal protocol errors, and golden vectors.
+  The fork workspace passes 219 transport tests plus 42 relay tests. No
+  upstream issue, pull request, or maintainer message was created.
+- rvoip revision `a258af2e6e9d1fd185cd48f6157c8417eaecce6a`
+  exact-pins that fork and adds rvoip-owned compatibility, namespace,
+  authorization, replay, MSF catalog, monotonic LOC timestamp, and typed
+  broadcast lifecycle models without exposing moq-rs types. The combined
+  core/QUIC/MOQT suite and strict scoped clippy/doc checks pass.
+- This is an integration checkpoint, not Gate 5 completion. Production MSF
+  stream-per-object delivery, complete PUBLISH/FETCH, network authorization,
+  mTLS relay admission, reconnect/drain, and two-substrate relay traversal are
+  still required by items 3, 5, 6, and 7.
+
 Gate 5 external evidence note: draft-19 and LOC-03 were published on
 2026-07-06. At the 2026-07-11 audit, Meta moxygen and the other catalogued
 independent implementations supported draft-18 or earlier. The fork and rvoip

@@ -22,8 +22,13 @@
     "upstream": "cloudflare/moq-rs",
     "fork": "eisenzopf/moq-rs",
     "portBaseRevision": "c7e80e49f4189efd1e55e2533eab36adf0e8f4b4",
-    "reviewedForkRevision": null,
-    "status": "draft-19-port-in-progress"
+    "reviewedForkRevision": "f3c29d319766061b013ed683552a26ff8b7e5a2f",
+    "status": "draft-19-control-port-in-progress"
+  },
+  "rvoipIntegration": {
+    "revision": "a258af2e6e9d1fd185cd48f6157c8417eaecce6a",
+    "wireRevision": "f3c29d319766061b013ed683552a26ff8b7e5a2f",
+    "status": "compatibility-auth-and-models-complete-wire-lifecycle-in-progress"
   },
   "independentInterop": {
     "implementation": "facebookexperimental/moxygen",
