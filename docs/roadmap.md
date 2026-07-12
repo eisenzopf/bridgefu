@@ -326,13 +326,54 @@ interoperability suites pass.
 
 ### Gate 6 — Build Bridgefu's durable call engine (`pending`)
 
-- [ ] Add typed calls/legs, transition rules, deadlines, atomic admission, and
-  transactional command handling.
-- [ ] Implement common memory, SQLite, and PostgreSQL repository contracts.
-- [ ] Add Redis leases, worker selection, replay, routing, and command delivery.
-- [ ] Replace FIFO pairing with explicit attachment tokens.
-- [ ] Handle cancellation, glare, timeouts, hangup, teardown, transfer
-  compensation, restart recovery, and drain.
+The implementation order is deliberate. In particular, FIFO pairing cannot be
+removed safely until rvoip preserves a single-take, redacted inbound routing
+hint for SIP and WebRTC connections.
+
+1. [ ] Add an additive rvoip inbound-context seam before the normalized
+   `ConnectionInbound` event. Preserve the SIP Request-URI routing hint and the
+   WHIP/WS path or authenticated session hint, expose it through Orchestrator as
+   a single-take value, and erase it on terminal cleanup. Prove once-only,
+   redacted, transport-bound, and cross-tenant-safe behavior.
+2. [ ] Add Bridgefu's pure typed two-leg aggregate with strong call/leg/tenant
+   IDs, exact call and leg states, directions, typed leg kinds, UTC deadlines,
+   binding generations, sanitized failures, transition invariants, and
+   serializable effect intents. Keep the frozen Amazon runtime untouched.
+3. [ ] Add high-level atomic repository contracts and a memory implementation
+   covering capacity reservation, tenant-scoped load, optimistic command/outbox
+   commit, attachment consumption, provider-event deduplication, deadlines,
+   and restart claims. Use one lock across all memory indexes so tests exercise
+   real atomic semantics.
+4. [ ] Add SQLite and PostgreSQL migrations and implementations for calls,
+   legs, commands, 24-hour idempotency, attachments, provider events, outbox,
+   worker capacity, and assignments. Run one repository conformance suite
+   against all three backends; use `BEGIN IMMEDIATE` or conditional capacity
+   updates rather than count-based admission.
+5. [ ] Add a transactional call service and authenticated API principal. Read
+   `Idempotency-Key` from the header, bind it to tenant plus canonical request
+   hash, persist state/command/effect intents before external I/O, and reconcile
+   provider or rvoip outcomes afterward. Tenant override requires a dedicated
+   administrative scope.
+6. [ ] Add memory and Redis worker coordination with fenced leases, capability
+   and capacity-aware selection, reservations, routing, replay markers, drain,
+   and Redis Streams notification. PostgreSQL remains authoritative and a
+   transactional outbox avoids PostgreSQL/Redis dual writes.
+7. [ ] Replace global FIFO pairing with at least 256-bit, two-minute,
+   single-use attachment tokens. Persist only a digest bound to tenant, call,
+   leg, expected transport, and worker fence; atomically bind the exact rvoip
+   Connection ID and reject expiry, replay, wrong transport, and cross-call or
+   cross-tenant use.
+8. [ ] Add a bounded lifecycle supervisor for setup/media/transfer/cleanup
+   deadlines, cancellation and compensation, hangup-versus-transfer glare,
+   peer teardown, stale generation rejection, worker drain, and fenced restart
+   recovery. Active media is ended and cleaned after worker loss, never
+   migrated.
+
+Gate 6 qualification must include interleaved unrelated attachments, repository
+parity, concurrent capacity/idempotency races, callback-before-originate-result,
+outbox crash points, token replay/expiry/isolation, remote teardown, transfer
+glare, restart, and drain. The existing `ConnectScreenPopServer` remains the
+default StandardCharter path until Gate 7 moves Amazon behind the common engine.
 
 Exit: state/repository tests pass and unrelated concurrent calls cannot
 cross-connect.
