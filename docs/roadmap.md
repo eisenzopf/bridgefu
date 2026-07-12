@@ -386,6 +386,21 @@ hint for SIP and WebRTC connections.
      Command ID namespace across core and service operations, and redact endpoint
      URIs, transfer destinations, phone numbers, and credential-bearing URL
      components from durable-model diagnostics.
+   - Preserve service ownership independently from the execution-plan row.
+     A normalized, one-way `service_managed` marker on the call must agree with
+     exact plan coverage, and every raw compatibility mutation checks that
+     marker so deleting or corrupting a plan cannot downgrade a managed call to
+     a legacy call.
+   - Retire expired service/control idempotency receipts into immutable,
+     cross-linked claim tombstones before allowing active-key reuse. Historical
+     command requests must be backed by either their exact active receipt or an
+     expiry-eligible tombstone; premature receipt deletion remains a fail-closed
+     storage error.
+   - Reconstruct durable evidence bidirectionally: every successful or externally
+     failed managed effect has exactly one reconciliation receipt, every active
+     outbound binding has its original bind receipt, and every receipt points
+     back to the same immutable command/effect identity. Locally invalidated
+     control work carries an explicit, command-backed retirement failure.
    - Inject rvoip `AuthenticatedPrincipal` validation into Axum, inherit tenant
      from the principal, require operation scopes, and allow tenant override
      only with `calls:tenant-override`.
