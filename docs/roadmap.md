@@ -346,13 +346,31 @@ hint for SIP and WebRTC connections.
 4. [ ] Add SQLite and PostgreSQL migrations and implementations for calls,
    legs, commands, 24-hour idempotency, attachments, provider events, outbox,
    worker capacity, and assignments. Run one repository conformance suite
-   against all three backends; use `BEGIN IMMEDIATE` or conditional capacity
-   updates rather than count-based admission.
+   against all three backends; use cancellation-safe `BEGIN IMMEDIATE` or
+   conditional capacity updates rather than count-based admission. Read paths
+   must not mutate storage, SQL mutations write only changed rows, normalized
+   call/leg ownership must be database-enforced, and mandatory CI must exercise
+   a real disposable PostgreSQL service plus two-instance races.
 5. [ ] Add a transactional call service and authenticated API principal. Read
    `Idempotency-Key` from the header, bind it to tenant plus canonical request
    hash, persist state/command/effect intents before external I/O, and reconcile
    provider or rvoip outcomes afterward. Tenant override requires a dedicated
    administrative scope.
+   - Persist a versioned execution plan alongside the aggregate so each leg's
+     endpoint/configuration survives replay and restart without putting secrets
+     in domain state.
+   - Add durable payloads for transfer targets, a fenced DTMF/control outbox,
+     and outbound connection binding with permanent connection-ID uniqueness.
+   - Add one atomic effect-result reconciliation transaction that verifies the
+     outbox claim, records provider/rvoip references, releases callback-before-
+     reference events, commits the follow-up state transition, completes the
+     effect, and retains an exact replay result.
+   - Inject rvoip `AuthenticatedPrincipal` validation into Axum, inherit tenant
+     from the principal, require operation scopes, and allow tenant override
+     only with `calls:tenant-override`.
+   - Keep `ConnectScreenPopServer` and the existing StandardCharter listener
+     untouched; the new API and effect executor do not call its active-call or
+     teardown helpers during this item.
 6. [ ] Add memory and Redis worker coordination with fenced leases, capability
    and capacity-aware selection, reservations, routing, replay markers, drain,
    and Redis Streams notification. PostgreSQL remains authoritative and a
