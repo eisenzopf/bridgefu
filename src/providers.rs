@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use bridgefu::call_engine::ProviderAccountKey;
+
 type HmacSha1 = Hmac<Sha1>;
 
 #[derive(Clone, Deserialize)]
@@ -162,6 +164,10 @@ impl WebhookRequest {
 #[async_trait]
 pub trait ProviderControl: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Stable credential/account namespace used by durable webhook and call
+    /// reference reconciliation. The value is validated when the adapter is
+    /// constructed and its `Debug` representation is always redacted.
+    fn account_key(&self) -> ProviderAccountKey;
     fn capabilities(&self) -> ProviderCapabilities;
     async fn originate(&self, command: OriginateCommand) -> Result<ProviderCall, ProviderError>;
     async fn transfer(&self, call_id: &str, target: &str) -> Result<(), ProviderError>;
@@ -216,15 +222,18 @@ impl ProviderRegistry {
 
 struct TwilioProvider {
     config: TwilioConfig,
+    account_key: ProviderAccountKey,
     auth_token: String,
     http: reqwest::Client,
 }
 
 impl TwilioProvider {
     fn new(config: TwilioConfig) -> Result<Self, ProviderError> {
+        let account_key = provider_account_key("twilio", &config.account_sid)?;
         Ok(Self {
             auth_token: config.auth_token.resolve()?,
             config,
+            account_key,
             http: reqwest::Client::new(),
         })
     }
@@ -247,6 +256,9 @@ impl TwilioProvider {
 impl ProviderControl for TwilioProvider {
     fn name(&self) -> &'static str {
         "twilio"
+    }
+    fn account_key(&self) -> ProviderAccountKey {
+        self.account_key.clone()
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
@@ -394,6 +406,7 @@ impl ProviderControl for TwilioProvider {
 
 struct TelnyxProvider {
     config: TelnyxConfig,
+    account_key: ProviderAccountKey,
     api_key: String,
     webhook_key: Vec<u8>,
     http: reqwest::Client,
@@ -401,6 +414,7 @@ struct TelnyxProvider {
 
 impl TelnyxProvider {
     fn new(config: TelnyxConfig) -> Result<Self, ProviderError> {
+        let account_key = provider_account_key("telnyx", &config.connection_id)?;
         let webhook_key = base64::engine::general_purpose::STANDARD
             .decode(config.webhook_public_key.resolve()?)
             .map_err(|_| {
@@ -409,6 +423,7 @@ impl TelnyxProvider {
         Ok(Self {
             api_key: config.api_key.resolve()?,
             config,
+            account_key,
             webhook_key,
             http: reqwest::Client::new(),
         })
@@ -427,6 +442,9 @@ impl TelnyxProvider {
 impl ProviderControl for TelnyxProvider {
     fn name(&self) -> &'static str {
         "telnyx"
+    }
+    fn account_key(&self) -> ProviderAccountKey {
+        self.account_key.clone()
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -531,6 +549,7 @@ impl ProviderControl for TelnyxProvider {
 
 struct VonageProvider {
     config: VonageConfig,
+    account_key: ProviderAccountKey,
     private_key: Vec<u8>,
     signature_secret: String,
     http: reqwest::Client,
@@ -555,10 +574,12 @@ struct VonageWebhookClaims {
 
 impl VonageProvider {
     fn new(config: VonageConfig) -> Result<Self, ProviderError> {
+        let account_key = provider_account_key("vonage", &config.application_id)?;
         Ok(Self {
             private_key: config.private_key.resolve()?.into_bytes(),
             signature_secret: config.signature_secret.resolve()?,
             config,
+            account_key,
             http: reqwest::Client::new(),
         })
     }
@@ -594,6 +615,9 @@ impl VonageProvider {
 impl ProviderControl for VonageProvider {
     fn name(&self) -> &'static str {
         "vonage"
+    }
+    fn account_key(&self) -> ProviderAccountKey {
+        self.account_key.clone()
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
@@ -748,6 +772,22 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn provider_account_key(
+    provider: &'static str,
+    configured_account: &str,
+) -> Result<ProviderAccountKey, ProviderError> {
+    if configured_account.is_empty()
+        || configured_account.trim() != configured_account
+        || configured_account.chars().any(char::is_control)
+    {
+        return Err(ProviderError::Configuration(
+            "invalid provider account identifier".into(),
+        ));
+    }
+    ProviderAccountKey::parse(format!("{provider}:{configured_account}"))
+        .map_err(|_| ProviderError::Configuration("invalid provider account identifier".into()))
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -794,5 +834,51 @@ mod tests {
     fn vonage_endpoints_distinguish_sip_and_phone() {
         assert_eq!(vonage_endpoint("sip:a@example.com")["type"], "sip");
         assert_eq!(vonage_endpoint("+12065550100")["type"], "phone");
+    }
+
+    #[test]
+    fn provider_account_keys_are_stable_and_namespaced() {
+        let twilio = TwilioProvider::new(TwilioConfig {
+            account_sid: "AC-account".into(),
+            auth_token: SecretRef("secret".into()),
+            base_url: twilio_base_url(),
+        })
+        .unwrap();
+        assert_eq!(twilio.account_key().as_str(), "twilio:AC-account");
+
+        let telnyx = TelnyxProvider::new(TelnyxConfig {
+            api_key: SecretRef("secret".into()),
+            connection_id: "connection-a".into(),
+            webhook_public_key: SecretRef(
+                base64::engine::general_purpose::STANDARD.encode([0_u8; 32]),
+            ),
+            base_url: telnyx_base_url(),
+        })
+        .unwrap();
+        assert_eq!(telnyx.account_key().as_str(), "telnyx:connection-a");
+
+        let vonage = VonageProvider::new(VonageConfig {
+            application_id: "application-a".into(),
+            private_key: SecretRef("not-used-by-this-test".into()),
+            signature_secret: SecretRef("secret".into()),
+            base_url: vonage_base_url(),
+        })
+        .unwrap();
+        assert_eq!(vonage.account_key().as_str(), "vonage:application-a");
+    }
+
+    #[test]
+    fn provider_account_keys_reject_empty_configured_identifiers() {
+        let error = TwilioProvider::new(TwilioConfig {
+            account_sid: String::new(),
+            auth_token: SecretRef("secret".into()),
+            base_url: twilio_base_url(),
+        })
+        .err()
+        .expect("empty account is rejected");
+        assert_eq!(
+            error.to_string(),
+            "provider configuration error: invalid provider account identifier"
+        );
     }
 }

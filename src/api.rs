@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -27,6 +28,7 @@ use rvoip_moq::{MoqBroadcastPublisher, MoqPublisherConfig};
 use rvoip_quic::UctpBroadcastPublisher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -37,7 +39,10 @@ use bridgefu::api_principal::{
     ApiBearerAuthenticator, ApiPrincipal, ApiPrincipalError, ConfiguredApiKeyValidator,
     MAX_API_BEARER_BYTES,
 };
-use bridgefu::call_engine::{RepositoryError, TenantId};
+use bridgefu::call_engine::{
+    CallRepository, ProviderAccountKey, ProviderCallId, ProviderEventDigest, ProviderEventInput,
+    ProviderEventOutcome, ProviderPayloadDigest, RepositoryError, TenantId,
+};
 use bridgefu::call_service::{
     build_call_service_runtime, CallServiceError, CallServiceRuntime, CallServiceRuntimeConfig,
     CallTimeoutPolicy, ControlCryptoError, SamePrincipalAttachmentResolver, SystemCallServiceClock,
@@ -57,7 +62,7 @@ pub struct ApiState {
     server: Arc<ConnectScreenPopServer>,
     providers: ProviderRegistry,
     broadcasts: Arc<DashMap<String, Arc<ActiveBroadcast>>>,
-    webhook_events: Arc<DashMap<String, DateTime<Utc>>>,
+    provider_events: Option<Arc<dyn ProviderEventPersistence>>,
     metrics: PrometheusHandle,
     tenants: Vec<String>,
     bearer_authenticator: Option<ApiBearerAuthenticator>,
@@ -72,6 +77,28 @@ pub struct ApiState {
     context_policy: ContextPolicy,
     generic_runtime: Option<Arc<GenericBridgeRuntime>>,
     screen_pop_evidence: ScreenPopEvidenceStore,
+}
+
+#[async_trait]
+trait ProviderEventPersistence: Send + Sync {
+    async fn ingest_provider_event(
+        &self,
+        request: ProviderEventInput,
+    ) -> Result<ProviderEventOutcome, RepositoryError>;
+}
+
+struct RepositoryProviderEventPersistence {
+    repository: Arc<dyn CallRepository>,
+}
+
+#[async_trait]
+impl ProviderEventPersistence for RepositoryProviderEventPersistence {
+    async fn ingest_provider_event(
+        &self,
+        request: ProviderEventInput,
+    ) -> Result<ProviderEventOutcome, RepositoryError> {
+        self.repository.ingest_provider_event(request).await
+    }
 }
 
 struct LegacyBearerToken(Vec<u8>);
@@ -188,6 +215,11 @@ impl ApiState {
             }
             None
         };
+        let provider_events = call_runtime.as_ref().map(|runtime| {
+            Arc::new(RepositoryProviderEventPersistence {
+                repository: runtime.repository(),
+            }) as Arc<dyn ProviderEventPersistence>
+        });
         let screen_pop_evidence = ScreenPopEvidenceStore::new(
             DEFAULT_SCREEN_POP_EVIDENCE_TTL,
             DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY,
@@ -196,7 +228,7 @@ impl ApiState {
             server,
             providers,
             broadcasts: Arc::new(DashMap::new()),
-            webhook_events: Arc::new(DashMap::new()),
+            provider_events,
             metrics,
             tenants,
             bearer_authenticator,
@@ -423,17 +455,134 @@ async fn provider_webhook(
         body: body.to_vec(),
     };
     let event = adapter.verify_webhook(&request)?;
-    let dedupe_key = format!("{}:{}", event.provider, event.event_id);
-    if state
-        .webhook_events
-        .insert(dedupe_key, Utc::now())
-        .is_some()
+    let persistence = state.provider_events.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "call_service_unavailable",
+            "call service is unavailable",
+        )
+    })?;
+    let input = provider_event_input(adapter.account_key(), adapter.name(), &event, Utc::now())?;
+    match persistence
+        .ingest_provider_event(input)
+        .await
+        .map_err(map_provider_event_repository_error)?
     {
-        metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "duplicate").increment(1);
-        return Ok((StatusCode::OK, Json(event)));
+        ProviderEventOutcome::Accepted(_) => {
+            metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "accepted").increment(1);
+            Ok((StatusCode::ACCEPTED, Json(event)))
+        }
+        ProviderEventOutcome::Duplicate(_) => {
+            metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "duplicate").increment(1);
+            Ok((StatusCode::OK, Json(event)))
+        }
     }
-    metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "accepted").increment(1);
-    Ok((StatusCode::ACCEPTED, Json(event)))
+}
+
+fn provider_event_input(
+    account: ProviderAccountKey,
+    expected_provider: &str,
+    event: &NormalizedProviderEvent,
+    received_at: DateTime<Utc>,
+) -> Result<ProviderEventInput, ApiError> {
+    if event.provider != expected_provider || !valid_provider_identifier(&event.event_id) {
+        return Err(invalid_provider_event());
+    }
+    let provider_call_id = event
+        .provider_call_id
+        .as_ref()
+        .ok_or_else(invalid_provider_event)
+        .and_then(|value| {
+            if valid_provider_identifier(value) {
+                ProviderCallId::parse(value.clone()).map_err(|_| invalid_provider_event())
+            } else {
+                Err(invalid_provider_event())
+            }
+        })?;
+    let occurred_at = event
+        .occurred_at
+        .as_deref()
+        .map(parse_provider_timestamp)
+        .transpose()?;
+    let payload = canonicalize_provider_json(&event.raw);
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|_| invalid_provider_event())?;
+
+    Ok(ProviderEventInput {
+        account,
+        event_digest: ProviderEventDigest::new(provider_digest(
+            b"event-id",
+            event.event_id.as_bytes(),
+        )),
+        payload_digest: ProviderPayloadDigest::new(provider_digest(b"payload", &payload_bytes)),
+        provider_call_id,
+        kind: event.event_type.clone(),
+        payload,
+        occurred_at,
+        received_at,
+    })
+}
+
+fn valid_provider_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn parse_provider_timestamp(value: &str) -> Result<DateTime<Utc>, ApiError> {
+    DateTime::parse_from_rfc3339(value)
+        .or_else(|_| DateTime::parse_from_rfc2822(value))
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| invalid_provider_event())
+}
+
+fn canonicalize_provider_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonicalize_provider_json).collect())
+        }
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonicalize_provider_json(value)))
+                    .collect(),
+            )
+        }
+        _ => value.clone(),
+    }
+}
+
+fn provider_digest(domain: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"bridgefu.provider-webhook.v1\0");
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+    digest.finalize().into()
+}
+
+fn invalid_provider_event() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_provider_event",
+        "provider webhook event is invalid",
+    )
+}
+
+fn map_provider_event_repository_error(error: RepositoryError) -> ApiError {
+    match error {
+        RepositoryError::ProviderEventConflict => ApiError::new(
+            StatusCode::CONFLICT,
+            "provider_event_conflict",
+            "provider webhook conflicts with an existing event",
+        ),
+        RepositoryError::InvalidInput(_) => invalid_provider_event(),
+        error => ApiError::from(error),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -970,6 +1119,8 @@ impl From<ProviderError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
     use rvoip_amazon_connect::{
@@ -978,9 +1129,79 @@ mod tests {
     use rvoip_core::{start_media_graph, CodecInfo, MediaFrame};
     use tower::ServiceExt;
 
+    use crate::providers::{OriginateCommand, ProviderCall, ProviderCapabilities, ProviderControl};
     use crate::screen_pop_evidence::ScreenPopStage;
 
     struct UnusedStarter;
+
+    struct VerifiedTestProvider {
+        verifications: Arc<AtomicUsize>,
+    }
+
+    impl VerifiedTestProvider {
+        fn new(verifications: Arc<AtomicUsize>) -> Self {
+            Self { verifications }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderControl for VerifiedTestProvider {
+        fn name(&self) -> &'static str {
+            "test-provider"
+        }
+
+        fn account_key(&self) -> ProviderAccountKey {
+            ProviderAccountKey::parse("test-provider:account-a").unwrap()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn originate(
+            &self,
+            _command: OriginateCommand,
+        ) -> Result<ProviderCall, ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+
+        async fn transfer(&self, _call_id: &str, _target: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+
+        async fn hangup(&self, _call_id: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+
+        async fn send_dtmf(&self, _call_id: &str, _digits: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+
+        fn verify_webhook(
+            &self,
+            request: &WebhookRequest,
+        ) -> Result<NormalizedProviderEvent, ProviderError> {
+            self.verifications.fetch_add(1, Ordering::SeqCst);
+            if !request.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-test-signature") && value == "valid"
+            }) {
+                return Err(ProviderError::InvalidSignature);
+            }
+            serde_json::from_slice(&request.body).map_err(ProviderError::Json)
+        }
+    }
+
+    struct UnavailableProviderEventPersistence;
+
+    #[async_trait]
+    impl ProviderEventPersistence for UnavailableProviderEventPersistence {
+        async fn ingest_provider_event(
+            &self,
+            _request: ProviderEventInput,
+        ) -> Result<ProviderEventOutcome, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+    }
 
     #[async_trait]
     impl ConnectContactStarter for UnusedStarter {
@@ -1140,6 +1361,91 @@ persistence:
         )
         .await
         .expect("diagnostics API state builds")
+    }
+
+    async fn sqlite_test_state(database_url: &str) -> ApiState {
+        let yaml = format!(
+            r#"
+aws:
+  region: us-west-2
+  instance_id: instance-test
+  contact_flow_id: flow-test
+sip:
+  bind_ip: 127.0.0.1
+  port: {}
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+api:
+  enabled: true
+  bearer_token: diagnostics-secret
+  control_hmac_key: "0123456789abcdef0123456789abcdef"
+runtime:
+  max_concurrent_calls: 8
+broadcast:
+  token_secret: test-broadcast-secret
+persistence:
+  backend: sqlite
+  database_url: "{database_url}"
+  deployment_id: provider-webhook-restart-test
+"#,
+            available_udp_port()
+        );
+        let config: Config = serde_yaml::from_str(&yaml).expect("SQLite API config parses");
+        config.validate().expect("SQLite API config is valid");
+        let server_config = config
+            .into_server_config_with_starter(Arc::new(UnusedStarter))
+            .await
+            .expect("SQLite API server config builds");
+        let server = ConnectScreenPopServer::build(server_config)
+            .await
+            .expect("SQLite API SIP server builds");
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        ApiState::from_config(
+            &config,
+            server,
+            recorder.handle(),
+            config.tenant_names().unwrap(),
+            None,
+        )
+        .await
+        .expect("SQLite API state builds")
+    }
+
+    fn install_verified_test_provider(state: &ApiState, verifications: Arc<AtomicUsize>) {
+        state
+            .providers
+            .insert(Arc::new(VerifiedTestProvider::new(verifications)));
+    }
+
+    fn verified_event(event_id: &str, provider_call_id: Option<&str>) -> NormalizedProviderEvent {
+        NormalizedProviderEvent {
+            provider: "test-provider".into(),
+            event_id: event_id.into(),
+            provider_call_id: provider_call_id.map(str::to_owned),
+            event_type: "call.answered".into(),
+            occurred_at: Some("2026-07-12T12:34:56.789Z".into()),
+            raw: json!({
+                "data": {
+                    "call_control_id": provider_call_id,
+                    "event": "answered"
+                }
+            }),
+        }
+    }
+
+    async fn post_verified_webhook(app: &Router, event: &NormalizedProviderEvent) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/test-provider/webhooks")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("x-test-signature", "valid")
+                    .body(Body::from(serde_json::to_vec(event).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .expect("verified webhook request completes")
     }
 
     async fn legacy_multi_tenant_state() -> ApiState {
@@ -1687,6 +1993,151 @@ persistence:
         )
         .await;
         assert_eq!(webhook.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn provider_event_canonicalization_is_stable_and_redacted() {
+        let received_at = DateTime::parse_from_rfc3339("2026-07-12T12:35:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let account = ProviderAccountKey::parse("test-provider:account-a").unwrap();
+        let mut left = verified_event("event-canonical", Some("call-canonical"));
+        let mut right = left.clone();
+        left.raw = serde_json::from_str(r#"{"z":1,"a":{"y":2,"b":3}}"#).unwrap();
+        right.raw = serde_json::from_str(r#"{"a":{"b":3,"y":2},"z":1}"#).unwrap();
+
+        let left =
+            provider_event_input(account.clone(), "test-provider", &left, received_at).unwrap();
+        let right = provider_event_input(account, "test-provider", &right, received_at).unwrap();
+
+        assert_eq!(left.event_digest, right.event_digest);
+        assert_eq!(left.payload_digest, right.payload_digest);
+        assert_eq!(left.payload, right.payload);
+        assert_eq!(left.received_at, received_at);
+        assert_eq!(
+            left.occurred_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-12T12:34:56.789Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        let debug = format!("{left:?}");
+        assert!(!debug.contains("call-canonical"));
+        assert!(!debug.contains("event-canonical"));
+        assert!(!debug.contains("\"z\""));
+    }
+
+    #[tokio::test]
+    async fn verified_provider_webhook_is_accepted_deduplicated_and_conflict_checked() {
+        let state = call_api_test_state(8).await;
+        install_verified_test_provider(&state, Arc::new(AtomicUsize::new(0)));
+        let app = router(state);
+        let event = verified_event("event-1", Some("call-1"));
+
+        let accepted = post_verified_webhook(&app, &event).await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response_json(accepted).await,
+            serde_json::to_value(&event).unwrap()
+        );
+
+        let duplicate = post_verified_webhook(&app, &event).await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(duplicate).await,
+            serde_json::to_value(&event).unwrap()
+        );
+
+        let mut conflicting = event;
+        conflicting.raw["sensitive"] = Value::String("must-not-leak".into());
+        let conflict = post_verified_webhook(&app, &conflicting).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = response_json(conflict).await;
+        assert_eq!(conflict_body["error"]["code"], "provider_event_conflict");
+        assert!(!conflict_body.to_string().contains("must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn provider_webhook_rejects_missing_and_invalid_provider_call_ids() {
+        let state = call_api_test_state(8).await;
+        install_verified_test_provider(&state, Arc::new(AtomicUsize::new(0)));
+        let app = router(state);
+
+        for (event_id, provider_call_id) in [
+            ("missing-call", None),
+            ("empty-call", Some("")),
+            ("blank-call", Some("   ")),
+            ("control-call", Some("call\r\ninjected")),
+        ] {
+            let response =
+                post_verified_webhook(&app, &verified_event(event_id, provider_call_id)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{event_id}");
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "invalid_provider_event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_webhook_fails_closed_without_or_during_persistence() {
+        let verifications = Arc::new(AtomicUsize::new(0));
+        let state = diagnostics_test_state().await;
+        install_verified_test_provider(&state, Arc::clone(&verifications));
+        let unavailable = post_verified_webhook(
+            &router(state),
+            &verified_event("no-persistence", Some("call-no-persistence")),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(verifications.load(Ordering::SeqCst), 1);
+
+        let mut state = call_api_test_state(8).await;
+        install_verified_test_provider(&state, Arc::clone(&verifications));
+        state.provider_events = Some(Arc::new(UnavailableProviderEventPersistence));
+        let outage = post_verified_webhook(
+            &router(state),
+            &verified_event("store-outage", Some("call-store-outage")),
+        )
+        .await;
+        assert_eq!(outage.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(verifications.load(Ordering::SeqCst), 2);
+        let body = response_json(outage).await;
+        assert_eq!(body["error"]["code"], "call_service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn provider_webhook_deduplication_survives_sqlite_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "bridgefu-provider-webhook-restart-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let database_url = format!("sqlite://{}", path.display());
+        let event = verified_event("restart-event", Some("restart-call"));
+
+        let first_state = sqlite_test_state(&database_url).await;
+        install_verified_test_provider(&first_state, Arc::new(AtomicUsize::new(0)));
+        let first_app = router(first_state);
+        let accepted = post_verified_webhook(&first_app, &event).await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        drop(first_app);
+        tokio::task::yield_now().await;
+
+        let second_state = sqlite_test_state(&database_url).await;
+        install_verified_test_provider(&second_state, Arc::new(AtomicUsize::new(0)));
+        let second_app = router(second_state);
+        let duplicate = post_verified_webhook(&second_app, &event).await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(duplicate).await,
+            serde_json::to_value(&event).unwrap()
+        );
+        drop(second_app);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     }
 
     #[tokio::test]
