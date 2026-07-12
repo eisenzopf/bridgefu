@@ -858,10 +858,19 @@ not hide an earlier adapter side effect behind a nominally staged API.
    validated RFC 4733 duration and inter-digit spacing.
    - [ ] 2a — Add `SipOriginateContext`, ordered bounded initial headers,
      typed/redacted credentials, wrong-context rejection, and packet-silence
-     tests for every validation failure.
+     tests for every validation failure. Bound and control-check Digest,
+     Basic, Bearer, and non-nested composite auth before reserving a route;
+     redact every retaining diagnostic container. SIP tracing must be
+     credential/context-safe by default, and folded continuation lines must
+     inherit the preceding header's keep/redact/drop decision. Verbatim trace
+     output requires an explicit development opt-in.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
+     Initial and authenticated-retry INVITEs must use one defense-in-depth
+     validated append path so allowed duplicate headers preserve exact order
+     and multiplicity while singleton duplicates fail. Validate generated
+     auth values, including AKA-provider output, before wire serialization.
    - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
      both directions, with validated internal label/message-ID headers and
      explicit reliability capability errors.
@@ -870,7 +879,9 @@ not hide an earlier adapter side effect behind a nominally staged API.
      inter-digit pacing.
    - [ ] 2e — Run SIP library/dialog/adapter, packet, lifecycle, strict lint,
      documentation, and real localhost interoperability qualification; obtain
-     an independent P0/P1 audit before item 2 is complete.
+     an independent P0/P1 audit before item 2 is complete. Property/fuzz
+     evidence must show that no accepted header or auth value can serialize an
+     additional SIP header line.
 3. [ ] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
    WHEP, while retaining the corresponding authenticated server roles. Local
    SDP offer construction is not an outbound client. Pin WHIP to
