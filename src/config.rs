@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +19,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use zeroize::Zeroize;
 
-use bridgefu::call_engine::TenantId;
-use bridgefu::call_service::{MAX_CONTROL_KEY_BYTES, MIN_CONTROL_KEY_BYTES};
+use bridgefu::call_engine::{TenantId, WorkerId};
+use bridgefu::call_service::{
+    CallRepositoryBackendConfig, MAX_CONTROL_KEY_BYTES, MIN_CONTROL_KEY_BYTES,
+};
 
 use rvoip_amazon_connect::{
     request_uri_user, to_uri_user, AttributeMapping, AwsConnectStarter, ConnectConfig,
@@ -55,6 +58,10 @@ pub struct Config {
     pub tenants: BTreeMap<String, TenantCfg>,
     #[serde(default)]
     pub runtime: RuntimeCfg,
+    /// Transactional call-state persistence. SQLite is the standalone default;
+    /// memory requires an explicit development/test opt-in.
+    #[serde(default)]
+    pub persistence: PersistenceCfg,
     #[serde(default)]
     pub api: ApiCfg,
     #[serde(default)]
@@ -91,6 +98,37 @@ pub struct RuntimeCfg {
     pub setup_timeout_secs: u64,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_secs: u64,
+}
+
+/// Transactional call-state repository configuration.
+#[derive(Debug, Deserialize)]
+pub struct PersistenceCfg {
+    /// `sqlite` (default), `postgres`, or explicitly ephemeral `memory`.
+    #[serde(default)]
+    pub backend: PersistenceBackend,
+    /// Secret-bearing SQL connection URL. SQLite defaults to a local file.
+    #[serde(default)]
+    pub database_url: Option<SecretRef>,
+    /// Stable non-nil worker UUID. Required for PostgreSQL clusters.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Required acknowledgement for the non-durable memory backend.
+    #[serde(default)]
+    pub allow_ephemeral_memory: bool,
+}
+
+/// Supported transactional repository implementations.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistenceBackend {
+    /// Durable local storage for an all-in-one process.
+    #[default]
+    Sqlite,
+    /// Durable clustered storage.
+    #[serde(alias = "postgresql")]
+    Postgres,
+    /// Explicitly ephemeral development/test storage.
+    Memory,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +281,7 @@ impl Config {
                 "runtime.max_concurrent_calls must be greater than zero"
             ));
         }
+        self.validate_persistence()?;
         if !matches!(
             self.broadcast.default_transport.as_str(),
             "moqt" | "uctp-quic"
@@ -279,6 +318,101 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    fn validate_persistence(&self) -> Result<()> {
+        if let Some(worker_id) = self.persistence.worker_id.as_deref() {
+            WorkerId::from_str(worker_id)
+                .map_err(|_| anyhow!("persistence.worker_id must be a non-nil UUID"))?;
+        }
+        match self.persistence.backend {
+            PersistenceBackend::Memory => {
+                if !self.persistence.allow_ephemeral_memory {
+                    return Err(anyhow!(
+                        "persistence.backend memory is dev/test-only and requires allow_ephemeral_memory: true"
+                    ));
+                }
+                if self.persistence.database_url.is_some() {
+                    return Err(anyhow!(
+                        "persistence.database_url is not valid for the memory backend"
+                    ));
+                }
+            }
+            PersistenceBackend::Sqlite => {
+                if self.persistence.allow_ephemeral_memory {
+                    return Err(anyhow!(
+                        "persistence.allow_ephemeral_memory is valid only with the memory backend"
+                    ));
+                }
+            }
+            PersistenceBackend::Postgres => {
+                if self.persistence.database_url.is_none() {
+                    return Err(anyhow!(
+                        "persistence.database_url is required for the postgres backend"
+                    ));
+                }
+                if self.persistence.worker_id.is_none() {
+                    return Err(anyhow!(
+                        "persistence.worker_id is required for the postgres backend"
+                    ));
+                }
+                if self.persistence.allow_ephemeral_memory {
+                    return Err(anyhow!(
+                        "persistence.allow_ephemeral_memory is valid only with the memory backend"
+                    ));
+                }
+            }
+        }
+        if let Some(database_url) = &self.persistence.database_url {
+            let mut resolved = database_url
+                .resolve()
+                .map_err(|error| anyhow!("resolving persistence.database_url: {error}"))?;
+            let empty = resolved.is_empty();
+            resolved.zeroize();
+            if empty {
+                return Err(anyhow!("persistence.database_url must not be empty"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the repository choice only when transactional startup needs it.
+    /// The returned SQL URL has a redacted `Debug` implementation in the shared
+    /// runtime config and is zeroized after connection.
+    pub fn call_repository_backend(&self) -> Result<CallRepositoryBackendConfig> {
+        match self.persistence.backend {
+            PersistenceBackend::Memory => Ok(CallRepositoryBackendConfig::Memory),
+            PersistenceBackend::Sqlite => Ok(CallRepositoryBackendConfig::Sqlite {
+                database_url: self
+                    .persistence
+                    .database_url
+                    .as_ref()
+                    .map(SecretRef::resolve)
+                    .transpose()
+                    .map_err(|error| anyhow!("resolving persistence.database_url: {error}"))?
+                    .unwrap_or_else(default_sqlite_database_url),
+            }),
+            PersistenceBackend::Postgres => Ok(CallRepositoryBackendConfig::Postgres {
+                database_url: self
+                    .persistence
+                    .database_url
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("persistence.database_url is required"))?
+                    .resolve()
+                    .map_err(|error| anyhow!("resolving persistence.database_url: {error}"))?,
+            }),
+        }
+    }
+
+    /// Stable worker ID used for fencing and reservation accounting.
+    pub fn call_worker_id(&self) -> Result<WorkerId> {
+        let value = self
+            .persistence
+            .worker_id
+            .as_deref()
+            .unwrap_or(DEFAULT_STANDALONE_WORKER_ID);
+        WorkerId::from_str(value)
+            .map_err(|_| anyhow!("persistence.worker_id must be a non-nil UUID"))
     }
 
     /// Resolve the effective routing table: `(user part → route, effective
@@ -507,6 +641,7 @@ fn redact_secrets(value: &mut serde_yaml::Value) {
                             | "token_secret"
                             | "bearer_token"
                             | "control_hmac_key"
+                            | "database_url"
                             | "password"
                     )
                 });
@@ -528,6 +663,9 @@ fn redact_secrets(value: &mut serde_yaml::Value) {
 
 /// Tenant name used for the legacy single-tenant schema.
 pub const LEGACY_TENANT: &str = "default";
+/// One stable identity for a single standalone SQLite repository. Clustered
+/// PostgreSQL deployments must configure a distinct worker ID explicitly.
+const DEFAULT_STANDALONE_WORKER_ID: &str = "00000000-0000-4000-8000-000000000001";
 
 /// B.4 match order: R-URI user part, else `To:` user part, else the default
 /// tenant, else `None` (caller rejects 404).
@@ -630,6 +768,9 @@ fn default_setup_timeout() -> u64 {
 fn default_drain_timeout() -> u64 {
     30
 }
+fn default_sqlite_database_url() -> String {
+    "sqlite://bridgefu.db".into()
+}
 fn default_true() -> bool {
     true
 }
@@ -688,6 +829,16 @@ impl Default for RuntimeCfg {
             max_concurrent_calls: default_max_calls(),
             setup_timeout_secs: default_setup_timeout(),
             drain_timeout_secs: default_drain_timeout(),
+        }
+    }
+}
+impl Default for PersistenceCfg {
+    fn default() -> Self {
+        Self {
+            backend: PersistenceBackend::Sqlite,
+            database_url: None,
+            worker_id: None,
+            allow_ephemeral_memory: false,
         }
     }
 }
@@ -894,14 +1045,76 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
     #[test]
     fn effective_config_redacts_control_hmac_key() {
         let mut value: serde_yaml::Value = serde_yaml::from_str(
-            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\n",
+            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\npersistence:\n  database_url: postgres://private-database\n",
         )
         .unwrap();
         redact_secrets(&mut value);
         let rendered = serde_yaml::to_string(&value).unwrap();
         assert!(!rendered.contains("bearer-private"));
         assert!(!rendered.contains("hmac-private"));
-        assert_eq!(rendered.matches("[redacted]").count(), 2);
+        assert!(!rendered.contains("private-database"));
+        assert_eq!(rendered.matches("[redacted]").count(), 3);
+    }
+
+    #[test]
+    fn persistence_defaults_to_durable_sqlite_with_stable_worker() {
+        let cfg = parse(LEGACY);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.persistence.backend, PersistenceBackend::Sqlite);
+        assert_eq!(
+            cfg.call_worker_id().unwrap().to_string(),
+            DEFAULT_STANDALONE_WORKER_ID
+        );
+        let backend = cfg.call_repository_backend().unwrap();
+        assert!(matches!(
+            &backend,
+            CallRepositoryBackendConfig::Sqlite { .. }
+        ));
+        assert!(!format!("{backend:?}").contains("bridgefu.db"));
+    }
+
+    #[test]
+    fn ephemeral_memory_requires_explicit_dev_test_acknowledgement() {
+        let rejected = parse(&format!("{LEGACY}\npersistence:\n  backend: memory\n"));
+        let error = rejected.validate().unwrap_err().to_string();
+        assert!(error.contains("dev/test-only"));
+
+        let accepted = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: memory\n  allow_ephemeral_memory: true\n"
+        ));
+        accepted.validate().unwrap();
+        assert!(matches!(
+            accepted.call_repository_backend().unwrap(),
+            CallRepositoryBackendConfig::Memory
+        ));
+    }
+
+    #[test]
+    fn postgres_requires_secret_url_and_explicit_valid_worker() {
+        let missing = parse(&format!("{LEGACY}\npersistence:\n  backend: postgres\n"));
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("database_url is required"));
+
+        for invalid in ["not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            let cfg = parse(&format!(
+                "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: '{invalid}'\n"
+            ));
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("non-nil UUID"), "unexpected error: {error}");
+            assert!(!error.contains("private.example"));
+        }
+
+        let valid = parse(&format!(
+            "{LEGACY}\npersistence:\n  backend: postgres\n  database_url: postgres://private.example/bridgefu\n  worker_id: 00000000-0000-4000-8000-000000000002\n"
+        ));
+        valid.validate().unwrap();
+        let backend = valid.call_repository_backend().unwrap();
+        let debug = format!("{backend:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("private.example"));
     }
 
     #[test]

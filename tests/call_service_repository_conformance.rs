@@ -242,6 +242,7 @@ struct ConformanceEvidence {
     owner: TenantId,
     worker: WorkerLease,
     call_id: CallId,
+    original_create: StoredServiceCall,
     control_leg_id: LegId,
     plan: CallExecutionPlan,
     command_request: ServiceCommandTransaction,
@@ -558,6 +559,7 @@ where
         owner,
         worker,
         call_id: active.command.call.aggregate.id(),
+        original_create: service_call,
         control_leg_id: inbound_leg,
         plan,
         command_request,
@@ -583,6 +585,32 @@ async fn assert_restart_replays<R>(repository: &R, evidence: &ConformanceEvidenc
 where
     R: CallServiceRepository + Sync,
 {
+    // The attachment was consumed and its two-minute token has expired by this
+    // observation. The retained 24-hour create receipt must still return the
+    // immutable original descriptors; this read must not purge or rewrite it.
+    assert_eq!(
+        repository
+            .load_create_replay(
+                &evidence.owner,
+                IdempotencyKeyDigest::new(digest(10)),
+                RequestDigest::new(digest(11)),
+                at(123),
+            )
+            .await
+            .unwrap(),
+        Some(evidence.original_create.clone())
+    );
+    assert_eq!(
+        repository
+            .load_create_replay(
+                &evidence.owner,
+                IdempotencyKeyDigest::new(digest(10)),
+                RequestDigest::new(digest(99)),
+                at(123),
+            )
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
     assert_eq!(
         repository
             .load_service_call(&evidence.owner, evidence.call_id)
@@ -1086,6 +1114,29 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
     let first = SqliteRepository::connect(&url).await.unwrap();
     let evidence = assert_service_conformance(&first).await;
     let second = SqliteRepository::connect(&url).await.unwrap();
+    let replay_epoch_before: i64 =
+        sqlx::query_scalar("SELECT epoch FROM repository_metadata WHERE singleton = 1")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        second
+            .load_create_replay(
+                &evidence.owner,
+                IdempotencyKeyDigest::new(digest(10)),
+                RequestDigest::new(digest(11)),
+                at(123),
+            )
+            .await
+            .unwrap(),
+        Some(evidence.original_create.clone())
+    );
+    let replay_epoch_after: i64 =
+        sqlx::query_scalar("SELECT epoch FROM repository_metadata WHERE singleton = 1")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+    assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
@@ -1093,6 +1144,14 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
     let effect_id = view.effect.effect_id;
     assert_reused_key_restart(&third, request, view).await;
 
+    assert_sqlite_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "attachments",
+        &format!("call_id = '{}'", evidence.call_id),
+    )
+    .await;
     assert_sqlite_deletion_fails_closed(
         &third,
         &evidence.owner,
@@ -1250,6 +1309,29 @@ async fn postgres_service_repository_conformance_restart_and_races() {
     let first = PostgresRepository::connect(&scoped).await.unwrap();
     let evidence = assert_service_conformance(&first).await;
     let second = PostgresRepository::connect(&scoped).await.unwrap();
+    let replay_epoch_before: i64 =
+        sqlx::query_scalar("SELECT epoch FROM repository_metadata WHERE singleton = TRUE")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        second
+            .load_create_replay(
+                &evidence.owner,
+                IdempotencyKeyDigest::new(digest(10)),
+                RequestDigest::new(digest(11)),
+                at(123),
+            )
+            .await
+            .unwrap(),
+        Some(evidence.original_create.clone())
+    );
+    let replay_epoch_after: i64 =
+        sqlx::query_scalar("SELECT epoch FROM repository_metadata WHERE singleton = TRUE")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+    assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
@@ -1257,6 +1339,14 @@ async fn postgres_service_repository_conformance_restart_and_races() {
     let effect_id = view.effect.effect_id;
     assert_reused_key_restart(&third, request, view).await;
 
+    assert_postgres_deletion_fails_closed(
+        &third,
+        &evidence.owner,
+        evidence.call_id,
+        "attachments",
+        &format!("call_id = '{}'::uuid", evidence.call_id),
+    )
+    .await;
     assert_postgres_deletion_fails_closed(
         &third,
         &evidence.owner,

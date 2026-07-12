@@ -36,11 +36,47 @@
       },
       "additionalProperties": false
     },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "backend": { "enum": ["sqlite", "postgres", "postgresql", "memory"] },
+        "database_url": { "type": "string", "minLength": 1 },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid",
+          "not": { "const": "00000000-0000-0000-0000-000000000000" }
+        },
+        "allow_ephemeral_memory": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "backend": { "const": "memory" } },
+            "required": ["backend"]
+          },
+          "then": {
+            "required": ["allow_ephemeral_memory"],
+            "properties": { "allow_ephemeral_memory": { "const": true } },
+            "not": { "required": ["database_url"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "backend": { "enum": ["postgres", "postgresql"] } },
+            "required": ["backend"]
+          },
+          "then": { "required": ["database_url", "worker_id"] }
+        }
+      ],
+      "additionalProperties": false
+    },
     "api": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
-        "bearer_token": { "type": "string" }
+        "bearer_token": { "type": "string" },
+        "control_hmac_key": { "type": "string" },
+        "static_tenant": { "type": "string" }
       },
       "additionalProperties": false
     },

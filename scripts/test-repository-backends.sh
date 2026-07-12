@@ -38,3 +38,4 @@ export BRIDGEFU_TEST_POSTGRES_URL="postgres://bridgefu:bridgefu-test-only@127.0.
 
 cargo test --locked --test repository_conformance -- --nocapture --test-threads=1
 cargo test --locked --test call_service_repository_conformance -- --nocapture --test-threads=1
+cargo test --locked --test call_service_runtime -- --nocapture --test-threads=1

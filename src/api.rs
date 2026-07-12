@@ -2,7 +2,6 @@
 
 mod calls;
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,12 +36,11 @@ use bridgefu::api_principal::{
     ApiBearerAuthenticator, ApiPrincipal, ApiPrincipalError, ConfiguredApiKeyValidator,
     MAX_API_BEARER_BYTES,
 };
-use bridgefu::call_engine::{CallRepository, RegisterWorker, RepositoryError, TenantId, WorkerId};
+use bridgefu::call_engine::{RepositoryError, TenantId};
 use bridgefu::call_service::{
-    CallService, CallServiceCrypto, CallServiceError, CallTimeoutPolicy, ControlCryptoError,
-    FixedWorkerPlacement, SamePrincipalAttachmentResolver, SystemCallServiceClock,
+    build_call_service_runtime, CallServiceError, CallServiceRuntime, CallServiceRuntimeConfig,
+    CallTimeoutPolicy, ControlCryptoError, SamePrincipalAttachmentResolver, SystemCallServiceClock,
 };
-use bridgefu::persistence::MemoryRepository;
 
 use crate::config::Config;
 use crate::context::ContextPolicy;
@@ -63,7 +61,7 @@ pub struct ApiState {
     tenants: Vec<String>,
     bearer_authenticator: Option<ApiBearerAuthenticator>,
     legacy_bearer_token: Option<Arc<LegacyBearerToken>>,
-    call_service: Option<Arc<CallService>>,
+    call_runtime: Option<Arc<CallServiceRuntime>>,
     token_secret: Arc<Vec<u8>>,
     token_ttl: Duration,
     max_broadcasts: usize,
@@ -149,31 +147,35 @@ impl ApiState {
             .map(LegacyBearerToken)
             .map(Arc::new);
 
-        let call_service = if let (Some(_), Some(control_key)) =
-            (&bearer_authenticator, &config.api.control_hmac_key)
-        {
-            let repository = Arc::new(MemoryRepository::new());
-            let worker = repository
-                .register_worker(RegisterWorker {
-                    worker_id: WorkerId::new(),
+        let call_runtime = if let (true, Some(_), Some(control_key)) = (
+            config.api.enabled,
+            bearer_authenticator.as_ref(),
+            config.api.control_hmac_key.as_ref(),
+        ) {
+            let runtime = build_call_service_runtime(
+                CallServiceRuntimeConfig {
+                    backend: config.call_repository_backend()?,
+                    worker_id: config.call_worker_id()?,
                     max_calls: config.runtime.max_concurrent_calls,
-                    capabilities: BTreeSet::new(),
-                    at: Utc::now(),
-                })
-                .await?;
-            let crypto = CallServiceCrypto::new(control_key.resolve()?.into_bytes())?;
-            Some(Arc::new(CallService::new(
-                repository,
-                Arc::new(FixedWorkerPlacement::new(worker.lease)),
-                Arc::new(SamePrincipalAttachmentResolver),
-                crypto,
-                Arc::new(SystemCallServiceClock),
-                CallTimeoutPolicy {
-                    setup: Duration::from_secs(config.runtime.setup_timeout_secs),
-                    transfer: Duration::from_secs(30),
-                    ending: Duration::from_secs(config.runtime.drain_timeout_secs.max(1)),
+                    control_key: control_key.resolve()?.into_bytes(),
+                    timeouts: CallTimeoutPolicy {
+                        setup: Duration::from_secs(config.runtime.setup_timeout_secs),
+                        transfer: Duration::from_secs(30),
+                        ending: Duration::from_secs(config.runtime.drain_timeout_secs.max(1)),
+                    },
                 },
-            )))
+                Arc::new(SamePrincipalAttachmentResolver),
+                Arc::new(SystemCallServiceClock),
+            )
+            .await?;
+            tracing::info!(
+                backend = runtime.backend().as_str(),
+                worker_id = %runtime.worker().lease.worker_id,
+                worker_fence = runtime.worker().lease.fence.as_i64(),
+                reserved_calls = runtime.worker().reserved_calls,
+                "transactional call service ready"
+            );
+            Some(Arc::new(runtime))
         } else {
             if config.api.enabled {
                 tracing::warn!(
@@ -195,7 +197,7 @@ impl ApiState {
             tenants,
             bearer_authenticator,
             legacy_bearer_token,
-            call_service,
+            call_runtime,
             token_secret: Arc::new(token_secret),
             token_ttl: Duration::from_secs(config.broadcast.token_ttl_secs),
             max_broadcasts: config.broadcast.max_active,
@@ -651,7 +653,8 @@ async fn diagnostics(
         "version": env!("CARGO_PKG_VERSION"),
         "tenant_id": principal.tenant(),
         "active_amazon_calls": state.server.active_call_ids(),
-        "transactional_call_api": state.call_service.is_some(),
+        "transactional_call_api": state.call_runtime.is_some(),
+        "call_repository": state.call_runtime.as_ref().map(|runtime| runtime.backend().as_str()),
         "providers": state.providers.names(),
         "broadcasts": broadcasts,
         "moqt_target_draft": rvoip_moq::TARGET_MOQT_DRAFT,
@@ -987,6 +990,79 @@ mod tests {
         test_state(false, 100, false).await
     }
 
+    #[tokio::test]
+    async fn persistence_is_opened_only_for_enabled_complete_transactional_auth() {
+        for (api, should_open) in [
+            (
+                "  enabled: true\n  control_hmac_key: \"0123456789abcdef0123456789abcdef\"",
+                false,
+            ),
+            (
+                "  enabled: false\n  bearer_token: diagnostics-secret\n  control_hmac_key: \"0123456789abcdef0123456789abcdef\"",
+                false,
+            ),
+            (
+                "  enabled: true\n  bearer_token: diagnostics-secret\n  control_hmac_key: \"0123456789abcdef0123456789abcdef\"",
+                true,
+            ),
+        ] {
+            let unavailable_root = std::env::temp_dir()
+                .join(format!("bridgefu-no-api-db-{}", Uuid::new_v4()));
+            let private_url = format!(
+                "sqlite://{}/missing/bridgefu.sqlite",
+                unavailable_root.display()
+            );
+            let yaml = format!(
+                r#"
+aws:
+  region: us-west-2
+  instance_id: instance-test
+  contact_flow_id: flow-test
+sip:
+  bind_ip: 127.0.0.1
+  port: {}
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+api:
+{api}
+persistence:
+  backend: sqlite
+  database_url: "{private_url}"
+broadcast:
+  token_secret: test-broadcast-secret
+"#,
+                available_udp_port()
+            );
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            config.validate().unwrap();
+            let server_config = config
+                .into_server_config_with_starter(Arc::new(UnusedStarter))
+                .await
+                .unwrap();
+            let server = ConnectScreenPopServer::build(server_config).await.unwrap();
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let result = ApiState::from_config(
+                &config,
+                server,
+                recorder.handle(),
+                config.tenant_names().unwrap(),
+                None,
+            )
+            .await;
+            if should_open {
+                let error = result.err().expect("requested SQLite startup fails closed");
+                assert_eq!(
+                    error.to_string(),
+                    "transactional call repository unavailable"
+                );
+                assert!(!error.to_string().contains(&private_url));
+            } else {
+                assert!(result.unwrap().call_runtime.is_none());
+            }
+            assert!(!unavailable_root.exists());
+        }
+    }
+
     async fn test_state(call_control: bool, max_calls: usize, bearer_enabled: bool) -> ApiState {
         let control = if call_control {
             "  control_hmac_key: \"0123456789abcdef0123456789abcdef\"\n"
@@ -1015,6 +1091,9 @@ api:
   max_concurrent_calls: {max_calls}
 broadcast:
   token_secret: test-broadcast-secret
+persistence:
+  backend: memory
+  allow_ephemeral_memory: true
 "#,
             available_udp_port()
         );
@@ -1074,6 +1153,9 @@ api:
   max_concurrent_calls: 8
 broadcast:
   token_secret: test-broadcast-secret
+persistence:
+  backend: memory
+  allow_ephemeral_memory: true
 "#,
             available_udp_port()
         );

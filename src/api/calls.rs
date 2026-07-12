@@ -120,13 +120,17 @@ fn call_context(
     state: &ApiState,
     principal: Option<Extension<ApiPrincipal>>,
 ) -> Result<(Arc<CallService>, ApiPrincipal), ApiError> {
-    let service = state.call_service.clone().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "call_service_unavailable",
-            "transactional call service is not configured",
-        )
-    })?;
+    let service = state
+        .call_runtime
+        .as_ref()
+        .map(|runtime| runtime.service())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "call_service_unavailable",
+                "transactional call service is not configured",
+            )
+        })?;
     let principal = principal.map(|value| value.0).ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,

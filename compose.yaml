@@ -12,10 +12,12 @@ services:
       - /tmp:size=64m,mode=1777
     volumes:
       - ./config/bridgefu.example.yaml:/etc/bridgefu/bridgefu.yaml:ro
+      - bridgefu-data:/var/lib/bridgefu
     environment:
       BRIDGEFU__SIP__ADVERTISED_IP: "127.0.0.1"
       BRIDGEFU__SIP__MEDIA_PUBLIC_IP: "127.0.0.1"
       BRIDGEFU_API_TOKEN: change-me
+      BRIDGEFU_CONTROL_HMAC_KEY: change-this-32-byte-control-key-now
       BRIDGEFU_BROADCAST_TOKEN_SECRET: change-me-too
     ports:
       - "5060:5060/udp"
@@ -32,3 +34,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  bridgefu-data:

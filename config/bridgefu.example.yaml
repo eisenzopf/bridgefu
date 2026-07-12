@@ -69,6 +69,16 @@ runtime:
   setup_timeout_secs: 30
   drain_timeout_secs: 30
 
+# Transactional call state is durable by default. The local path is suitable
+# for an all-in-one process; mount its parent directory in a container.
+persistence:
+  backend: sqlite             # sqlite | postgres | memory (dev/test only)
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  # PostgreSQL clusters require a distinct, stable non-nil UUID per worker.
+  # worker_id: 00000000-0000-4000-8000-000000000001
+  # Memory never activates implicitly:
+  # allow_ephemeral_memory: false
+
 api:
   enabled: true
   bearer_token: env:BRIDGEFU_API_TOKEN

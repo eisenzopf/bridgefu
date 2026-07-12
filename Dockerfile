@@ -17,7 +17,8 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 65532 bridgefu \
-    && useradd --system --uid 65532 --gid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin bridgefu
+    && useradd --system --uid 65532 --gid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin bridgefu \
+    && install -d -o 65532 -g 65532 -m 0750 /var/lib/bridgefu
 COPY --from=builder /out/bridgefu /usr/local/bin/bridgefu
 
 USER 65532:65532

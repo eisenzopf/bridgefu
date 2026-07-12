@@ -577,6 +577,39 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
+        let mut referenced_attachment_digests = HashSet::new();
+        let mut referenced_attachment_ids = HashSet::new();
+        for result in state.command_results.values() {
+            for issue in &result.command.attachments {
+                let row = state
+                    .attachments
+                    .get(&issue.token_digest)
+                    .ok_or(RepositoryError::Unavailable)?;
+                if !referenced_attachment_digests.insert(issue.token_digest)
+                    || !referenced_attachment_ids.insert(issue.attachment_id)
+                    || row.attachment_id != issue.attachment_id
+                    || row.tenant_id != result.command.tenant_id
+                    || row.call_id != result.command.call_id
+                    || row.leg_id != issue.leg_id
+                    || row.binding_generation != issue.binding_generation
+                    || row.transport != issue.transport
+                    || row.expected_principal != issue.expected_principal
+                    || row.worker != result.command.worker
+                    || row.expires_at != issue.expires_at
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+        }
+        if referenced_attachment_digests.len() != state.attachments.len()
+            || referenced_attachment_ids.len() != state.attachment_ids.len()
+            || state
+                .attachments
+                .keys()
+                .any(|digest| !referenced_attachment_digests.contains(digest))
+        {
+            return Err(RepositoryError::Unavailable);
+        }
         for event in snapshot.provider_events {
             let key = (event.account.clone(), event.event_digest);
             if state.provider_events.insert(key, event).is_some() {

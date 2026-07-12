@@ -150,7 +150,15 @@ are tenant-bound and retained for 24 hours. `POST /v1/calls` accepts exactly two
 typed SIP, WebRTC, WHIP/WHEP, Amazon Connect, or provider-controlled legs.
 Startup validation resolves the control-key reference, verifies its byte
 length without rendering it, and rejects a static tenant that is not present
-in the configured routing table. Attachment-principal resolution and worker
+in the configured routing table. Transactional state uses durable SQLite by
+default (`persistence.backend: sqlite`) and retains one stable standalone
+worker identity across restarts. PostgreSQL requires both a secret-referenced
+`database_url` and a distinct stable `worker_id` per worker. A requested SQL
+backend fails startup on connection, migration, or worker-registration errors;
+it never falls back to memory. The memory backend is dev/test-only and requires
+both `backend: memory` and `allow_ephemeral_memory: true`. Connection URLs and
+control keys are redacted from effective configuration and diagnostics.
+Attachment-principal resolution and worker
 placement share the original setup budget; Bridgefu commits no call or worker
 capacity after that budget or the two-minute attachment window is exhausted.
 Missing API authentication makes every protected route fail closed with `503`;
@@ -293,6 +301,7 @@ in place:
 # as a sibling of this repo.
 cargo build
 export BRIDGEFU_API_TOKEN=dev-api-token
+export BRIDGEFU_CONTROL_HMAC_KEY=change-this-32-byte-control-key-now
 export BRIDGEFU_BROADCAST_TOKEN_SECRET=dev-broadcast-secret
 cargo run -- --config config/bridgefu.example.yaml validate
 

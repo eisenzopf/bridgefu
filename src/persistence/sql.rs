@@ -3571,6 +3571,25 @@ macro_rules! impl_call_service_repository {
     ($repository:ty) => {
         #[async_trait]
         impl CallServiceRepository for $repository {
+            async fn load_create_replay(
+                &self,
+                tenant_id: &TenantId,
+                key_digest: crate::call_engine::IdempotencyKeyDigest,
+                request_digest: crate::call_engine::RequestDigest,
+                at: DateTime<Utc>,
+            ) -> Result<Option<StoredServiceCall>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_create_replay(&tenant_id, key_digest, request_digest, at)
+                                .await
+                        })
+                    })
+                    .await
+            }
+
             async fn create_with_plan(
                 &self,
                 request: ServiceCreateTransaction,
