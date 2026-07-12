@@ -445,6 +445,11 @@ impl CallServiceRuntime {
         self.supervisor_health.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_supervisor_health_for_test(&self, health: RuntimeSupervisorHealth) {
+        self.supervisor_health.send_replace(health);
+    }
+
     /// Marks this fence draining, cancels supervised background work, and
     /// joins every owned task. Active calls remain pinned for the normal
     /// worker drain path; no task is detached.

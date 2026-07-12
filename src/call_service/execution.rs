@@ -5,7 +5,7 @@
 //! actors all use bounded single-consumer channels whose tasks are owned by
 //! [`CallExecutionSupervisor`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,17 +28,19 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::call_engine::{
-    AttachmentTransport, CallCommand, CallId, ClaimedDeadline, ClaimedOutbox, CommandCommit,
-    CommandId, DeadlineKind, EffectIntent, FailureDetails, LegId, LegState, RepositoryError,
-    RestartClaim, TransferResult,
+    AttachmentTransport, CallCommand, CallId, CallState, ClaimedDeadline, ClaimedOutbox,
+    CommandCommit, CommandId, DeadlineKind, EffectIntent, FailureDetails, LegId, LegState,
+    RepositoryError, RestartClaim, TransferResult,
 };
 
 use super::{
-    BoundConnectionStateCommit, CallExecutionPlan, CallServiceRuntime, ClaimedControlEffect,
-    ControlIntent, EffectResultOutcome, EffectResultReconciliation, InboundAttachmentError,
-    InboundAttachmentRequest, InboundAttachmentResult, ProviderEventReconciliationOutcome,
-    ProviderEventReconciliationTransaction, RuntimeSupervisorHealth, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceEffectPayload, ServiceEffectResult, StoredServiceCall,
+    BoundConnectionStateCommit, CallExecutionPlan, CallServiceError, CallServiceRuntime,
+    ClaimedControlEffect, ControlIntent, EffectResultOutcome, EffectResultReconciliation,
+    InboundAttachmentError, InboundAttachmentRequest, InboundAttachmentResult,
+    MediaActivityGeneration, MediaActivityObservation, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ProviderKind, RuntimeSupervisorHealth,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceEffectPayload, ServiceEffectResult,
+    StoredServiceCall,
 };
 
 const OPERATIONAL_MAILBOX_PER_CALL: usize = 64;
@@ -52,6 +54,7 @@ const WORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WORK_CLAIM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const WORK_BATCH_SIZE: usize = 64;
 const EXTERNAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINAL_RETIRE_QUIET: Duration = Duration::from_secs(1);
 
 /// Installation or lifecycle failure for the call execution owner.
 #[derive(Debug, Error)]
@@ -171,7 +174,6 @@ async fn recover_before_listeners(
 ) -> Result<(), RepositoryError> {
     let worker = runtime.worker().lease;
     let (_, shutdown) = watch::channel(ActorShutdown::Running);
-    let mut recovered = HashSet::new();
     loop {
         let claims = runtime
             .repository()
@@ -181,24 +183,16 @@ async fn recover_before_listeners(
             break;
         }
         for claim in claims {
-            recovered.insert(claim.call.aggregate.id());
             recover_restarted_call(claim, Arc::clone(&runtime), shutdown.clone()).await?;
         }
     }
-    if recovered.is_empty() {
-        return Ok(());
-    }
-
     for _ in 0..10_000 {
         let work = claim_startup_cleanup(Arc::clone(&runtime)).await?;
         if work.is_empty() {
             return Ok(());
         }
         for item in work {
-            let call_id = actor_work_call_id(&item).ok_or(RepositoryError::Unavailable)?;
-            if !recovered.contains(&call_id) {
-                return Err(RepositoryError::Unavailable);
-            }
+            let _ = actor_work_call_id(&item).ok_or(RepositoryError::Unavailable)?;
             let outcome = execute_actor_work(
                 item,
                 Arc::clone(&orchestrator),
@@ -322,6 +316,8 @@ struct ActorBinding {
 
 struct AdmissionOperationResult {
     connection_id: ConnectionId,
+    conversation_id: Option<ConversationId>,
+    session_id: Option<SessionId>,
     result: Result<(), rvoip_core::RvoipError>,
 }
 
@@ -377,17 +373,34 @@ async fn run_supervisor(
     let mut accepting_admission = true;
     let mut accepting_work = true;
     let mut lease_lost = false;
+    let mut stopping = false;
     let mut pending_operational = None;
+    let mut pending_work = VecDeque::new();
 
     loop {
+        if stopping
+            && proof_tasks.is_empty()
+            && work_claims.is_empty()
+            && pending_work.is_empty()
+            && pending_operational.is_none()
+            && operational.is_empty()
+        {
+            let _ = actor_shutdown.send(if lease_lost {
+                ActorShutdown::LeaseLost
+            } else {
+                ActorShutdown::Graceful
+            });
+            break;
+        }
         tokio::select! {
             biased;
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
+                    stopping = true;
+                    accepting_admission = false;
+                    accepting_work = false;
                     admissions.close();
                     work_claims.abort_all();
-                    let _ = actor_shutdown.send(ActorShutdown::Graceful);
-                    break;
                 }
             }
             changed = runtime_health.changed() => {
@@ -411,6 +424,7 @@ async fn run_supervisor(
                     accepting_work = false;
                     admissions.close();
                     work_claims.abort_all();
+                    pending_work.clear();
                     let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
                     while let Ok(admission) = admissions.try_recv() {
                         let _ = admission.reject(RejectReason::ServerError).await;
@@ -420,7 +434,6 @@ async fn run_supervisor(
             changed = drain.changed() => {
                 if changed.is_err() || *drain.borrow() {
                     accepting_admission = false;
-                    accepting_work = false;
                     admissions.close();
                     while let Ok(admission) = admissions.try_recv() {
                         let _ = admission.reject(RejectReason::ServerError).await;
@@ -482,19 +495,7 @@ async fn run_supervisor(
             result = work_claims.join_next(), if !work_claims.is_empty() => {
                 match result {
                     Some(Ok(batch)) => {
-                        for item in batch.items {
-                            route_claimed_work(
-                                item,
-                                &orchestrator,
-                                &runtime,
-                                &mut actor_slots,
-                                &mut connection_owners,
-                                &mut leg_owners,
-                                &mut actors,
-                                drain.clone(),
-                                actor_shutdown_rx.clone(),
-                            ).await;
-                        }
+                        pending_work.extend(batch.items);
                     }
                     Some(Err(error)) => tracing::error!(%error, "durable work claim task panicked"),
                     None => {}
@@ -508,6 +509,22 @@ async fn run_supervisor(
                     &actor_slots,
                     &connection_owners,
                 ).await;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)), if !pending_work.is_empty() && !lease_lost => {
+                let item = pending_work.pop_front().expect("guarded claimed work");
+                if let Some(item) = route_claimed_work(
+                    item,
+                    &orchestrator,
+                    &runtime,
+                    &mut actor_slots,
+                    &mut connection_owners,
+                    &mut leg_owners,
+                    &mut actors,
+                    drain.clone(),
+                    actor_shutdown_rx.clone(),
+                ).await {
+                    pending_work.push_back(item);
+                }
             }
             event = operational.recv(), if pending_operational.is_none() => {
                 let Some(event) = event else {
@@ -534,12 +551,12 @@ async fn run_supervisor(
                     prove_admission(admission, runtime, setup_timeout).await
                 });
             }
-            changed = work_wakeups.changed(), if accepting_work && work_claims.is_empty() => {
+            changed = work_wakeups.changed(), if accepting_work && pending_work.is_empty() && work_claims.is_empty() => {
                 if changed.is_ok() {
                     spawn_work_claim(&mut work_claims, Arc::clone(&runtime));
                 }
             }
-            _ = work_poll.tick(), if accepting_work && work_claims.is_empty() => {
+            _ = work_poll.tick(), if accepting_work && pending_work.is_empty() && work_claims.is_empty() => {
                 spawn_work_claim(&mut work_claims, Arc::clone(&runtime));
             }
         }
@@ -850,14 +867,14 @@ async fn route_claimed_work(
     actors: &mut JoinSet<ActorExit>,
     drain: watch::Receiver<bool>,
     shutdown: watch::Receiver<ActorShutdown>,
-) {
+) -> Option<ActorWork> {
     let (tenant_id, call_id) = match &item {
         ActorWork::Call(claim) => (&claim.record.tenant_id, claim.record.call_id),
         ActorWork::Control(claim) => (&claim.record.tenant_id, claim.record.call_id),
         ActorWork::Provider(claim) => {
             let Some(target) = claim.event.target.as_ref() else {
                 tracing::error!("claimed provider event has no durable target");
-                return;
+                return Some(item);
             };
             (&target.tenant_id, target.call_id)
         }
@@ -867,7 +884,7 @@ async fn route_claimed_work(
     if !actor_slots.contains_key(&call_id) {
         if actor_slots.len() >= runtime.worker().max_calls {
             tracing::error!(%call_id, "durable work could not allocate its reserved call actor");
-            return;
+            return Some(item);
         }
         let stored = match runtime
             .service_repository()
@@ -877,7 +894,7 @@ async fn route_claimed_work(
             Ok(stored) => stored,
             Err(error) => {
                 tracing::warn!(%call_id, %error, "loading claimed call work failed");
-                return;
+                return Some(item);
             }
         };
         if spawn_call_actor(
@@ -893,14 +910,25 @@ async fn route_claimed_work(
         )
         .is_err()
         {
-            return;
+            return Some(item);
         }
     }
     let Some(actor) = actor_slots.get(&call_id) else {
-        return;
+        return Some(item);
     };
-    if actor.work.try_send(item).is_err() {
-        tracing::warn!(%call_id, "call actor work mailbox is full; claim will expire without I/O");
+    match try_deliver_actor_work(&actor.work, item) {
+        None => None,
+        Some(item) => {
+            tracing::debug!(%call_id, "call actor work mailbox is temporarily unavailable");
+            Some(item)
+        }
+    }
+}
+
+fn try_deliver_actor_work(mailbox: &mpsc::Sender<ActorWork>, item: ActorWork) -> Option<ActorWork> {
+    match mailbox.try_send(item) {
+        Ok(()) => None,
+        Err(error) => Some(error.into_inner()),
     }
 }
 
@@ -1041,6 +1069,85 @@ async fn fail_panicked_actor(
     }
 }
 
+async fn activate_admission(
+    proven: ProvenAdmission,
+    orchestrator: Arc<Orchestrator>,
+    tenant_id: crate::call_engine::TenantId,
+    existing_session: Option<SessionId>,
+) -> AdmissionOperationResult {
+    let ProvenAdmission {
+        admission,
+        consumed,
+    } = proven;
+    let connection_id = consumed.binding.connection_id;
+    let mut created_conversation = None;
+    let mut created_session = None;
+    let result = async {
+        let session_id = if let Some(session_id) = existing_session {
+            session_id
+        } else {
+            let conversation_id = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                orchestrator.open_conversation(
+                    RvoipTenantId::from_string(tenant_id.as_str()),
+                    ConversationPolicy::default(),
+                    HashMap::new(),
+                ),
+            )
+            .await
+            .map_err(|_| rvoip_core::RvoipError::InvalidState("conversation setup timed out"))??;
+            created_conversation = Some(conversation_id.clone());
+            let session_id = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                orchestrator.start_session(
+                    conversation_id.clone(),
+                    SessionMedium::Voice,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .map_err(|_| rvoip_core::RvoipError::InvalidState("session setup timed out"))??;
+            created_session = Some(session_id.clone());
+            session_id
+        };
+        tokio::time::timeout(EXTERNAL_OPERATION_TIMEOUT, admission.accept())
+            .await
+            .map_err(|_| {
+                rvoip_core::RvoipError::InvalidState("admission activation timed out")
+            })??;
+        tokio::time::timeout(
+            EXTERNAL_OPERATION_TIMEOUT,
+            orchestrator.route_inbound_connection(
+                connection_id.clone(),
+                InboundAction::Accept {
+                    session_id,
+                    participant_id: ParticipantId::new(),
+                },
+            ),
+        )
+        .await
+        .map_err(|_| rvoip_core::RvoipError::InvalidState("inbound routing timed out"))??;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        if let Some(session_id) = created_session.take() {
+            let _ = orchestrator
+                .end_session(session_id, EndReason::Cancelled)
+                .await;
+        }
+        if let Some(conversation_id) = created_conversation.take() {
+            let _ = orchestrator.close_conversation(conversation_id, true).await;
+        }
+    }
+    AdmissionOperationResult {
+        connection_id,
+        conversation_id: created_conversation,
+        session_id: created_session,
+        result,
+    }
+}
+
 impl CallActor {
     fn new(
         stored: StoredServiceCall,
@@ -1057,24 +1164,19 @@ impl CallActor {
             .bindings
             .values()
             .filter_map(|binding| {
-                stored
-                    .call
-                    .aggregate
-                    .leg(binding.leg_id)
-                    .map(|leg| {
-                        (
-                            binding.leg_id,
-                            ActorBinding {
-                                connection_id: binding.connection_id.clone(),
-                                leg_id: binding.leg_id,
-                                binding_generation: binding.binding_generation,
-                                state: leg.state(),
-                            },
-                        )
-                    })
+                stored.call.aggregate.leg(binding.leg_id).map(|leg| {
+                    (
+                        binding.leg_id,
+                        ActorBinding {
+                            connection_id: binding.connection_id.clone(),
+                            leg_id: binding.leg_id,
+                            binding_generation: binding.binding_generation,
+                            state: leg.state(),
+                        },
+                    )
+                })
             })
             .collect();
-        let terminal = stored.call.aggregate.state().is_terminal();
         Self {
             call_id: stored.call.aggregate.id(),
             tenant_id: stored.call.aggregate.tenant_id().clone(),
@@ -1094,27 +1196,39 @@ impl CallActor {
             bridge_id: None,
             conversation_id: None,
             session_id: None,
-            terminal,
+            // A newly spawned actor must receive the work/admission that
+            // caused its allocation before it can evaluate retirement. This
+            // closes the send-after-spawn race for terminal cleanup effects.
+            terminal: false,
         }
     }
 
     async fn run(mut self) -> ActorExit {
         let mut graceful = false;
+        let mut terminal_since = None;
         loop {
-            let operation_idle = self.admission_operation.is_empty() && self.work_operation.is_empty();
+            let operation_idle =
+                self.admission_operation.is_empty() && self.work_operation.is_empty();
             if operation_idle && !graceful && !self.pending_admissions.is_empty() {
-                self.start_next_admission().await;
+                self.start_next_admission();
             } else if operation_idle && !self.pending_work.is_empty() {
                 self.start_next_work();
             }
-            if (graceful || self.terminal)
-                && self.admission_operation.is_empty()
+            let idle = self.admission_operation.is_empty()
                 && self.work_operation.is_empty()
                 && self.pending_admissions.is_empty()
                 && self.pending_work.is_empty()
                 && self.commands.is_empty()
-                && self.work.is_empty()
-            {
+                && self.work.is_empty();
+            if self.terminal && idle {
+                let since = terminal_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= TERMINAL_RETIRE_QUIET {
+                    break;
+                }
+            } else {
+                terminal_since = None;
+            }
+            if graceful && idle {
                 break;
             }
             tokio::select! {
@@ -1192,6 +1306,7 @@ impl CallActor {
                         self.pending_work.push_back(work);
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(25)), if terminal_since.is_some() => {}
             }
         }
         let allow_durable_cleanup = *self.shutdown.borrow() != ActorShutdown::LeaseLost;
@@ -1235,80 +1350,26 @@ impl CallActor {
         self.pending_admissions.push_back(proven);
     }
 
-    async fn start_next_admission(&mut self) {
+    fn start_next_admission(&mut self) {
         let Some(proven) = self.pending_admissions.pop_front() else {
             return;
         };
-        let session_id = match self.ensure_session().await {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                tracing::error!(call_id = %self.call_id, %error, "creating rvoip call session failed");
-                let allow_durable_write = *self.shutdown.borrow() != ActorShutdown::LeaseLost;
-                fail_unowned_proven_admission(
-                    proven,
-                    &self.orchestrator,
-                    &self.runtime,
-                    allow_durable_write,
-                ).await;
-                return;
-            }
-        };
-        let connection_id = proven.consumed.binding.connection_id.clone();
         let orchestrator = Arc::clone(&self.orchestrator);
+        let tenant_id = self.tenant_id.clone();
+        let session_id = self.session_id.clone();
         self.admission_operation.spawn(async move {
-            let result = async {
-                proven.admission.accept().await?;
-                orchestrator
-                    .route_inbound_connection(
-                        connection_id.clone(),
-                        InboundAction::Accept {
-                            session_id,
-                            participant_id: ParticipantId::new(),
-                        },
-                    )
-                    .await
-            }
-            .await;
-            AdmissionOperationResult {
-                connection_id,
-                result,
-            }
+            activate_admission(proven, orchestrator, tenant_id, session_id).await
         });
-    }
-
-    async fn ensure_session(&mut self) -> Result<SessionId, rvoip_core::RvoipError> {
-        if let Some(session_id) = &self.session_id {
-            return Ok(session_id.clone());
-        }
-        let conversation_id = self
-            .orchestrator
-            .open_conversation(
-                RvoipTenantId::from_string(self.tenant_id.as_str()),
-                ConversationPolicy::default(),
-                HashMap::new(),
-            )
-            .await?;
-        let session_id = match self
-            .orchestrator
-            .start_session(conversation_id.clone(), SessionMedium::Voice, Vec::new())
-            .await
-        {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                let _ = self
-                    .orchestrator
-                    .close_conversation(conversation_id, true)
-                    .await;
-                return Err(error);
-            }
-        };
-        self.conversation_id = Some(conversation_id);
-        self.session_id = Some(session_id.clone());
-        Ok(session_id)
     }
 
     async fn finish_admission_operation(&mut self, result: AdmissionOperationResult) {
         if result.result.is_ok() {
+            if let Some(conversation_id) = result.conversation_id {
+                self.conversation_id = Some(conversation_id);
+            }
+            if let Some(session_id) = result.session_id {
+                self.session_id = Some(session_id);
+            }
             metrics::counter!("bridgefu_attachment_admission_total", "result" => "accepted")
                 .increment(1);
             return;
@@ -1389,6 +1450,7 @@ impl CallActor {
             .bindings
             .values()
             .find(|binding| binding.connection_id == event.connection_id)
+            .cloned()
         else {
             tracing::error!(call_id = %self.call_id, connection_id = %event.connection_id, sequence = event.sequence, "actor received a foreign operational event");
             return;
@@ -1410,6 +1472,15 @@ impl CallActor {
             tracing::error!(call_id = %self.call_id, %leg_id, "bound operational leg disappeared");
             return;
         };
+        if let OperationalEventKind::MediaActivity { generation } = &event.kind {
+            if let Err(error) = self
+                .record_media_activity(&binding, *generation, event.at, stored)
+                .await
+            {
+                tracing::warn!(call_id = %self.call_id, %leg_id, %error, "authoritative media activity did not reconcile");
+            }
+            return;
+        }
         let transition = classify_operational_event(leg.state(), &event.kind);
         match transition {
             OperationalTransition::Ignore => {
@@ -1428,16 +1499,19 @@ impl CallActor {
             }
             OperationalTransition::Commit { state, failure } => {
                 let at = std::cmp::max(event.at, stored.call.aggregate.updated_at());
-                if let Ok(committed) = self.commit_current_binding(leg_id, state, failure, at).await {
+                if let Ok(committed) = self
+                    .commit_current_binding(leg_id, state, failure, at)
+                    .await
+                {
                     self.terminal = committed.call.aggregate.state().is_terminal();
                     if !self.terminal {
-                        let _ = ensure_ending_deadline(
-                            &self.runtime,
-                            committed,
-                            self.shutdown.clone(),
-                        ).await;
+                        let _ =
+                            ensure_ending_deadline(&self.runtime, committed, self.shutdown.clone())
+                                .await;
                     }
-                    if let Some(binding) = self.bindings.get_mut(&leg_id) { binding.state = state; }
+                    if let Some(binding) = self.bindings.get_mut(&leg_id) {
+                        binding.state = state;
+                    }
                 }
             }
             OperationalTransition::Ephemeral => {
@@ -1446,6 +1520,96 @@ impl CallActor {
                     "kind" => operational_kind_label(&event.kind)
                 )
                 .increment(1);
+            }
+        }
+    }
+
+    async fn record_media_activity(
+        &mut self,
+        binding: &ActorBinding,
+        generation: u64,
+        observed_at: DateTime<Utc>,
+        mut stored: StoredServiceCall,
+    ) -> Result<(), RepositoryError> {
+        let generation = i64::try_from(generation)
+            .ok()
+            .and_then(|generation| MediaActivityGeneration::from_i64(generation).ok())
+            .ok_or(RepositoryError::InvalidInput(
+                "media activity generation is outside the durable range",
+            ))?;
+        let command_id = CommandId::new();
+        loop {
+            if *self.shutdown.borrow() == ActorShutdown::LeaseLost {
+                return Err(RepositoryError::Unavailable);
+            }
+            let Some(leg) = stored.call.aggregate.leg(binding.leg_id) else {
+                return Ok(());
+            };
+            let Some(durable_binding) = stored.call.bindings.get(&binding.leg_id) else {
+                return Ok(());
+            };
+            if !matches!(
+                stored.call.aggregate.state(),
+                CallState::Active | CallState::Transferring
+            ) || !matches!(leg.state(), LegState::Connected | LegState::Held)
+                || durable_binding.connection_id != binding.connection_id
+                || durable_binding.binding_generation != binding.binding_generation
+            {
+                return Ok(());
+            }
+            let at = std::cmp::max(observed_at, stored.call.aggregate.updated_at());
+            let observation = MediaActivityObservation {
+                tenant_id: self.tenant_id.clone(),
+                call_id: self.call_id,
+                expected_version: stored.call.aggregate.version(),
+                command_id,
+                leg_id: binding.leg_id,
+                binding_generation: binding.binding_generation,
+                connection_id: binding.connection_id.clone(),
+                activity_generation: generation,
+                worker: self.runtime.worker().lease,
+                at,
+            };
+            let mut delay = REPOSITORY_RETRY_MIN;
+            loop {
+                match self
+                    .runtime
+                    .service()
+                    .record_media_activity(observation.clone())
+                    .await
+                {
+                    Ok(ServiceCommandOutcome::Committed(view))
+                    | Ok(ServiceCommandOutcome::Replayed(view)) => {
+                        self.terminal = view.command.call.aggregate.state().is_terminal();
+                        return Ok(());
+                    }
+                    Err(CallServiceError::Repository(RepositoryError::Unavailable)) => {
+                        tokio::select! {
+                            changed = self.shutdown.changed() => {
+                                if changed.is_err() || *self.shutdown.borrow() == ActorShutdown::LeaseLost {
+                                    return Err(RepositoryError::Unavailable);
+                                }
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
+                    }
+                    Err(CallServiceError::Repository(RepositoryError::VersionConflict)) => {
+                        stored = self
+                            .runtime
+                            .service_repository()
+                            .load_service_call(&self.tenant_id, self.call_id)
+                            .await?;
+                        break;
+                    }
+                    Err(CallServiceError::Repository(
+                        RepositoryError::StaleClaim
+                        | RepositoryError::StaleWorkerFence
+                        | RepositoryError::InvalidInput(_),
+                    )) => return Ok(()),
+                    Err(CallServiceError::Repository(error)) => return Err(error),
+                    Err(_) => return Err(RepositoryError::Unavailable),
+                }
             }
         }
     }
@@ -1497,7 +1661,8 @@ impl CallActor {
                 &self.orchestrator,
                 &self.runtime,
                 allow_durable_write,
-            ).await;
+            )
+            .await;
         }
         self.admission_operation.abort_all();
         while self.admission_operation.join_next().await.is_some() {}
@@ -1591,9 +1756,7 @@ async fn execute_actor_work(
         ActorWork::Control(claim) => {
             execute_control_effect(claim, orchestrator, runtime, bindings, shutdown).await
         }
-        ActorWork::Provider(claim) => {
-            execute_provider_event(claim, runtime, shutdown).await
-        }
+        ActorWork::Provider(claim) => execute_provider_event(claim, runtime, shutdown).await,
         ActorWork::Deadline(claim) => WorkOperationResult {
             effect_id: None,
             bridge_update: None,
@@ -1645,14 +1808,7 @@ async fn execute_call_effect(
             return WorkOperationResult {
                 effect_id: Some(effect_id),
                 bridge_update: None,
-                result: reconcile_effect(
-                    meta,
-                    result,
-                    FollowUpPlan::None,
-                    runtime,
-                    shutdown,
-                )
-                .await,
+                result: reconcile_effect(meta, result, FollowUpPlan::None, runtime, shutdown).await,
             };
         }
     } else if let Err(error) = current {
@@ -1754,22 +1910,25 @@ async fn execute_call_effect(
             binding_generation,
             ..
         } => match bindings.get(&leg_id) {
-            Some(binding) if binding.binding_generation == binding_generation => match tokio::time::timeout(
-                EXTERNAL_OPERATION_TIMEOUT,
-                orchestrator.end_connection(binding.connection_id.clone(), EndReason::BridgeTorn),
-            )
-            .await
-            {
-                Ok(Ok(())) => (ServiceEffectResult::Succeeded, FollowUpPlan::None),
-                Ok(Err(_)) | Err(_) => (
-                    ServiceEffectResult::Failed(FailureDetails::sanitized(
-                        "stop_leg_failed",
-                        "rvoip could not confirm transport teardown",
-                        true,
-                    )),
-                    FollowUpPlan::None,
-                ),
-            },
+            Some(binding) if binding.binding_generation == binding_generation => {
+                match tokio::time::timeout(
+                    EXTERNAL_OPERATION_TIMEOUT,
+                    orchestrator
+                        .end_connection(binding.connection_id.clone(), EndReason::BridgeTorn),
+                )
+                .await
+                {
+                    Ok(Ok(())) => (ServiceEffectResult::Succeeded, FollowUpPlan::None),
+                    Ok(Err(_)) | Err(_) => (
+                        ServiceEffectResult::Failed(FailureDetails::sanitized(
+                            "stop_leg_failed",
+                            "rvoip could not confirm transport teardown",
+                            true,
+                        )),
+                        FollowUpPlan::None,
+                    ),
+                }
+            }
             _ => (ServiceEffectResult::Succeeded, FollowUpPlan::None),
         },
         EffectIntent::StartLeg {
@@ -1935,16 +2094,26 @@ async fn reconcile_provider_event(
             .service_repository()
             .load_service_call(&target.tenant_id, target.call_id)
             .await?;
-        let at = [
-            runtime.observation_time(),
-            stored.call.aggregate.updated_at(),
-            claim.event.received_at,
-            claim.event.occurred_at.unwrap_or(claim.event.received_at),
-        ]
-        .into_iter()
-        .max()
-        .ok_or(RepositoryError::Unavailable)?;
-        let follow_up = build_provider_follow_up(&claim.event.kind, &target, &stored, at)?;
+        let observed_at = runtime.observation_time();
+        let skew_bound = chrono::Duration::minutes(5);
+        let received_at = if claim.event.received_at < observed_at - skew_bound
+            || claim.event.received_at > observed_at + skew_bound
+        {
+            observed_at
+        } else {
+            claim.event.received_at
+        };
+        let at = [observed_at, stored.call.aggregate.updated_at(), received_at]
+            .into_iter()
+            .max()
+            .ok_or(RepositoryError::Unavailable)?;
+        let follow_up = build_provider_follow_up(
+            &claim.event.account,
+            &claim.event.kind,
+            &target,
+            &stored,
+            at,
+        )?;
         let request = ProviderEventReconciliationTransaction {
             account: claim.event.account.clone(),
             event_digest: claim.event.event_digest,
@@ -1982,6 +2151,7 @@ async fn reconcile_provider_event(
 }
 
 fn build_provider_follow_up(
+    account: &crate::call_engine::ProviderAccountKey,
     kind: &str,
     target: &crate::call_engine::ProviderEventTarget,
     stored: &StoredServiceCall,
@@ -1995,43 +2165,35 @@ fn build_provider_follow_up(
         .aggregate
         .leg(target.leg_id)
         .ok_or(RepositoryError::ProviderReferenceConflict)?;
-    let normalized = kind.to_ascii_lowercase().replace(['_', ' '], "-");
-    let progress = ["queued", "initiated", "ringing", "started"]
+    let provider = stored
+        .plan
+        .legs
         .iter()
-        .any(|needle| normalized.contains(needle));
-    let connected = ["answered", "in-progress", "connected", "active"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
-    let ended = ["completed", "hangup", "ended", "disconnected"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
-    let failed = [
-        "failed",
-        "busy",
-        "no-answer",
-        "canceled",
-        "cancelled",
-        "rejected",
-        "timeout",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle));
-
-    let (state, failure) = if failed || (!progress && !connected && !ended) {
+        .find(|spec| spec.leg_id == target.leg_id)
+        .and_then(|spec| match &spec.endpoint {
+            super::LegEndpointConfig::Provider(config)
+                if config.account_profile == account.as_str() =>
+            {
+                Some(config.provider)
+            }
+            _ => None,
+        })
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    let lifecycle = classify_provider_lifecycle(provider, kind);
+    let (state, failure) = if matches!(lifecycle, ProviderLifecycle::Failed) {
         (
             LegState::Failed,
             Some(FailureDetails::sanitized(
-                if failed {
-                    "provider_call_failed"
-                } else {
-                    "provider_event_unsupported"
-                },
+                "provider_call_failed",
                 "provider signaling did not complete successfully",
                 false,
             )),
         )
-    } else if ended {
-        if matches!(leg.state(), LegState::Connected | LegState::Held | LegState::Ending) {
+    } else if lifecycle == ProviderLifecycle::Ended {
+        if matches!(
+            leg.state(),
+            LegState::Connected | LegState::Held | LegState::Ending
+        ) {
             (LegState::Ended, None)
         } else {
             (
@@ -2043,16 +2205,22 @@ fn build_provider_follow_up(
                 )),
             )
         }
-    } else if connected {
+    } else if lifecycle == ProviderLifecycle::Connected {
         match leg.state() {
             LegState::Connected | LegState::Held | LegState::Ending => (leg.state(), None),
             _ => (LegState::Connected, None),
         }
-    } else {
+    } else if lifecycle == ProviderLifecycle::Progress {
         match leg.state() {
             LegState::Pending | LegState::AwaitingAttach => (LegState::Signaling, None),
             _ => (leg.state(), None),
         }
+    } else {
+        // Verified but non-lifecycle callbacks (recording, machine detection,
+        // DTMF acknowledgements, and future provider extensions) are durably
+        // acknowledged through an explicit no-op command. They never infer a
+        // call failure or connection from an unknown string.
+        (leg.state(), leg.failure().cloned())
     };
     Ok(Some(ServiceCommandTransaction {
         command: CommandCommit {
@@ -2077,6 +2245,42 @@ fn build_provider_follow_up(
         bound_connection: None,
         media_activity: None,
     }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderLifecycle {
+    Progress,
+    Connected,
+    Ended,
+    Failed,
+    Ignore,
+}
+
+fn classify_provider_lifecycle(provider: ProviderKind, kind: &str) -> ProviderLifecycle {
+    let kind = kind.trim().to_ascii_lowercase();
+    match provider {
+        ProviderKind::Twilio => match kind.as_str() {
+            "queued" | "ringing" => ProviderLifecycle::Progress,
+            "in-progress" => ProviderLifecycle::Connected,
+            "completed" => ProviderLifecycle::Ended,
+            "busy" | "failed" | "no-answer" | "canceled" => ProviderLifecycle::Failed,
+            _ => ProviderLifecycle::Ignore,
+        },
+        ProviderKind::Telnyx => match kind.as_str() {
+            "call.initiated" | "call.ringing" => ProviderLifecycle::Progress,
+            "call.answered" | "call.bridged" => ProviderLifecycle::Connected,
+            "call.hangup" => ProviderLifecycle::Ended,
+            "call.failed" => ProviderLifecycle::Failed,
+            _ => ProviderLifecycle::Ignore,
+        },
+        ProviderKind::Vonage => match kind.as_str() {
+            "started" | "ringing" => ProviderLifecycle::Progress,
+            "answered" => ProviderLifecycle::Connected,
+            "completed" => ProviderLifecycle::Ended,
+            "busy" | "unanswered" | "rejected" | "timeout" | "failed" => ProviderLifecycle::Failed,
+            _ => ProviderLifecycle::Ignore,
+        },
+    }
 }
 
 async fn reconcile_effect(
@@ -2242,7 +2446,10 @@ async fn ensure_ending_deadline(
         if *shutdown.borrow() == ActorShutdown::LeaseLost {
             return Err(RepositoryError::Unavailable);
         }
-        let at = std::cmp::max(runtime.observation_time(), stored.call.aggregate.updated_at());
+        let at = std::cmp::max(
+            runtime.observation_time(),
+            stored.call.aggregate.updated_at(),
+        );
         let due_at = at
             .checked_add_signed(
                 chrono::Duration::from_std(runtime.timeouts().ending)
@@ -2677,6 +2884,7 @@ fn classify_operational_event(
                 }
             }
         }
+        OperationalEventKind::MediaActivity { .. } => OperationalTransition::Ephemeral,
         OperationalEventKind::Dtmf { .. }
         | OperationalEventKind::DataMessage { .. }
         | OperationalEventKind::Transfer { .. } => OperationalTransition::Ephemeral,
@@ -2693,6 +2901,7 @@ fn classify_operational_event(
 
 fn operational_kind_label(kind: &OperationalEventKind) -> &'static str {
     match kind {
+        OperationalEventKind::MediaActivity { .. } => "media_activity",
         OperationalEventKind::Dtmf { .. } => "dtmf",
         OperationalEventKind::DataMessage { .. } => "data_message",
         OperationalEventKind::Transfer { .. } => "transfer",
@@ -2703,6 +2912,360 @@ fn operational_kind_label(kind: &OperationalEventKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::call_engine::WorkerId;
+    use crate::call_service::{
+        build_call_service_runtime, CallRepositoryBackendConfig, CallServiceCoordinationConfig,
+        CallServiceRuntimeConfig, CallTimeoutPolicy, CreateCallInput, IdempotencyKey,
+        LegEndpointConfig, RequestedLeg, SamePrincipalAttachmentResolver, SipEndpointConfig,
+        SystemCallServiceClock, WebRtcEndpointConfig,
+    };
+    use crate::coordination::DeploymentId;
+    use crate::{api_principal::ApiPrincipal, call_engine::LegDirection};
+    use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod};
+    use rvoip_core::config::Config as CoreConfig;
+    use rvoip_core::{IdentityAssurance, Jwk, OperationalEventStreamHealth};
+
+    fn deadline_work(call_id: CallId) -> ActorWork {
+        ActorWork::Deadline(ClaimedDeadline {
+            record: crate::call_engine::DeadlineRecord {
+                tenant_id: crate::call_engine::TenantId::parse("mailbox-tenant").unwrap(),
+                call_id,
+                kind: DeadlineKind::Setup,
+                generation: crate::call_engine::DeadlineGeneration::default(),
+                due_at: Utc::now(),
+                state: crate::call_engine::DeadlineState::Pending,
+            },
+            claim_generation: crate::call_engine::ClaimGeneration::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn full_actor_mailbox_returns_the_exact_claim_for_root_retention() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let first_call = CallId::new();
+        let retained_call = CallId::new();
+        assert!(try_deliver_actor_work(&sender, deadline_work(first_call)).is_none());
+        let retained = try_deliver_actor_work(&sender, deadline_work(retained_call))
+            .expect("full mailbox must return ownership of the claim");
+        assert_eq!(actor_work_call_id(&retained), Some(retained_call));
+        assert_eq!(
+            actor_work_call_id(&receiver.recv().await.unwrap()),
+            Some(first_call)
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_normalization_is_conservative_and_provider_neutral() {
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Telnyx, "call.initiated"),
+            ProviderLifecycle::Progress
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Telnyx, "call.answered"),
+            ProviderLifecycle::Connected
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Twilio, "completed"),
+            ProviderLifecycle::Ended
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Telnyx, "call.hangup"),
+            ProviderLifecycle::Ended
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Vonage, "unanswered"),
+            ProviderLifecycle::Failed
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Twilio, "unanswered"),
+            ProviderLifecycle::Ignore
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Telnyx, "call.not-connected"),
+            ProviderLifecycle::Ignore
+        );
+        assert_eq!(
+            classify_provider_lifecycle(ProviderKind::Vonage, "new-provider-state"),
+            ProviderLifecycle::Ignore
+        );
+    }
+
+    #[test]
+    fn media_activity_is_not_misclassified_as_a_lifecycle_failure() {
+        assert!(matches!(
+            classify_operational_event(
+                LegState::Connected,
+                &OperationalEventKind::MediaActivity { generation: 7 },
+            ),
+            OperationalTransition::Ephemeral
+        ));
+    }
+
+    #[tokio::test]
+    async fn lease_loss_stops_execution_without_dropping_operational_receiver() {
+        let mut coordination = CallServiceCoordinationConfig::new(
+            DeploymentId::parse("execution-lease-loss-test").unwrap(),
+        );
+        coordination.worker_lease_ttl = Duration::from_secs(300);
+        coordination.worker_renew_interval = Duration::from_secs(100);
+        let runtime = Arc::new(
+            build_call_service_runtime(
+                CallServiceRuntimeConfig {
+                    backend: CallRepositoryBackendConfig::Memory,
+                    worker_id: WorkerId::new(),
+                    max_calls: 2,
+                    worker_capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+                    control_key: vec![0x52; 32],
+                    timeouts: CallTimeoutPolicy {
+                        setup: Duration::from_secs(30),
+                        media_idle: Duration::from_secs(30),
+                        transfer: Duration::from_secs(30),
+                        ending: Duration::from_secs(30),
+                    },
+                    coordination,
+                },
+                Arc::new(SamePrincipalAttachmentResolver),
+                Arc::new(SystemCallServiceClock),
+            )
+            .await
+            .unwrap(),
+        );
+        let orchestrator = Orchestrator::new(CoreConfig::default());
+        let supervisor = CallExecutionSupervisor::install(
+            Arc::clone(&orchestrator),
+            Arc::clone(&runtime),
+            4,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        runtime.force_supervisor_health_for_test(RuntimeSupervisorHealth::LeaseLost);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            orchestrator.operational_event_stream_health(),
+            OperationalEventStreamHealth::Healthy
+        );
+        supervisor.shutdown(Duration::from_secs(2)).await;
+    }
+
+    fn media_principal() -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            subject: "media-subject".into(),
+            tenant: Some("media-tenant".into()),
+            scopes: vec!["*".into()],
+            issuer: Some("media-test".into()),
+            expires_at: None,
+            method: AuthenticationMethod::Jwt,
+            assurance: IdentityAssurance::Pseudonymous {
+                ephemeral_key: Jwk(serde_json::json!({"kty": "test"})),
+            },
+        }
+    }
+
+    async fn active_media_actor() -> (
+        Arc<CallServiceRuntime>,
+        CallActor,
+        ActorBinding,
+        watch::Sender<ActorShutdown>,
+    ) {
+        let mut coordination =
+            CallServiceCoordinationConfig::new(DeploymentId::parse("media-actor-test").unwrap());
+        coordination.worker_lease_ttl = Duration::from_secs(300);
+        coordination.worker_renew_interval = Duration::from_secs(100);
+        let runtime = Arc::new(
+            build_call_service_runtime(
+                CallServiceRuntimeConfig {
+                    backend: CallRepositoryBackendConfig::Memory,
+                    worker_id: WorkerId::new(),
+                    max_calls: 2,
+                    worker_capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+                    control_key: vec![0x63; 32],
+                    timeouts: CallTimeoutPolicy {
+                        setup: Duration::from_secs(30),
+                        media_idle: Duration::from_secs(30),
+                        transfer: Duration::from_secs(30),
+                        ending: Duration::from_secs(30),
+                    },
+                    coordination,
+                },
+                Arc::new(SamePrincipalAttachmentResolver),
+                Arc::new(SystemCallServiceClock),
+            )
+            .await
+            .unwrap(),
+        );
+        let principal = media_principal();
+        let owner = ApiPrincipal::new(principal.clone(), Utc::now()).unwrap();
+        let created = runtime
+            .service()
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("media-actor-call").unwrap(),
+                CreateCallInput {
+                    tenant_id: None,
+                    legs: [
+                        RequestedLeg {
+                            direction: LegDirection::Inbound,
+                            endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                        },
+                        RequestedLeg {
+                            direction: LegDirection::Inbound,
+                            endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                                signaling_uri: None,
+                            }),
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let tenant_id = crate::call_engine::TenantId::parse("media-tenant").unwrap();
+        for leg in &created.value.call.legs {
+            let attachment = leg.attachment.as_ref().unwrap();
+            let connection_id = ConnectionId::new();
+            runtime
+                .service()
+                .consume_inbound_attachment(InboundAttachmentRequest::new(
+                    principal.clone(),
+                    Some(attachment.token.clone()),
+                    attachment.transport,
+                    runtime.worker().lease,
+                    connection_id.clone(),
+                ))
+                .await
+                .unwrap();
+            let stored = runtime
+                .service_repository()
+                .load_service_call(&tenant_id, created.value.call.call_id)
+                .await
+                .unwrap();
+            let binding = stored.call.bindings.get(&leg.leg_id).unwrap();
+            let at = std::cmp::max(
+                runtime.observation_time(),
+                stored.call.aggregate.updated_at(),
+            );
+            runtime
+                .service()
+                .commit_bound_connection_state(BoundConnectionStateCommit {
+                    tenant_id: tenant_id.clone(),
+                    call_id: stored.call.aggregate.id(),
+                    expected_version: stored.call.aggregate.version(),
+                    command_id: CommandId::new(),
+                    leg_id: leg.leg_id,
+                    binding_generation: binding.binding_generation,
+                    connection_id,
+                    worker: runtime.worker().lease,
+                    state: LegState::Connected,
+                    failure: None,
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+        let stored = runtime
+            .service_repository()
+            .load_service_call(&tenant_id, created.value.call.call_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.call.aggregate.state(), CallState::Active);
+        let first_binding = stored.call.bindings.values().next().unwrap().clone();
+        let actor_binding = ActorBinding {
+            connection_id: first_binding.connection_id,
+            leg_id: first_binding.leg_id,
+            binding_generation: first_binding.binding_generation,
+            state: LegState::Connected,
+        };
+        let (_commands_tx, commands_rx) = mpsc::channel(1);
+        let (_operational_tx, operational_rx) = mpsc::channel(1);
+        let (_work_tx, work_rx) = mpsc::channel(1);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ActorShutdown::Running);
+        let actor = CallActor::new(
+            stored,
+            Orchestrator::new(CoreConfig::default()),
+            Arc::clone(&runtime),
+            commands_rx,
+            operational_rx,
+            work_rx,
+            drain_rx,
+            shutdown_rx,
+        );
+        (runtime, actor, actor_binding, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn media_activity_is_consecutive_stale_safe_and_lease_loss_cancelled() {
+        let (runtime, mut actor, binding, shutdown) = active_media_actor().await;
+        let initial = runtime
+            .service_repository()
+            .load_service_call(&actor.tenant_id, actor.call_id)
+            .await
+            .unwrap();
+        let at = std::cmp::max(
+            runtime.observation_time(),
+            initial.call.aggregate.updated_at(),
+        );
+        actor
+            .record_media_activity(&binding, 1, at, initial)
+            .await
+            .unwrap();
+        let first = runtime
+            .service_repository()
+            .load_service_call(&actor.tenant_id, actor.call_id)
+            .await
+            .unwrap();
+        let first_deadline = first
+            .call
+            .aggregate
+            .deadlines()
+            .get(DeadlineKind::Media)
+            .due_at();
+        assert!(first_deadline.is_some());
+
+        actor
+            .record_media_activity(&binding, 1, at, first.clone())
+            .await
+            .unwrap();
+        let skipped = runtime
+            .service_repository()
+            .load_service_call(&actor.tenant_id, actor.call_id)
+            .await
+            .unwrap();
+        actor
+            .record_media_activity(&binding, 3, at, skipped)
+            .await
+            .unwrap();
+        let unchanged = runtime
+            .service_repository()
+            .load_service_call(&actor.tenant_id, actor.call_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged
+                .call
+                .aggregate
+                .deadlines()
+                .get(DeadlineKind::Media)
+                .due_at(),
+            first_deadline
+        );
+
+        let mut stale_binding = binding.clone();
+        stale_binding.connection_id = ConnectionId::new();
+        actor
+            .record_media_activity(&stale_binding, 2, at, unchanged.clone())
+            .await
+            .unwrap();
+        shutdown.send_replace(ActorShutdown::LeaseLost);
+        assert_eq!(
+            actor
+                .record_media_activity(&binding, 2, at, unchanged)
+                .await,
+            Err(RepositoryError::Unavailable)
+        );
+    }
 
     #[test]
     fn operational_transition_never_revives_terminal_state() {
