@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,8 @@ use rvoip_core::ids::{
 };
 use rvoip_core::session::SessionMedium;
 use rvoip_core::{
-    InboundAdmission, OperationalEndReason, OperationalEvent, OperationalEventKind, Orchestrator,
+    InboundAdmission, OperationalEndReason, OperationalEvent, OperationalEventKind,
+    OperationalEventStreamHealth, OperationalEventStreamHealthSubscription, Orchestrator,
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
@@ -45,6 +47,7 @@ use super::{
 
 const OPERATIONAL_MAILBOX_PER_CALL: usize = 64;
 const ACTOR_COMMAND_MAILBOX: usize = 16;
+const ACTOR_PENDING_WORK_CAPACITY: usize = 16;
 const REPOSITORY_RETRY_MIN: Duration = Duration::from_millis(25);
 const REPOSITORY_RETRY_MAX: Duration = Duration::from_secs(1);
 const WORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -71,6 +74,9 @@ pub enum CallExecutionError {
     /// Durable startup recovery exceeded the configured setup boundary.
     #[error("durable call execution recovery timed out")]
     RecoveryTimeout,
+    /// The worker fence was already unavailable while installing execution.
+    #[error("durable call execution authority is unavailable")]
+    RuntimeUnavailable,
 }
 
 /// One process-owned execution supervisor.
@@ -107,12 +113,18 @@ impl CallExecutionSupervisor {
                     CallExecutionError::InvalidConfiguration("operational event capacity overflow"),
                 )?,
             )?;
-        tokio::time::timeout(
+        let operational_health = orchestrator.subscribe_operational_event_stream_health()?;
+        if operational_health.current() != OperationalEventStreamHealth::Healthy {
+            return Err(CallExecutionError::RuntimeUnavailable);
+        }
+        let mut runtime_health = call_runtime.subscribe_supervisor_health();
+        recover_before_listeners_with_health(
+            Arc::clone(&orchestrator),
+            Arc::clone(&call_runtime),
             setup_timeout,
-            recover_before_listeners(Arc::clone(&orchestrator), Arc::clone(&call_runtime)),
+            &mut runtime_health,
         )
-        .await
-        .map_err(|_| CallExecutionError::RecoveryTimeout)??;
+        .await?;
         let (drain, drain_rx) = watch::channel(false);
         let (stop, stop_rx) = watch::channel(false);
         let task = tokio::spawn(run_supervisor(
@@ -124,6 +136,8 @@ impl CallExecutionSupervisor {
             setup_timeout,
             drain_rx,
             stop_rx,
+            runtime_health,
+            operational_health,
         ));
         Ok(Self {
             drain,
@@ -152,6 +166,23 @@ impl CallExecutionSupervisor {
             let _ = task.await;
         }
     }
+}
+
+async fn recover_before_listeners_with_health(
+    orchestrator: Arc<Orchestrator>,
+    runtime: Arc<CallServiceRuntime>,
+    setup_timeout: Duration,
+    runtime_health: &mut watch::Receiver<RuntimeSupervisorHealth>,
+) -> Result<(), CallExecutionError> {
+    let recovery = tokio::time::timeout(
+        setup_timeout,
+        recover_before_listeners(orchestrator, runtime),
+    );
+    await_while_runtime_owned(recovery, runtime_health)
+        .await
+        .map_err(|()| CallExecutionError::RuntimeUnavailable)?
+        .map_err(|_| CallExecutionError::RecoveryTimeout)?
+        .map_err(CallExecutionError::Repository)
 }
 
 impl Drop for CallExecutionSupervisor {
@@ -274,6 +305,7 @@ struct ActorSlot {
     commands: mpsc::Sender<ActorCommand>,
     operational: mpsc::Sender<OperationalEvent>,
     work: mpsc::Sender<ActorWork>,
+    retiring: Arc<AtomicBool>,
 }
 
 enum ActorCommand {
@@ -348,6 +380,7 @@ struct CallActor {
     conversation_id: Option<ConversationId>,
     session_id: Option<SessionId>,
     terminal: bool,
+    retiring: Arc<AtomicBool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +393,8 @@ async fn run_supervisor(
     setup_timeout: Duration,
     mut drain: watch::Receiver<bool>,
     mut stop: watch::Receiver<bool>,
+    mut runtime_health: watch::Receiver<RuntimeSupervisorHealth>,
+    mut operational_health: OperationalEventStreamHealthSubscription,
 ) {
     let mut proof_tasks = JoinSet::new();
     let mut actors = JoinSet::<ActorExit>::new();
@@ -368,7 +403,7 @@ async fn run_supervisor(
     let mut connection_owners = HashMap::<ConnectionId, ConnectionOwner>::new();
     let mut leg_owners = HashMap::<(CallId, LegId), ConnectionId>::new();
     let mut work_wakeups = runtime.subscribe_work_wakeups();
-    let mut runtime_health = runtime.subscribe_supervisor_health();
+    let initial_runtime_health = *runtime_health.borrow();
     let (actor_shutdown, actor_shutdown_rx) = watch::channel(ActorShutdown::Running);
     let mut work_poll = tokio::time::interval(WORK_POLL_INTERVAL);
     work_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -378,6 +413,25 @@ async fn run_supervisor(
     let mut stopping = false;
     let mut pending_operational = None;
     let mut pending_work = VecDeque::new();
+    let actor_task_capacity = runtime
+        .worker()
+        .max_calls
+        .saturating_add(admission_capacity);
+    match initial_runtime_health {
+        RuntimeSupervisorHealth::Healthy | RuntimeSupervisorHealth::Degraded => {}
+        RuntimeSupervisorHealth::Draining => {
+            accepting_admission = false;
+            accepting_work = false;
+            admissions.close();
+        }
+        RuntimeSupervisorHealth::LeaseLost | RuntimeSupervisorHealth::Stopped => {
+            lease_lost = true;
+            accepting_admission = false;
+            accepting_work = false;
+            admissions.close();
+            let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+        }
+    }
 
     loop {
         if stopping
@@ -425,6 +479,23 @@ async fn run_supervisor(
                     accepting_admission = false;
                     accepting_work = false;
                     admissions.close();
+                    proof_tasks.abort_all();
+                    work_claims.abort_all();
+                    pending_work.clear();
+                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+                    while let Ok(admission) = admissions.try_recv() {
+                        let _ = admission.reject(RejectReason::ServerError).await;
+                    }
+                }
+            }
+            health = operational_health.changed(), if !lease_lost => {
+                if health != OperationalEventStreamHealth::Healthy {
+                    tracing::error!("authoritative operational stream degraded");
+                    lease_lost = true;
+                    accepting_admission = false;
+                    accepting_work = false;
+                    admissions.close();
+                    proof_tasks.abort_all();
                     work_claims.abort_all();
                     pending_work.clear();
                     let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
@@ -484,6 +555,7 @@ async fn run_supervisor(
                                 &mut connection_owners,
                                 &mut leg_owners,
                                 &mut actors,
+                                actor_task_capacity,
                                 drain.clone(),
                                 actor_shutdown_rx.clone(),
                             ).await;
@@ -522,6 +594,7 @@ async fn run_supervisor(
                     &mut connection_owners,
                     &mut leg_owners,
                     &mut actors,
+                    actor_task_capacity,
                     drain.clone(),
                     actor_shutdown_rx.clone(),
                 ).await {
@@ -532,6 +605,10 @@ async fn run_supervisor(
                 let Some(event) = event else {
                     tracing::error!("authoritative operational receiver closed");
                     lease_lost = true;
+                    admissions.close();
+                    proof_tasks.abort_all();
+                    work_claims.abort_all();
+                    pending_work.clear();
                     let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
                     break;
                 };
@@ -685,12 +762,17 @@ async fn prove_admission(
         runtime.worker().lease,
         connection_id,
     );
-    let consumed = match tokio::time::timeout(
-        setup_timeout,
-        runtime.service().consume_inbound_attachment(request),
-    )
-    .await
-    {
+    let mut runtime_health = runtime.subscribe_supervisor_health();
+    let service = runtime.service();
+    let consume = tokio::time::timeout(setup_timeout, service.consume_inbound_attachment(request));
+    let consumed = match await_while_runtime_owned(consume, &mut runtime_health).await {
+        Ok(consumed) => consumed,
+        Err(()) => {
+            let _ = admission.reject(RejectReason::ServerError).await;
+            return None;
+        }
+    };
+    let consumed = match consumed {
         Ok(Ok(consumed)) => consumed,
         Ok(Err(InboundAttachmentError::ProofRejected)) => {
             metrics::counter!("bridgefu_attachment_admission_total", "result" => "rejected")
@@ -711,6 +793,33 @@ async fn prove_admission(
     })
 }
 
+async fn await_while_runtime_owned<F, T>(
+    future: F,
+    health: &mut watch::Receiver<RuntimeSupervisorHealth>,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        if !matches!(
+            *health.borrow(),
+            RuntimeSupervisorHealth::Healthy | RuntimeSupervisorHealth::Degraded
+        ) {
+            return Err(());
+        }
+        tokio::select! {
+            biased;
+            changed = health.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+            }
+            result = &mut future => return Ok(result),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn register_proven_admission(
     proven: ProvenAdmission,
@@ -720,6 +829,7 @@ async fn register_proven_admission(
     connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
     leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
     actors: &mut JoinSet<ActorExit>,
+    actor_task_capacity: usize,
     drain: watch::Receiver<bool>,
     shutdown: watch::Receiver<ActorShutdown>,
 ) {
@@ -729,8 +839,9 @@ async fn register_proven_admission(
     let connection_id = binding.connection_id.clone();
     let leg_id = binding.leg_id;
     let mut spawned = false;
+    let mut inserted_index = false;
     if !actor_slots.contains_key(&call_id) {
-        if actor_slots.len() >= runtime.worker().max_calls {
+        if !can_spawn_actor(actor_slots, runtime.worker().max_calls, actor_task_capacity) {
             fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
             return;
         }
@@ -765,29 +876,64 @@ async fn register_proven_admission(
     }
 
     if !spawned {
-        if connection_owners.contains_key(&connection_id)
-            || leg_owners.contains_key(&(call_id, leg_id))
+        let indexed_connection = connection_owners.get(&connection_id);
+        let indexed_leg = leg_owners.get(&(call_id, leg_id));
+        let already_indexed_by_this_binding = matches!(
+            (indexed_connection, indexed_leg),
+            (Some(owner), Some(indexed_connection_id))
+                if owner.call_id == call_id
+                    && owner.leg_id == leg_id
+                    && indexed_connection_id == &connection_id
+        );
+        if !already_indexed_by_this_binding
+            && (indexed_connection.is_some() || indexed_leg.is_some())
         {
             fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
             return;
         }
-        connection_owners.insert(connection_id.clone(), ConnectionOwner { call_id, leg_id });
-        leg_owners.insert((call_id, leg_id), connection_id.clone());
+        if !already_indexed_by_this_binding {
+            connection_owners.insert(connection_id.clone(), ConnectionOwner { call_id, leg_id });
+            leg_owners.insert((call_id, leg_id), connection_id.clone());
+            inserted_index = true;
+        }
     }
 
     let Some(slot) = actor_slots.get(&call_id) else {
-        connection_owners.remove(&connection_id);
-        leg_owners.remove(&(call_id, leg_id));
+        if inserted_index {
+            connection_owners.remove(&connection_id);
+            leg_owners.remove(&(call_id, leg_id));
+        }
         fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
         return;
     };
     if let Err(error) = slot.commands.try_send(ActorCommand::Admit(proven)) {
         let ActorCommand::Admit(proven) = error.into_inner();
-        connection_owners.remove(&connection_id);
-        leg_owners.remove(&(call_id, leg_id));
+        if inserted_index {
+            connection_owners.remove(&connection_id);
+            leg_owners.remove(&(call_id, leg_id));
+        }
         tracing::error!(%call_id, %connection_id, "call actor admission mailbox is unavailable");
         fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
     }
+}
+
+fn active_actor_count(actor_slots: &HashMap<CallId, ActorSlot>) -> usize {
+    actor_slots
+        .values()
+        .filter(|slot| !slot.retiring.load(Ordering::Acquire))
+        .count()
+}
+
+fn can_spawn_actor(
+    actor_slots: &HashMap<CallId, ActorSlot>,
+    max_active: usize,
+    max_total: usize,
+) -> bool {
+    active_actor_count(actor_slots) < max_active && actor_slots.len() < max_total
+}
+
+fn can_buffer_actor_work(pending: usize) -> bool {
+    pending < ACTOR_PENDING_WORK_CAPACITY
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -829,12 +975,14 @@ fn spawn_call_actor(
     let (commands_tx, commands_rx) = mpsc::channel(ACTOR_COMMAND_MAILBOX);
     let (operational_tx, operational_rx) = mpsc::channel(OPERATIONAL_MAILBOX_PER_CALL);
     let (work_tx, work_rx) = mpsc::channel(ACTOR_COMMAND_MAILBOX);
+    let retiring = Arc::new(AtomicBool::new(false));
     actor_slots.insert(
         call_id,
         ActorSlot {
             commands: commands_tx,
             operational: operational_tx,
             work: work_tx,
+            retiring: Arc::clone(&retiring),
         },
     );
     let actor = CallActor::new(
@@ -846,6 +994,7 @@ fn spawn_call_actor(
         work_rx,
         drain,
         shutdown,
+        retiring,
     );
     let tenant_id = actor.tenant_id.clone();
     actors.spawn(async move {
@@ -870,6 +1019,7 @@ async fn route_claimed_work(
     connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
     leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
     actors: &mut JoinSet<ActorExit>,
+    actor_task_capacity: usize,
     drain: watch::Receiver<bool>,
     shutdown: watch::Receiver<ActorShutdown>,
 ) -> Option<ActorWork> {
@@ -887,7 +1037,7 @@ async fn route_claimed_work(
         ActorWork::Restart(claim) => (claim.call.aggregate.tenant_id(), claim.call.aggregate.id()),
     };
     if !actor_slots.contains_key(&call_id) {
-        if actor_slots.len() >= runtime.worker().max_calls {
+        if !can_spawn_actor(actor_slots, runtime.worker().max_calls, actor_task_capacity) {
             tracing::error!(%call_id, "durable work could not allocate its reserved call actor");
             return Some(item);
         }
@@ -966,14 +1116,16 @@ async fn fail_unowned_proven_admission(
         )
         .await;
     }
-    let _ = orchestrator
-        .end_connection(
+    let _ = tokio::time::timeout(
+        EXTERNAL_OPERATION_TIMEOUT,
+        orchestrator.end_connection(
             connection_id,
             EndReason::Failed {
                 detail: "call execution owner unavailable".into(),
             },
-        )
-        .await;
+        ),
+    )
+    .await;
 }
 
 async fn try_route_operational_event(
@@ -1176,6 +1328,7 @@ impl CallActor {
         work: mpsc::Receiver<ActorWork>,
         drain: watch::Receiver<bool>,
         shutdown: watch::Receiver<ActorShutdown>,
+        retiring: Arc<AtomicBool>,
     ) -> Self {
         let bindings = stored
             .call
@@ -1218,7 +1371,13 @@ impl CallActor {
             // caused its allocation before it can evaluate retirement. This
             // closes the send-after-spawn race for terminal cleanup effects.
             terminal: false,
+            retiring,
         }
+    }
+
+    fn set_terminal(&mut self, terminal: bool) {
+        self.terminal = terminal;
+        self.retiring.store(terminal, Ordering::Release);
     }
 
     async fn run(mut self) -> ActorExit {
@@ -1319,7 +1478,7 @@ impl CallActor {
                         }
                     }
                 }
-                work = self.work.recv() => {
+                work = self.work.recv(), if can_buffer_actor_work(self.pending_work.len()) => {
                     if let Some(work) = work {
                         self.pending_work.push_back(work);
                     }
@@ -1413,7 +1572,7 @@ impl CallActor {
                 self.runtime.observation_time(),
             )
             .await
-            .map(|stored| self.terminal = stored.call.aggregate.state().is_terminal());
+            .map(|stored| self.set_terminal(stored.call.aggregate.state().is_terminal()));
         let _ = self
             .orchestrator
             .end_connection(
@@ -1471,7 +1630,7 @@ impl CallActor {
             .load_service_call(&self.tenant_id, self.call_id)
             .await
         {
-            self.terminal = stored.call.aggregate.state().is_terminal();
+            self.set_terminal(stored.call.aggregate.state().is_terminal());
             if !self.terminal {
                 let _ = ensure_ending_deadline(&self.runtime, stored, self.shutdown.clone()).await;
             }
@@ -1479,6 +1638,9 @@ impl CallActor {
     }
 
     async fn handle_operational(&mut self, event: OperationalEvent) {
+        if *self.shutdown.borrow() == ActorShutdown::LeaseLost {
+            return;
+        }
         let Some(binding) = self
             .bindings
             .values()
@@ -1517,7 +1679,7 @@ impl CallActor {
         let transition = classify_operational_event(leg.state(), &event.kind);
         match transition {
             OperationalTransition::Ignore => {
-                self.terminal = stored.call.aggregate.state().is_terminal();
+                self.set_terminal(stored.call.aggregate.state().is_terminal());
             }
             OperationalTransition::EndUnexpectedConnected => {
                 let _ = self
@@ -1536,14 +1698,25 @@ impl CallActor {
                     .commit_current_binding(leg_id, state, failure, at)
                     .await
                 {
-                    self.terminal = committed.call.aggregate.state().is_terminal();
+                    let should_stop_peers = matches!(
+                        event.kind,
+                        OperationalEventKind::Ended { .. } | OperationalEventKind::Failed { .. }
+                    ) && committed.call.aggregate.state()
+                        == CallState::Ending;
+                    self.set_terminal(committed.call.aggregate.state().is_terminal());
                     if !self.terminal {
-                        let _ =
-                            ensure_ending_deadline(&self.runtime, committed, self.shutdown.clone())
-                                .await;
+                        let _ = ensure_ending_deadline(
+                            &self.runtime,
+                            committed.clone(),
+                            self.shutdown.clone(),
+                        )
+                        .await;
                     }
                     if let Some(binding) = self.bindings.get_mut(&leg_id) {
                         binding.state = state;
+                    }
+                    if should_stop_peers {
+                        self.stop_ending_peers(leg_id, &committed).await;
                     }
                 }
             }
@@ -1554,6 +1727,29 @@ impl CallActor {
                 )
                 .increment(1);
             }
+        }
+    }
+
+    async fn stop_ending_peers(&self, source_leg_id: LegId, stored: &StoredServiceCall) {
+        if *self.shutdown.borrow() == ActorShutdown::LeaseLost {
+            return;
+        }
+        for binding in self.bindings.values() {
+            if binding.leg_id == source_leg_id
+                || stored
+                    .call
+                    .aggregate
+                    .leg(binding.leg_id)
+                    .is_none_or(|leg| leg.state() != LegState::Ending)
+            {
+                continue;
+            }
+            let _ = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                self.orchestrator
+                    .end_connection(binding.connection_id.clone(), EndReason::BridgeTorn),
+            )
+            .await;
         }
     }
 
@@ -1605,15 +1801,17 @@ impl CallActor {
             };
             let mut delay = REPOSITORY_RETRY_MIN;
             loop {
-                match self
-                    .runtime
-                    .service()
-                    .record_media_activity(observation.clone())
-                    .await
-                {
+                let service = self.runtime.service();
+                let result = await_while_execution_owned(
+                    service.record_media_activity(observation.clone()),
+                    &mut self.shutdown,
+                )
+                .await
+                .map_err(|()| RepositoryError::Unavailable)?;
+                match result {
                     Ok(ServiceCommandOutcome::Committed(view))
                     | Ok(ServiceCommandOutcome::Replayed(view)) => {
-                        self.terminal = view.command.call.aggregate.state().is_terminal();
+                        self.set_terminal(view.command.call.aggregate.state().is_terminal());
                         return Ok(());
                     }
                     Err(CallServiceError::Repository(RepositoryError::Unavailable)) => {
@@ -1732,22 +1930,27 @@ impl CallActor {
             }
         }
         for binding in self.bindings.values() {
-            let _ = self
-                .orchestrator
-                .end_connection(binding.connection_id.clone(), EndReason::Cancelled)
-                .await;
+            let _ = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                self.orchestrator
+                    .end_connection(binding.connection_id.clone(), EndReason::Cancelled),
+            )
+            .await;
         }
         if let Some(session_id) = self.session_id.take() {
-            let _ = self
-                .orchestrator
-                .end_session(session_id, EndReason::Cancelled)
-                .await;
+            let _ = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                self.orchestrator
+                    .end_session(session_id, EndReason::Cancelled),
+            )
+            .await;
         }
         if let Some(conversation_id) = self.conversation_id.take() {
-            let _ = self
-                .orchestrator
-                .close_conversation(conversation_id, true)
-                .await;
+            let _ = tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                self.orchestrator.close_conversation(conversation_id, true),
+            )
+            .await;
         }
     }
 }
@@ -2650,11 +2853,14 @@ async fn ensure_ending_deadline(
             bound_connection: None,
             media_activity: None,
         };
-        match runtime
-            .service_repository()
-            .commit_with_effect_payloads(request)
-            .await
-        {
+        let repository = runtime.service_repository();
+        let result = await_while_execution_owned(
+            repository.commit_with_effect_payloads(request),
+            &mut shutdown,
+        )
+        .await
+        .map_err(|()| RepositoryError::Unavailable)?;
+        match result {
             Ok(_) => return Ok(()),
             Err(RepositoryError::VersionConflict) => {
                 stored = runtime
@@ -2924,11 +3130,20 @@ async fn commit_binding_state(
             failure: failure.clone(),
             at: event_at,
         };
-        match runtime
-            .service_repository()
-            .commit_bound_connection_state(request.clone())
+        let repository = runtime.service_repository();
+        let result = if let Some(cancel) = &mut cancel {
+            await_while_execution_owned(
+                repository.commit_bound_connection_state(request.clone()),
+                cancel,
+            )
             .await
-        {
+            .map_err(|()| RepositoryError::Unavailable)?
+        } else {
+            repository
+                .commit_bound_connection_state(request.clone())
+                .await
+        };
+        match result {
             Ok(ServiceCommandOutcome::Committed(view))
             | Ok(ServiceCommandOutcome::Replayed(view)) => {
                 return runtime
@@ -2970,6 +3185,30 @@ async fn commit_binding_state(
                 delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn await_while_execution_owned<F, T>(
+    future: F,
+    shutdown: &mut watch::Receiver<ActorShutdown>,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        if *shutdown.borrow() == ActorShutdown::LeaseLost {
+            return Err(());
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
+                    return Err(());
+                }
+            }
+            result = &mut future => return Ok(result),
         }
     }
 }
@@ -3085,6 +3324,7 @@ fn operational_kind_label(kind: &OperationalEventKind) -> &'static str {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicUsize;
 
     use crate::call_engine::WorkerId;
     use crate::call_service::{
@@ -3111,6 +3351,89 @@ mod tests {
             },
             claim_generation: crate::call_engine::ClaimGeneration::default(),
         })
+    }
+
+    fn actor_slot(retiring: bool) -> ActorSlot {
+        let (commands, _) = mpsc::channel(1);
+        let (operational, _) = mpsc::channel(1);
+        let (work, _) = mpsc::channel(1);
+        ActorSlot {
+            commands,
+            operational,
+            work,
+            retiring: Arc::new(AtomicBool::new(retiring)),
+        }
+    }
+
+    #[test]
+    fn retiring_actors_release_active_capacity_but_total_tasks_remain_bounded() {
+        let mut actors = HashMap::new();
+        actors.insert(CallId::new(), actor_slot(true));
+        assert_eq!(active_actor_count(&actors), 0);
+        assert!(can_spawn_actor(&actors, 1, 3));
+        actors.insert(CallId::new(), actor_slot(true));
+        actors.insert(CallId::new(), actor_slot(true));
+        assert!(!can_spawn_actor(&actors, 1, 3));
+        actors.clear();
+        actors.insert(CallId::new(), actor_slot(false));
+        assert!(!can_spawn_actor(&actors, 1, 3));
+    }
+
+    #[test]
+    fn per_call_claim_buffer_stops_at_its_explicit_bound() {
+        assert!(can_buffer_actor_work(ACTOR_PENDING_WORK_CAPACITY - 1));
+        assert!(!can_buffer_actor_work(ACTOR_PENDING_WORK_CAPACITY));
+        assert!(!can_buffer_actor_work(ACTOR_PENDING_WORK_CAPACITY + 1));
+    }
+
+    #[tokio::test]
+    async fn runtime_authority_loss_cancels_before_or_during_owned_future() {
+        let (health, mut already_lost) = watch::channel(RuntimeSupervisorHealth::LeaseLost);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let ready = std::future::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(())
+        });
+        assert_eq!(
+            await_while_runtime_owned(ready, &mut already_lost).await,
+            Err(())
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+
+        let mut healthy = health.subscribe();
+        health.send_replace(RuntimeSupervisorHealth::Healthy);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let task = tokio::spawn(async move {
+            let pending = std::future::poll_fn(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::<()>::Pending
+            });
+            await_while_runtime_owned(pending, &mut healthy).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while polls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        health.send_replace(RuntimeSupervisorHealth::LeaseLost);
+        assert_eq!(task.await.unwrap(), Err(()));
+    }
+
+    #[tokio::test]
+    async fn operational_write_guard_never_polls_after_lease_loss() {
+        let (_shutdown, mut lost) = watch::channel(ActorShutdown::LeaseLost);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let write = std::future::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(())
+        });
+        assert_eq!(await_while_execution_owned(write, &mut lost).await, Err(()));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3297,6 +3620,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn install_rejects_an_already_lost_worker_before_recovery_or_listeners() {
+        let mut coordination = CallServiceCoordinationConfig::new(
+            DeploymentId::parse("execution-initial-lease-loss-test").unwrap(),
+        );
+        coordination.worker_lease_ttl = Duration::from_secs(300);
+        coordination.worker_renew_interval = Duration::from_secs(100);
+        let runtime = Arc::new(
+            build_call_service_runtime(
+                CallServiceRuntimeConfig {
+                    backend: CallRepositoryBackendConfig::Memory,
+                    worker_id: WorkerId::new(),
+                    max_calls: 1,
+                    worker_capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+                    control_key: vec![0x53; 32],
+                    timeouts: CallTimeoutPolicy::default(),
+                    coordination,
+                },
+                Arc::new(SamePrincipalAttachmentResolver),
+                Arc::new(SystemCallServiceClock),
+            )
+            .await
+            .unwrap(),
+        );
+        runtime.force_supervisor_health_for_test(RuntimeSupervisorHealth::LeaseLost);
+        let orchestrator = Orchestrator::new(CoreConfig::default());
+        assert!(matches!(
+            CallExecutionSupervisor::install(
+                Arc::clone(&orchestrator),
+                Arc::clone(&runtime),
+                2,
+                Duration::from_secs(1),
+            )
+            .await,
+            Err(CallExecutionError::RuntimeUnavailable)
+        ));
+        assert_eq!(
+            orchestrator.operational_event_stream_health(),
+            OperationalEventStreamHealth::Degraded,
+            "the failed install drops its correctness receiver and cannot be reused"
+        );
+        drop(orchestrator);
+        Arc::try_unwrap(runtime)
+            .expect("failed installation retained no runtime owner")
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
     fn media_principal() -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             subject: "media-subject".into(),
@@ -3438,6 +3810,7 @@ mod tests {
             work_rx,
             drain_rx,
             shutdown_rx,
+            Arc::new(AtomicBool::new(false)),
         );
         (runtime, actor, actor_binding, shutdown_tx)
     }

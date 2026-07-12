@@ -125,23 +125,61 @@ impl GenericBridgeRuntime {
     }
 
     pub async fn shutdown(&self, deadline: Duration) {
+        let deadline_at = tokio::time::Instant::now() + deadline;
         // Stop policy admission first but keep the operational consumer alive
         // while listeners and their live routes emit terminal events.
         if let Some(supervisor) = self.execution.lock().await.as_ref() {
             supervisor.begin_drain();
         }
-        if let Some(server) = self.webrtc.lock().await.take() {
-            server.shutdown_with_deadline(deadline).await;
+        let webrtc = self.webrtc.lock().await.take();
+        let listener_budget = shutdown_budget(deadline_at);
+        if tokio::time::timeout(listener_budget, async {
+            let webrtc_shutdown = async {
+                if let Some(server) = webrtc {
+                    server.shutdown_with_deadline(listener_budget).await;
+                }
+            };
+            let sip_shutdown = async {
+                if let Err(error) = self.sip.shutdown_gracefully(Some(listener_budget)).await {
+                    tracing::warn!(%error, "generic SIP coordinator did not drain cleanly");
+                }
+            };
+            tokio::join!(webrtc_shutdown, sip_shutdown);
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("public signaling listeners exceeded the shutdown deadline");
         }
-        if let Err(error) = self.sip.shutdown_gracefully(Some(deadline)).await {
-            tracing::warn!(%error, "generic SIP coordinator did not drain cleanly");
-        }
-        self.orchestrator
-            .drain_prepared_outbound_connections()
-            .await;
-        self.orchestrator.drain_connection_lifecycle_tasks().await;
+        // Keep the correctness receiver alive through listener teardown, then
+        // stop its actors before aborting rvoip normalization tasks. Reversing
+        // these two waits can deadlock shutdown when an actor is blocked on a
+        // durable store while a lifecycle task is backpressured on that
+        // actor's full operational mailbox.
         if let Some(supervisor) = self.execution.lock().await.take() {
-            supervisor.shutdown(deadline).await;
+            supervisor.shutdown(shutdown_budget(deadline_at)).await;
+        }
+        if tokio::time::timeout(
+            shutdown_budget(deadline_at),
+            self.orchestrator.drain_prepared_outbound_connections(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("prepared outbound drain exceeded the shutdown deadline");
+        }
+        if tokio::time::timeout(
+            shutdown_budget(deadline_at),
+            self.orchestrator.drain_connection_lifecycle_tasks(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("rvoip lifecycle drain exceeded the shutdown deadline");
         }
     }
+}
+
+fn shutdown_budget(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
 }
