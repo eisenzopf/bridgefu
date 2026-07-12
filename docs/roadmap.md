@@ -1080,6 +1080,17 @@ Gate 7 progress evidence recorded on 2026-07-12:
   complete. `TransactionKey`'s public `Display`/`Debug` formats remain unchanged
   because legacy event/API round trips parse them functionally; only log sinks
   may use the safe wrapper.
+- rvoip revision `10e239bd5adf4fdf3c47aad2d3acdbcd13bef5ae`
+  closes the exact typed serializer boundary. It validates every rendered
+  header variant and nested value through an early-stopping bounded formatter,
+  validates exact header names plus method/URI/version start-line fields, fixes
+  `Call-Info` serialization, and rejects unsafe fields before manager,
+  UDP/TCP/TLS/WS/WSS, direct-connection, or multiplexed transport I/O while
+  preserving explicit raw sends. The five-crate qualification executes 2,768
+  tests with one ignored, and passes checks, strict lower-crate Clippy,
+  warning-free rustdoc, formatting, and diff checks. Item 2a remains open only
+  for the separately enumerated transaction/parser/option diagnostic closure
+  and its final independent audit.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
