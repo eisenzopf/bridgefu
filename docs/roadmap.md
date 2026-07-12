@@ -465,6 +465,15 @@ Gate 6 progress evidence recorded on 2026-07-12:
   tests. It covers interleaving, queue saturation, fast-auto-accept cleanup,
   principal expiry, tenantless principals, reserved-header denial, and
   cross-principal update/delete isolation.
+- rvoip revision `1ec7b370e82ed3ba646e795b343a117466667e48`
+  extends the first-party WebRTC auth-core hook with an opt-in, separately
+  prefixed WebSocket session hint for attachment routing. Authentication and
+  attachment material remain independent; missing, duplicate, oversized, or
+  prefix-ambiguous values fail closed, and neither bearer nor attachment
+  subprotocols are echoed during upgrade. `AuthContext` diagnostics redact the
+  subject, principal, and hint. Ten auth tests, two handshake-selection tests,
+  five real WebSocket-auth tests, three signaling-ownership tests, strict
+  Clippy, and warning-free rustdoc pass. Bridgefu CI now pins this revision.
 - Bridgefu revisions `952a01adcf41a2bc2c73a4999521876533bfb87d`,
   `c758981fd4726810fdec3135eb730c9bf082c471`, and
   `ad3dbec819335d5afb82425125af94769a009384` add the backend-neutral atomic
