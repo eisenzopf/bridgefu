@@ -740,7 +740,7 @@ async fn postgres_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time(
     };
     let administration = sqlx::PgPool::connect(&url).await.unwrap();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let source_schema = format!("bridgefu_v3_source_{suffix}");
+    let source_schema = format!("bridgefu_v4_source_{suffix}");
     let target_schema = format!("bridgefu_v1_target_{suffix}");
     sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
         .execute(&administration)
@@ -886,7 +886,7 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
     };
     let administration = sqlx::PgPool::connect(&url).await.unwrap();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let source_schema = format!("bridgefu_v3_service_source_{suffix}");
+    let source_schema = format!("bridgefu_v4_service_source_{suffix}");
     let target_schema = format!("bridgefu_v2_service_target_{suffix}");
     sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
         .execute(&administration)
@@ -990,12 +990,12 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
 async fn sqlite_migration_checksum_drift_fails_closed_and_recovers_after_restore() {
     let (url, path) = sqlite_database("migration-checksum");
     let repository = SqliteRepository::connect(&url).await.unwrap();
-    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 4")
         .fetch_one(repository.pool())
         .await
         .unwrap()
         .get::<Vec<u8>, _>("checksum");
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 3")
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 4")
         .bind(vec![0_u8; checksum.len()])
         .execute(repository.pool())
         .await
@@ -1004,7 +1004,7 @@ async fn sqlite_migration_checksum_drift_fails_closed_and_recovers_after_restore
         SqliteRepository::connect(&url).await.err(),
         Some(RepositoryError::Unavailable)
     );
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 3")
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 4")
         .bind(checksum)
         .execute(repository.pool())
         .await
@@ -1033,12 +1033,12 @@ async fn postgres_migration_checksum_drift_fails_closed_and_recovers_after_resto
         .append_pair("options", &format!("-csearch_path={schema}"));
     let scoped = scoped.to_string();
     let repository = PostgresRepository::connect(&scoped).await.unwrap();
-    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 4")
         .fetch_one(repository.pool())
         .await
         .unwrap()
         .get::<Vec<u8>, _>("checksum");
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 3")
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 4")
         .bind(vec![0_u8; checksum.len()])
         .execute(repository.pool())
         .await
@@ -1047,7 +1047,7 @@ async fn postgres_migration_checksum_drift_fails_closed_and_recovers_after_resto
         PostgresRepository::connect(&scoped).await.err(),
         Some(RepositoryError::Unavailable)
     );
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 3")
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 4")
         .bind(checksum)
         .execute(repository.pool())
         .await
@@ -1799,6 +1799,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "control_outbox",
     "control_outbox_retirements",
     "control_sequences",
+    "coordination_outbox",
     "deadlines",
     "external_references",
     "idempotency",
@@ -1820,7 +1821,9 @@ const REQUIRED_TABLES: &[&str] = &[
 
 async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
     let rows = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_sqlx_%' ORDER BY name",
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE '_sqlx_%' AND name <> 'sqlite_sequence' \
+         ORDER BY name",
     )
     .fetch_all(repository.pool())
     .await
@@ -1835,6 +1838,8 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
             "missing SQLite table {required}"
         );
     }
+    assert!(actual.contains("coordination_projection_locks"));
+    assert_eq!(actual.len(), REQUIRED_TABLES.len() + 1);
     let foreign_key_violations = sqlx::query("PRAGMA foreign_key_check")
         .fetch_all(repository.pool())
         .await
@@ -1844,26 +1849,25 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 3);
-    assert_eq!(migrations[0].get::<i64, _>("version"), 1);
-    assert!(migrations[0].get::<bool, _>("success"));
-    assert_eq!(migrations[1].get::<i64, _>("version"), 2);
-    assert!(migrations[1].get::<bool, _>("success"));
-    assert_eq!(migrations[2].get::<i64, _>("version"), 3);
-    assert!(migrations[2].get::<bool, _>("success"));
+    assert_eq!(migrations.len(), 4);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=4) {
+        assert_eq!(migration.get::<i64, _>("version"), expected_version);
+        assert!(migration.get::<bool, _>("success"));
+    }
     assert_eq!(
         sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = 1")
             .fetch_one(repository.pool())
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        3
+        4
     );
 }
 
 async fn assert_required_postgres_tables(repository: &PostgresRepository) {
     let rows = sqlx::query(
-        "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = current_schema()",
+        "SELECT tablename FROM pg_catalog.pg_tables \
+         WHERE schemaname = current_schema() AND tablename NOT LIKE '_sqlx_%'",
     )
     .fetch_all(repository.pool())
     .await
@@ -1878,24 +1882,23 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
             "missing PostgreSQL table {required}"
         );
     }
+    assert_eq!(actual.len(), REQUIRED_TABLES.len());
     let migrations = sqlx::query("SELECT version, success FROM _sqlx_migrations ORDER BY version")
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 3);
-    assert_eq!(migrations[0].get::<i64, _>("version"), 1);
-    assert!(migrations[0].get::<bool, _>("success"));
-    assert_eq!(migrations[1].get::<i64, _>("version"), 2);
-    assert!(migrations[1].get::<bool, _>("success"));
-    assert_eq!(migrations[2].get::<i64, _>("version"), 3);
-    assert!(migrations[2].get::<bool, _>("success"));
+    assert_eq!(migrations.len(), 4);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=4) {
+        assert_eq!(migration.get::<i64, _>("version"), expected_version);
+        assert!(migration.get::<bool, _>("success"));
+    }
     assert_eq!(
         sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = TRUE")
             .fetch_one(repository.pool())
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        3
+        4
     );
 }
 

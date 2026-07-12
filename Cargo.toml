@@ -38,6 +38,7 @@ hmac = "0.12"
 jsonwebtoken = "9.3"
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+redis = { version = "1.0.4", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "streams"] }
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "1"
