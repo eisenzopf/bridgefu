@@ -879,7 +879,23 @@ not hide an earlier adapter side effect behind a nominally staged API.
      performs I/O. Request methods must be exact SIP tokens, and every rendered
      Request-URI/version start-line component is bounded and single-line before
      route lookup or I/O. Outer diagnostics classify extension methods without
-     formatting their caller-controlled spelling.
+     formatting their caller-controlled spelling. Transaction-layer diagnostics
+     must likewise be metadata-only: no derived `Debug` of a command or complete
+     SIP message, no peer-controlled Via branch or extension-method spelling in
+     transaction-key logs, and no raw expected/received branch comparison. Use
+     log-only safe wrappers so functional transaction identity, wire formatting,
+     parsing, and protocol correlation remain byte-for-byte compatible. Apply
+     those wrappers to transaction commands, events, messages, errors, client
+     and server data, request-authorization decisions, and rejection details;
+     arbitrary error strings and challenge headers are presence/length metadata
+     only. Validate typed requests at transaction-manager entry before route
+     selection, then retain full wire validation after stack normalization;
+     route/Via diagnostics remain metadata-only even for valid messages. A
+     static scan plus secret-bearing canaries must cover every transaction-key,
+     method, branch, message, event, error, and route log sink. Parser
+     failures expose only offsets, error classes, and remaining byte counts;
+     they never log the unparsed remainder because it may contain credentials,
+     malformed headers, or a body.
      Authorization-bearing raw values, their enclosing typed headers, and
      complete requests must also redact secrets from diagnostics regardless of
      whether the header name uses a canonical variant or a case-insensitive
@@ -895,6 +911,9 @@ not hide an earlier adapter side effect behind a nominally staged API.
      a continuation-aware, body-safe default when no application policy is
      installed; and the default typed-header policy is a deliberate safe
      allowlist rather than an `_ => Keep` fallback.
+     SIP option materialization errors expose only field presence/length and
+     validation class; they never include P-Asserted-Identity, proxy URI, From,
+     target, credential, or application-header values.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
@@ -1045,6 +1064,22 @@ Gate 7 progress evidence recorded on 2026-07-12:
   or header-smuggling gaps. It also confirmed that true dormant activation and
   terminal-stage reclamation remain item 2b blockers. These findings are
   release gates, not deferred cleanup.
+- The subsequent item 2a audit at rvoip revision
+  `36f7d59e5dfc8398e7c6725fec998955dcb94c13` confirms the authorization,
+  trace-event, orphan-fold, typed raw-field, response-reason, and outer-event
+  closures already landed, but keeps 2a open. Exact serializer validation for
+  structured typed headers and request start lines is in qualification, and a
+  further P1 diagnostic audit found transaction commands, complete SIP
+  messages, Via branches, extension methods, arbitrary errors, original
+  requests/responses, authorization decisions, and pre-validation route/Via
+  values reflected by transaction-layer logs, plus a parser failure path that
+  reflects the unparsed peer-controlled remainder. The 2b dependency audit also
+  found raw P-Asserted-Identity/proxy URI values in SIP option-materialization
+  errors. Those diagnostic surfaces
+  must be closed with log-only wrappers before 2a may be represented as
+  complete. `TransactionKey`'s public `Display`/`Debug` formats remain unchanged
+  because legacy event/API round trips parse them functionally; only log sinks
+  may use the safe wrapper.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
