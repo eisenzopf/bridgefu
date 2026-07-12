@@ -34,15 +34,15 @@ use crate::call_engine::{
     TransferResult, WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
-    CallExecutionPlan, CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect,
-    ControlCommandOutcome, ControlCommandTransaction, ControlCommandView, ControlOutboxRecord,
-    ControlSequence, EffectResultOutcome, EffectResultReconciliation, EffectResultView,
-    ExternalReferenceBinding, ExternalReferenceValue, OperationIdempotency,
-    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
-    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
-    ServiceOperationKind, StoredControlCommand, StoredExternalReference, StoredServiceCall,
-    StoredServiceEffectPayload,
+    BoundConnectionGuard, BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository,
+    ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction,
+    ControlCommandView, ControlOutboxRecord, ControlSequence, EffectResultOutcome,
+    EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
+    OperationIdempotency, OperationIdempotencyReceipt, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, StoredControlCommand,
+    StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -1180,6 +1180,7 @@ impl MemoryRepository {
                     .is_some_and(|claim| {
                         !Self::service_operation_claim_has_proof(&state, result, claim)
                     })
+                    || !Self::bound_connection_guard_crosslinks(&state, result)
             })
             || state.control_command_results.values().any(|result| {
                 result
@@ -1304,6 +1305,44 @@ impl MemoryRepository {
                             })
                 }),
         }
+    }
+
+    fn bound_connection_guard_crosslinks(
+        state: &MemoryState,
+        result: &StoredServiceCommandResult,
+    ) -> bool {
+        let Some(guard) = &result.request.bound_connection else {
+            return true;
+        };
+        let command_matches = matches!(
+            &result.request.command.command,
+            CallCommand::SetLegState {
+                leg_id,
+                binding_generation,
+                ..
+            } if *leg_id == guard.leg_id
+                && *binding_generation == guard.binding_generation
+        );
+        if !command_matches || !state.used_connection_ids.contains(&guard.connection_id) {
+            return false;
+        }
+        let call_id = result.request.command.call_id;
+        state.attachments.values().any(|row| {
+            row.call_id == call_id
+                && row.leg_id == guard.leg_id
+                && row.binding_generation == guard.binding_generation
+                && row.binding.as_ref().is_some_and(|binding| {
+                    binding.connection_id == guard.connection_id
+                        && binding.leg_id == guard.leg_id
+                        && binding.binding_generation == guard.binding_generation
+                })
+        }) || state.outbound_binding_results.values().any(|stored| {
+            stored.request.call_id == call_id
+                && stored.request.leg_id == guard.leg_id
+                && stored.request.binding_generation == guard.binding_generation
+                && stored.request.connection_id == guard.connection_id
+                && stored.binding.connection_id == guard.connection_id
+        })
     }
 
     fn retired_operation_claim_crosslinks(
@@ -2645,6 +2684,13 @@ impl CallServiceRepository for MemoryRepository {
         <Self as CallRepository>::consume_attachment(self, request).await
     }
 
+    async fn commit_bound_connection_state(
+        &self,
+        request: BoundConnectionStateCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError> {
+        self.transaction(|state| commit_bound_connection_state_in_state(state, request))
+    }
+
     async fn load_create_replay(
         &self,
         tenant_id: &TenantId,
@@ -3115,6 +3161,23 @@ fn normalize_service_command(
     if let Some(idempotency) = &request.operation_idempotency {
         idempotency.validate_service_command(&request.command.command)?;
     }
+    if let Some(guard) = &request.bound_connection {
+        if request.operation_idempotency.is_some()
+            || !matches!(
+                &request.command.command,
+                CallCommand::SetLegState {
+                    leg_id,
+                    binding_generation,
+                    ..
+                } if *leg_id == guard.leg_id
+                    && *binding_generation == guard.binding_generation
+            )
+        {
+            return Err(RepositoryError::InvalidInput(
+                "bound connection guard does not match lifecycle command",
+            ));
+        }
+    }
     request
         .effect_payloads
         .sort_by_key(|payload| payload.ordinal);
@@ -3251,6 +3314,87 @@ fn commit_service_command_in_state(
         )?;
     }
     Ok(ServiceCommandOutcome::Committed(view))
+}
+
+fn commit_bound_connection_state_in_state(
+    state: &mut MemoryState,
+    request: BoundConnectionStateCommit,
+) -> Result<ServiceCommandOutcome, RepositoryError> {
+    if !matches!(
+        request.state,
+        LegState::Connected
+            | LegState::Held
+            | LegState::Ending
+            | LegState::Ended
+            | LegState::Failed
+    ) {
+        return Err(RepositoryError::InvalidInput(
+            "invalid bound connection lifecycle state",
+        ));
+    }
+    let transaction = normalize_service_command(ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: request.tenant_id.clone(),
+            call_id: request.call_id,
+            expected_version: request.expected_version,
+            command_id: request.command_id,
+            command: CallCommand::SetLegState {
+                at: request.at,
+                leg_id: request.leg_id,
+                binding_generation: request.binding_generation,
+                state: request.state,
+                failure: request.failure,
+            },
+            worker: request.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: request.at,
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: Some(BoundConnectionGuard {
+            connection_id: request.connection_id.clone(),
+            leg_id: request.leg_id,
+            binding_generation: request.binding_generation,
+        }),
+    })?;
+
+    // Exact lost-response replay wins even after the call or binding advances.
+    // A command ID reused with different contents is still rejected by the
+    // shared service-command implementation.
+    if state
+        .service_command_results
+        .contains_key(&transaction.command.command_id)
+    {
+        return commit_service_command_in_state(state, transaction);
+    }
+
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
+    let call = state
+        .calls
+        .get(&request.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let binding = call
+        .bindings
+        .get(&request.leg_id)
+        .filter(|binding| {
+            binding.connection_id == request.connection_id
+                && binding.binding_generation == request.binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    let key = (request.call_id, request.leg_id, request.binding_generation);
+    if state.connection_owners.get(&request.connection_id) != Some(&key)
+        || binding.leg_id != request.leg_id
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    commit_service_command_in_state(state, transaction)
 }
 
 fn enqueue_control_in_state(
@@ -5211,6 +5355,7 @@ mod tests {
             },
             effect_payloads: Vec::new(),
             operation_idempotency: None,
+            bound_connection: None,
         };
         let committed = match repo
             .commit_with_effect_payloads(command.clone())
@@ -5259,6 +5404,140 @@ mod tests {
         assert_eq!(
             recovered.snapshot().unwrap().service_command_results.len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_connection_lifecycle_is_exact_fenced_and_replayable() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-bound-lifecycle");
+        let aggregate = new_call(owner.clone());
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[0].id(),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                },
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[1].id(),
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/lifecycle".into()),
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+        let stored = match repo
+            .create_with_plan(ServiceCreateTransaction {
+                create: create_request(aggregate, worker.lease, 31, 32),
+                plan,
+                alternatives: Vec::new(),
+            })
+            .await
+            .unwrap()
+        {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh service call replayed"),
+        };
+        let issue = stored.attachments[0].clone();
+        let candidate = repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: issue.token_digest,
+                tenant_id: owner.clone(),
+                transport: issue.transport,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        let connection_id = ConnectionId::new();
+        let consumed = repo
+            .consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: issue.leg_id,
+                    binding_generation: issue.binding_generation,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: connection_id.clone(),
+                principal_fingerprint: service_principal(),
+                principal_expires_at: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+
+        let command_id = CommandId::new();
+        let transition = BoundConnectionStateCommit {
+            tenant_id: owner.clone(),
+            call_id: consumed.commit.call.aggregate.id(),
+            expected_version: consumed.commit.call.aggregate.version(),
+            command_id,
+            leg_id: issue.leg_id,
+            binding_generation: issue.binding_generation,
+            connection_id: connection_id.clone(),
+            worker: worker.lease,
+            state: LegState::Connected,
+            failure: None,
+            at: at(4),
+        };
+        let mut wrong_connection = transition.clone();
+        wrong_connection.connection_id = ConnectionId::new();
+        assert_eq!(
+            repo.commit_bound_connection_state(wrong_connection.clone())
+                .await,
+            Err(RepositoryError::StaleClaim)
+        );
+
+        let committed = match repo
+            .commit_bound_connection_state(transition.clone())
+            .await
+            .unwrap()
+        {
+            ServiceCommandOutcome::Committed(view) => view,
+            ServiceCommandOutcome::Replayed(_) => panic!("fresh lifecycle command replayed"),
+        };
+        assert_eq!(
+            committed
+                .command
+                .call
+                .aggregate
+                .leg(issue.leg_id)
+                .unwrap()
+                .state(),
+            LegState::Connected
+        );
+        assert_eq!(
+            repo.commit_bound_connection_state(transition.clone())
+                .await
+                .unwrap(),
+            ServiceCommandOutcome::Replayed(committed)
+        );
+        assert_eq!(
+            repo.commit_bound_connection_state(wrong_connection).await,
+            Err(RepositoryError::CommandConflict)
+        );
+
+        let mut secret_failure = transition.clone();
+        secret_failure.state = LegState::Failed;
+        secret_failure.failure = Some(FailureDetails::sanitized(
+            "transport",
+            "private endpoint detail",
+            false,
+        ));
+        assert!(!format!("{secret_failure:?}").contains("private endpoint detail"));
+
+        let mut stale_version = transition;
+        stale_version.command_id = CommandId::new();
+        assert_eq!(
+            repo.commit_bound_connection_state(stale_version).await,
+            Err(RepositoryError::VersionConflict)
         );
     }
 
@@ -5577,6 +5856,7 @@ mod tests {
                 },
                 effect_payloads: Vec::new(),
                 operation_idempotency: None,
+                bound_connection: None,
             })
             .await
             .unwrap(),

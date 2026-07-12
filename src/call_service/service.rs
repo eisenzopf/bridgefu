@@ -24,14 +24,15 @@ use crate::coordination::{CoordinationProjection, WorkerSelectionRequest};
 
 use super::{
     digest_presented_attachment_token, AmazonConnectEndpointConfig, AttachmentTokenContext,
-    AttachmentView, CallExecutionPlan, CallOperationResult, CallServiceCrypto,
-    CallServiceRepository, CallView, CanonicalRequestTranscript, ControlCommandOutcome,
-    ControlCommandTransaction, ControlIntent, CreateCallView, DtmfAcceptedView, DtmfSequence,
-    IdempotencyKey, LegEndpointConfig, LegExecutionSpec, OperationIdempotency,
-    ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCreateCandidate, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
-    ServiceEffectPayloadInput, ServiceOperationKind, SipEndpointConfig, StoredServiceCall,
-    TransferTarget, WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
+    AttachmentView, BoundConnectionStateCommit, CallExecutionPlan, CallOperationResult,
+    CallServiceCrypto, CallServiceRepository, CallView, CanonicalRequestTranscript,
+    ControlCommandOutcome, ControlCommandTransaction, ControlIntent, CreateCallView,
+    DtmfAcceptedView, DtmfSequence, IdempotencyKey, LegEndpointConfig, LegExecutionSpec,
+    OperationIdempotency, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
+    ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput,
+    ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
+    WebRtcEndpointConfig, WhepEndpointConfig, WhipEndpointConfig,
 };
 
 /// One API-requested logical leg.
@@ -626,6 +627,23 @@ impl CallService {
         })
     }
 
+    /// Commits one worker-internal lifecycle observation against the exact
+    /// durable rvoip connection binding.
+    ///
+    /// This is intentionally not a tenant-facing control API. The execution
+    /// supervisor supplies the retained command ID/version and current worker
+    /// fence so retries are exact and delayed events cannot target a rotated
+    /// leg.
+    pub async fn commit_bound_connection_state(
+        &self,
+        request: BoundConnectionStateCommit,
+    ) -> Result<ServiceCommandOutcome, CallServiceError> {
+        Ok(self
+            .repository
+            .commit_bound_connection_state(request)
+            .await?)
+    }
+
     /// Authenticates ownership, reserves a worker, and creates both legs atomically.
     pub async fn create_call(
         &self,
@@ -1026,6 +1044,7 @@ impl CallService {
                 },
                 effect_payloads,
                 operation_idempotency: Some(operation),
+                bound_connection: None,
             })
             .await?;
         let (view, replayed) = match outcome {
@@ -1590,6 +1609,13 @@ mod tests {
             self.inner.consume_inbound_attachment(request).await
         }
 
+        async fn commit_bound_connection_state(
+            &self,
+            request: BoundConnectionStateCommit,
+        ) -> Result<ServiceCommandOutcome, RepositoryError> {
+            self.inner.commit_bound_connection_state(request).await
+        }
+
         async fn load_create_replay(
             &self,
             _tenant_id: &TenantId,
@@ -1890,6 +1916,7 @@ mod tests {
                     },
                     effect_payloads: Vec::new(),
                     operation_idempotency: None,
+                    bound_connection: None,
                 })
                 .await
                 .unwrap();
@@ -3262,6 +3289,7 @@ mod tests {
                     },
                     effect_payloads: Vec::new(),
                     operation_idempotency: None,
+                    bound_connection: None,
                 })
                 .await
                 .unwrap();

@@ -8,11 +8,12 @@ use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
-    AttachmentCandidate, AttachmentConsume, AttachmentIssue, AttachmentLookup, AttachmentTransport,
-    BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit, CommandCommitView,
-    CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId, FailureDetails,
-    IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
-    ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
+    AggregateVersion, AttachmentCandidate, AttachmentConsume, AttachmentIssue, AttachmentLookup,
+    AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit,
+    CommandCommitView, CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId,
+    FailureDetails, IdempotencyKeyDigest, LegId, LegState, OutboxRecord, OutboxState,
+    PrincipalFingerprint, ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall,
+    TenantId, WorkerLease,
 };
 
 use super::{CallExecutionPlan, ControlIntent, ExternalReferenceValue, ServiceEffectPayload};
@@ -146,6 +147,17 @@ pub struct StoredServiceEffectPayload {
     pub payload: ServiceEffectPayload,
 }
 
+/// Exact durable connection guard retained with lifecycle-command replay.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoundConnectionGuard {
+    /// Exact rvoip route that produced the lifecycle observation.
+    pub connection_id: ConnectionId,
+    /// Exact logical leg.
+    pub leg_id: LegId,
+    /// Exact signaling/media incarnation.
+    pub binding_generation: BindingGeneration,
+}
+
 /// Atomic core command plus service-owned effect payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceCommandTransaction {
@@ -156,6 +168,60 @@ pub struct ServiceCommandTransaction {
     /// Optional public-operation replay claim. Internal effect follow-ups omit it.
     #[serde(default)]
     pub operation_idempotency: Option<OperationIdempotency>,
+    /// Optional exact connection guard for transport lifecycle observations.
+    #[serde(default)]
+    pub bound_connection: Option<BoundConnectionGuard>,
+}
+
+/// Fenced lifecycle transition for one exact durably bound connection.
+///
+/// The repository validates the current connection ID and binding generation
+/// inside the same transaction as the state-machine command. This prevents a
+/// delayed event from an old transport route from advancing a replacement
+/// leg after a restart or transfer.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoundConnectionStateCommit {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Durable call receiving the observation.
+    pub call_id: CallId,
+    /// Compare-and-swap version retained across lost-response retries.
+    pub expected_version: AggregateVersion,
+    /// Stable event delivery identity retained across retries.
+    pub command_id: CommandId,
+    /// Exact logical leg.
+    pub leg_id: LegId,
+    /// Exact signaling/media incarnation.
+    pub binding_generation: BindingGeneration,
+    /// Exact rvoip route that produced the event.
+    pub connection_id: ConnectionId,
+    /// Current fenced worker.
+    pub worker: WorkerLease,
+    /// Target lifecycle state.
+    pub state: LegState,
+    /// Sanitized failure details when `state` is failed.
+    pub failure: Option<FailureDetails>,
+    /// Observation and commit time.
+    pub at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for BoundConnectionStateCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundConnectionStateCommit")
+            .field("tenant_id", &self.tenant_id)
+            .field("call_id", &self.call_id)
+            .field("expected_version", &self.expected_version)
+            .field("command_id", &self.command_id)
+            .field("leg_id", &self.leg_id)
+            .field("binding_generation", &self.binding_generation)
+            .field("connection_id", &self.connection_id)
+            .field("worker", &self.worker)
+            .field("state", &self.state)
+            .field("failure", &self.failure.as_ref().map(|_| "[redacted]"))
+            .field("at", &self.at)
+            .finish()
+    }
 }
 
 /// Exact result of a service command transaction.
@@ -496,6 +562,13 @@ pub trait CallServiceRepository: Send + Sync {
         &self,
         request: AttachmentConsume,
     ) -> Result<ConsumedAttachment, RepositoryError>;
+
+    /// Atomically validates one exact connection binding and commits its
+    /// lifecycle observation.
+    async fn commit_bound_connection_state(
+        &self,
+        request: BoundConnectionStateCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError>;
 
     /// Returns an unexpired exact create receipt before worker placement.
     ///

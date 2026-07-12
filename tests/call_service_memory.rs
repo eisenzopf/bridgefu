@@ -235,6 +235,7 @@ async fn service_command(
             },
             effect_payloads: Vec::new(),
             operation_idempotency: None,
+            bound_connection: None,
         })
         .await
         .unwrap();
@@ -405,6 +406,7 @@ fn transfer_operation(
             request_digest,
             ServiceOperationKind::TransferCall,
         )),
+        bound_connection: None,
     }
 }
 
@@ -605,6 +607,7 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
             },
         }],
         operation_idempotency: None,
+        bound_connection: None,
     };
 
     assert_eq!(
@@ -691,6 +694,7 @@ async fn operation_idempotency_replays_original_before_time_and_cas_evaluation()
             202,
             ServiceOperationKind::TransferCall,
         )),
+        bound_connection: None,
     };
     let ServiceCommandOutcome::Committed(original) = repository
         .commit_with_effect_payloads(first.clone())
@@ -754,6 +758,7 @@ async fn operation_idempotency_conflicts_across_body_kind_and_create_receipt() {
             211,
             ServiceOperationKind::HangupCall,
         )),
+        bound_connection: None,
     };
     assert_eq!(
         repository.commit_with_effect_payloads(wrong_kind).await,
@@ -1228,6 +1233,7 @@ async fn operation_idempotency_keys_are_isolated_by_tenant() {
             222,
             ServiceOperationKind::HangupCall,
         )),
+        bound_connection: None,
     };
     assert!(matches!(
         repository
@@ -1806,6 +1812,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
         },
         effect_payloads: Vec::new(),
         operation_idempotency: None,
+        bound_connection: None,
     };
     let base = EffectResultReconciliation {
         tenant_id: owner.clone(),

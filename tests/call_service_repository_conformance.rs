@@ -10,14 +10,15 @@ use bridgefu::call_engine::{
     TenantId, WorkerLease,
 };
 use bridgefu::call_service::{
-    CallExecutionPlan, CallServiceRepository, ControlCommandOutcome, ControlCommandTransaction,
-    ControlIntent, DtmfSequence, EffectResultOutcome, EffectResultReconciliation, EffectResultView,
-    ExternalReferenceBinding, ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec,
-    OperationIdempotency, OutboundConnectionBind, OutboundConnectionBindOutcome,
-    ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
-    ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, SipEndpointConfig,
-    StoredServiceCall, StoredServiceEffectPayload, TransferTarget, WebRtcEndpointConfig,
+    BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository, ControlCommandOutcome,
+    ControlCommandTransaction, ControlIntent, DtmfSequence, EffectResultOutcome,
+    EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
+    LegEndpointConfig, LegExecutionSpec, OperationIdempotency, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
+    ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction,
+    ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind,
+    SipEndpointConfig, StoredServiceCall, StoredServiceEffectPayload, TransferTarget,
+    WebRtcEndpointConfig,
 };
 use bridgefu::persistence::{MemoryRepository, PostgresRepository, SqliteRepository};
 use chrono::{DateTime, TimeZone, Utc};
@@ -377,6 +378,7 @@ where
         },
         effect_payloads: Vec::new(),
         operation_idempotency: None,
+        bound_connection: None,
     };
     let ServiceCommandOutcome::Committed(view) = repository
         .commit_with_effect_payloads(request.clone())
@@ -398,6 +400,10 @@ struct ConformanceEvidence {
     plan: CallExecutionPlan,
     command_request: ServiceCommandTransaction,
     command_view: ServiceCommandView,
+    inbound_lifecycle_request: BoundConnectionStateCommit,
+    inbound_lifecycle_view: ServiceCommandView,
+    outbound_lifecycle_request: BoundConnectionStateCommit,
+    outbound_lifecycle_view: ServiceCommandView,
     control_request: ControlCommandTransaction,
     control_view: bridgefu::call_service::ControlCommandView,
     control_reconciliation: EffectResultReconciliation,
@@ -410,6 +416,7 @@ struct ConformanceEvidence {
     provider_owner: TenantId,
     provider_call_id: CallId,
     provider_leg_id: LegId,
+    cross_call_connection_id: ConnectionId,
     provider_reconciliation: EffectResultReconciliation,
     provider_reconciliation_view: EffectResultView,
 }
@@ -495,32 +502,78 @@ where
         },
     )
     .await;
-    let (_, inbound_connected) = service_command(
-        repository,
-        &command_view.command.call,
+    let inbound_lifecycle_request = BoundConnectionStateCommit {
+        tenant_id: owner.clone(),
+        call_id: service_call.call.aggregate.id(),
+        expected_version: command_view.command.call.aggregate.version(),
+        command_id: CommandId::new(),
+        leg_id: inbound_leg,
+        binding_generation: BindingGeneration::INITIAL,
+        connection_id: consumed.binding.connection_id.clone(),
         worker,
-        CallCommand::SetLegState {
-            at: at(6),
-            leg_id: inbound_leg,
-            binding_generation: BindingGeneration::INITIAL,
-            state: LegState::Connected,
-            failure: None,
-        },
-    )
-    .await;
-    let (_, active) = service_command(
-        repository,
-        &inbound_connected.command.call,
+        state: LegState::Connected,
+        failure: None,
+        at: at(6),
+    };
+    let mut invalid_lifecycle_state = inbound_lifecycle_request.clone();
+    invalid_lifecycle_state.command_id = CommandId::new();
+    invalid_lifecycle_state.state = LegState::Signaling;
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(invalid_lifecycle_state)
+            .await,
+        Err(RepositoryError::InvalidInput(
+            "invalid bound connection lifecycle state"
+        ))
+    );
+    let mut unknown_connection = inbound_lifecycle_request.clone();
+    unknown_connection.command_id = CommandId::new();
+    unknown_connection.connection_id = ConnectionId::from_string("unknown-service-connection");
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(unknown_connection)
+            .await,
+        Err(RepositoryError::StaleClaim)
+    );
+    let ServiceCommandOutcome::Committed(inbound_lifecycle_view) = repository
+        .commit_bound_connection_state(inbound_lifecycle_request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh inbound lifecycle command replayed")
+    };
+    assert_eq!(
+        inbound_lifecycle_view
+            .command
+            .call
+            .aggregate
+            .leg(inbound_leg)
+            .unwrap()
+            .state(),
+        LegState::Connected
+    );
+
+    let outbound_lifecycle_request = BoundConnectionStateCommit {
+        tenant_id: owner.clone(),
+        call_id: service_call.call.aggregate.id(),
+        expected_version: inbound_lifecycle_view.command.call.aggregate.version(),
+        command_id: CommandId::new(),
+        leg_id: outbound_leg,
+        binding_generation: BindingGeneration::INITIAL,
+        connection_id: outbound_binding.connection_id.clone(),
         worker,
-        CallCommand::SetLegState {
-            at: at(7),
-            leg_id: outbound_leg,
-            binding_generation: BindingGeneration::INITIAL,
-            state: LegState::Connected,
-            failure: None,
-        },
-    )
-    .await;
+        state: LegState::Connected,
+        failure: None,
+        at: at(7),
+    };
+    let ServiceCommandOutcome::Committed(outbound_lifecycle_view) = repository
+        .commit_bound_connection_state(outbound_lifecycle_request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh outbound lifecycle command replayed")
+    };
+    let active = &outbound_lifecycle_view;
 
     let control_request = ControlCommandTransaction {
         command_id: CommandId::new(),
@@ -621,6 +674,7 @@ where
             63,
             ServiceOperationKind::TransferCall,
         )),
+        bound_connection: None,
     };
     let mut invalid_transfer = transfer_request.clone();
     invalid_transfer.effect_payloads[0].ordinal = 999;
@@ -656,6 +710,51 @@ where
             .unwrap(),
     );
     let provider_leg_id = provider.call.aggregate.legs()[0].id();
+    let cross_call_connection_id = ConnectionId::from_string("provider-cross-call");
+    let OutboundConnectionBindOutcome::Bound(_) = repository
+        .bind_outbound_connection(OutboundConnectionBind {
+            operation_id: CommandId::new(),
+            tenant_id: provider_owner.clone(),
+            call_id: provider.call.aggregate.id(),
+            leg_id: provider_leg_id,
+            binding_generation: BindingGeneration::INITIAL,
+            worker,
+            connection_id: cross_call_connection_id.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(3),
+            at: at(22),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fresh cross-call binding replayed")
+    };
+    let mut cross_call_guard = BoundConnectionStateCommit {
+        tenant_id: owner.clone(),
+        call_id: service_call.call.aggregate.id(),
+        expected_version: transfer_view.command.call.aggregate.version(),
+        command_id: CommandId::new(),
+        leg_id: inbound_leg,
+        binding_generation: BindingGeneration::INITIAL,
+        connection_id: cross_call_connection_id.clone(),
+        worker,
+        state: LegState::Held,
+        failure: None,
+        at: at(22),
+    };
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(cross_call_guard.clone())
+            .await,
+        Err(RepositoryError::StaleClaim)
+    );
+    cross_call_guard.command_id = inbound_lifecycle_request.command_id;
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(cross_call_guard)
+            .await,
+        Err(RepositoryError::CommandConflict)
+    );
     let claimed = repository
         .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
         .await
@@ -716,6 +815,10 @@ where
         plan,
         command_request,
         command_view,
+        inbound_lifecycle_request,
+        inbound_lifecycle_view,
+        outbound_lifecycle_request,
+        outbound_lifecycle_view,
         control_request,
         control_view,
         control_reconciliation,
@@ -728,6 +831,7 @@ where
         provider_owner,
         provider_call_id: provider.call.aggregate.id(),
         provider_leg_id,
+        cross_call_connection_id,
         provider_reconciliation,
         provider_reconciliation_view,
     }
@@ -777,6 +881,20 @@ where
             .await
             .unwrap(),
         ServiceCommandOutcome::Replayed(evidence.command_view.clone())
+    );
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(evidence.inbound_lifecycle_request.clone())
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(evidence.inbound_lifecycle_view.clone())
+    );
+    assert_eq!(
+        repository
+            .commit_bound_connection_state(evidence.outbound_lifecycle_request.clone())
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(evidence.outbound_lifecycle_view.clone())
     );
     assert_eq!(
         repository
@@ -920,6 +1038,7 @@ where
             },
             effect_payloads: Vec::new(),
             operation_idempotency: None,
+            bound_connection: None,
         })
         .await
         .unwrap();
@@ -1171,6 +1290,103 @@ async fn assert_postgres_service_drift_detection(
     }
 }
 
+async fn assert_sqlite_bound_guard_tamper_fails_closed(
+    repository: &SqliteRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let command_id = evidence.inbound_lifecycle_request.command_id.to_string();
+    let original: String =
+        sqlx::query_scalar("SELECT body FROM service_command_results WHERE command_id = ?")
+            .bind(&command_id)
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    let cross_call_connection_id = evidence.cross_call_connection_id.to_string();
+    let changed = sqlx::query(
+        "UPDATE service_command_results SET body = json_set(body, '$.result.request.bound_connection.connection_id', ?) WHERE command_id = ?",
+    )
+    .bind(&cross_call_connection_id)
+    .bind(&command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    let stored_guard: String = sqlx::query_scalar(
+        "SELECT json_extract(body, '$.result.request.bound_connection.connection_id') FROM service_command_results WHERE command_id = ?",
+    )
+    .bind(&command_id)
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_guard, cross_call_connection_id);
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "SQLite accepted a lifecycle guard backed by a different call"
+    );
+    sqlx::query("UPDATE service_command_results SET body = ? WHERE command_id = ?")
+        .bind(original)
+        .bind(command_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+}
+
+async fn assert_postgres_bound_guard_tamper_fails_closed(
+    repository: &PostgresRepository,
+    evidence: &ConformanceEvidence,
+) {
+    let command_id = evidence.inbound_lifecycle_request.command_id.to_string();
+    let original: String = sqlx::query_scalar(
+        "SELECT body::text FROM service_command_results WHERE command_id = $1::uuid",
+    )
+    .bind(&command_id)
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    let cross_call_connection_id = evidence.cross_call_connection_id.to_string();
+    let changed = sqlx::query(
+        "UPDATE service_command_results SET body = jsonb_set(body, '{result,request,bound_connection,connection_id}', to_jsonb($1::text), false) WHERE command_id = $2::uuid",
+    )
+    .bind(&cross_call_connection_id)
+    .bind(&command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    let stored_guard: String = sqlx::query_scalar(
+        "SELECT body #>> '{result,request,bound_connection,connection_id}' FROM service_command_results WHERE command_id = $1::uuid",
+    )
+    .bind(&command_id)
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_guard, cross_call_connection_id);
+    assert_eq!(
+        repository
+            .load_service_call(&evidence.owner, evidence.call_id)
+            .await,
+        Err(RepositoryError::Unavailable),
+        "PostgreSQL accepted a lifecycle guard backed by a different call"
+    );
+    sqlx::query("UPDATE service_command_results SET body = $1::jsonb WHERE command_id = $2::uuid")
+        .bind(original)
+        .bind(command_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+}
+
 async fn assert_sqlite_deletion_fails_closed(
     repository: &SqliteRepository,
     owner: &TenantId,
@@ -1365,6 +1581,7 @@ async fn sqlite_service_repository_conformance_restart_and_races() {
             .unwrap();
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
+    assert_sqlite_bound_guard_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
     let third = SqliteRepository::connect(&url).await.unwrap();
@@ -1560,6 +1777,7 @@ async fn postgres_service_repository_conformance_restart_and_races() {
             .unwrap();
     assert_eq!(replay_epoch_after, replay_epoch_before);
     assert_restart_replays(&second, &evidence).await;
+    assert_postgres_bound_guard_tamper_fails_closed(&second, &evidence).await;
     assert_two_instance_control_race(&first, &second, &evidence).await;
     let (request, view) = assert_expiry_and_same_key_reuse(&second, &evidence).await;
     let third = PostgresRepository::connect(&scoped).await.unwrap();

@@ -40,13 +40,13 @@ use crate::call_engine::{
     WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
-    CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome,
-    ControlCommandTransaction, ControlIntent, ControlOutboxRecord, EffectResultOutcome,
-    EffectResultReconciliation, ExternalReferenceValue, LegEndpointConfig,
-    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
-    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateOutcome,
-    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult, ServiceOperationKind,
-    StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    BoundConnectionStateCommit, CallServiceRepository, ClaimedControlEffect,
+    CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
+    ControlOutboxRecord, EffectResultOutcome, EffectResultReconciliation, ExternalReferenceValue,
+    LegEndpointConfig, OperationIdempotencyReceipt, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult,
+    ServiceOperationKind, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
 use crate::coordination::{
     CallRouteHint, CoordinationPayload, DeploymentId, PostgresCoordinationOutbox, ReplayDigest,
@@ -3921,6 +3921,19 @@ macro_rules! impl_call_service_repository {
                 request: AttachmentConsume,
             ) -> Result<ConsumedAttachment, RepositoryError> {
                 <Self as CallRepository>::consume_attachment(self, request).await
+            }
+
+            async fn commit_bound_connection_state(
+                &self,
+                request: BoundConnectionStateCommit,
+            ) -> Result<ServiceCommandOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(
+                            async move { repository.commit_bound_connection_state(request).await },
+                        )
+                    })
+                    .await
             }
 
             async fn load_create_replay(
