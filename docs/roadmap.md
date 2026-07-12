@@ -436,6 +436,17 @@ hint for SIP and WebRTC connections.
    leg, expected transport, and worker fence; atomically bind the exact rvoip
    Connection ID and reject expiry, replay, wrong transport, and cross-call or
    cross-tenant use.
+   - Do not authorize inbound attachments from rvoip's lossy public event
+     broadcast. Add an opt-in, bounded single-consumer admission queue before
+     adapter registration; queue saturation, receiver loss, or an admission
+     timeout must reject and forget the route, erase its inbound context, and
+     close the transport. Emit the compatibility `ConnectionInbound` event
+     only after the admission owner accepts the connection.
+   - Require principal-bearing rvoip authentication in the generic runtime.
+     WebRTC uses the auth-core hook with a separately retained session hint;
+     SIP uses an enforceable listener policy. Anonymous or identity-only
+     compatibility modes that cannot supply the complete principal and routing
+     hint are not valid for durable attachment admission.
    - Treat signaling authentication and attachment proof as separate checks.
      The attachment token never substitutes for the authenticated rvoip
      principal, and an inbound provider leg resolves its expected transport
@@ -446,6 +457,12 @@ hint for SIP and WebRTC connections.
      Keep the WebSocket authentication bearer in its existing independent
      subprotocol/header path; do not put attachment tokens in query strings.
      rvoip's auth hook retains only a redacted, single-take session hint.
+   - Model WHIP and WHEP according to their direction instead of forcing both
+     through the unsolicited-inbound event shape. WHIP publication enters the
+     reliable inbound-admission path. WHEP resource creation must validate and
+     consume the durable resource tag before originating its subscriber leg,
+     retaining the same principal, worker-fence, once-only, and cleanup
+     guarantees.
    - On every inbound connection, obtain the complete authenticated principal,
      consume its owner-bound rvoip inbound context once, hash the routing hint,
      inspect and consume the durable attachment atomically, and reject/close
