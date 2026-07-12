@@ -864,7 +864,14 @@ not hide an earlier adapter side effect behind a nominally staged API.
      credential/context-safe by default across headers and SIP bodies, and
      folded continuation lines must inherit the preceding header's
      keep/redact/drop decision. Verbatim header or body trace output requires
-     an explicit development opt-in.
+     an explicit development opt-in. Before this slice can close, the combined
+     security audit must also prove that every generated or precomputed raw
+     authentication value is bounded and control-free at its final insertion
+     point; request start lines redact the complete Request-URI in both the raw
+     trace and the separate event field; the public lower-level trace API uses
+     a continuation-aware, body-safe default when no application policy is
+     installed; and the default typed-header policy is a deliberate safe
+     allowlist rather than an `_ => Keep` fallback.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
@@ -975,6 +982,18 @@ Gate 7 progress evidence recorded on 2026-07-12:
   then reported no remaining release blocker. The two unsplit workspace check
   failures are pre-existing feature-configuration defects outside this change
   and are recorded for Gate 7 cleanup rather than represented as new evidence.
+- rvoip revision `52c2d78eb71eb62c20920dcf94881a31afe16c21`
+  implements the first 2a admission and diagnostic-redaction pass. Its combined
+  qualification passes 2,050 sip-core tests (one ignored), 328 sip-dialog
+  tests, 232 rvoip-sip library tests, and 12 trace integration tests, together
+  with package checks, strict sip-core/sip-dialog Clippy, rustdoc, rustfmt, and
+  diff checks. The retained originate context is intentionally not applied to
+  a packet yet. An independent P0/P1 audit found no P0 but rejected completion
+  because final raw auth insertion, start-line redaction, the lower-level
+  no-policy trace path, and the typed-header default still have P1 disclosure
+  or header-smuggling gaps. It also confirmed that true dormant activation and
+  terminal-stage reclamation remain item 2b blockers. These findings are
+  release gates, not deferred cleanup.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
