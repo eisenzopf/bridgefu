@@ -62,6 +62,7 @@ impl GenericBridgeRuntime {
             admission_capacity,
             setup_timeout,
         )
+        .await
         .context("installing generic call execution supervisor")?;
 
         // The configured generic SIP listener is UDP today, so accepting a

@@ -5,11 +5,13 @@
 //! actors all use bounded single-consumer channels whose tasks are owned by
 //! [`CallExecutionSupervisor`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use rvoip_core::adapter::{EndReason, RejectReason};
 use rvoip_core::commands::InboundAction;
 use rvoip_core::connection::Transport;
@@ -27,15 +29,16 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::call_engine::{
     AttachmentTransport, CallCommand, CallId, ClaimedDeadline, ClaimedOutbox, CommandCommit,
-    CommandId, EffectIntent, FailureDetails, LegId, LegState, RepositoryError, RestartClaim,
-    TransferResult,
+    CommandId, DeadlineKind, EffectIntent, FailureDetails, LegId, LegState, RepositoryError,
+    RestartClaim, TransferResult,
 };
 
 use super::{
     BoundConnectionStateCommit, CallExecutionPlan, CallServiceRuntime, ClaimedControlEffect,
     ControlIntent, EffectResultOutcome, EffectResultReconciliation, InboundAttachmentError,
-    InboundAttachmentRequest, InboundAttachmentResult, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceEffectResult, StoredServiceCall,
+    InboundAttachmentRequest, InboundAttachmentResult, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, RuntimeSupervisorHealth, ServiceCommandOutcome,
+    ServiceCommandTransaction, ServiceEffectPayload, ServiceEffectResult, StoredServiceCall,
 };
 
 const OPERATIONAL_MAILBOX_PER_CALL: usize = 64;
@@ -43,8 +46,12 @@ const ACTOR_COMMAND_MAILBOX: usize = 16;
 const REPOSITORY_RETRY_MIN: Duration = Duration::from_millis(25);
 const REPOSITORY_RETRY_MAX: Duration = Duration::from_secs(1);
 const WORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const WORK_CLAIM_TTL: Duration = Duration::from_secs(30);
+// A live worker never intentionally reclaims its own ambiguous operation.
+// Restart recovery resets claims immediately after a fence change, so a long
+// TTL protects retained in-process results without delaying crash recovery.
+const WORK_CLAIM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const WORK_BATCH_SIZE: usize = 64;
+const EXTERNAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Installation or lifecycle failure for the call execution owner.
 #[derive(Debug, Error)]
@@ -55,6 +62,12 @@ pub enum CallExecutionError {
     /// A configured capacity or timeout is invalid.
     #[error("invalid call execution configuration: {0}")]
     InvalidConfiguration(&'static str),
+    /// Durable startup recovery failed before listeners could be opened.
+    #[error("durable call execution recovery failed: {0}")]
+    Repository(#[from] RepositoryError),
+    /// Durable startup recovery exceeded the configured setup boundary.
+    #[error("durable call execution recovery timed out")]
+    RecoveryTimeout,
 }
 
 /// One process-owned execution supervisor.
@@ -67,7 +80,7 @@ pub struct CallExecutionSupervisor {
 impl CallExecutionSupervisor {
     /// Installs both correctness streams before adapters are registered and
     /// starts their single process owner.
-    pub fn install(
+    pub async fn install(
         orchestrator: Arc<Orchestrator>,
         call_runtime: Arc<CallServiceRuntime>,
         admission_capacity: usize,
@@ -91,6 +104,12 @@ impl CallExecutionSupervisor {
                     CallExecutionError::InvalidConfiguration("operational event capacity overflow"),
                 )?,
             )?;
+        tokio::time::timeout(
+            setup_timeout,
+            recover_before_listeners(Arc::clone(&orchestrator), Arc::clone(&call_runtime)),
+        )
+        .await
+        .map_err(|_| CallExecutionError::RecoveryTimeout)??;
         let (drain, drain_rx) = watch::channel(false);
         let (stop, stop_rx) = watch::channel(false);
         let task = tokio::spawn(run_supervisor(
@@ -98,6 +117,7 @@ impl CallExecutionSupervisor {
             operational,
             orchestrator,
             call_runtime,
+            admission_capacity,
             setup_timeout,
             drain_rx,
             stop_rx,
@@ -141,6 +161,110 @@ impl Drop for CallExecutionSupervisor {
     }
 }
 
+/// Advances every call left behind by an older fence before any public
+/// signaling listener is constructed. The second loop completes the cleanup
+/// effects emitted by those failures; no recovered process-local route is
+/// ever activated or migrated.
+async fn recover_before_listeners(
+    orchestrator: Arc<Orchestrator>,
+    runtime: Arc<CallServiceRuntime>,
+) -> Result<(), RepositoryError> {
+    let worker = runtime.worker().lease;
+    let (_, shutdown) = watch::channel(ActorShutdown::Running);
+    let mut recovered = HashSet::new();
+    loop {
+        let claims = runtime
+            .repository()
+            .claim_restart_calls(worker, runtime.observation_time(), WORK_BATCH_SIZE)
+            .await?;
+        if claims.is_empty() {
+            break;
+        }
+        for claim in claims {
+            recovered.insert(claim.call.aggregate.id());
+            recover_restarted_call(claim, Arc::clone(&runtime), shutdown.clone()).await?;
+        }
+    }
+    if recovered.is_empty() {
+        return Ok(());
+    }
+
+    for _ in 0..10_000 {
+        let work = claim_startup_cleanup(Arc::clone(&runtime)).await?;
+        if work.is_empty() {
+            return Ok(());
+        }
+        for item in work {
+            let call_id = actor_work_call_id(&item).ok_or(RepositoryError::Unavailable)?;
+            if !recovered.contains(&call_id) {
+                return Err(RepositoryError::Unavailable);
+            }
+            let outcome = execute_actor_work(
+                item,
+                Arc::clone(&orchestrator),
+                Arc::clone(&runtime),
+                HashMap::new(),
+                None,
+                shutdown.clone(),
+            )
+            .await;
+            outcome.result?;
+        }
+    }
+    Err(RepositoryError::Unavailable)
+}
+
+async fn claim_startup_cleanup(
+    runtime: Arc<CallServiceRuntime>,
+) -> Result<Vec<ActorWork>, RepositoryError> {
+    let worker = runtime.worker().lease;
+    let at = runtime.observation_time();
+    let mut work = Vec::new();
+    work.extend(
+        runtime
+            .repository()
+            .claim_outbox(worker, at, WORK_CLAIM_TTL, WORK_BATCH_SIZE)
+            .await?
+            .into_iter()
+            .map(ActorWork::Call),
+    );
+    work.extend(
+        runtime
+            .service_repository()
+            .claim_control_effects(worker, at, WORK_CLAIM_TTL, WORK_BATCH_SIZE)
+            .await?
+            .into_iter()
+            .map(ActorWork::Control),
+    );
+    work.extend(
+        runtime
+            .repository()
+            .claim_provider_events(worker, at, WORK_CLAIM_TTL, WORK_BATCH_SIZE)
+            .await?
+            .into_iter()
+            .map(ActorWork::Provider),
+    );
+    work.extend(
+        runtime
+            .repository()
+            .claim_due_deadlines(worker, at, WORK_CLAIM_TTL, WORK_BATCH_SIZE)
+            .await?
+            .into_iter()
+            .map(ActorWork::Deadline),
+    );
+    Ok(work)
+}
+
+fn actor_work_call_id(work: &ActorWork) -> Option<CallId> {
+    match work {
+        ActorWork::Call(claim) => Some(claim.record.call_id),
+        ActorWork::Control(claim) => Some(claim.record.call_id),
+        ActorWork::Provider(claim) => claim.event.target.as_ref().map(|target| target.call_id),
+        ActorWork::Deadline(claim) => Some(claim.record.call_id),
+        ActorWork::Restart(claim) => Some(claim.call.aggregate.id()),
+    }
+}
+
 struct ProvenAdmission {
     admission: InboundAdmission,
     consumed: InboundAttachmentResult,
@@ -165,6 +289,7 @@ enum ActorCommand {
 enum ActorWork {
     Call(ClaimedOutbox),
     Control(ClaimedControlEffect),
+    Provider(crate::call_engine::ClaimedProviderEvent),
     Deadline(ClaimedDeadline),
     Restart(RestartClaim),
 }
@@ -176,6 +301,15 @@ struct WorkClaimBatch {
 
 struct ActorExit {
     call_id: CallId,
+    tenant_id: crate::call_engine::TenantId,
+    panicked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorShutdown {
+    Running,
+    Graceful,
+    LeaseLost,
 }
 
 #[derive(Clone)]
@@ -207,7 +341,7 @@ struct CallActor {
     operational: mpsc::Receiver<OperationalEvent>,
     work: mpsc::Receiver<ActorWork>,
     drain: watch::Receiver<bool>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
     bindings: HashMap<LegId, ActorBinding>,
     pending_admissions: VecDeque<ProvenAdmission>,
     admission_operation: JoinSet<AdmissionOperationResult>,
@@ -216,6 +350,7 @@ struct CallActor {
     bridge_id: Option<BridgeId>,
     conversation_id: Option<ConversationId>,
     session_id: Option<SessionId>,
+    terminal: bool,
 }
 
 async fn run_supervisor(
@@ -223,6 +358,7 @@ async fn run_supervisor(
     mut operational: mpsc::Receiver<OperationalEvent>,
     orchestrator: Arc<Orchestrator>,
     runtime: Arc<CallServiceRuntime>,
+    admission_capacity: usize,
     setup_timeout: Duration,
     mut drain: watch::Receiver<bool>,
     mut stop: watch::Receiver<bool>,
@@ -232,9 +368,16 @@ async fn run_supervisor(
     let mut work_claims = JoinSet::<WorkClaimBatch>::new();
     let mut actor_slots = HashMap::<CallId, ActorSlot>::new();
     let mut connection_owners = HashMap::<ConnectionId, ConnectionOwner>::new();
+    let mut leg_owners = HashMap::<(CallId, LegId), ConnectionId>::new();
     let mut work_wakeups = runtime.subscribe_work_wakeups();
+    let mut runtime_health = runtime.subscribe_supervisor_health();
+    let (actor_shutdown, actor_shutdown_rx) = watch::channel(ActorShutdown::Running);
     let mut work_poll = tokio::time::interval(WORK_POLL_INTERVAL);
     work_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut accepting_admission = true;
+    let mut accepting_work = true;
+    let mut lease_lost = false;
+    let mut pending_operational = None;
 
     loop {
         tokio::select! {
@@ -242,11 +385,42 @@ async fn run_supervisor(
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     admissions.close();
+                    work_claims.abort_all();
+                    let _ = actor_shutdown.send(ActorShutdown::Graceful);
                     break;
+                }
+            }
+            changed = runtime_health.changed() => {
+                if changed.is_err() {
+                    lease_lost = true;
+                } else {
+                    match *runtime_health.borrow() {
+                        RuntimeSupervisorHealth::Healthy | RuntimeSupervisorHealth::Degraded => {}
+                        RuntimeSupervisorHealth::Draining => {
+                            accepting_admission = false;
+                            accepting_work = false;
+                            admissions.close();
+                        }
+                        RuntimeSupervisorHealth::LeaseLost | RuntimeSupervisorHealth::Stopped => {
+                            lease_lost = true;
+                        }
+                    }
+                }
+                if lease_lost {
+                    accepting_admission = false;
+                    accepting_work = false;
+                    admissions.close();
+                    work_claims.abort_all();
+                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+                    while let Ok(admission) = admissions.try_recv() {
+                        let _ = admission.reject(RejectReason::ServerError).await;
+                    }
                 }
             }
             changed = drain.changed() => {
                 if changed.is_err() || *drain.borrow() {
+                    accepting_admission = false;
+                    accepting_work = false;
                     admissions.close();
                     while let Ok(admission) = admissions.try_recv() {
                         let _ = admission.reject(RejectReason::ServerError).await;
@@ -256,8 +430,19 @@ async fn run_supervisor(
             result = actors.join_next(), if !actors.is_empty() => {
                 match result {
                     Some(Ok(exit)) => {
+                        if exit.panicked {
+                            fail_panicked_actor(
+                                exit.call_id,
+                                &exit.tenant_id,
+                                &connection_owners,
+                                &orchestrator,
+                                &runtime,
+                                !lease_lost,
+                            ).await;
+                        }
                         actor_slots.remove(&exit.call_id);
                         connection_owners.retain(|_, owner| owner.call_id != exit.call_id);
+                        leg_owners.retain(|(call_id, _), _| *call_id != exit.call_id);
                     }
                     Some(Err(error)) => {
                         tracing::error!(%error, "call actor panicked");
@@ -268,8 +453,13 @@ async fn run_supervisor(
             result = proof_tasks.join_next(), if !proof_tasks.is_empty() => {
                 match result {
                     Some(Ok(Some(proven))) => {
-                        if *drain.borrow() {
-                            fail_unowned_proven_admission(proven, &orchestrator, &runtime).await;
+                        if !accepting_admission {
+                            fail_unowned_proven_admission(
+                                proven,
+                                &orchestrator,
+                                &runtime,
+                                !lease_lost,
+                            ).await;
                         } else {
                             register_proven_admission(
                                 proven,
@@ -277,9 +467,10 @@ async fn run_supervisor(
                                 &runtime,
                                 &mut actor_slots,
                                 &mut connection_owners,
+                                &mut leg_owners,
                                 &mut actors,
                                 drain.clone(),
-                                stop.clone(),
+                                actor_shutdown_rx.clone(),
                             ).await;
                         }
                     }
@@ -297,9 +488,11 @@ async fn run_supervisor(
                                 &orchestrator,
                                 &runtime,
                                 &mut actor_slots,
+                                &mut connection_owners,
+                                &mut leg_owners,
                                 &mut actors,
                                 drain.clone(),
-                                stop.clone(),
+                                actor_shutdown_rx.clone(),
                             ).await;
                         }
                     }
@@ -307,31 +500,46 @@ async fn run_supervisor(
                     None => {}
                 }
             }
-            event = operational.recv() => {
-                let Some(event) = event else {
-                    tracing::error!("authoritative operational receiver closed");
-                    break;
-                };
-                route_operational_event(
+            _ = tokio::time::sleep(Duration::from_millis(1)), if pending_operational.is_some() => {
+                let event = pending_operational.take().expect("guarded operational event");
+                pending_operational = try_route_operational_event(
                     event,
                     &orchestrator,
                     &actor_slots,
                     &connection_owners,
                 ).await;
             }
-            admission = admissions.recv() => {
-                let Some(admission) = admission else { break; };
+            event = operational.recv(), if pending_operational.is_none() => {
+                let Some(event) = event else {
+                    tracing::error!("authoritative operational receiver closed");
+                    lease_lost = true;
+                    let _ = actor_shutdown.send(ActorShutdown::LeaseLost);
+                    break;
+                };
+                pending_operational = try_route_operational_event(
+                    event,
+                    &orchestrator,
+                    &actor_slots,
+                    &connection_owners,
+                ).await;
+            }
+            admission = admissions.recv(), if accepting_admission && proof_tasks.len() < admission_capacity => {
+                let Some(admission) = admission else {
+                    accepting_admission = false;
+                    accepting_work = false;
+                    continue;
+                };
                 let runtime = Arc::clone(&runtime);
                 proof_tasks.spawn(async move {
                     prove_admission(admission, runtime, setup_timeout).await
                 });
             }
-            changed = work_wakeups.changed(), if work_claims.is_empty() && !*drain.borrow() => {
+            changed = work_wakeups.changed(), if accepting_work && work_claims.is_empty() => {
                 if changed.is_ok() {
                     spawn_work_claim(&mut work_claims, Arc::clone(&runtime));
                 }
             }
-            _ = work_poll.tick(), if work_claims.is_empty() && !*drain.borrow() => {
+            _ = work_poll.tick(), if accepting_work && work_claims.is_empty() => {
                 spawn_work_claim(&mut work_claims, Arc::clone(&runtime));
             }
         }
@@ -342,11 +550,16 @@ async fn run_supervisor(
     }
     while let Some(result) = proof_tasks.join_next().await {
         if let Ok(Some(proven)) = result {
-            fail_unowned_proven_admission(proven, &orchestrator, &runtime).await;
+            fail_unowned_proven_admission(proven, &orchestrator, &runtime, !lease_lost).await;
         }
     }
     work_claims.abort_all();
     while work_claims.join_next().await.is_some() {}
+    let _ = actor_shutdown.send(if lease_lost {
+        ActorShutdown::LeaseLost
+    } else {
+        ActorShutdown::Graceful
+    });
     actor_slots.clear();
     while let Some(result) = actors.join_next().await {
         if let Err(error) = result {
@@ -380,6 +593,16 @@ async fn claim_durable_work(runtime: Arc<CallServiceRuntime>) -> WorkClaimBatch 
             .items
             .extend(claims.into_iter().map(ActorWork::Control)),
         Err(error) => tracing::warn!(%error, "claiming durable control effects failed"),
+    }
+    match runtime
+        .repository()
+        .claim_provider_events(worker, at, WORK_CLAIM_TTL, WORK_BATCH_SIZE)
+        .await
+    {
+        Ok(claims) => batch
+            .items
+            .extend(claims.into_iter().map(ActorWork::Provider)),
+        Err(error) => tracing::warn!(%error, "claiming provider events failed"),
     }
     match runtime
         .repository()
@@ -474,30 +697,20 @@ async fn register_proven_admission(
     runtime: &Arc<CallServiceRuntime>,
     actor_slots: &mut HashMap<CallId, ActorSlot>,
     connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
+    leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
     actors: &mut JoinSet<ActorExit>,
     drain: watch::Receiver<bool>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) {
     let call_id = proven.consumed.commit.call.aggregate.id();
     let tenant_id = proven.consumed.commit.call.aggregate.tenant_id().clone();
     let binding = &proven.consumed.binding;
     let connection_id = binding.connection_id.clone();
-    let owner = ConnectionOwner {
-        call_id,
-        leg_id: binding.leg_id,
-    };
-    if connection_owners
-        .insert(connection_id.clone(), owner)
-        .is_some()
-    {
-        fail_unowned_proven_admission(proven, orchestrator, runtime).await;
-        return;
-    }
-
+    let leg_id = binding.leg_id;
+    let mut spawned = false;
     if !actor_slots.contains_key(&call_id) {
         if actor_slots.len() >= runtime.worker().max_calls {
-            connection_owners.remove(&connection_id);
-            fail_unowned_proven_admission(proven, orchestrator, runtime).await;
+            fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
             return;
         }
         let stored = match runtime
@@ -507,46 +720,91 @@ async fn register_proven_admission(
         {
             Ok(stored) => stored,
             Err(_) => {
-                connection_owners.remove(&connection_id);
-                fail_unowned_proven_admission(proven, orchestrator, runtime).await;
+                fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
                 return;
             }
         };
-        spawn_call_actor(
+        if spawn_call_actor(
             stored,
             orchestrator,
             runtime,
             actor_slots,
+            connection_owners,
+            leg_owners,
             actors,
             drain,
-            stop,
-        );
+            shutdown,
+        )
+        .is_err()
+        {
+            fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
+            return;
+        }
+        spawned = true;
+    }
+
+    if !spawned {
+        if connection_owners.contains_key(&connection_id)
+            || leg_owners.contains_key(&(call_id, leg_id))
+        {
+            fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
+            return;
+        }
+        connection_owners.insert(connection_id.clone(), ConnectionOwner { call_id, leg_id });
+        leg_owners.insert((call_id, leg_id), connection_id.clone());
     }
 
     let Some(slot) = actor_slots.get(&call_id) else {
         connection_owners.remove(&connection_id);
-        fail_unowned_proven_admission(proven, orchestrator, runtime).await;
+        leg_owners.remove(&(call_id, leg_id));
+        fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
         return;
     };
-    if let Err(mpsc::error::SendError(ActorCommand::Admit(proven))) =
-        slot.commands.send(ActorCommand::Admit(proven)).await
-    {
+    if let Err(error) = slot.commands.try_send(ActorCommand::Admit(proven)) {
+        let ActorCommand::Admit(proven) = error.into_inner();
         connection_owners.remove(&connection_id);
-        tracing::error!(%call_id, %connection_id, "call actor rejected a proven admission");
-        fail_unowned_proven_admission(proven, orchestrator, runtime).await;
+        leg_owners.remove(&(call_id, leg_id));
+        tracing::error!(%call_id, %connection_id, "call actor admission mailbox is unavailable");
+        fail_unowned_proven_admission(proven, orchestrator, runtime, true).await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_call_actor(
     stored: StoredServiceCall,
     orchestrator: &Arc<Orchestrator>,
     runtime: &Arc<CallServiceRuntime>,
     actor_slots: &mut HashMap<CallId, ActorSlot>,
+    connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
+    leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
     actors: &mut JoinSet<ActorExit>,
     drain: watch::Receiver<bool>,
-    stop: watch::Receiver<bool>,
-) {
+    shutdown: watch::Receiver<ActorShutdown>,
+) -> Result<(), ()> {
     let call_id = stored.call.aggregate.id();
+    let stored_bindings = stored
+        .call
+        .bindings
+        .values()
+        .map(|binding| (binding.connection_id.clone(), binding.leg_id))
+        .collect::<Vec<_>>();
+    if stored_bindings.iter().any(|(connection_id, leg_id)| {
+        connection_owners.contains_key(connection_id)
+            || leg_owners.contains_key(&(call_id, *leg_id))
+    }) {
+        tracing::error!(%call_id, "durable connection index conflicts with a live actor");
+        return Err(());
+    }
+    for (connection_id, leg_id) in &stored_bindings {
+        connection_owners.insert(
+            connection_id.clone(),
+            ConnectionOwner {
+                call_id,
+                leg_id: *leg_id,
+            },
+        );
+        leg_owners.insert((call_id, *leg_id), connection_id.clone());
+    }
     let (commands_tx, commands_rx) = mpsc::channel(ACTOR_COMMAND_MAILBOX);
     let (operational_tx, operational_rx) = mpsc::channel(OPERATIONAL_MAILBOX_PER_CALL);
     let (work_tx, work_rx) = mpsc::channel(ACTOR_COMMAND_MAILBOX);
@@ -558,19 +816,28 @@ fn spawn_call_actor(
             work: work_tx,
         },
     );
-    actors.spawn(
-        CallActor::new(
-            stored,
-            Arc::clone(orchestrator),
-            Arc::clone(runtime),
-            commands_rx,
-            operational_rx,
-            work_rx,
-            drain,
-            stop,
-        )
-        .run(),
+    let actor = CallActor::new(
+        stored,
+        Arc::clone(orchestrator),
+        Arc::clone(runtime),
+        commands_rx,
+        operational_rx,
+        work_rx,
+        drain,
+        shutdown,
     );
+    let tenant_id = actor.tenant_id.clone();
+    actors.spawn(async move {
+        match AssertUnwindSafe(actor.run()).catch_unwind().await {
+            Ok(exit) => exit,
+            Err(_) => ActorExit {
+                call_id,
+                tenant_id,
+                panicked: true,
+            },
+        }
+    });
+    Ok(())
 }
 
 async fn route_claimed_work(
@@ -578,13 +845,22 @@ async fn route_claimed_work(
     orchestrator: &Arc<Orchestrator>,
     runtime: &Arc<CallServiceRuntime>,
     actor_slots: &mut HashMap<CallId, ActorSlot>,
+    connection_owners: &mut HashMap<ConnectionId, ConnectionOwner>,
+    leg_owners: &mut HashMap<(CallId, LegId), ConnectionId>,
     actors: &mut JoinSet<ActorExit>,
     drain: watch::Receiver<bool>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) {
     let (tenant_id, call_id) = match &item {
         ActorWork::Call(claim) => (&claim.record.tenant_id, claim.record.call_id),
         ActorWork::Control(claim) => (&claim.record.tenant_id, claim.record.call_id),
+        ActorWork::Provider(claim) => {
+            let Some(target) = claim.event.target.as_ref() else {
+                tracing::error!("claimed provider event has no durable target");
+                return;
+            };
+            (&target.tenant_id, target.call_id)
+        }
         ActorWork::Deadline(claim) => (&claim.record.tenant_id, claim.record.call_id),
         ActorWork::Restart(claim) => (claim.call.aggregate.tenant_id(), claim.call.aggregate.id()),
     };
@@ -604,21 +880,27 @@ async fn route_claimed_work(
                 return;
             }
         };
-        spawn_call_actor(
+        if spawn_call_actor(
             stored,
             orchestrator,
             runtime,
             actor_slots,
+            connection_owners,
+            leg_owners,
             actors,
             drain,
-            stop,
-        );
+            shutdown,
+        )
+        .is_err()
+        {
+            return;
+        }
     }
     let Some(actor) = actor_slots.get(&call_id) else {
         return;
     };
-    if actor.work.send(item).await.is_err() {
-        tracing::error!(%call_id, "call actor closed after durable work was claimed");
+    if actor.work.try_send(item).is_err() {
+        tracing::warn!(%call_id, "call actor work mailbox is full; claim will expire without I/O");
     }
 }
 
@@ -626,28 +908,31 @@ async fn fail_unowned_proven_admission(
     proven: ProvenAdmission,
     orchestrator: &Arc<Orchestrator>,
     runtime: &Arc<CallServiceRuntime>,
+    allow_durable_write: bool,
 ) {
     let connection_id = proven.consumed.binding.connection_id.clone();
     let _ = proven.admission.reject(RejectReason::ServerError).await;
-    let failure = FailureDetails::sanitized(
-        "execution_unavailable",
-        "call execution owner unavailable after durable attachment",
-        true,
-    );
-    let _ = tokio::time::timeout(
-        Duration::from_secs(2),
-        commit_binding_state(
-            runtime,
-            proven.consumed.commit.call.aggregate.tenant_id(),
-            proven.consumed.commit.call.aggregate.id(),
-            &proven.consumed.binding,
-            LegState::Failed,
-            Some(failure),
-            Utc::now(),
-            None,
-        ),
-    )
-    .await;
+    if allow_durable_write {
+        let failure = FailureDetails::sanitized(
+            "execution_unavailable",
+            "call execution owner unavailable after durable attachment",
+            true,
+        );
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            commit_binding_state(
+                runtime,
+                proven.consumed.commit.call.aggregate.tenant_id(),
+                proven.consumed.commit.call.aggregate.id(),
+                &proven.consumed.binding,
+                LegState::Failed,
+                Some(failure),
+                runtime.observation_time(),
+                None,
+            ),
+        )
+        .await;
+    }
     let _ = orchestrator
         .end_connection(
             connection_id,
@@ -658,12 +943,12 @@ async fn fail_unowned_proven_admission(
         .await;
 }
 
-async fn route_operational_event(
+async fn try_route_operational_event(
     event: OperationalEvent,
     orchestrator: &Arc<Orchestrator>,
     actors: &HashMap<CallId, ActorSlot>,
     owners: &HashMap<ConnectionId, ConnectionOwner>,
-) {
+) -> Option<OperationalEvent> {
     let Some(owner) = owners.get(&event.connection_id) else {
         if matches!(event.kind, OperationalEventKind::Connected) {
             tracing::error!(connection_id = %event.connection_id, sequence = event.sequence, "unowned operational connection event");
@@ -676,14 +961,83 @@ async fn route_operational_event(
                 )
                 .await;
         }
-        return;
+        return None;
     };
     let Some(actor) = actors.get(&owner.call_id) else {
         tracing::error!(call_id = %owner.call_id, leg_id = %owner.leg_id, "operational event owner actor is missing");
+        return None;
+    };
+    match actor.operational.try_send(event) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(event)) => Some(event),
+        Err(mpsc::error::TrySendError::Closed(event)) => {
+            tracing::error!(call_id = %owner.call_id, leg_id = %owner.leg_id, "operational event owner actor closed");
+            let _ = orchestrator
+                .end_connection(
+                    event.connection_id,
+                    EndReason::Failed {
+                        detail: "operational event owner closed".into(),
+                    },
+                )
+                .await;
+            None
+        }
+    }
+}
+
+async fn fail_panicked_actor(
+    call_id: CallId,
+    tenant_id: &crate::call_engine::TenantId,
+    owners: &HashMap<ConnectionId, ConnectionOwner>,
+    orchestrator: &Arc<Orchestrator>,
+    runtime: &Arc<CallServiceRuntime>,
+    allow_durable_write: bool,
+) {
+    let connections = owners
+        .iter()
+        .filter(|(_, owner)| owner.call_id == call_id)
+        .map(|(connection_id, _)| connection_id.clone())
+        .collect::<Vec<_>>();
+    for connection_id in connections {
+        let _ = orchestrator
+            .end_connection(
+                connection_id,
+                EndReason::Failed {
+                    detail: "call actor panicked".into(),
+                },
+            )
+            .await;
+    }
+    if !allow_durable_write {
+        return;
+    }
+    let Ok(stored) = runtime
+        .service_repository()
+        .load_service_call(tenant_id, call_id)
+        .await
+    else {
         return;
     };
-    if actor.operational.send(event).await.is_err() {
-        tracing::error!(call_id = %owner.call_id, leg_id = %owner.leg_id, "operational event owner actor closed");
+    for binding in stored.call.bindings.values() {
+        let failure = FailureDetails::sanitized(
+            "execution_panicked",
+            "the process-owned call actor stopped unexpectedly",
+            true,
+        );
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            commit_binding_state(
+                runtime,
+                stored.call.aggregate.tenant_id(),
+                call_id,
+                binding,
+                LegState::Failed,
+                Some(failure),
+                runtime.observation_time(),
+                None,
+            ),
+        )
+        .await;
     }
 }
 
@@ -696,8 +1050,31 @@ impl CallActor {
         operational: mpsc::Receiver<OperationalEvent>,
         work: mpsc::Receiver<ActorWork>,
         drain: watch::Receiver<bool>,
-        stop: watch::Receiver<bool>,
+        shutdown: watch::Receiver<ActorShutdown>,
     ) -> Self {
+        let bindings = stored
+            .call
+            .bindings
+            .values()
+            .filter_map(|binding| {
+                stored
+                    .call
+                    .aggregate
+                    .leg(binding.leg_id)
+                    .map(|leg| {
+                        (
+                            binding.leg_id,
+                            ActorBinding {
+                                connection_id: binding.connection_id.clone(),
+                                leg_id: binding.leg_id,
+                                binding_generation: binding.binding_generation,
+                                state: leg.state(),
+                            },
+                        )
+                    })
+            })
+            .collect();
+        let terminal = stored.call.aggregate.state().is_terminal();
         Self {
             call_id: stored.call.aggregate.id(),
             tenant_id: stored.call.aggregate.tenant_id().clone(),
@@ -708,8 +1085,8 @@ impl CallActor {
             operational,
             work,
             drain,
-            stop,
-            bindings: HashMap::new(),
+            shutdown,
+            bindings,
             pending_admissions: VecDeque::new(),
             admission_operation: JoinSet::new(),
             pending_work: VecDeque::new(),
@@ -717,22 +1094,52 @@ impl CallActor {
             bridge_id: None,
             conversation_id: None,
             session_id: None,
+            terminal,
         }
     }
 
     async fn run(mut self) -> ActorExit {
+        let mut graceful = false;
         loop {
-            if self.admission_operation.is_empty() && !self.pending_admissions.is_empty() {
+            let operation_idle = self.admission_operation.is_empty() && self.work_operation.is_empty();
+            if operation_idle && !graceful && !self.pending_admissions.is_empty() {
                 self.start_next_admission().await;
-            }
-            if self.work_operation.is_empty() && !self.pending_work.is_empty() {
+            } else if operation_idle && !self.pending_work.is_empty() {
                 self.start_next_work();
+            }
+            if (graceful || self.terminal)
+                && self.admission_operation.is_empty()
+                && self.work_operation.is_empty()
+                && self.pending_admissions.is_empty()
+                && self.pending_work.is_empty()
+                && self.commands.is_empty()
+                && self.work.is_empty()
+            {
+                break;
             }
             tokio::select! {
                 biased;
-                changed = self.stop.changed() => {
-                    if changed.is_err() || *self.stop.borrow() {
+                changed = self.shutdown.changed() => {
+                    let state = if changed.is_err() {
+                        ActorShutdown::LeaseLost
+                    } else {
+                        *self.shutdown.borrow()
+                    };
+                    if state == ActorShutdown::LeaseLost {
                         break;
+                    }
+                    if state == ActorShutdown::Graceful {
+                        graceful = true;
+                        self.commands.close();
+                        self.work.close();
+                        while let Ok(ActorCommand::Admit(proven)) = self.commands.try_recv() {
+                            fail_unowned_proven_admission(
+                                proven,
+                                &self.orchestrator,
+                                &self.runtime,
+                                true,
+                            ).await;
+                        }
                     }
                 }
                 changed = self.drain.changed() => {
@@ -742,6 +1149,7 @@ impl CallActor {
                                 proven,
                                 &self.orchestrator,
                                 &self.runtime,
+                                true,
                             ).await;
                         }
                     }
@@ -759,31 +1167,48 @@ impl CallActor {
                 }
                 result = self.work_operation.join_next(), if !self.work_operation.is_empty() => {
                     match result {
-                        Some(Ok(result)) => self.finish_work_operation(result),
+                        Some(Ok(result)) => self.finish_work_operation(result).await,
                         Some(Err(error)) => tracing::error!(call_id = %self.call_id, %error, "durable work operation panicked"),
                         None => {}
                     }
                 }
                 command = self.commands.recv() => {
-                    let Some(command) = command else { break; };
-                    match command {
-                        ActorCommand::Admit(proven) => self.queue_admission(proven).await,
+                    if let Some(command) = command {
+                        match command {
+                            ActorCommand::Admit(proven) if !graceful => self.queue_admission(proven).await,
+                            ActorCommand::Admit(proven) => {
+                                fail_unowned_proven_admission(
+                                    proven,
+                                    &self.orchestrator,
+                                    &self.runtime,
+                                    true,
+                                ).await;
+                            }
+                        }
                     }
                 }
                 work = self.work.recv() => {
-                    let Some(work) = work else { break; };
-                    self.pending_work.push_back(work);
+                    if let Some(work) = work {
+                        self.pending_work.push_back(work);
+                    }
                 }
             }
         }
-        self.cleanup().await;
+        let allow_durable_cleanup = *self.shutdown.borrow() != ActorShutdown::LeaseLost;
+        self.cleanup(allow_durable_cleanup).await;
         ActorExit {
             call_id: self.call_id,
+            tenant_id: self.tenant_id.clone(),
+            panicked: false,
         }
     }
 
     async fn queue_admission(&mut self, proven: ProvenAdmission) {
         let binding = &proven.consumed.binding;
+        let existing_binding_matches = self.bindings.get(&binding.leg_id).is_some_and(|existing| {
+            existing.connection_id == binding.connection_id
+                && existing.binding_generation == binding.binding_generation
+        });
         if proven.consumed.commit.call.aggregate.id() != self.call_id
             || proven.consumed.commit.call.aggregate.tenant_id() != &self.tenant_id
             || self
@@ -791,20 +1216,22 @@ impl CallActor {
                 .legs
                 .iter()
                 .all(|leg| leg.leg_id != binding.leg_id)
-            || self.bindings.contains_key(&binding.leg_id)
+            || (self.bindings.contains_key(&binding.leg_id) && !existing_binding_matches)
         {
-            fail_unowned_proven_admission(proven, &self.orchestrator, &self.runtime).await;
+            fail_unowned_proven_admission(proven, &self.orchestrator, &self.runtime, true).await;
             return;
         }
-        self.bindings.insert(
-            binding.leg_id,
-            ActorBinding {
-                connection_id: binding.connection_id.clone(),
-                leg_id: binding.leg_id,
-                binding_generation: binding.binding_generation,
-                state: LegState::Signaling,
-            },
-        );
+        if !existing_binding_matches {
+            self.bindings.insert(
+                binding.leg_id,
+                ActorBinding {
+                    connection_id: binding.connection_id.clone(),
+                    leg_id: binding.leg_id,
+                    binding_generation: binding.binding_generation,
+                    state: LegState::Signaling,
+                },
+            );
+        }
         self.pending_admissions.push_back(proven);
     }
 
@@ -816,7 +1243,13 @@ impl CallActor {
             Ok(session_id) => session_id,
             Err(error) => {
                 tracing::error!(call_id = %self.call_id, %error, "creating rvoip call session failed");
-                fail_unowned_proven_admission(proven, &self.orchestrator, &self.runtime).await;
+                let allow_durable_write = *self.shutdown.borrow() != ActorShutdown::LeaseLost;
+                fail_unowned_proven_admission(
+                    proven,
+                    &self.orchestrator,
+                    &self.runtime,
+                    allow_durable_write,
+                ).await;
                 return;
             }
         };
@@ -894,8 +1327,14 @@ impl CallActor {
             true,
         );
         let _ = self
-            .commit_current_binding(binding.leg_id, LegState::Failed, Some(failure), Utc::now())
-            .await;
+            .commit_current_binding(
+                binding.leg_id,
+                LegState::Failed,
+                Some(failure),
+                self.runtime.observation_time(),
+            )
+            .await
+            .map(|stored| self.terminal = stored.call.aggregate.state().is_terminal());
         let _ = self
             .orchestrator
             .end_connection(
@@ -915,13 +1354,13 @@ impl CallActor {
         let runtime = Arc::clone(&self.runtime);
         let bindings = self.bindings.clone();
         let bridge_id = self.bridge_id.clone();
-        let stop = self.stop.clone();
+        let shutdown = self.shutdown.clone();
         self.work_operation.spawn(async move {
-            execute_actor_work(work, orchestrator, runtime, bindings, bridge_id, stop).await
+            execute_actor_work(work, orchestrator, runtime, bindings, bridge_id, shutdown).await
         });
     }
 
-    fn finish_work_operation(&mut self, result: WorkOperationResult) {
+    async fn finish_work_operation(&mut self, result: WorkOperationResult) {
         if let Some(bridge_update) = result.bridge_update {
             self.bridge_id = bridge_update;
         }
@@ -930,6 +1369,17 @@ impl CallActor {
                 tracing::warn!(call_id = %self.call_id, %effect_id, %error, "durable work did not reconcile");
             } else {
                 tracing::warn!(call_id = %self.call_id, %error, "durable internal work failed");
+            }
+        }
+        if let Ok(stored) = self
+            .runtime
+            .service_repository()
+            .load_service_call(&self.tenant_id, self.call_id)
+            .await
+        {
+            self.terminal = stored.call.aggregate.state().is_terminal();
+            if !self.terminal {
+                let _ = ensure_ending_deadline(&self.runtime, stored, self.shutdown.clone()).await;
             }
         }
     }
@@ -962,7 +1412,9 @@ impl CallActor {
         };
         let transition = classify_operational_event(leg.state(), &event.kind);
         match transition {
-            OperationalTransition::Ignore => {}
+            OperationalTransition::Ignore => {
+                self.terminal = stored.call.aggregate.state().is_terminal();
+            }
             OperationalTransition::EndUnexpectedConnected => {
                 let _ = self
                     .orchestrator
@@ -976,14 +1428,16 @@ impl CallActor {
             }
             OperationalTransition::Commit { state, failure } => {
                 let at = std::cmp::max(event.at, stored.call.aggregate.updated_at());
-                if self
-                    .commit_current_binding(leg_id, state, failure, at)
-                    .await
-                    .is_ok()
-                {
-                    if let Some(binding) = self.bindings.get_mut(&leg_id) {
-                        binding.state = state;
+                if let Ok(committed) = self.commit_current_binding(leg_id, state, failure, at).await {
+                    self.terminal = committed.call.aggregate.state().is_terminal();
+                    if !self.terminal {
+                        let _ = ensure_ending_deadline(
+                            &self.runtime,
+                            committed,
+                            self.shutdown.clone(),
+                        ).await;
                     }
+                    if let Some(binding) = self.bindings.get_mut(&leg_id) { binding.state = state; }
                 }
             }
             OperationalTransition::Ephemeral => {
@@ -1031,14 +1485,19 @@ impl CallActor {
             state,
             failure,
             at,
-            Some(self.stop.clone()),
+            Some(self.shutdown.clone()),
         )
         .await
     }
 
-    async fn cleanup(&mut self) {
+    async fn cleanup(&mut self, allow_durable_write: bool) {
         while let Some(proven) = self.pending_admissions.pop_front() {
-            fail_unowned_proven_admission(proven, &self.orchestrator, &self.runtime).await;
+            fail_unowned_proven_admission(
+                proven,
+                &self.orchestrator,
+                &self.runtime,
+                allow_durable_write,
+            ).await;
         }
         self.admission_operation.abort_all();
         while self.admission_operation.join_next().await.is_some() {}
@@ -1046,6 +1505,9 @@ impl CallActor {
         while self.work_operation.join_next().await.is_some() {}
         let leg_ids = self.bindings.keys().copied().collect::<Vec<_>>();
         for leg_id in leg_ids {
+            if !allow_durable_write {
+                continue;
+            }
             let current = self
                 .runtime
                 .service_repository()
@@ -1065,7 +1527,7 @@ impl CallActor {
                         leg_id,
                         LegState::Failed,
                         Some(failure),
-                        Utc::now(),
+                        self.runtime.observation_time(),
                     ),
                 )
                 .await;
@@ -1120,24 +1582,27 @@ async fn execute_actor_work(
     runtime: Arc<CallServiceRuntime>,
     bindings: HashMap<LegId, ActorBinding>,
     bridge_id: Option<BridgeId>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) -> WorkOperationResult {
     match work {
         ActorWork::Call(claim) => {
-            execute_call_effect(claim, orchestrator, runtime, bindings, bridge_id, stop).await
+            execute_call_effect(claim, orchestrator, runtime, bindings, bridge_id, shutdown).await
         }
         ActorWork::Control(claim) => {
-            execute_control_effect(claim, orchestrator, runtime, bindings, stop).await
+            execute_control_effect(claim, orchestrator, runtime, bindings, shutdown).await
+        }
+        ActorWork::Provider(claim) => {
+            execute_provider_event(claim, runtime, shutdown).await
         }
         ActorWork::Deadline(claim) => WorkOperationResult {
             effect_id: None,
             bridge_update: None,
-            result: commit_deadline(claim, runtime, stop).await,
+            result: commit_deadline(claim, runtime, shutdown).await,
         },
         ActorWork::Restart(claim) => WorkOperationResult {
             effect_id: None,
             bridge_update: None,
-            result: recover_restarted_call(claim, runtime, stop).await,
+            result: recover_restarted_call(claim, runtime, shutdown).await,
         },
     }
 }
@@ -1148,7 +1613,7 @@ async fn execute_call_effect(
     runtime: Arc<CallServiceRuntime>,
     bindings: HashMap<LegId, ActorBinding>,
     bridge_id: Option<BridgeId>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) -> WorkOperationResult {
     let effect_id = claim.record.effect_id;
     let meta = ClaimedEffectMeta {
@@ -1157,6 +1622,46 @@ async fn execute_call_effect(
         effect_id,
         claim_generation: claim.claim_generation,
     };
+    let current = runtime
+        .service_repository()
+        .load_service_call(&meta.tenant_id, meta.call_id)
+        .await;
+    if let Ok(stored) = &current {
+        if stored.call.aggregate.state().is_terminal() {
+            let result = if matches!(
+                claim.record.intent,
+                EffectIntent::StartLeg { .. }
+                    | EffectIntent::BridgeMedia { .. }
+                    | EffectIntent::ExecuteTransfer { .. }
+            ) {
+                ServiceEffectResult::Failed(FailureDetails::sanitized(
+                    "call_already_terminal",
+                    "external work was retired after terminal call convergence",
+                    false,
+                ))
+            } else {
+                ServiceEffectResult::Succeeded
+            };
+            return WorkOperationResult {
+                effect_id: Some(effect_id),
+                bridge_update: None,
+                result: reconcile_effect(
+                    meta,
+                    result,
+                    FollowUpPlan::None,
+                    runtime,
+                    shutdown,
+                )
+                .await,
+            };
+        }
+    } else if let Err(error) = current {
+        return WorkOperationResult {
+            effect_id: Some(effect_id),
+            bridge_update: None,
+            result: Err(error),
+        };
+    }
     let mut bridge_update = None;
     let (result, follow_up) = match claim.record.intent {
         EffectIntent::AwaitLegAttachment { .. }
@@ -1172,15 +1677,20 @@ async fn execute_call_effect(
             let left = bindings.get(&left_leg_id);
             let right = bindings.get(&right_leg_id);
             match (left, right) {
-                (Some(left), Some(right)) => match orchestrator
-                    .bridge_connections(left.connection_id.clone(), right.connection_id.clone())
-                    .await
+                (Some(left), Some(right)) => match tokio::time::timeout(
+                    EXTERNAL_OPERATION_TIMEOUT,
+                    orchestrator.bridge_connections(
+                        left.connection_id.clone(),
+                        right.connection_id.clone(),
+                    ),
+                )
+                .await
                 {
-                    Ok(created) => {
+                    Ok(Ok(created)) => {
                         bridge_update = Some(Some(created));
                         (ServiceEffectResult::Succeeded, FollowUpPlan::None)
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         let failure = FailureDetails::sanitized(
                             "media_bridge_failed",
                             "rvoip could not establish the two-leg media graph",
@@ -1218,12 +1728,17 @@ async fn execute_call_effect(
             }
         }
         EffectIntent::UnbridgeMedia { .. } => match bridge_id {
-            Some(bridge_id) => match orchestrator.unbridge_connections(bridge_id).await {
-                Ok(()) => {
+            Some(bridge_id) => match tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                orchestrator.unbridge_connections(bridge_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
                     bridge_update = Some(None);
                     (ServiceEffectResult::Succeeded, FollowUpPlan::None)
                 }
-                Err(_) => (
+                Ok(Err(_)) | Err(_) => (
                     ServiceEffectResult::Failed(FailureDetails::sanitized(
                         "media_unbridge_failed",
                         "rvoip could not confirm media graph removal",
@@ -1239,12 +1754,14 @@ async fn execute_call_effect(
             binding_generation,
             ..
         } => match bindings.get(&leg_id) {
-            Some(binding) if binding.binding_generation == binding_generation => match orchestrator
-                .end_connection(binding.connection_id.clone(), EndReason::BridgeTorn)
-                .await
+            Some(binding) if binding.binding_generation == binding_generation => match tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                orchestrator.end_connection(binding.connection_id.clone(), EndReason::BridgeTorn),
+            )
+            .await
             {
-                Ok(()) => (ServiceEffectResult::Succeeded, FollowUpPlan::None),
-                Err(_) => (
+                Ok(Ok(())) => (ServiceEffectResult::Succeeded, FollowUpPlan::None),
+                Ok(Err(_)) | Err(_) => (
                     ServiceEffectResult::Failed(FailureDetails::sanitized(
                         "stop_leg_failed",
                         "rvoip could not confirm transport teardown",
@@ -1264,11 +1781,24 @@ async fn execute_call_effect(
             // prepared outbound adapter path. Claiming and failing now keeps
             // unsupported outbound calls from blocking their entire ordered
             // outbox indefinitely.
-            let failure = FailureDetails::sanitized(
-                "outbound_not_ready",
-                "outbound signaling is not enabled for this endpoint",
-                false,
-            );
+            let authority = runtime
+                .service_repository()
+                .load_service_call(&meta.tenant_id, meta.call_id)
+                .await
+                .and_then(|stored| stored.plan.authorization_principal_fingerprint());
+            let failure = if authority.is_ok() {
+                FailureDetails::sanitized(
+                    "outbound_not_ready",
+                    "outbound signaling is not enabled for this endpoint",
+                    false,
+                )
+            } else {
+                FailureDetails::sanitized(
+                    "outbound_authorization_missing",
+                    "the persisted execution plan cannot authorize outbound signaling",
+                    false,
+                )
+            };
             (
                 ServiceEffectResult::Failed(failure.clone()),
                 FollowUpPlan::FailLeg {
@@ -1281,11 +1811,32 @@ async fn execute_call_effect(
         EffectIntent::ExecuteTransfer {
             deadline_generation,
         } => {
-            let failure = FailureDetails::sanitized(
-                "transfer_not_ready",
-                "the selected transfer executor is not enabled",
-                false,
+            let payload = runtime
+                .service_repository()
+                .load_effect_payload(&meta.tenant_id, effect_id)
+                .await;
+            let valid_payload = matches!(
+                payload,
+                Ok(Some(ref stored_payload)) if matches!(
+                    stored_payload.payload,
+                    ServiceEffectPayload::Transfer { target_leg_id, target_binding_generation, .. }
+                        if bindings.get(&target_leg_id).is_some_and(|binding|
+                            binding.binding_generation == target_binding_generation)
+                )
             );
+            let failure = if valid_payload {
+                FailureDetails::sanitized(
+                    "transfer_not_ready",
+                    "the selected transfer executor is not enabled",
+                    false,
+                )
+            } else {
+                FailureDetails::sanitized(
+                    "transfer_target_unavailable",
+                    "the persisted transfer target is missing or no longer current",
+                    false,
+                )
+            };
             (
                 ServiceEffectResult::Failed(failure.clone()),
                 FollowUpPlan::FinishTransfer {
@@ -1295,7 +1846,7 @@ async fn execute_call_effect(
             )
         }
     };
-    let reconciled = reconcile_effect(meta, result, follow_up, runtime, stop).await;
+    let reconciled = reconcile_effect(meta, result, follow_up, runtime, shutdown).await;
     WorkOperationResult {
         effect_id: Some(effect_id),
         bridge_update,
@@ -1308,7 +1859,7 @@ async fn execute_control_effect(
     orchestrator: Arc<Orchestrator>,
     runtime: Arc<CallServiceRuntime>,
     bindings: HashMap<LegId, ActorBinding>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) -> WorkOperationResult {
     let effect_id = claim.record.effect_id;
     let meta = ClaimedEffectMeta {
@@ -1321,16 +1872,18 @@ async fn execute_control_effect(
         (ControlIntent::Dtmf { sequence }, Some(binding))
             if binding.binding_generation == claim.record.binding_generation =>
         {
-            match orchestrator
-                .send_dtmf(
+            match tokio::time::timeout(
+                EXTERNAL_OPERATION_TIMEOUT,
+                orchestrator.send_dtmf(
                     binding.connection_id.clone(),
                     &sequence.digits,
                     u32::from(sequence.duration_ms),
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(()) => ServiceEffectResult::Succeeded,
-                Err(_) => ServiceEffectResult::Failed(FailureDetails::sanitized(
+                Ok(Ok(())) => ServiceEffectResult::Succeeded,
+                Ok(Err(_)) | Err(_) => ServiceEffectResult::Failed(FailureDetails::sanitized(
                     "dtmf_failed",
                     "rvoip could not deliver the requested DTMF sequence",
                     true,
@@ -1343,7 +1896,7 @@ async fn execute_control_effect(
             false,
         )),
     };
-    let reconciled = reconcile_effect(meta, result, FollowUpPlan::None, runtime, stop).await;
+    let reconciled = reconcile_effect(meta, result, FollowUpPlan::None, runtime, shutdown).await;
     WorkOperationResult {
         effect_id: Some(effect_id),
         bridge_update: None,
@@ -1351,15 +1904,190 @@ async fn execute_control_effect(
     }
 }
 
+async fn execute_provider_event(
+    claim: crate::call_engine::ClaimedProviderEvent,
+    runtime: Arc<CallServiceRuntime>,
+    mut shutdown: watch::Receiver<ActorShutdown>,
+) -> WorkOperationResult {
+    let result = reconcile_provider_event(claim, &runtime, &mut shutdown).await;
+    WorkOperationResult {
+        effect_id: None,
+        bridge_update: None,
+        result,
+    }
+}
+
+async fn reconcile_provider_event(
+    claim: crate::call_engine::ClaimedProviderEvent,
+    runtime: &Arc<CallServiceRuntime>,
+    shutdown: &mut watch::Receiver<ActorShutdown>,
+) -> Result<(), RepositoryError> {
+    let target = claim
+        .event
+        .target
+        .clone()
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    loop {
+        if *shutdown.borrow() == ActorShutdown::LeaseLost {
+            return Err(RepositoryError::Unavailable);
+        }
+        let stored = runtime
+            .service_repository()
+            .load_service_call(&target.tenant_id, target.call_id)
+            .await?;
+        let at = [
+            runtime.observation_time(),
+            stored.call.aggregate.updated_at(),
+            claim.event.received_at,
+            claim.event.occurred_at.unwrap_or(claim.event.received_at),
+        ]
+        .into_iter()
+        .max()
+        .ok_or(RepositoryError::Unavailable)?;
+        let follow_up = build_provider_follow_up(&claim.event.kind, &target, &stored, at)?;
+        let request = ProviderEventReconciliationTransaction {
+            account: claim.event.account.clone(),
+            event_digest: claim.event.event_digest,
+            claim_generation: claim.claim_generation,
+            worker: runtime.worker().lease,
+            target: target.clone(),
+            follow_up,
+            at,
+        };
+        let mut delay = REPOSITORY_RETRY_MIN;
+        loop {
+            match runtime
+                .service_repository()
+                .reconcile_provider_event(request.clone())
+                .await
+            {
+                Ok(ProviderEventReconciliationOutcome::Reconciled(_))
+                | Ok(ProviderEventReconciliationOutcome::Replayed(_)) => return Ok(()),
+                Err(RepositoryError::Unavailable) => {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
+                                return Err(RepositoryError::Unavailable);
+                            }
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
+                }
+                Err(RepositoryError::VersionConflict) => break,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn build_provider_follow_up(
+    kind: &str,
+    target: &crate::call_engine::ProviderEventTarget,
+    stored: &StoredServiceCall,
+    at: DateTime<Utc>,
+) -> Result<Option<ServiceCommandTransaction>, RepositoryError> {
+    if stored.call.aggregate.state().is_terminal() {
+        return Ok(None);
+    }
+    let leg = stored
+        .call
+        .aggregate
+        .leg(target.leg_id)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    let normalized = kind.to_ascii_lowercase().replace(['_', ' '], "-");
+    let progress = ["queued", "initiated", "ringing", "started"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    let connected = ["answered", "in-progress", "connected", "active"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    let ended = ["completed", "hangup", "ended", "disconnected"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    let failed = [
+        "failed",
+        "busy",
+        "no-answer",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+
+    let (state, failure) = if failed || (!progress && !connected && !ended) {
+        (
+            LegState::Failed,
+            Some(FailureDetails::sanitized(
+                if failed {
+                    "provider_call_failed"
+                } else {
+                    "provider_event_unsupported"
+                },
+                "provider signaling did not complete successfully",
+                false,
+            )),
+        )
+    } else if ended {
+        if matches!(leg.state(), LegState::Connected | LegState::Held | LegState::Ending) {
+            (LegState::Ended, None)
+        } else {
+            (
+                LegState::Failed,
+                Some(FailureDetails::sanitized(
+                    "provider_ended_during_setup",
+                    "provider signaling ended before the leg connected",
+                    false,
+                )),
+            )
+        }
+    } else if connected {
+        match leg.state() {
+            LegState::Connected | LegState::Held | LegState::Ending => (leg.state(), None),
+            _ => (LegState::Connected, None),
+        }
+    } else {
+        match leg.state() {
+            LegState::Pending | LegState::AwaitingAttach => (LegState::Signaling, None),
+            _ => (leg.state(), None),
+        }
+    };
+    Ok(Some(ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: target.tenant_id.clone(),
+            call_id: target.call_id,
+            expected_version: stored.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at,
+                leg_id: target.leg_id,
+                binding_generation: leg.binding_generation(),
+                state,
+                failure,
+            },
+            worker: stored.call.assignment.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at,
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: None,
+    }))
+}
+
 async fn reconcile_effect(
     meta: ClaimedEffectMeta,
     result: ServiceEffectResult,
     follow_up: FollowUpPlan,
     runtime: Arc<CallServiceRuntime>,
-    mut stop: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<(), RepositoryError> {
     loop {
-        if *stop.borrow() {
+        if *shutdown.borrow() == ActorShutdown::LeaseLost {
             return Err(RepositoryError::Unavailable);
         }
         let at = runtime.observation_time();
@@ -1389,12 +2117,12 @@ async fn reconcile_effect(
                     return Ok(())
                 }
                 Err(RepositoryError::Unavailable) => {
-                    if *stop.borrow() {
+                    if *shutdown.borrow() == ActorShutdown::LeaseLost {
                         return Err(RepositoryError::Unavailable);
                     }
                     tokio::select! {
-                        changed = stop.changed() => {
-                            if changed.is_err() || *stop.borrow() {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
                                 return Err(RepositoryError::Unavailable);
                             }
                         }
@@ -1486,13 +2214,97 @@ async fn build_effect_follow_up(
         effect_payloads: Vec::new(),
         operation_idempotency: None,
         bound_connection: None,
+        media_activity: None,
     }))
+}
+
+async fn ensure_ending_deadline(
+    runtime: &Arc<CallServiceRuntime>,
+    mut stored: StoredServiceCall,
+    mut shutdown: watch::Receiver<ActorShutdown>,
+) -> Result<(), RepositoryError> {
+    let tenant_id = stored.call.aggregate.tenant_id().clone();
+    let call_id = stored.call.aggregate.id();
+    let command_id = CommandId::new();
+    let mut delay = REPOSITORY_RETRY_MIN;
+    loop {
+        if stored.call.aggregate.state() != crate::call_engine::CallState::Ending
+            || stored
+                .call
+                .aggregate
+                .deadlines()
+                .get(DeadlineKind::Ending)
+                .due_at()
+                .is_some()
+        {
+            return Ok(());
+        }
+        if *shutdown.borrow() == ActorShutdown::LeaseLost {
+            return Err(RepositoryError::Unavailable);
+        }
+        let at = std::cmp::max(runtime.observation_time(), stored.call.aggregate.updated_at());
+        let due_at = at
+            .checked_add_signed(
+                chrono::Duration::from_std(runtime.timeouts().ending)
+                    .map_err(|_| RepositoryError::InvalidInput("ending timeout is too large"))?,
+            )
+            .ok_or(RepositoryError::InvalidInput(
+                "ending deadline is outside UTC range",
+            ))?;
+        let request = ServiceCommandTransaction {
+            command: CommandCommit {
+                tenant_id: tenant_id.clone(),
+                call_id,
+                expected_version: stored.call.aggregate.version(),
+                command_id,
+                command: CallCommand::ArmDeadline {
+                    at,
+                    kind: DeadlineKind::Ending,
+                    due_at,
+                },
+                worker: runtime.worker().lease,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at,
+            },
+            effect_payloads: Vec::new(),
+            operation_idempotency: None,
+            bound_connection: None,
+            media_activity: None,
+        };
+        match runtime
+            .service_repository()
+            .commit_with_effect_payloads(request)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(RepositoryError::VersionConflict) => {
+                stored = runtime
+                    .service_repository()
+                    .load_service_call(&tenant_id, call_id)
+                    .await?;
+                delay = REPOSITORY_RETRY_MIN;
+            }
+            Err(RepositoryError::Unavailable) => {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
+                            return Err(RepositoryError::Unavailable);
+                        }
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn commit_deadline(
     claim: ClaimedDeadline,
     runtime: Arc<CallServiceRuntime>,
-    mut stop: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<(), RepositoryError> {
     let tenant_id = claim.record.tenant_id.clone();
     let call_id = claim.record.call_id;
@@ -1533,6 +2345,7 @@ async fn commit_deadline(
             effect_payloads: Vec::new(),
             operation_idempotency: None,
             bound_connection: None,
+            media_activity: None,
         };
         let mut delay = REPOSITORY_RETRY_MIN;
         loop {
@@ -1543,12 +2356,12 @@ async fn commit_deadline(
             {
                 Ok(_) => return Ok(()),
                 Err(RepositoryError::Unavailable) => {
-                    if *stop.borrow() {
+                    if *shutdown.borrow() == ActorShutdown::LeaseLost {
                         return Err(RepositoryError::Unavailable);
                     }
                     tokio::select! {
-                        changed = stop.changed() => {
-                            if changed.is_err() || *stop.borrow() {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
                                 return Err(RepositoryError::Unavailable);
                             }
                         }
@@ -1566,7 +2379,7 @@ async fn commit_deadline(
 async fn recover_restarted_call(
     claim: RestartClaim,
     runtime: Arc<CallServiceRuntime>,
-    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<(), RepositoryError> {
     let tenant_id = claim.call.aggregate.tenant_id().clone();
     let call_id = claim.call.aggregate.id();
@@ -1603,7 +2416,7 @@ async fn recover_restarted_call(
                 LegState::Failed,
                 Some(failure),
                 runtime.observation_time(),
-                Some(stop.clone()),
+                Some(shutdown.clone()),
             )
             .await?;
         } else {
@@ -1613,7 +2426,7 @@ async fn recover_restarted_call(
                 leg_id,
                 leg.binding_generation(),
                 failure,
-                stop.clone(),
+                shutdown.clone(),
             )
             .await?;
         }
@@ -1627,7 +2440,7 @@ async fn commit_unbound_restart_failure(
     leg_id: LegId,
     binding_generation: crate::call_engine::BindingGeneration,
     failure: FailureDetails,
-    mut stop: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<(), RepositoryError> {
     let tenant_id = initial.call.aggregate.tenant_id().clone();
     let call_id = initial.call.aggregate.id();
@@ -1669,6 +2482,7 @@ async fn commit_unbound_restart_failure(
             effect_payloads: Vec::new(),
             operation_idempotency: None,
             bound_connection: None,
+            media_activity: None,
         };
         let mut delay = REPOSITORY_RETRY_MIN;
         loop {
@@ -1679,12 +2493,12 @@ async fn commit_unbound_restart_failure(
             {
                 Ok(_) => return Ok(()),
                 Err(RepositoryError::Unavailable) => {
-                    if *stop.borrow() {
+                    if *shutdown.borrow() == ActorShutdown::LeaseLost {
                         return Err(RepositoryError::Unavailable);
                     }
                     tokio::select! {
-                        changed = stop.changed() => {
-                            if changed.is_err() || *stop.borrow() {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
                                 return Err(RepositoryError::Unavailable);
                             }
                         }
@@ -1707,7 +2521,7 @@ async fn commit_binding_state(
     state: LegState,
     failure: Option<FailureDetails>,
     at: DateTime<Utc>,
-    mut cancel: Option<watch::Receiver<bool>>,
+    mut cancel: Option<watch::Receiver<ActorShutdown>>,
 ) -> Result<StoredServiceCall, RepositoryError> {
     let tenant_id = tenant_id.clone();
     let mut stored = runtime
@@ -1760,12 +2574,12 @@ async fn commit_binding_state(
             }
             Err(RepositoryError::Unavailable) => {
                 if let Some(cancel) = &mut cancel {
-                    if *cancel.borrow() {
+                    if *cancel.borrow() == ActorShutdown::LeaseLost {
                         return Err(RepositoryError::Unavailable);
                     }
                     tokio::select! {
                         changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
+                            if changed.is_err() || *cancel.borrow() == ActorShutdown::LeaseLost {
                                 return Err(RepositoryError::Unavailable);
                             }
                         }
