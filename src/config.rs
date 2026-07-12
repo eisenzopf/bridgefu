@@ -87,6 +87,8 @@ pub struct GenericBridgeCfg {
     #[serde(default = "default_webrtc_whip_bind")]
     pub webrtc_whip_bind: String,
     #[serde(default)]
+    /// Deprecated compatibility field. Generic signaling must use the exact
+    /// validator configured at `api.bearer_token`.
     pub bearer_token: Option<SecretRef>,
 }
 
@@ -303,6 +305,20 @@ impl Config {
         if self.runtime.max_concurrent_calls == 0 {
             return Err(anyhow!(
                 "runtime.max_concurrent_calls must be greater than zero"
+            ));
+        }
+        if self.generic_bridge.bearer_token.is_some() {
+            return Err(anyhow!(
+                "generic_bridge.bearer_token is no longer supported; use api.bearer_token so HTTP, SIP, and WebRTC share one validator"
+            ));
+        }
+        if self.generic_bridge.enabled
+            && (!self.api.enabled
+                || self.api.bearer_token.is_none()
+                || self.api.control_hmac_key.is_none())
+        {
+            return Err(anyhow!(
+                "generic_bridge requires api.enabled, api.bearer_token, and api.control_hmac_key"
             ));
         }
         self.validate_persistence()?;
@@ -1243,6 +1259,28 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
             CallRepositoryBackendConfig::Sqlite { .. }
         ));
         assert!(!format!("{backend:?}").contains("bridgefu.db"));
+    }
+
+    #[test]
+    fn generic_bridge_requires_the_shared_durable_auth_authority() {
+        let legacy_token = parse(&format!(
+            "{LEGACY}\ngeneric_bridge:\n  enabled: true\n  bearer_token: legacy-private\n"
+        ));
+        let error = legacy_token.validate().unwrap_err().to_string();
+        assert!(error.contains("generic_bridge.bearer_token"));
+        assert!(!error.contains("legacy-private"));
+
+        let incomplete = parse(&format!(
+            "{LEGACY}\ngeneric_bridge:\n  enabled: true\napi:\n  enabled: true\n  bearer_token: shared-private\n"
+        ));
+        let error = incomplete.validate().unwrap_err().to_string();
+        assert!(error.contains("api.control_hmac_key"));
+        assert!(!error.contains("shared-private"));
+
+        let complete = parse(&format!(
+            "{LEGACY}\ngeneric_bridge:\n  enabled: true\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n"
+        ));
+        complete.validate().unwrap();
     }
 
     #[test]

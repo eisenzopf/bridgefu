@@ -112,13 +112,13 @@ broadcast:
   token_secret: env:BRIDGEFU_BROADCAST_TOKEN_SECRET
 
 # Optional normal rvoip SIP↔WebRTC bridge, independent of the Amazon listener.
-# Incoming SIP and WebRTC legs are paired FIFO in this 1.0 runtime.
+# Inbound legs attach to explicit durable calls using their one-time tokens;
+# SIP, WebRTC, and the control API share api.bearer_token.
 generic_bridge:
   enabled: false
   sip_bind: 0.0.0.0:5070
   webrtc_ws_bind: 0.0.0.0:8080
   webrtc_whip_bind: 0.0.0.0:8081
-  # bearer_token: env:BRIDGEFU_WEBRTC_TOKEN
 
 # Configure any subset. Provider media is delivered through SIP/RTP.
 providers:

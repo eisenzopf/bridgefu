@@ -138,7 +138,11 @@
         "sip_bind": { "type": "string" },
         "webrtc_ws_bind": { "type": "string" },
         "webrtc_whip_bind": { "type": "string" },
-        "bearer_token": { "type": "string" }
+        "bearer_token": {
+          "type": "string",
+          "deprecated": true,
+          "description": "Rejected by Bridgefu 1.0; generic signaling shares api.bearer_token"
+        }
       },
       "additionalProperties": false
     },

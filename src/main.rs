@@ -16,6 +16,7 @@ mod screen_pop_evidence;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -88,15 +89,30 @@ async fn main() -> Result<()> {
 
     observability::spawn_metrics_updater(server.clone(), tenants.clone());
 
+    // Construct the durable authority before any generic signaling listener.
+    // HTTP, SIP, and WebRTC must share this exact repository, worker fence,
+    // validator, and cryptographic policy.
+    let mut api_state =
+        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, None).await?;
     let generic_runtime = if cfg.generic_bridge.enabled {
-        Some(runtime::GenericBridgeRuntime::start(&cfg.generic_bridge, &cfg.runtime).await?)
+        let call_runtime = api_state.call_runtime().ok_or_else(|| {
+            anyhow::anyhow!("generic_bridge requires the authenticated transactional call runtime")
+        })?;
+        let bearer_validator = api_state.bearer_validator().ok_or_else(|| {
+            anyhow::anyhow!("generic_bridge requires the shared API bearer validator")
+        })?;
+        let runtime = runtime::GenericBridgeRuntime::start(
+            &cfg.generic_bridge,
+            &cfg.runtime,
+            call_runtime,
+            bearer_validator,
+        )
+        .await?;
+        api_state.set_generic_runtime(Arc::clone(&runtime));
+        Some(runtime)
     } else {
         None
     };
-
-    let api_state =
-        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, generic_runtime.clone())
-            .await?;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut lifecycle_task = screen_pop_evidence::spawn_lifecycle_ingest(
         lifecycle_events,
