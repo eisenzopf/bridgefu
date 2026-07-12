@@ -407,7 +407,7 @@ hint for SIP and WebRTC connections.
    - Keep `ConnectScreenPopServer` and the existing StandardCharter listener
      untouched; the new API and effect executor do not call its active-call or
      teardown helpers during this item.
-6. [ ] Add memory and Redis worker coordination with fenced leases, capability
+6. [x] Add memory and Redis worker coordination with fenced leases, capability
    and capacity-aware selection, reservations, routing, replay markers, drain,
    and Redis Streams notification. PostgreSQL remains authoritative and a
    transactional outbox avoids PostgreSQL/Redis dual writes.
@@ -627,6 +627,22 @@ Gate 6 progress evidence recorded on 2026-07-12:
   attachment is consumed and expired. Strict changed-surface Clippy,
   warning-free rustdoc, rustfmt, schema parsing, Compose validation, and diff
   checks pass.
+- Bridgefu revision `4196625` completes Gate 6 item 6. Worker placement and
+  reservation are database-authoritative and capability/capacity-aware;
+  PostgreSQL uses database time for leases and one deployment-scoped ordering
+  lock for state plus coordination-outbox commits. Redis and the standalone
+  memory projection carry only bounded, sequence-checked hints with
+  non-resurrectable tombstones, fenced renewal, one-way drain, replay markers,
+  and recoverable Streams wakeups. SQLite runs the same local projector and
+  supervised wakeup path, while PostgreSQL without `rediss://` requires an
+  explicit all-in-one dev/test acknowledgement.
+- The integrated locked suite passes 206 tests with three credentialed backend
+  cases intentionally skipped. The digest-pinned PostgreSQL 17.5 and Redis 7.2
+  runner adds 32 PostgreSQL-backed passes and one Redis conformance pass,
+  including delayed projection recovery, commit-order locking, restart/flush/
+  group recreation, v3-to-v4 migration, values above `2^53`, startup failure,
+  expired/replaced fences, acknowledgement outages, bounded fallback polling,
+  and clean shutdown. Formatting, JSON Schema parsing, and diff checks pass.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
