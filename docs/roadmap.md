@@ -356,6 +356,12 @@ hint for SIP and WebRTC connections.
    hash, persist state/command/effect intents before external I/O, and reconcile
    provider or rvoip outcomes afterward. Tenant override requires a dedicated
    administrative scope.
+   - Require durable 24-hour idempotency for create and non-naturally-idempotent
+     mutating call operations such as transfer and DTMF. Persist a typed
+     operation receipt atomically with each service/control command so a retry
+     returns the original result even when wall time, aggregate version, or a
+     newly generated Command ID would differ; reject reuse for another
+     canonical request or receipt kind.
    - Persist a versioned execution plan alongside the aggregate so each leg's
      endpoint/configuration survives replay and restart without putting secrets
      in domain state.
