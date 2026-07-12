@@ -22,6 +22,8 @@ The ordered implementation gates and their evidence are tracked in the
 also documented in
 [protocol compatibility](docs/protocol-compatibility.md) and
 [BENCHMARKS.md](BENCHMARKS.md).
+The Gate 6 SQL transaction model and its deterministic PostgreSQL runner are
+documented in [durable repository backends](docs/repository-backends.md).
 
 MOQT draft-19 qualification is recorded in the
 [independent interop report](docs/moq-independent-interop.md),

@@ -334,7 +334,7 @@ pub struct DeadlineClaimGuard {
 }
 
 /// Optimistic, fenced pure-command transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandCommit {
     /// Authenticated tenant scope.
     pub tenant_id: TenantId,
@@ -357,7 +357,7 @@ pub struct CommandCommit {
 }
 
 /// Result shared by ordinary and attachment-driven command commits.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandCommitView {
     /// Persisted command receipt.
     pub command: StoredCommand,
@@ -742,7 +742,7 @@ pub struct ClaimedProviderEvent {
 }
 
 /// Atomically applies a claimed provider event with its call command.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderEventCommit {
     /// Provider namespace.
     pub account: ProviderAccountKey,
@@ -769,7 +769,7 @@ pub struct ProviderEventCommitOutcome {
 
 /// Fenced terminal-call acknowledgement for a provider event that requires no
 /// further aggregate transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalProviderEventAcknowledge {
     /// Provider namespace.
     pub account: ProviderAccountKey,

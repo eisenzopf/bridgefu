@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rvoip_core::ids::ConnectionId;
+use serde::{Deserialize, Serialize};
 
 use crate::call_engine::{
     chrono_ttl, idempotency_expiry, validate_attachment_issue, validate_provider_event,
@@ -57,39 +58,90 @@ pub struct MemoryRepositoryCounts {
     pub idempotency: usize,
 }
 
-#[derive(Clone)]
-struct IdempotencyRow {
-    request_digest: crate::call_engine::RequestDigest,
-    call_id: CallId,
-    expires_at: DateTime<Utc>,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct IdempotencyRow {
+    pub(super) request_digest: crate::call_engine::RequestDigest,
+    pub(super) call_id: CallId,
+    pub(super) expires_at: DateTime<Utc>,
 }
 
-#[derive(Clone)]
-struct AttachmentRow {
-    attachment_id: AttachmentId,
-    token_digest: AttachmentTokenDigest,
-    tenant_id: TenantId,
-    call_id: CallId,
-    leg_id: LegId,
-    binding_generation: BindingGeneration,
-    transport: AttachmentTransport,
-    expected_principal: PrincipalFingerprint,
-    worker: WorkerLease,
-    expires_at: DateTime<Utc>,
-    consumed_at: Option<DateTime<Utc>>,
-    revoked_at: Option<DateTime<Utc>>,
-    binding: Option<ConnectionBinding>,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct AttachmentRow {
+    pub(super) attachment_id: AttachmentId,
+    pub(super) token_digest: AttachmentTokenDigest,
+    pub(super) tenant_id: TenantId,
+    pub(super) call_id: CallId,
+    pub(super) leg_id: LegId,
+    pub(super) binding_generation: BindingGeneration,
+    pub(super) transport: AttachmentTransport,
+    pub(super) expected_principal: PrincipalFingerprint,
+    pub(super) worker: WorkerLease,
+    pub(super) expires_at: DateTime<Utc>,
+    pub(super) consumed_at: Option<DateTime<Utc>>,
+    pub(super) revoked_at: Option<DateTime<Utc>>,
+    pub(super) binding: Option<ConnectionBinding>,
 }
 
-#[derive(Clone)]
-struct ProviderReferenceRow {
-    target: ProviderEventTarget,
-    #[allow(dead_code)]
-    bound_at: DateTime<Utc>,
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct ProviderReferenceRow {
+    pub(super) target: ProviderEventTarget,
+    pub(super) bound_at: DateTime<Utc>,
 }
 
-#[derive(Clone)]
-enum ProviderCompletionRow {
+/// One command and its immutable replay result in a durable snapshot.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedCommandRow {
+    pub(super) command: StoredCommand,
+    pub(super) result: CommandCommitView,
+}
+
+/// Tenant-scoped idempotency row in a durable snapshot.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedIdempotencyRow {
+    pub(super) tenant_id: TenantId,
+    pub(super) key_digest: IdempotencyKeyDigest,
+    pub(super) row: IdempotencyRow,
+}
+
+/// Provider reference key and target in a durable snapshot.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedProviderReferenceRow {
+    pub(super) account: ProviderAccountKey,
+    pub(super) provider_call_id: ProviderCallId,
+    pub(super) row: ProviderReferenceRow,
+}
+
+/// Provider completion key and immutable replay guard in a durable snapshot.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct PersistedProviderCompletionRow {
+    pub(super) account: ProviderAccountKey,
+    pub(super) event_digest: ProviderEventDigest,
+    pub(super) row: ProviderCompletionRow,
+}
+
+/// Authoritative, backend-neutral primary rows persisted by SQL repositories.
+///
+/// Secondary indexes are deliberately omitted and rebuilt with uniqueness
+/// validation on load, preventing stale derived indexes from surviving a
+/// process restart.
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct MemoryStateSnapshot {
+    pub(super) workers: Vec<WorkerSnapshot>,
+    pub(super) calls: Vec<StoredCall>,
+    pub(super) commands: Vec<PersistedCommandRow>,
+    pub(super) idempotency: Vec<PersistedIdempotencyRow>,
+    pub(super) attachments: Vec<AttachmentRow>,
+    pub(super) provider_events: Vec<ProviderEventEnvelope>,
+    pub(super) provider_references: Vec<PersistedProviderReferenceRow>,
+    pub(super) provider_completions: Vec<PersistedProviderCompletionRow>,
+    pub(super) provider_receipt_sequence: Option<ProviderReceiptSequence>,
+    pub(super) used_connection_ids: Vec<ConnectionId>,
+    pub(super) outbox: Vec<OutboxRecord>,
+    pub(super) deadlines: Vec<DeadlineRecord>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) enum ProviderCompletionRow {
     Command {
         request: Box<ProviderEventCommit>,
         view: Box<CommandCommitView>,
@@ -166,6 +218,248 @@ impl MemoryRepository {
             provider_events: state.provider_events.len(),
             deadlines: state.deadlines.len(),
             idempotency: state.idempotency.len(),
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> Result<MemoryStateSnapshot, RepositoryError> {
+        let state = self.lock()?;
+        let mut commands = Vec::with_capacity(state.commands.len());
+        for command in state.commands.values() {
+            let result = state
+                .command_results
+                .get(&command.command_id)
+                .filter(|result| result.command == *command)
+                .cloned()
+                .ok_or(RepositoryError::Unavailable)?;
+            commands.push(PersistedCommandRow {
+                command: command.clone(),
+                result,
+            });
+        }
+
+        Ok(MemoryStateSnapshot {
+            workers: state.workers.values().cloned().collect(),
+            calls: state.calls.values().cloned().collect(),
+            commands,
+            idempotency: state
+                .idempotency
+                .iter()
+                .map(|((tenant_id, key_digest), row)| PersistedIdempotencyRow {
+                    tenant_id: tenant_id.clone(),
+                    key_digest: *key_digest,
+                    row: row.clone(),
+                })
+                .collect(),
+            attachments: state.attachments.values().cloned().collect(),
+            provider_events: state.provider_events.values().cloned().collect(),
+            provider_references: state
+                .provider_references
+                .iter()
+                .map(
+                    |((account, provider_call_id), row)| PersistedProviderReferenceRow {
+                        account: account.clone(),
+                        provider_call_id: provider_call_id.clone(),
+                        row: row.clone(),
+                    },
+                )
+                .collect(),
+            provider_completions: state
+                .provider_completions
+                .iter()
+                .map(
+                    |((account, event_digest), row)| PersistedProviderCompletionRow {
+                        account: account.clone(),
+                        event_digest: *event_digest,
+                        row: row.clone(),
+                    },
+                )
+                .collect(),
+            provider_receipt_sequence: state.provider_receipt_sequence,
+            used_connection_ids: state.used_connection_ids.iter().cloned().collect(),
+            outbox: state.outbox.values().cloned().collect(),
+            deadlines: state.deadlines.values().cloned().collect(),
+        })
+    }
+
+    pub(super) fn from_snapshot(snapshot: MemoryStateSnapshot) -> Result<Self, RepositoryError> {
+        let mut state = MemoryState::default();
+
+        for worker in snapshot.workers {
+            if state
+                .workers
+                .insert(worker.lease.worker_id, worker)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for call in snapshot.calls {
+            call.aggregate
+                .validate()
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let call_id = call.aggregate.id();
+            for leg in call.aggregate.legs() {
+                if state.leg_owners.insert(leg.id(), call_id).is_some() {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+            for (leg_id, binding) in &call.bindings {
+                let leg = call
+                    .aggregate
+                    .leg(*leg_id)
+                    .ok_or(RepositoryError::Unavailable)?;
+                if binding.leg_id != *leg_id
+                    || binding.binding_generation != leg.binding_generation()
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+                let key = (call_id, *leg_id, binding.binding_generation);
+                if state
+                    .connection_owners
+                    .insert(binding.connection_id.clone(), key)
+                    .is_some()
+                    || state
+                        .principal_bindings
+                        .insert(
+                            (binding.principal_fingerprint, key),
+                            binding.connection_id.clone(),
+                        )
+                        .is_some()
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+            if state.calls.insert(call_id, call).is_some() {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.commands {
+            let command_id = persisted.command.command_id;
+            if persisted.result.command != persisted.command
+                || state
+                    .commands
+                    .insert(command_id, persisted.command)
+                    .is_some()
+                || state
+                    .command_results
+                    .insert(command_id, persisted.result)
+                    .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.idempotency {
+            if state
+                .idempotency
+                .insert((persisted.tenant_id, persisted.key_digest), persisted.row)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for attachment in snapshot.attachments {
+            let token_digest = attachment.token_digest;
+            let binding_key = (
+                attachment.call_id,
+                attachment.leg_id,
+                attachment.binding_generation,
+            );
+            if state
+                .attachment_ids
+                .insert(attachment.attachment_id, token_digest)
+                .is_some()
+                || state
+                    .active_attachments
+                    .insert(binding_key, token_digest)
+                    .is_some()
+                || state.attachments.insert(token_digest, attachment).is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for event in snapshot.provider_events {
+            let key = (event.account.clone(), event.event_digest);
+            if state.provider_events.insert(key, event).is_some() {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.provider_references {
+            if state
+                .provider_references
+                .insert(
+                    (persisted.account, persisted.provider_call_id),
+                    persisted.row,
+                )
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for persisted in snapshot.provider_completions {
+            if state
+                .provider_completions
+                .insert((persisted.account, persisted.event_digest), persisted.row)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for connection_id in snapshot.used_connection_ids {
+            if !state.used_connection_ids.insert(connection_id) {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        if state
+            .connection_owners
+            .keys()
+            .any(|connection_id| !state.used_connection_ids.contains(connection_id))
+            || state.provider_completions.keys().any(|key| {
+                !state
+                    .provider_events
+                    .get(key)
+                    .is_some_and(|event| matches!(event.state, ProviderEventState::Applied))
+            })
+            || state.provider_events.iter().any(|(key, event)| {
+                matches!(event.state, ProviderEventState::Applied)
+                    && !state.provider_completions.contains_key(key)
+            })
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+        state.provider_receipt_sequence = snapshot.provider_receipt_sequence;
+        if state
+            .provider_events
+            .values()
+            .map(|event| event.receipt_sequence)
+            .max()
+            != state.provider_receipt_sequence
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+        for record in snapshot.outbox {
+            if state.outbox.insert(record.effect_id, record).is_some() {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        for record in snapshot.deadlines {
+            let key = (record.call_id, record.kind, record.generation);
+            if state.deadlines.insert(key, record).is_some() {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+
+        for call in state.calls.values() {
+            let worker = state
+                .workers
+                .get(&call.assignment.lease.worker_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            if worker.lease.fence < call.assignment.lease.fence {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+
+        Ok(Self {
+            state: Mutex::new(state),
         })
     }
 
