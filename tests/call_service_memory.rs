@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bridgefu::call_engine::{
@@ -15,11 +16,12 @@ use bridgefu::call_service::{
     AmazonConnectEndpointConfig, CallExecutionPlan, CallServiceRepository, CompletedServiceEffect,
     ControlCommandOutcome, ControlCommandTransaction, ControlIntent, DtmfSequence,
     EffectResultOutcome, EffectResultReconciliation, ExternalReferenceBinding,
-    ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceCreateOutcome, ServiceCreateTransaction,
-    ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult, SipEndpointConfig,
-    StoredServiceCall, TransferTarget, WebRtcEndpointConfig,
+    ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, OperationIdempotency,
+    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
+    ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
+    WebRtcEndpointConfig,
 };
 use bridgefu::persistence::MemoryRepository;
 use chrono::{DateTime, TimeZone, Utc};
@@ -39,6 +41,31 @@ fn tenant(value: &str) -> TenantId {
 
 fn principal(byte: u8) -> PrincipalFingerprint {
     PrincipalFingerprint::new(digest(byte))
+}
+
+fn operation_idempotency(
+    key: u8,
+    request: u8,
+    operation: ServiceOperationKind,
+) -> OperationIdempotency {
+    OperationIdempotency {
+        key_digest: IdempotencyKeyDigest::new(digest(key)),
+        request_digest: RequestDigest::new(digest(request)),
+        operation,
+    }
+}
+
+#[test]
+fn operation_idempotency_debug_redacts_both_digests() {
+    let claim = OperationIdempotency {
+        key_digest: IdempotencyKeyDigest::new([0xab; 32]),
+        request_digest: RequestDigest::new([0xcd; 32]),
+        operation: ServiceOperationKind::TransferCall,
+    };
+    let rendered = format!("{claim:?}");
+    assert!(rendered.contains("[redacted]"));
+    assert!(!rendered.contains("171"));
+    assert!(!rendered.contains("205"));
 }
 
 async fn register(repository: &MemoryRepository, max_calls: usize) -> WorkerLease {
@@ -198,6 +225,7 @@ async fn service_command(
                 at,
             },
             effect_payloads: Vec::new(),
+            operation_idempotency: None,
         })
         .await
         .unwrap();
@@ -330,6 +358,75 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
     )
 }
 
+fn transfer_operation(
+    fixture: &ActiveFixture,
+    key: u8,
+    request_digest: u8,
+    second: i64,
+    destination: &str,
+    ordinal: u32,
+) -> ServiceCommandTransaction {
+    ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            expected_version: fixture.service_call.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::BeginTransfer {
+                at: at(second),
+                transfer_deadline: at(second + 30),
+            },
+            worker: fixture.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(second),
+        },
+        effect_payloads: vec![ServiceEffectPayloadInput {
+            ordinal,
+            payload: ServiceEffectPayload::Transfer {
+                target: TransferTarget::Sip {
+                    uri: destination.to_owned(),
+                },
+            },
+        }],
+        operation_idempotency: Some(operation_idempotency(
+            key,
+            request_digest,
+            ServiceOperationKind::TransferCall,
+        )),
+    }
+}
+
+fn dtmf_operation(
+    fixture: &ActiveFixture,
+    key: u8,
+    request_digest: u8,
+    second: i64,
+    digits: &str,
+) -> ControlCommandTransaction {
+    ControlCommandTransaction {
+        command_id: CommandId::new(),
+        tenant_id: fixture.owner.clone(),
+        call_id: fixture.service_call.call.aggregate.id(),
+        leg_id: fixture.service_call.call.aggregate.legs()[1].id(),
+        binding_generation: BindingGeneration::INITIAL,
+        worker: fixture.worker,
+        intent: ControlIntent::Dtmf {
+            sequence: DtmfSequence {
+                digits: digits.to_owned(),
+                duration_ms: 100,
+                gap_ms: 50,
+            },
+        },
+        at: at(second),
+        operation_idempotency: Some(operation_idempotency(
+            key,
+            request_digest,
+            ServiceOperationKind::DtmfCall,
+        )),
+    }
+}
+
 #[tokio::test]
 async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
     let repository = MemoryRepository::new();
@@ -436,6 +533,7 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
                 },
             },
         }],
+        operation_idempotency: None,
     };
 
     assert_eq!(
@@ -488,6 +586,197 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
             .await,
         Err(RepositoryError::CommandConflict)
     );
+}
+
+#[tokio::test]
+async fn operation_idempotency_replays_original_before_time_and_cas_evaluation() {
+    let (repository, fixture) = active_fixture(21).await;
+    let before = fixture.service_call.call.clone();
+    let first = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: fixture.owner.clone(),
+            call_id: before.aggregate.id(),
+            expected_version: before.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::BeginTransfer {
+                at: at(10),
+                transfer_deadline: at(40),
+            },
+            worker: fixture.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(10),
+        },
+        effect_payloads: vec![ServiceEffectPayloadInput {
+            ordinal: 1,
+            payload: ServiceEffectPayload::Transfer {
+                target: TransferTarget::Sip {
+                    uri: "sip:replay@example.test".to_owned(),
+                },
+            },
+        }],
+        operation_idempotency: Some(operation_idempotency(
+            201,
+            202,
+            ServiceOperationKind::TransferCall,
+        )),
+    };
+    let ServiceCommandOutcome::Committed(original) = repository
+        .commit_with_effect_payloads(first.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected first operation commit")
+    };
+
+    let mut retry = first;
+    retry.command.command_id = CommandId::new();
+    retry.command.expected_version = original.command.call.aggregate.version();
+    retry.command.command = CallCommand::BeginTransfer {
+        at: at(20),
+        transfer_deadline: at(50),
+    };
+    retry.command.at = at(20);
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(retry)
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(ref replayed) if replayed == &original
+    ));
+}
+
+#[tokio::test]
+async fn operation_idempotency_conflicts_across_body_kind_and_create_receipt() {
+    let (repository, fixture) = active_fixture(22).await;
+    let original = transfer_operation(&fixture, 210, 211, 10, "sip:original@example.test", 1);
+    repository
+        .commit_with_effect_payloads(original)
+        .await
+        .unwrap();
+
+    let changed_body = transfer_operation(&fixture, 210, 212, 11, "sip:changed@example.test", 1);
+    assert_eq!(
+        repository.commit_with_effect_payloads(changed_body).await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+
+    let wrong_kind = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            expected_version: fixture.service_call.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::BeginEnding {
+                at: at(12),
+                ending_deadline: Some(at(42)),
+                reason: StopLegReason::Requested,
+            },
+            worker: fixture.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(12),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: Some(operation_idempotency(
+            210,
+            211,
+            ServiceOperationKind::HangupCall,
+        )),
+    };
+    assert_eq!(
+        repository.commit_with_effect_payloads(wrong_kind).await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+
+    // The active fixture's call creation retained key digest 22. A later
+    // operation cannot reuse that key even with a different receipt family.
+    assert_eq!(
+        repository
+            .commit_with_effect_payloads(transfer_operation(
+                &fixture,
+                22,
+                213,
+                13,
+                "sip:create-key@example.test",
+                1,
+            ))
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+}
+
+#[tokio::test]
+async fn failed_operation_rolls_back_receipt_and_allows_corrected_retry() {
+    let (repository, fixture) = active_fixture(23).await;
+    let before = repository.counts().unwrap();
+    let invalid = transfer_operation(&fixture, 214, 215, 10, "sip:rollback@example.test", 0);
+    assert_eq!(
+        repository.commit_with_effect_payloads(invalid).await,
+        Err(RepositoryError::InvalidInput(
+            "service payload ordinal does not target a compatible effect"
+        ))
+    );
+    assert_eq!(repository.counts().unwrap(), before);
+
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(transfer_operation(
+                &fixture,
+                214,
+                215,
+                11,
+                "sip:rollback@example.test",
+                1,
+            ))
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Committed(_)
+    ));
+    assert_eq!(
+        repository.counts().unwrap().idempotency,
+        before.idempotency + 1
+    );
+}
+
+#[tokio::test]
+async fn operation_idempotency_is_atomic_under_concurrent_same_key_delivery() {
+    let (repository, fixture) = active_fixture(24).await;
+    let repository = Arc::new(repository);
+    let mut tasks = Vec::new();
+    for delivery in 0..32_i64 {
+        let repository = Arc::clone(&repository);
+        let request = transfer_operation(
+            &fixture,
+            216,
+            217,
+            10 + delivery,
+            "sip:concurrent@example.test",
+            1,
+        );
+        tasks.push(tokio::spawn(async move {
+            repository.commit_with_effect_payloads(request).await
+        }));
+    }
+
+    let mut committed = 0;
+    let mut replayed = 0;
+    let mut views = Vec::new();
+    for task in tasks {
+        match task.await.unwrap().unwrap() {
+            ServiceCommandOutcome::Committed(view) => {
+                committed += 1;
+                views.push(view);
+            }
+            ServiceCommandOutcome::Replayed(view) => {
+                replayed += 1;
+                views.push(view);
+            }
+        }
+    }
+    assert_eq!(committed, 1);
+    assert_eq!(replayed, 31);
+    assert!(views.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[tokio::test]
@@ -570,6 +859,7 @@ async fn service_managed_calls_reject_raw_mutation_completion_and_reference_bypa
                     },
                 },
                 at: at(6),
+                operation_idempotency: None,
             })
             .await,
         Err(RepositoryError::InvalidInput(
@@ -597,6 +887,7 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
             },
         },
         at: at(10),
+        operation_idempotency: None,
     };
     let ControlCommandOutcome::Enqueued(view) =
         repository.enqueue_control(request.clone()).await.unwrap()
@@ -751,6 +1042,117 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
 }
 
 #[tokio::test]
+async fn control_operation_replays_expires_and_conflicts_with_other_receipt_kinds() {
+    let (repository, fixture) = active_fixture(31).await;
+    let first_request = dtmf_operation(&fixture, 218, 219, 10, "1");
+    let ControlCommandOutcome::Enqueued(original) = repository
+        .enqueue_control(first_request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected first DTMF operation")
+    };
+    let retained_after_first = repository.counts().unwrap().idempotency;
+
+    let mut retry = first_request;
+    retry.command_id = CommandId::new();
+    retry.at = at(20);
+    assert!(matches!(
+        repository.enqueue_control(retry).await.unwrap(),
+        ControlCommandOutcome::Replayed(ref replayed) if replayed == &original
+    ));
+
+    assert_eq!(
+        repository
+            .enqueue_control(dtmf_operation(&fixture, 218, 220, 21, "2"))
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+    assert_eq!(
+        repository
+            .commit_with_effect_payloads(transfer_operation(
+                &fixture,
+                218,
+                219,
+                22,
+                "sip:wrong-family@example.test",
+                1,
+            ))
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+
+    // At the exact 24-hour boundary the old receipt is expired, so the same
+    // key may protect a new canonical request and result.
+    let ControlCommandOutcome::Enqueued(reused) = repository
+        .enqueue_control(dtmf_operation(&fixture, 218, 220, 86_410, "2"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected expired key reuse")
+    };
+    assert_eq!(
+        repository.counts().unwrap().idempotency,
+        retained_after_first - 1
+    );
+    assert!(matches!(
+        repository
+            .enqueue_control(dtmf_operation(&fixture, 218, 220, 86_411, "2"))
+            .await
+            .unwrap(),
+        ControlCommandOutcome::Replayed(ref replayed) if replayed == &reused
+    ));
+}
+
+#[tokio::test]
+async fn operation_idempotency_keys_are_isolated_by_tenant() {
+    let repository = MemoryRepository::new();
+    let worker = register(&repository, 2).await;
+    let (first_create, _) = sip_webrtc_create(tenant("operation-tenant-a"), worker, 60);
+    let (second_create, _) = sip_webrtc_create(tenant("operation-tenant-b"), worker, 61);
+    let first = created(repository.create_with_plan(first_create).await.unwrap());
+    let second = created(repository.create_with_plan(second_create).await.unwrap());
+
+    let hangup = |call: &StoredServiceCall, second_at| ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: call.call.aggregate.tenant_id().clone(),
+            call_id: call.call.aggregate.id(),
+            expected_version: call.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::BeginEnding {
+                at: at(second_at),
+                ending_deadline: Some(at(second_at + 30)),
+                reason: StopLegReason::Requested,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(second_at),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: Some(operation_idempotency(
+            221,
+            222,
+            ServiceOperationKind::HangupCall,
+        )),
+    };
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(hangup(&first, 10))
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(hangup(&second, 11))
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Committed(_)
+    ));
+}
+
+#[tokio::test]
 async fn controls_are_fifo_per_binding_and_block_later_claims() {
     let (repository, fixture) = active_fixture(32).await;
     let leg_id = fixture.service_call.call.aggregate.legs()[1].id();
@@ -769,6 +1171,7 @@ async fn controls_are_fifo_per_binding_and_block_later_claims() {
             },
         },
         at: at_time,
+        operation_idempotency: None,
     };
     let ControlCommandOutcome::Enqueued(first) = repository
         .enqueue_control(request("1", at(10)))
@@ -840,6 +1243,7 @@ async fn claimed_control_is_invalidated_when_teardown_begins() {
                 },
             },
             at: at(10),
+            operation_idempotency: None,
         })
         .await
         .unwrap()
@@ -894,6 +1298,7 @@ fn view_to_request(view: &bridgefu::call_service::ControlCommandView) -> Control
         worker: view.command.worker,
         intent: view.command.intent.clone(),
         at: view.command.recorded_at,
+        operation_idempotency: None,
     }
 }
 
@@ -917,6 +1322,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
                 },
             },
             at: at(10),
+            operation_idempotency: None,
         })
         .await
         .unwrap()
@@ -1092,6 +1498,7 @@ async fn command_ids_conflict_across_control_core_and_attachment_paths() {
                 },
             },
             at: at(10),
+            operation_idempotency: None,
         })
         .await
         .unwrap();
@@ -1303,6 +1710,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
             at: at(8),
         },
         effect_payloads: Vec::new(),
+        operation_idempotency: None,
     };
     let base = EffectResultReconciliation {
         tenant_id: owner.clone(),

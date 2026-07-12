@@ -36,11 +36,11 @@ use crate::call_service::{
     CallExecutionPlan, CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect,
     ControlCommandOutcome, ControlCommandTransaction, ControlCommandView, ControlOutboxRecord,
     ControlSequence, EffectResultOutcome, EffectResultReconciliation, EffectResultView,
-    ExternalReferenceBinding, ExternalReferenceValue, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
-    ServiceEffectPayloadInput, ServiceEffectResult, StoredControlCommand, StoredExternalReference,
-    StoredServiceCall, StoredServiceEffectPayload,
+    ExternalReferenceBinding, ExternalReferenceValue, OperationIdempotency,
+    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
+    StoredControlCommand, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
 };
 
 type BindingKey = (CallId, LegId, BindingGeneration);
@@ -104,6 +104,7 @@ pub(super) struct IdempotencyRow {
     pub(super) request_digest: crate::call_engine::RequestDigest,
     pub(super) call_id: CallId,
     pub(super) expires_at: DateTime<Utc>,
+    pub(super) receipt: OperationIdempotencyReceipt,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,15 +401,6 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
-        for persisted in snapshot.idempotency {
-            if state
-                .idempotency
-                .insert((persisted.tenant_id, persisted.key_digest), persisted.row)
-                .is_some()
-            {
-                return Err(RepositoryError::Unavailable);
-            }
-        }
         for attachment in snapshot.attachments {
             let token_digest = attachment.token_digest;
             let binding_key = (
@@ -499,6 +491,21 @@ impl MemoryRepository {
                 return Err(RepositoryError::Unavailable);
             }
         }
+        for persisted in snapshot.idempotency {
+            validate_idempotency_snapshot(
+                &state,
+                &persisted.tenant_id,
+                persisted.key_digest,
+                &persisted.row,
+            )?;
+            if state
+                .idempotency
+                .insert((persisted.tenant_id, persisted.key_digest), persisted.row)
+                .is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
 
         for call in state.calls.values() {
             let worker = state
@@ -537,6 +544,134 @@ impl MemoryRepository {
         *state = draft;
         Ok(result)
     }
+}
+
+fn validate_idempotency_snapshot(
+    state: &MemoryState,
+    tenant_id: &TenantId,
+    key_digest: IdempotencyKeyDigest,
+    row: &IdempotencyRow,
+) -> Result<(), RepositoryError> {
+    let call = state
+        .calls
+        .get(&row.call_id)
+        .filter(|call| call.aggregate.tenant_id() == tenant_id)
+        .ok_or(RepositoryError::Unavailable)?;
+    match &row.receipt {
+        OperationIdempotencyReceipt::CreateCall => {
+            let mut matching = state.command_results.values().filter(|result| {
+                result.command.tenant_id == *tenant_id
+                    && result.command.call_id == row.call_id
+                    && result.command.observed_version.value() == 0
+            });
+            let create = matching.next().ok_or(RepositoryError::Unavailable)?;
+            if matching.next().is_some()
+                || create.call.aggregate.tenant_id() != tenant_id
+                || create.call.aggregate.id() != row.call_id
+                || row.expires_at <= create.command.recorded_at
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+        OperationIdempotencyReceipt::ServiceCommand { operation, view } => {
+            let command = &view.command.command;
+            OperationIdempotency {
+                key_digest,
+                request_digest: row.request_digest,
+                operation: *operation,
+            }
+            .validate_service_command(&command.command)
+            .map_err(|_| RepositoryError::Unavailable)?;
+            if command.tenant_id != *tenant_id
+                || command.call_id != row.call_id
+                || view.command.call.aggregate.tenant_id() != tenant_id
+                || view.command.call.aggregate.id() != row.call_id
+                || state.command_results.get(&command.command_id) != Some(&view.command)
+                || row.expires_at <= command.recorded_at
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+
+            let mut payload_effects = HashSet::new();
+            for payload in &view.effect_payloads {
+                payload
+                    .payload
+                    .validate()
+                    .map_err(|_| RepositoryError::Unavailable)?;
+                let effect = view
+                    .command
+                    .outbox
+                    .iter()
+                    .find(|effect| effect.effect_id == payload.effect_id)
+                    .ok_or(RepositoryError::Unavailable)?;
+                if payload.command_id != command.command_id
+                    || effect.command_id != command.command_id
+                    || effect.ordinal != payload.ordinal
+                    || !matches!(
+                        (&effect.intent, &payload.payload),
+                        (
+                            EffectIntent::ExecuteTransfer { .. },
+                            ServiceEffectPayload::Transfer { .. }
+                        )
+                    )
+                    || !payload_effects.insert(payload.effect_id)
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+            for effect in &view.command.outbox {
+                let actual = state
+                    .outbox
+                    .get(&effect.effect_id)
+                    .ok_or(RepositoryError::Unavailable)?;
+                if !same_outbox_identity(effect, actual)
+                    || matches!(effect.intent, EffectIntent::ExecuteTransfer { .. })
+                        != payload_effects.contains(&effect.effect_id)
+                {
+                    return Err(RepositoryError::Unavailable);
+                }
+            }
+        }
+        OperationIdempotencyReceipt::ControlCommand { operation, view } => {
+            OperationIdempotency {
+                key_digest,
+                request_digest: row.request_digest,
+                operation: *operation,
+            }
+            .validate_control(&view.command.intent)
+            .map_err(|_| RepositoryError::Unavailable)?;
+            if view.command.tenant_id != *tenant_id
+                || view.command.call_id != row.call_id
+                || call.aggregate.leg(view.command.leg_id).is_none()
+                || view.effect.command_id != view.command.command_id
+                || view.effect.tenant_id != *tenant_id
+                || view.effect.call_id != row.call_id
+                || view.effect.leg_id != view.command.leg_id
+                || view.effect.binding_generation != view.command.binding_generation
+                || view.effect.worker != view.command.worker
+                || view.effect.intent != view.command.intent
+                || view.effect.available_at != view.command.recorded_at
+                || !matches!(view.effect.state, OutboxState::Ready)
+                || state.outbox.contains_key(&view.effect.effect_id)
+                || row.expires_at <= view.command.recorded_at
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_outbox_identity(left: &OutboxRecord, right: &OutboxRecord) -> bool {
+    left.effect_id == right.effect_id
+        && left.command_id == right.command_id
+        && left.ordinal == right.ordinal
+        && left.tenant_id == right.tenant_id
+        && left.call_id == right.call_id
+        && left.aggregate_version == right.aggregate_version
+        && left.worker == right.worker
+        && left.intent == right.intent
+        && left.available_at == right.available_at
 }
 
 #[async_trait]
@@ -1431,6 +1566,9 @@ impl CallServiceRepository for MemoryRepository {
         request: ControlCommandTransaction,
     ) -> Result<ControlCommandOutcome, RepositoryError> {
         request.intent.validate()?;
+        if let Some(idempotency) = &request.operation_idempotency {
+            idempotency.validate_control(&request.intent)?;
+        }
         self.transaction(|state| enqueue_control_in_state(state, request))
     }
 
@@ -1559,9 +1697,101 @@ fn original_create_snapshot(
     Ok(call)
 }
 
+fn replay_service_operation(
+    state: &mut MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<Option<ServiceCommandOutcome>, RepositoryError> {
+    let Some(idempotency) = &request.operation_idempotency else {
+        return Ok(None);
+    };
+    state
+        .idempotency
+        .retain(|_, existing| existing.expires_at > request.command.at);
+    let key = (request.command.tenant_id.clone(), idempotency.key_digest);
+    let Some(existing) = state.idempotency.get(&key).cloned() else {
+        return Ok(None);
+    };
+    if existing.request_digest != idempotency.request_digest
+        || existing.call_id != request.command.call_id
+    {
+        return Err(RepositoryError::IdempotencyConflict);
+    }
+    match existing.receipt {
+        OperationIdempotencyReceipt::ServiceCommand { operation, view }
+            if operation == idempotency.operation
+                && view.command.command.tenant_id == request.command.tenant_id
+                && view.command.command.call_id == request.command.call_id =>
+        {
+            Ok(Some(ServiceCommandOutcome::Replayed(*view)))
+        }
+        _ => Err(RepositoryError::IdempotencyConflict),
+    }
+}
+
+fn replay_control_operation(
+    state: &mut MemoryState,
+    request: &ControlCommandTransaction,
+) -> Result<Option<ControlCommandOutcome>, RepositoryError> {
+    let Some(idempotency) = &request.operation_idempotency else {
+        return Ok(None);
+    };
+    state
+        .idempotency
+        .retain(|_, existing| existing.expires_at > request.at);
+    let key = (request.tenant_id.clone(), idempotency.key_digest);
+    let Some(existing) = state.idempotency.get(&key).cloned() else {
+        return Ok(None);
+    };
+    if existing.request_digest != idempotency.request_digest || existing.call_id != request.call_id
+    {
+        return Err(RepositoryError::IdempotencyConflict);
+    }
+    match existing.receipt {
+        OperationIdempotencyReceipt::ControlCommand { operation, view }
+            if operation == idempotency.operation
+                && view.command.tenant_id == request.tenant_id
+                && view.command.call_id == request.call_id =>
+        {
+            Ok(Some(ControlCommandOutcome::Replayed(*view)))
+        }
+        _ => Err(RepositoryError::IdempotencyConflict),
+    }
+}
+
+fn retain_operation_receipt(
+    state: &mut MemoryState,
+    tenant_id: TenantId,
+    call_id: CallId,
+    idempotency: OperationIdempotency,
+    receipt: OperationIdempotencyReceipt,
+    at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    let expires_at = idempotency_expiry(at)?;
+    let key = (tenant_id, idempotency.key_digest);
+    if state
+        .idempotency
+        .insert(
+            key,
+            IdempotencyRow {
+                request_digest: idempotency.request_digest,
+                call_id,
+                expires_at,
+                receipt,
+            },
+        )
+        .is_some()
+    {
+        return Err(RepositoryError::Unavailable);
+    }
+    Ok(())
+}
+
 fn normalize_service_command(
     mut request: ServiceCommandTransaction,
 ) -> Result<ServiceCommandTransaction, RepositoryError> {
+    if let Some(idempotency) = &request.operation_idempotency {
+        idempotency.validate_service_command(&request.command.command)?;
+    }
     request
         .effect_payloads
         .sort_by_key(|payload| payload.ordinal);
@@ -1584,6 +1814,9 @@ fn commit_service_command_in_state(
     state: &mut MemoryState,
     request: ServiceCommandTransaction,
 ) -> Result<ServiceCommandOutcome, RepositoryError> {
+    if let Some(replayed) = replay_service_operation(state, &request)? {
+        return Ok(replayed);
+    }
     if let Some(existing) = state
         .service_command_results
         .get(&request.command.command_id)
@@ -1665,6 +1898,10 @@ fn commit_service_command_in_state(
         command: core,
         effect_payloads: stored_payloads,
     };
+    let operation_idempotency = request.operation_idempotency.clone();
+    let operation_at = request.command.at;
+    let operation_tenant = request.command.tenant_id.clone();
+    let operation_call = request.command.call_id;
     state.service_command_results.insert(
         request.command.command_id,
         StoredServiceCommandResult {
@@ -1672,6 +1909,20 @@ fn commit_service_command_in_state(
             view: view.clone(),
         },
     );
+    if let Some(idempotency) = operation_idempotency {
+        let operation = idempotency.operation;
+        retain_operation_receipt(
+            state,
+            operation_tenant,
+            operation_call,
+            idempotency,
+            OperationIdempotencyReceipt::ServiceCommand {
+                operation,
+                view: Box::new(view.clone()),
+            },
+            operation_at,
+        )?;
+    }
     Ok(ServiceCommandOutcome::Committed(view))
 }
 
@@ -1679,6 +1930,9 @@ fn enqueue_control_in_state(
     state: &mut MemoryState,
     request: ControlCommandTransaction,
 ) -> Result<ControlCommandOutcome, RepositoryError> {
+    if let Some(replayed) = replay_control_operation(state, &request)? {
+        return Ok(replayed);
+    }
     if let Some(existing) = state.control_command_results.get(&request.command_id) {
         return if existing.request == request {
             Ok(ControlCommandOutcome::Replayed(existing.view.clone()))
@@ -1765,6 +2019,10 @@ fn enqueue_control_in_state(
         command: command.clone(),
         effect: effect.clone(),
     };
+    let operation_idempotency = request.operation_idempotency.clone();
+    let operation_at = request.at;
+    let operation_tenant = request.tenant_id.clone();
+    let operation_call = request.call_id;
     state.control_commands.insert(request.command_id, command);
     state.control_outbox.insert(effect_id, effect);
     state.control_sequences.insert(binding_key, sequence);
@@ -1775,6 +2033,20 @@ fn enqueue_control_in_state(
             view: view.clone(),
         },
     );
+    if let Some(idempotency) = operation_idempotency {
+        let operation = idempotency.operation;
+        retain_operation_receipt(
+            state,
+            operation_tenant,
+            operation_call,
+            idempotency,
+            OperationIdempotencyReceipt::ControlCommand {
+                operation,
+                view: Box::new(view.clone()),
+            },
+            operation_at,
+        )?;
+    }
     Ok(ControlCommandOutcome::Enqueued(view))
 }
 
@@ -2567,7 +2839,9 @@ fn create_call_in_state(
     let idempotency_key = (tenant_id.clone(), request.idempotency_key);
     if let Some(existing) = state.idempotency.get(&idempotency_key) {
         if existing.expires_at > request.at {
-            if existing.request_digest != request.request_digest {
+            if existing.request_digest != request.request_digest
+                || !matches!(existing.receipt, OperationIdempotencyReceipt::CreateCall)
+            {
                 return Err(RepositoryError::IdempotencyConflict);
             }
             let call = tenant_call(state, &tenant_id, existing.call_id)?;
@@ -2673,6 +2947,7 @@ fn create_call_in_state(
             request_digest: request.request_digest,
             call_id,
             expires_at,
+            receipt: OperationIdempotencyReceipt::CreateCall,
         },
     );
     state.command_results.insert(

@@ -8,10 +8,10 @@ use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
-    AttachmentTransport, BindingGeneration, CallId, ClaimGeneration, CommandCommit,
-    CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId, FailureDetails, LegId,
-    OutboxRecord, OutboxState, PrincipalFingerprint, ProviderEventEnvelope, RepositoryError,
-    StoredCall, TenantId, WorkerLease,
+    AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit,
+    CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId, FailureDetails,
+    IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
+    ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
 };
 
 use super::{CallExecutionPlan, ControlIntent, ExternalReferenceValue, ServiceEffectPayload};
@@ -43,6 +43,71 @@ pub enum ServiceCreateOutcome {
     Replayed(StoredServiceCall),
 }
 
+/// Public HTTP operation protected by the tenant-wide idempotency-key namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOperationKind {
+    /// Creates one two-leg call.
+    CreateCall,
+    /// Starts durable call teardown.
+    HangupCall,
+    /// Starts a durable call transfer.
+    TransferCall,
+    /// Enqueues DTMF for one bound leg.
+    DtmfCall,
+}
+
+/// Tenant-scoped canonical idempotency claim supplied by the HTTP service.
+///
+/// Digests have redacted `Debug` implementations. The raw header and request
+/// body never cross this repository boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationIdempotency {
+    /// HMAC digest of the tenant-bound `Idempotency-Key` header.
+    pub key_digest: IdempotencyKeyDigest,
+    /// HMAC digest of the canonical authenticated operation request.
+    pub request_digest: RequestDigest,
+    /// Typed public operation whose original result must be replayed.
+    pub operation: ServiceOperationKind,
+}
+
+impl OperationIdempotency {
+    pub(crate) fn validate_service_command(
+        &self,
+        command: &CallCommand,
+    ) -> Result<(), RepositoryError> {
+        let valid = matches!(
+            (&self.operation, command),
+            (
+                ServiceOperationKind::HangupCall,
+                CallCommand::BeginEnding { .. }
+            ) | (
+                ServiceOperationKind::TransferCall,
+                CallCommand::BeginTransfer { .. }
+            )
+        );
+        if valid {
+            Ok(())
+        } else {
+            Err(RepositoryError::InvalidInput(
+                "operation idempotency kind does not match service command",
+            ))
+        }
+    }
+
+    pub(crate) fn validate_control(&self, intent: &ControlIntent) -> Result<(), RepositoryError> {
+        if self.operation == ServiceOperationKind::DtmfCall
+            && matches!(intent, ControlIntent::Dtmf { .. })
+        {
+            Ok(())
+        } else {
+            Err(RepositoryError::InvalidInput(
+                "operation idempotency kind does not match control command",
+            ))
+        }
+    }
+}
+
 /// One service payload mapped to a core effect ordinal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceEffectPayloadInput {
@@ -72,6 +137,9 @@ pub struct ServiceCommandTransaction {
     pub command: CommandCommit,
     /// Payloads keyed by core decision ordinal.
     pub effect_payloads: Vec<ServiceEffectPayloadInput>,
+    /// Optional public-operation replay claim. Internal effect follow-ups omit it.
+    #[serde(default)]
+    pub operation_idempotency: Option<OperationIdempotency>,
 }
 
 /// Exact result of a service command transaction.
@@ -111,6 +179,9 @@ pub struct ControlCommandTransaction {
     pub intent: ControlIntent,
     /// Repository observation time.
     pub at: DateTime<Utc>,
+    /// Optional public-operation replay claim. Internal controls may omit it.
+    #[serde(default)]
+    pub operation_idempotency: Option<OperationIdempotency>,
 }
 
 /// Immutable receipt for an accepted control command.
@@ -227,6 +298,29 @@ pub enum ControlCommandOutcome {
     Enqueued(ControlCommandView),
     /// The exact request returned the original effect.
     Replayed(ControlCommandView),
+}
+
+/// Typed immutable result retained by the shared 24-hour idempotency row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "receipt", rename_all = "snake_case")]
+pub enum OperationIdempotencyReceipt {
+    /// Existing call-creation receipt. The original create snapshot is loaded
+    /// through its version-zero command result.
+    CreateCall,
+    /// Original state-changing service command result.
+    ServiceCommand {
+        /// Exact public operation represented by the command.
+        operation: ServiceOperationKind,
+        /// Immutable result returned to every exact retry.
+        view: Box<ServiceCommandView>,
+    },
+    /// Original non-state-changing control result.
+    ControlCommand {
+        /// Exact public operation represented by the control.
+        operation: ServiceOperationKind,
+        /// Immutable result returned to every exact retry.
+        view: Box<ControlCommandView>,
+    },
 }
 
 /// Claimed control effect and its completion guard.
