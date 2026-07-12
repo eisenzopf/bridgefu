@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -337,6 +338,20 @@ struct RuntimeSupervisor {
     tasks: Vec<JoinHandle<()>>,
 }
 
+#[async_trait]
+trait WorkerLeaseAuthority: Send + Sync {
+    async fn renew(&self, request: RenewWorkerLease) -> Result<WorkerSnapshot, RepositoryError>;
+}
+
+struct RepositoryWorkerLeaseAuthority(Arc<dyn CallRepository>);
+
+#[async_trait]
+impl WorkerLeaseAuthority for RepositoryWorkerLeaseAuthority {
+    async fn renew(&self, request: RenewWorkerLease) -> Result<WorkerSnapshot, RepositoryError> {
+        self.0.renew_worker_lease(request).await
+    }
+}
+
 struct RuntimeTaskControl {
     cancel_all: watch::Sender<bool>,
     cancel: watch::Receiver<bool>,
@@ -511,6 +526,7 @@ impl RuntimeSupervisor {
     fn start(
         repository: Arc<dyn CallRepository>,
         worker: crate::call_engine::WorkerLease,
+        registered_at: tokio::time::Instant,
         lease_ttl: Duration,
         renew_interval: Duration,
         clock: Arc<dyn CallServiceClock>,
@@ -521,9 +537,12 @@ impl RuntimeSupervisor {
         health: watch::Sender<RuntimeSupervisorHealth>,
     ) -> Self {
         let (cancel, renew_cancel) = watch::channel(false);
+        let lease_authority: Arc<dyn WorkerLeaseAuthority> =
+            Arc::new(RepositoryWorkerLeaseAuthority(Arc::clone(&repository)));
         let mut tasks = vec![tokio::spawn(run_worker_renewal(
-            Arc::clone(&repository),
+            lease_authority,
             worker,
+            registered_at,
             lease_ttl,
             renew_interval,
             Arc::clone(&clock),
@@ -752,29 +771,67 @@ fn merge_wakeup_messages(
 }
 
 async fn run_worker_renewal(
-    repository: Arc<dyn CallRepository>,
+    authority: Arc<dyn WorkerLeaseAuthority>,
     worker: crate::call_engine::WorkerLease,
+    registered_at: tokio::time::Instant,
     lease_ttl: Duration,
     renew_interval: Duration,
     clock: Arc<dyn CallServiceClock>,
     mut control: RuntimeTaskControl,
 ) {
-    let start = tokio::time::Instant::now() + renew_interval;
+    let mut lease_valid_until = registered_at + lease_ttl;
+    let start = registered_at + renew_interval;
     let mut ticker = tokio::time::interval_at(start, renew_interval);
     loop {
         tokio::select! {
+            biased;
             changed = control.cancel.changed() => {
                 if changed.is_err() || *control.cancel.borrow() {
                     break;
                 }
             }
+            _ = tokio::time::sleep_until(lease_valid_until) => {
+                if *control.health.borrow() != RuntimeSupervisorHealth::Draining {
+                    control
+                        .health
+                        .send_replace(RuntimeSupervisorHealth::LeaseLost);
+                }
+                let _ = control.cancel_all.send(true);
+                break;
+            }
             _ = ticker.tick() => {
-                match repository.renew_worker_lease(RenewWorkerLease {
-                    worker,
-                    lease_ttl,
-                    at: clock.now(),
-                }).await {
+                let attempt_started = tokio::time::Instant::now();
+                let renewal = tokio::select! {
+                    biased;
+                    changed = control.cancel.changed() => {
+                        if changed.is_err() || *control.cancel.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep_until(lease_valid_until) => {
+                        if *control.health.borrow() != RuntimeSupervisorHealth::Draining {
+                            control
+                                .health
+                                .send_replace(RuntimeSupervisorHealth::LeaseLost);
+                        }
+                        let _ = control.cancel_all.send(true);
+                        break;
+                    }
+                    result = authority.renew(RenewWorkerLease {
+                        worker,
+                        lease_ttl,
+                        at: clock.now(),
+                    }) => result,
+                };
+                match renewal {
                     Ok(_) => {
+                        // The repository applies its authoritative expiry no
+                        // earlier than this request began. Measuring from the
+                        // local attempt start is therefore conservative even
+                        // when a database response is delayed or wall clocks
+                        // differ.
+                        lease_valid_until = attempt_started + lease_ttl;
                         if *control.health.borrow() == RuntimeSupervisorHealth::Degraded {
                             control
                                 .health
@@ -963,6 +1020,7 @@ where
     // registration transaction, so dependency-first construction is the
     // equivalent fail-closed startup boundary.
     let wakeup_consumer = coordination.wakeup_consumer(config.worker_id).await?;
+    let worker_registration_started = tokio::time::Instant::now();
     let worker = repository
         .register_worker(RegisterWorker {
             worker_id: config.worker_id,
@@ -1000,6 +1058,7 @@ where
     let supervisor = RuntimeSupervisor::start(
         Arc::clone(&core_repository),
         worker.lease,
+        worker_registration_started,
         config.coordination.worker_lease_ttl,
         config.coordination.worker_renew_interval,
         Arc::clone(&clock),
@@ -1038,6 +1097,19 @@ mod tests {
 
     #[derive(Debug)]
     struct ManualCallClock(Mutex<DateTime<Utc>>);
+
+    #[derive(Debug)]
+    struct UnavailableLeaseAuthority;
+
+    #[async_trait]
+    impl WorkerLeaseAuthority for UnavailableLeaseAuthority {
+        async fn renew(
+            &self,
+            _request: RenewWorkerLease,
+        ) -> Result<WorkerSnapshot, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+    }
 
     impl ManualCallClock {
         fn new(now: DateTime<Utc>) -> Self {
@@ -1333,8 +1405,9 @@ mod tests {
         let (cancel, mut sibling_cancel) = watch::channel(false);
         let (health, _) = watch::channel(RuntimeSupervisorHealth::Healthy);
         let task = tokio::spawn(run_worker_renewal(
-            repository,
+            Arc::new(RepositoryWorkerLeaseAuthority(repository)),
             original.lease,
+            tokio::time::Instant::now(),
             Duration::from_secs(30),
             Duration::from_millis(10),
             clock,
@@ -1350,6 +1423,49 @@ mod tests {
             .unwrap();
         assert!(*sibling_cancel.borrow());
         assert_eq!(*health.borrow(), RuntimeSupervisorHealth::LeaseLost);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_outage_cannot_extend_the_last_confirmed_lease() {
+        let repository = Arc::new(MemoryRepository::new());
+        let worker =
+            registered_worker(&repository, WorkerId::new(), at(0), Duration::from_secs(30)).await;
+        let clock = Arc::new(ManualCallClock::new(at(0)));
+        let (cancel, mut sibling_cancel) = watch::channel(false);
+        let (health, mut health_rx) = watch::channel(RuntimeSupervisorHealth::Healthy);
+        let registered_at = tokio::time::Instant::now();
+        let task = tokio::spawn(run_worker_renewal(
+            Arc::new(UnavailableLeaseAuthority),
+            worker.lease,
+            registered_at,
+            Duration::from_millis(80),
+            Duration::from_millis(10),
+            clock,
+            RuntimeTaskControl {
+                cancel_all: cancel.clone(),
+                cancel: cancel.subscribe(),
+                health,
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_millis(50), health_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*health_rx.borrow(), RuntimeSupervisorHealth::Degraded);
+        while *health_rx.borrow() != RuntimeSupervisorHealth::LeaseLost {
+            tokio::time::timeout(Duration::from_millis(250), health_rx.changed())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(50), sibling_cancel.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*sibling_cancel.borrow());
+        assert!(tokio::time::Instant::now() >= registered_at + Duration::from_millis(80));
         task.await.unwrap();
     }
 }
