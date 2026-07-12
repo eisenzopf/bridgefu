@@ -1035,6 +1035,7 @@ fn invalid_if(condition: bool) -> Result<(), RepositoryError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_worker_columns(
     worker: &WorkerSnapshot,
     worker_id: &str,

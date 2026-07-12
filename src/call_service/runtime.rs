@@ -337,6 +337,12 @@ struct RuntimeSupervisor {
     tasks: Vec<JoinHandle<()>>,
 }
 
+struct RuntimeTaskControl {
+    cancel_all: watch::Sender<bool>,
+    cancel: watch::Receiver<bool>,
+    health: watch::Sender<RuntimeSupervisorHealth>,
+}
+
 enum RuntimeCoordinationBackend {
     None,
     Memory(Arc<MemoryCoordinator>),
@@ -521,9 +527,11 @@ impl RuntimeSupervisor {
             lease_ttl,
             renew_interval,
             Arc::clone(&clock),
-            cancel.clone(),
-            renew_cancel,
-            health.clone(),
+            RuntimeTaskControl {
+                cancel_all: cancel.clone(),
+                cancel: renew_cancel,
+                health: health.clone(),
+            },
         ))];
         if let (Some(outbox), Some(projection)) = (coordination_outbox, projection) {
             tasks.push(tokio::spawn(run_coordination_projector(
@@ -540,9 +548,11 @@ impl RuntimeSupervisor {
                 consumer,
                 work_wakeups,
                 clock,
-                cancel.clone(),
-                cancel.subscribe(),
-                health.clone(),
+                RuntimeTaskControl {
+                    cancel_all: cancel.clone(),
+                    cancel: cancel.subscribe(),
+                    health: health.clone(),
+                },
             )));
         }
         Self {
@@ -574,9 +584,7 @@ async fn run_work_wakeup_consumer(
     mut consumer: Box<dyn WakeupConsumer>,
     notifications: watch::Sender<Option<RuntimeWorkWakeup>>,
     clock: Arc<dyn CallServiceClock>,
-    cancel_all: watch::Sender<bool>,
-    mut cancel: watch::Receiver<bool>,
-    health: watch::Sender<RuntimeSupervisorHealth>,
+    mut control: RuntimeTaskControl,
 ) {
     const BATCH_SIZE: usize = 128;
     const STALE_PENDING_IDLE: Duration = Duration::from_secs(1);
@@ -588,8 +596,8 @@ async fn run_work_wakeup_consumer(
         let mut coordination_failed = false;
         if !pending_acknowledgements.is_empty() {
             let acknowledgement = tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         break;
                     }
                     continue;
@@ -608,8 +616,8 @@ async fn run_work_wakeup_consumer(
 
         let mut poll = if coordination_failed {
             tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         break;
                     }
                     continue;
@@ -622,8 +630,8 @@ async fn run_work_wakeup_consumer(
             }
         } else {
             tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         break;
                     }
                     continue;
@@ -633,8 +641,8 @@ async fn run_work_wakeup_consumer(
         };
         if !coordination_failed {
             let recovered = tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         break;
                     }
                     continue;
@@ -656,8 +664,8 @@ async fn run_work_wakeup_consumer(
 
         let observed_worker = loop {
             let snapshot = tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         return;
                     }
                     continue;
@@ -670,12 +678,14 @@ async fn run_work_wakeup_consumer(
             match snapshot {
                 Ok(Ok(snapshot)) => break snapshot,
                 Ok(Err(RepositoryError::Unavailable)) | Err(_) => {
-                    if *health.borrow() == RuntimeSupervisorHealth::Healthy {
-                        health.send_replace(RuntimeSupervisorHealth::Degraded);
+                    if *control.health.borrow() == RuntimeSupervisorHealth::Healthy {
+                        control
+                            .health
+                            .send_replace(RuntimeSupervisorHealth::Degraded);
                     }
                     tokio::select! {
-                        changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
+                        changed = control.cancel.changed() => {
+                            if changed.is_err() || *control.cancel.borrow() {
                                 return;
                             }
                         }
@@ -683,10 +693,12 @@ async fn run_work_wakeup_consumer(
                     }
                 }
                 _ => {
-                    if *health.borrow() != RuntimeSupervisorHealth::Draining {
-                        health.send_replace(RuntimeSupervisorHealth::LeaseLost);
+                    if *control.health.borrow() != RuntimeSupervisorHealth::Draining {
+                        control
+                            .health
+                            .send_replace(RuntimeSupervisorHealth::LeaseLost);
                     }
-                    let _ = cancel_all.send(true);
+                    let _ = control.cancel_all.send(true);
                     return;
                 }
             }
@@ -703,8 +715,8 @@ async fn run_work_wakeup_consumer(
         }));
         if !entry_ids.is_empty() {
             let acknowledgement = tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
+                changed = control.cancel.changed() => {
+                    if changed.is_err() || *control.cancel.borrow() {
                         break;
                     }
                     continue;
@@ -745,16 +757,14 @@ async fn run_worker_renewal(
     lease_ttl: Duration,
     renew_interval: Duration,
     clock: Arc<dyn CallServiceClock>,
-    cancel_all: watch::Sender<bool>,
-    mut cancel: watch::Receiver<bool>,
-    health: watch::Sender<RuntimeSupervisorHealth>,
+    mut control: RuntimeTaskControl,
 ) {
     let start = tokio::time::Instant::now() + renew_interval;
     let mut ticker = tokio::time::interval_at(start, renew_interval);
     loop {
         tokio::select! {
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
+            changed = control.cancel.changed() => {
+                if changed.is_err() || *control.cancel.borrow() {
                     break;
                 }
             }
@@ -765,20 +775,26 @@ async fn run_worker_renewal(
                     at: clock.now(),
                 }).await {
                     Ok(_) => {
-                        if *health.borrow() == RuntimeSupervisorHealth::Degraded {
-                            health.send_replace(RuntimeSupervisorHealth::Healthy);
+                        if *control.health.borrow() == RuntimeSupervisorHealth::Degraded {
+                            control
+                                .health
+                                .send_replace(RuntimeSupervisorHealth::Healthy);
                         }
                     }
                     Err(RepositoryError::Unavailable) => {
                         // A transient store outage is retried at the bounded
                         // cadence. The database expiry still fails closed.
-                        health.send_replace(RuntimeSupervisorHealth::Degraded);
+                        control
+                            .health
+                            .send_replace(RuntimeSupervisorHealth::Degraded);
                     }
                     Err(_) => {
-                        if *health.borrow() != RuntimeSupervisorHealth::Draining {
-                            health.send_replace(RuntimeSupervisorHealth::LeaseLost);
+                        if *control.health.borrow() != RuntimeSupervisorHealth::Draining {
+                            control
+                                .health
+                                .send_replace(RuntimeSupervisorHealth::LeaseLost);
                         }
-                        let _ = cancel_all.send(true);
+                        let _ = control.cancel_all.send(true);
                         break;
                     }
                 }
@@ -1178,9 +1194,11 @@ mod tests {
             Box::new(FailingAckConsumer { polls: 0 }),
             notifications,
             clock,
-            cancel.clone(),
-            cancel_rx,
-            health,
+            RuntimeTaskControl {
+                cancel_all: cancel.clone(),
+                cancel: cancel_rx,
+                health,
+            },
         ));
 
         tokio::time::timeout(Duration::from_secs(1), observer.changed())
@@ -1232,9 +1250,11 @@ mod tests {
             }),
             notifications,
             clock.clone(),
-            cancel,
-            cancel_rx,
-            health,
+            RuntimeTaskControl {
+                cancel_all: cancel,
+                cancel: cancel_rx,
+                health,
+            },
         ));
         tokio::time::timeout(Duration::from_secs(1), observer.changed())
             .await
@@ -1274,9 +1294,11 @@ mod tests {
             }),
             notifications,
             clock,
-            cancel,
-            cancel_rx,
-            health,
+            RuntimeTaskControl {
+                cancel_all: cancel,
+                cancel: cancel_rx,
+                health,
+            },
         ));
         tokio::time::timeout(Duration::from_secs(1), observer.changed())
             .await
@@ -1316,9 +1338,11 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_millis(10),
             clock,
-            cancel.clone(),
-            cancel.subscribe(),
-            health.clone(),
+            RuntimeTaskControl {
+                cancel_all: cancel.clone(),
+                cancel: cancel.subscribe(),
+                health: health.clone(),
+            },
         ));
         tokio::time::timeout(Duration::from_secs(1), sibling_cancel.changed())
             .await

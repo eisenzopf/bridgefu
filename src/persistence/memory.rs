@@ -510,8 +510,10 @@ impl MemoryRepository {
         snapshot: MemoryStateSnapshot,
         authority_time: Option<DateTime<Utc>>,
     ) -> Result<Self, RepositoryError> {
-        let mut state = MemoryState::default();
-        state.authority_time = authority_time;
+        let mut state = MemoryState {
+            authority_time,
+            ..MemoryState::default()
+        };
 
         for worker in snapshot.workers {
             if state
