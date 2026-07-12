@@ -26,8 +26,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      redis:
+        image: redis@sha256:dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       BRIDGEFU_TEST_POSTGRES_URL: postgres://bridgefu:bridgefu-test-only@127.0.0.1:5432/bridgefu_repository_test
+      BRIDGEFU_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +57,16 @@ jobs:
             bridgefu
             rvoip
       - run: cargo test --locked --all-targets
+        working-directory: bridgefu
+      - name: PostgreSQL coordination conformance
+        run: >-
+          cargo test --locked --test coordination_sql
+          -- --ignored --nocapture --test-threads=1
+        working-directory: bridgefu
+      - name: Redis 7.2 coordination conformance
+        run: >-
+          cargo test --locked --test redis_coordination
+          -- --ignored --nocapture --test-threads=1
         working-directory: bridgefu
       # rvoip is a library workspace and intentionally does not commit its
       # Cargo.lock. Bridgefu's preceding locked build is the reproducible
