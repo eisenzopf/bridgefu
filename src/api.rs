@@ -19,6 +19,7 @@ use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use metrics_exporter_prometheus::PrometheusHandle;
 use rvoip_amazon_connect::{ConnectScreenPopServer, ScreenPopMediaLeg};
+use rvoip_auth_core::BearerValidator;
 use rvoip_core::broadcast::{BroadcastDescriptor, BroadcastPublisher};
 use rvoip_core::ids::MediaRouteId;
 use rvoip_core::media_graph::MediaGraphHandle;
@@ -219,6 +220,26 @@ impl ApiState {
     /// Clone the handle that the rvoip lifecycle-event bridge will feed.
     pub fn screen_pop_evidence_store(&self) -> ScreenPopEvidenceStore {
         self.screen_pop_evidence.clone()
+    }
+
+    /// Shared durable service bundle used by both HTTP and signaling ingress.
+    #[must_use]
+    pub fn call_runtime(&self) -> Option<Arc<CallServiceRuntime>> {
+        self.call_runtime.as_ref().map(Arc::clone)
+    }
+
+    /// Exact bearer validator used to construct control-plane principals.
+    #[must_use]
+    pub fn bearer_validator(&self) -> Option<Arc<dyn BearerValidator>> {
+        self.bearer_authenticator
+            .as_ref()
+            .map(ApiBearerAuthenticator::validator)
+    }
+
+    /// Installs the generic signaling runtime after the durable authority is
+    /// ready and before the API router is exposed.
+    pub fn set_generic_runtime(&mut self, runtime: Arc<GenericBridgeRuntime>) {
+        self.generic_runtime = Some(runtime);
     }
 }
 
