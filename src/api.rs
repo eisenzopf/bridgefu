@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, OriginalUri, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -34,9 +34,10 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use bridgefu::api_principal::{
-    ApiBearerAuthenticator, ApiPrincipalError, ConfiguredApiKeyValidator, MAX_API_BEARER_BYTES,
+    ApiBearerAuthenticator, ApiPrincipal, ApiPrincipalError, ConfiguredApiKeyValidator,
+    MAX_API_BEARER_BYTES,
 };
-use bridgefu::call_engine::{CallRepository, RegisterWorker, RepositoryError, WorkerId};
+use bridgefu::call_engine::{CallRepository, RegisterWorker, RepositoryError, TenantId, WorkerId};
 use bridgefu::call_service::{
     CallService, CallServiceCrypto, CallServiceError, CallTimeoutPolicy, ControlCryptoError,
     FixedWorkerPlacement, SamePrincipalAttachmentResolver, SystemCallServiceClock,
@@ -459,9 +460,13 @@ struct BroadcastView {
 
 async fn create_broadcast(
     State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
     Path(call_id): Path<String>,
     Json(request): Json<CreateBroadcastRequest>,
 ) -> Result<(StatusCode, Json<BroadcastView>), ApiError> {
+    let principal = require_api_principal(principal)?;
+    let tenant_id = inherit_principal_tenant(&principal, request.tenant_id.as_deref())?;
+    ensure_legacy_amazon_tenant(&state, &principal)?;
     if state.broadcasts.len() >= state.max_broadcasts {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -478,7 +483,6 @@ async fn create_broadcast(
         .media_graph(&call_id, leg)
         .ok_or_else(|| ApiError::not_found("active source leg not found"))?;
     let broadcast_id = Uuid::new_v4().to_string();
-    let tenant_id = request.tenant_id.unwrap_or_else(|| "default".into());
     let transport = request.transport.unwrap_or(state.default_transport);
     let publisher: Arc<dyn BroadcastPublisher> = match transport {
         BroadcastKind::Moqt => MoqBroadcastPublisher::new(MoqPublisherConfig {
@@ -529,20 +533,27 @@ async fn create_broadcast(
 
 async fn get_broadcast(
     State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
     Path(id): Path<String>,
 ) -> Result<Json<BroadcastView>, ApiError> {
+    let principal = require_api_principal(principal)?;
     state
         .broadcasts
         .get(&id)
+        .filter(|record| record.view.tenant_id == principal.tenant().as_str())
         .map(|record| Json(record.view.clone()))
         .ok_or_else(|| ApiError::not_found("broadcast not found"))
 }
 
 async fn delete_broadcast(
     State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let Some((_, active)) = state.broadcasts.remove(&id) else {
+    let principal = require_api_principal(principal)?;
+    let Some((_, active)) = state.broadcasts.remove_if(&id, |_, active| {
+        active.view.tenant_id == principal.tenant().as_str()
+    }) else {
         return Err(ApiError::not_found("broadcast not found"));
     };
     active.graph.remove_sink(active.route.clone());
@@ -582,12 +593,15 @@ struct BroadcastClaims<'a> {
 
 async fn create_broadcast_token(
     State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
     Path(id): Path<String>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
+    let principal = require_api_principal(principal)?;
     let active = state
         .broadcasts
         .get(&id)
+        .filter(|active| active.view.tenant_id == principal.tenant().as_str())
         .ok_or_else(|| ApiError::not_found("broadcast not found"))?;
     let ttl = Duration::from_secs(
         request
@@ -621,14 +635,21 @@ async fn create_broadcast_token(
     }))
 }
 
-async fn diagnostics(State(state): State<ApiState>) -> Json<Value> {
+async fn diagnostics(
+    State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
+) -> Result<Json<Value>, ApiError> {
+    let principal = require_api_principal(principal)?;
+    ensure_legacy_amazon_tenant(&state, &principal)?;
     let broadcasts: Vec<_> = state
         .broadcasts
         .iter()
+        .filter(|entry| entry.view.tenant_id == principal.tenant().as_str())
         .map(|entry| entry.view.clone())
         .collect();
-    Json(json!({
+    Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "tenant_id": principal.tenant(),
         "active_amazon_calls": state.server.active_call_ids(),
         "transactional_call_api": state.call_service.is_some(),
         "providers": state.providers.names(),
@@ -640,13 +661,16 @@ async fn diagnostics(State(state): State<ApiState>) -> Json<Value> {
             "ws": runtime.ws_addr,
             "whip": runtime.whip_addr,
         })),
-    }))
+    })))
 }
 
 async fn get_screen_pop_evidence(
     State(state): State<ApiState>,
+    principal: Option<Extension<ApiPrincipal>>,
     Path(correlation_id): Path<String>,
 ) -> Result<Json<ScreenPopEvidence>, ApiError> {
+    let principal = require_api_principal(principal)?;
+    ensure_legacy_amazon_tenant(&state, &principal)?;
     match state.screen_pop_evidence.get(&correlation_id) {
         Some(evidence) => {
             metrics::counter!(
@@ -664,6 +688,42 @@ async fn get_screen_pop_evidence(
             .increment(1);
             Err(ApiError::not_found("screen-pop evidence not found"))
         }
+    }
+}
+
+fn require_api_principal(
+    principal: Option<Extension<ApiPrincipal>>,
+) -> Result<ApiPrincipal, ApiError> {
+    principal.map(|value| value.0).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tenant_authentication_unavailable",
+            "tenant-scoped authentication is required for this resource",
+        )
+    })
+}
+
+fn inherit_principal_tenant(
+    principal: &ApiPrincipal,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(requested) = requested {
+        let requested = TenantId::parse(requested)
+            .map_err(|_| ApiError::from(ApiPrincipalError::InvalidTenant))?;
+        if &requested != principal.tenant() {
+            return Err(ApiError::from(ApiPrincipalError::TenantOverrideForbidden));
+        }
+    }
+    Ok(principal.tenant().as_str().to_owned())
+}
+
+fn ensure_legacy_amazon_tenant(state: &ApiState, principal: &ApiPrincipal) -> Result<(), ApiError> {
+    if matches!(state.tenants.as_slice(), [tenant] if tenant == principal.tenant().as_str()) {
+        Ok(())
+    } else {
+        Err(ApiError::capability(
+            "legacy Amazon call ownership is unavailable in a multi-tenant runtime",
+        ))
     }
 }
 
@@ -888,6 +948,7 @@ mod tests {
     use rvoip_amazon_connect::{
         ConnectContactStarter, ConnectError, ConnectionData, StartContactRequest,
     };
+    use rvoip_core::{start_media_graph, CodecInfo, MediaFrame};
     use tower::ServiceExt;
 
     use crate::screen_pop_evidence::ScreenPopStage;
@@ -979,6 +1040,17 @@ broadcast:
     }
 
     async fn legacy_multi_tenant_state() -> ApiState {
+        multi_tenant_state(None).await
+    }
+
+    async fn scoped_multi_tenant_state() -> ApiState {
+        multi_tenant_state(Some("tenant-a")).await
+    }
+
+    async fn multi_tenant_state(static_tenant: Option<&str>) -> ApiState {
+        let static_tenant = static_tenant
+            .map(|tenant| format!("  static_tenant: {tenant}\n"))
+            .unwrap_or_default();
         let yaml = format!(
             r#"
 aws:
@@ -998,6 +1070,8 @@ tenants:
 api:
   enabled: true
   bearer_token: diagnostics-secret
+{static_tenant}runtime:
+  max_concurrent_calls: 8
 broadcast:
   token_secret: test-broadcast-secret
 "#,
@@ -1101,6 +1175,62 @@ broadcast:
             )
             .await
             .unwrap()
+    }
+
+    async fn delete(app: &Router, uri: &str, bearer: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {bearer}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn seed_broadcast(
+        state: &ApiState,
+        tenant: &str,
+    ) -> (String, tokio::sync::mpsc::Sender<MediaFrame>) {
+        let broadcast_id = Uuid::new_v4().to_string();
+        let (source_tx, source_rx) = tokio::sync::mpsc::channel(1);
+        let graph = start_media_graph(
+            source_rx,
+            CodecInfo::from_name_with_defaults("opus"),
+            Default::default(),
+        )
+        .unwrap();
+        let publisher: Arc<dyn BroadcastPublisher> =
+            UctpBroadcastPublisher::new(broadcast_id.clone(), "audio/main", 10, 1_000).unwrap();
+        let route = graph
+            .add_sink(publisher.codec(), publisher.frames_out())
+            .unwrap();
+        let view = BroadcastView {
+            broadcast_id: broadcast_id.clone(),
+            call_id: "legacy-call-private".into(),
+            tenant_id: tenant.into(),
+            source_leg_id: SourceLeg::Sip,
+            transport: BroadcastKind::UctpQuic,
+            endpoint: format!("uctp://example.test/{broadcast_id}"),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            descriptor: publisher.descriptor(),
+        };
+        state.broadcasts.insert(
+            broadcast_id.clone(),
+            Arc::new(ActiveBroadcast {
+                view,
+                graph,
+                route,
+                publisher,
+            }),
+        );
+        (broadcast_id, source_tx)
     }
 
     fn create_body() -> Value {
@@ -1455,12 +1585,149 @@ broadcast:
     }
 
     #[tokio::test]
+    async fn scoped_tenant_cannot_reach_unowned_legacy_amazon_resources() {
+        let state = scoped_multi_tenant_state().await;
+        state
+            .screen_pop_evidence_store()
+            .record_now(
+                "tenant-b-correlation",
+                ScreenPopStage::SipInviteReceived,
+                None,
+            )
+            .unwrap();
+        let app = router(state);
+
+        let diagnostics = get(&app, "/diagnostics", Some("diagnostics-secret")).await;
+        assert_eq!(diagnostics.status(), StatusCode::CONFLICT);
+        assert!(!serde_json::to_string(&response_json(diagnostics).await)
+            .unwrap()
+            .contains("active_amazon_calls"));
+
+        let evidence = get(
+            &app,
+            "/v1/diagnostics/screen-pop/tenant-b-correlation",
+            Some("diagnostics-secret"),
+        )
+        .await;
+        assert_eq!(evidence.status(), StatusCode::CONFLICT);
+        assert!(!serde_json::to_string(&response_json(evidence).await)
+            .unwrap()
+            .contains("tenant-b-correlation"));
+
+        let forged_tenant = post_json(
+            &app,
+            "/v1/calls/tenant-b-call/broadcasts",
+            Some("diagnostics-secret"),
+            &[],
+            json!({"source_leg_id": "sip", "tenant_id": "tenant-b"}),
+        )
+        .await;
+        assert_eq!(forged_tenant.status(), StatusCode::FORBIDDEN);
+        let unowned_call = post_json(
+            &app,
+            "/v1/calls/tenant-b-call/broadcasts",
+            Some("diagnostics-secret"),
+            &[],
+            json!({"source_leg_id": "sip"}),
+        )
+        .await;
+        assert_eq!(unowned_call.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn broadcast_crud_and_tokens_are_hidden_from_other_tenants() {
+        let state = scoped_multi_tenant_state().await;
+        let (broadcast_id, _source_tx) = seed_broadcast(&state, "tenant-b");
+        let broadcasts = state.broadcasts.clone();
+        let mut tenant_b_state = state.clone();
+        tenant_b_state.bearer_authenticator = Some(ApiBearerAuthenticator::new(Arc::new(
+            ConfiguredApiKeyValidator::new("tenant-b-secret".into(), ["tenant-b"]).unwrap(),
+        )));
+        tenant_b_state.legacy_bearer_token = None;
+        let tenant_a = router(state);
+        let tenant_b = router(tenant_b_state);
+        let resource = format!("/v1/broadcasts/{broadcast_id}");
+
+        assert_eq!(
+            get(&tenant_a, &resource, Some("diagnostics-secret"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_json(
+                &tenant_a,
+                &format!("{resource}/tokens"),
+                Some("diagnostics-secret"),
+                &[],
+                json!({}),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete(&tenant_a, &resource, "diagnostics-secret")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(broadcasts.contains_key(&broadcast_id));
+
+        assert_eq!(
+            get(&tenant_b, &resource, Some("tenant-b-secret"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(
+                &tenant_b,
+                &format!("{resource}/tokens"),
+                Some("tenant-b-secret"),
+                &[],
+                json!({}),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete(&tenant_b, &resource, "tenant-b-secret")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!broadcasts.contains_key(&broadcast_id));
+    }
+
+    #[tokio::test]
     async fn legacy_bearer_rejects_duplicate_merged_and_malformed_credentials() {
         let app = router(legacy_multi_tenant_state().await);
         let valid = axum::http::HeaderValue::from_static("bEaReR diagnostics-secret");
         assert_eq!(
             raw_get(&app, "/diagnostics", &[valid]).await.status(),
-            StatusCode::OK
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            get(
+                &app,
+                "/v1/broadcasts/00000000-0000-4000-8000-000000000001",
+                Some("diagnostics-secret"),
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            get(
+                &app,
+                "/v1/diagnostics/screen-pop/legacy-correlation",
+                Some("diagnostics-secret"),
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
         for values in [
             vec![

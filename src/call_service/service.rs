@@ -1321,6 +1321,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_expired_attachment_replays_exactly_without_live_dependencies() {
+        let repository = Arc::new(MemoryRepository::new());
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let placement = Arc::new(SwitchablePlacement {
+            worker,
+            failure: Mutex::new(None),
+        });
+        let resolver = Arc::new(SwitchableAttachmentResolver::default());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let service = CallService::new(
+            repository.clone(),
+            placement.clone(),
+            resolver.clone(),
+            CallServiceCrypto::new(vec![0x64; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let owner = principal("tenant-a");
+        let key = IdempotencyKey::parse("consumed-expired-replay").unwrap();
+        let created = service
+            .create_call(&owner, &key, generic_input())
+            .await
+            .unwrap();
+        let leg = &created.value.call.legs[0];
+        let attachment = leg.attachment.as_ref().unwrap();
+        let lookup = AttachmentLookup {
+            token_digest: token_digest(&attachment.token),
+            tenant_id: TenantId::parse("tenant-a").unwrap(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: service.crypto.principal_fingerprint(&owner),
+            worker,
+            at: at(1),
+        };
+        let candidate = repository.inspect_attachment(lookup.clone()).await.unwrap();
+        repository
+            .consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(1),
+                    leg_id: leg.leg_id,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: ConnectionId::new(),
+                principal_fingerprint: service.crypto.principal_fingerprint(&owner),
+                at: at(1),
+            })
+            .await
+            .unwrap();
+
+        clock.set(at(121));
+        resolver.set_unavailable(true);
+        placement.set_failure(Some(PlacementError::Unavailable));
+        let replayed = service
+            .create_call(&owner, &key, generic_input())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, created.value);
+        assert!(
+            replayed.value.call.legs[0]
+                .attachment
+                .as_ref()
+                .unwrap()
+                .expires_at
+                < clock.now()
+        );
+        assert_eq!(
+            repository
+                .inspect_attachment(AttachmentLookup {
+                    at: at(121),
+                    ..lookup
+                })
+                .await
+                .unwrap_err(),
+            RepositoryError::AttachmentRejected
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_winner_outranks_inflight_resolver_failure() {
         let repository = Arc::new(MemoryRepository::new());
         let worker = repository

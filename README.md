@@ -151,7 +151,11 @@ typed SIP, WebRTC, WHIP/WHEP, Amazon Connect, or provider-controlled legs.
 Missing API authentication makes every protected route fail closed with `503`;
 missing call-control key material makes the call routes fail with `503`. The
 existing StandardCharter listener and public health/metrics endpoints continue
-to start normally.
+to start normally. Legacy Amazon-call broadcasts and screen-pop diagnostics
+remain available in an unambiguous single-tenant runtime. In a multi-tenant
+runtime they fail closed until those legacy resources carry durable tenant
+ownership; broadcast reads, token creation, and deletion always require the
+authenticated tenant to match the stored broadcast owner.
 
 ```bash
 curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \
