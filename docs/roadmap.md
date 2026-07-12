@@ -447,6 +447,17 @@ hint for SIP and WebRTC connections.
      SIP uses an enforceable listener policy. Anonymous or identity-only
      compatibility modes that cannot supply the complete principal and routing
      hint are not valid for durable attachment admission.
+   - Parse presented tokens as exactly one canonical, unpadded URL-safe Base64
+     encoding of 32 bytes, hash the decoded bytes with SHA-256, zeroize every
+     raw buffer, and return one indistinguishable proof failure for malformed,
+     missing, expired, replayed, or mismatched material.
+   - Keep proof consumption inside `CallService`: validate the complete
+     principal and owner-bound context, derive the existing issuer/tenant/
+     subject fingerprint, inspect using the current worker fence, re-observe
+     principal/token expiry after the database await, then atomically consume
+     and bind the exact Connection ID. The API and signaling runtime share one
+     repository, worker lease, validator, cryptographic policy, and service
+     bundle; they must never construct independent in-memory authorities.
    - Treat signaling authentication and attachment proof as separate checks.
      The attachment token never substitutes for the authenticated rvoip
      principal, and an inbound provider leg resolves its expected transport
@@ -467,6 +478,14 @@ hint for SIP and WebRTC connections.
      consume its owner-bound rvoip inbound context once, hash the routing hint,
      inspect and consume the durable attachment atomically, and reject/close
      the connection on any mismatch. Never log or serialize the raw hint.
+   - Replace FIFO tasks with a bounded supervisor-owned `JoinSet`/semaphore and
+     per-connection attachment state. Duplicate notices must not close an
+     already admitted winner, and no protocol acceptance, media work, or other
+     external I/O may occur before the durable bind commits.
+   - In clustered topology, a public gateway resolves only a token digest to
+     the authoritative pinned worker through PostgreSQL or a sequence-checked
+     coordination projection, then forwards over private authenticated UCTP.
+     It never guesses a worker or consumes a worker-owned attachment locally.
 8. [ ] Add a bounded lifecycle supervisor for setup/media/transfer/cleanup
    deadlines, cancellation and compensation, hangup-versus-transfer glare,
    peer teardown, stale generation rejection, worker drain, and fenced restart
