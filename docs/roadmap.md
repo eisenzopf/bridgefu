@@ -856,6 +856,21 @@ not hide an earlier adapter side effect behind a nominally staged API.
    byte-preserving in-dialog SIP MESSAGE mapping for reliable ordered
    `DataMessage`, typed asynchronous REFER progress/completion/failure, and
    validated RFC 4733 duration and inter-digit spacing.
+   - [ ] 2a — Add `SipOriginateContext`, ordered bounded initial headers,
+     typed/redacted credentials, wrong-context rejection, and packet-silence
+     tests for every validation failure.
+   - [ ] 2b — Replace eager originate with a dormant route, deferred media,
+     retained single-flight activation, actual Call-ID receipt, FIFO event
+     flush, cancellation compensation, exact cleanup, and capture-UAS tests.
+   - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
+     both directions, with validated internal label/message-ID headers and
+     explicit reliability capability errors.
+   - [ ] 2d — Publish typed REFER progress/completion/failure and implement
+     all-or-nothing bounded RFC 4733 digit validation, requested duration, and
+     inter-digit pacing.
+   - [ ] 2e — Run SIP library/dialog/adapter, packet, lifecycle, strict lint,
+     documentation, and real localhost interoperability qualification; obtain
+     an independent P0/P1 audit before item 2 is complete.
 3. [ ] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
    WHEP, while retaining the corresponding authenticated server roles. Local
    SDP offer construction is not an outbound client. Pin WHIP to
