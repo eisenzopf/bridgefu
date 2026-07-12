@@ -124,13 +124,16 @@ generic_bridge:
 # Configure any subset. Provider media is delivered through SIP/RTP.
 # providers:
 #   twilio:
+#     account_profile: twilio-sandbox # referenced by provider call legs
 #     account_sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 #     auth_token: env:TWILIO_AUTH_TOKEN
 #   telnyx:
+#     account_profile: telnyx-sandbox
 #     connection_id: "0000000000000000000"
 #     api_key: env:TELNYX_API_KEY
 #     webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
 #   vonage:
+#     account_profile: vonage-sandbox
 #     application_id: 00000000-0000-0000-0000-000000000000
 #     private_key: env:VONAGE_PRIVATE_KEY_PEM
 #     signature_secret: env:VONAGE_SIGNATURE_SECRET

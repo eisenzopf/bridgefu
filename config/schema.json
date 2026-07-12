@@ -147,7 +147,59 @@
       },
       "additionalProperties": false
     },
-    "providers": { "type": "object" },
+    "providers": {
+      "type": "object",
+      "properties": {
+        "twilio": {
+          "type": "object",
+          "required": ["account_sid", "auth_token"],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "twilio",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "account_sid": { "type": "string", "minLength": 1 },
+            "auth_token": { "type": "string", "minLength": 1 },
+            "base_url": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "telnyx": {
+          "type": "object",
+          "required": ["api_key", "connection_id", "webhook_public_key"],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "telnyx",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "api_key": { "type": "string", "minLength": 1 },
+            "connection_id": { "type": "string", "minLength": 1 },
+            "webhook_public_key": { "type": "string", "minLength": 1 },
+            "base_url": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "vonage": {
+          "type": "object",
+          "required": ["application_id", "private_key", "signature_secret"],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "vonage",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "application_id": { "type": "string", "minLength": 1 },
+            "private_key": { "type": "string", "minLength": 1 },
+            "signature_secret": { "type": "string", "minLength": 1 },
+            "base_url": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "context": { "type": "object" },
     "tenants": { "type": "object" }
   },

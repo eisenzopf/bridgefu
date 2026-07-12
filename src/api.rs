@@ -1098,7 +1098,9 @@ impl From<ProviderError> for ApiError {
                 "invalid_signature",
                 error.to_string(),
             ),
-            ProviderError::Unsupported => Self::capability(error.to_string()),
+            ProviderError::Unsupported | ProviderError::AccountProfileMismatch => {
+                Self::capability(error.to_string())
+            }
             ProviderError::Remote { .. } | ProviderError::Http(_) => {
                 Self::new(StatusCode::BAD_GATEWAY, "provider_error", error.to_string())
             }
@@ -1123,6 +1125,15 @@ mod tests {
 
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
+    use bridgefu::call_engine::{
+        CallCommand, CallId, CommandCommit, CommandId, EffectIntent, LegId, LegState,
+        ProviderEventState,
+    };
+    use bridgefu::call_service::{
+        EffectResultOutcome, EffectResultReconciliation, ExternalReferenceBinding,
+        ExternalReferenceValue, ProviderEndpointConfig, ProviderKind, ServiceCommandTransaction,
+        ServiceEffectResult,
+    };
     use rvoip_amazon_connect::{
         ConnectContactStarter, ConnectError, ConnectionData, StartContactRequest,
     };
@@ -1147,11 +1158,15 @@ mod tests {
     #[async_trait]
     impl ProviderControl for VerifiedTestProvider {
         fn name(&self) -> &'static str {
-            "test-provider"
+            "twilio"
+        }
+
+        fn kind(&self) -> bridgefu::call_service::ProviderKind {
+            bridgefu::call_service::ProviderKind::Twilio
         }
 
         fn account_key(&self) -> ProviderAccountKey {
-            ProviderAccountKey::parse("test-provider:account-a").unwrap()
+            ProviderAccountKey::parse("test-profile").unwrap()
         }
 
         fn capabilities(&self) -> ProviderCapabilities {
@@ -1414,12 +1429,13 @@ persistence:
     fn install_verified_test_provider(state: &ApiState, verifications: Arc<AtomicUsize>) {
         state
             .providers
-            .insert(Arc::new(VerifiedTestProvider::new(verifications)));
+            .insert(Arc::new(VerifiedTestProvider::new(verifications)))
+            .unwrap();
     }
 
     fn verified_event(event_id: &str, provider_call_id: Option<&str>) -> NormalizedProviderEvent {
         NormalizedProviderEvent {
-            provider: "test-provider".into(),
+            provider: "twilio".into(),
             event_id: event_id.into(),
             provider_call_id: provider_call_id.map(str::to_owned),
             event_type: "call.answered".into(),
@@ -1438,7 +1454,7 @@ persistence:
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/providers/test-provider/webhooks")
+                    .uri("/v1/providers/twilio/webhooks")
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .header("x-test-signature", "valid")
                     .body(Body::from(serde_json::to_vec(event).unwrap()))
@@ -1446,6 +1462,89 @@ persistence:
             )
             .await
             .expect("verified webhook request completes")
+    }
+
+    async fn reconcile_provider_start(
+        runtime: &CallServiceRuntime,
+        call_id: CallId,
+        provider_leg: LegId,
+        account_profile: &str,
+        provider_call_id: &str,
+    ) -> Result<EffectResultOutcome, RepositoryError> {
+        let worker = runtime.worker().lease;
+        let at = Utc::now() + chrono::Duration::milliseconds(1);
+        let claimed = runtime
+            .repository()
+            .claim_outbox(worker, at, Duration::from_secs(10), 1)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RepositoryError::NotFound)?;
+        let (leg_id, binding_generation) = match claimed.record.intent {
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                ..
+            } => (leg_id, binding_generation),
+            _ => {
+                return Err(RepositoryError::InvalidInput(
+                    "expected provider start effect",
+                ))
+            }
+        };
+        if leg_id != provider_leg {
+            return Err(RepositoryError::InvalidInput(
+                "provider start effect targeted the wrong leg",
+            ));
+        }
+        let tenant = TenantId::parse("default").expect("test tenant is valid");
+        let stored = runtime
+            .service_repository()
+            .load_service_call(&tenant, call_id)
+            .await?;
+        runtime
+            .service_repository()
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: tenant.clone(),
+                call_id,
+                effect_id: claimed.record.effect_id,
+                worker,
+                claim_generation: claimed.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: Some(ExternalReferenceBinding {
+                    leg_id,
+                    binding_generation,
+                    value: ExternalReferenceValue::ProviderCall {
+                        account: ProviderAccountKey::parse(account_profile)?,
+                        provider_call_id: ProviderCallId::parse(provider_call_id)?,
+                    },
+                }),
+                follow_up: Some(ServiceCommandTransaction {
+                    command: CommandCommit {
+                        tenant_id: tenant,
+                        call_id,
+                        expected_version: stored.call.aggregate.version(),
+                        command_id: CommandId::new(),
+                        command: CallCommand::SetLegState {
+                            at,
+                            leg_id,
+                            binding_generation,
+                            state: LegState::Signaling,
+                            failure: None,
+                        },
+                        worker,
+                        attachments: Vec::new(),
+                        deadline_claim: None,
+                        at,
+                    },
+                    effect_payloads: Vec::new(),
+                    operation_idempotency: None,
+                    bound_connection: None,
+                    media_activity: None,
+                }),
+                at,
+            })
+            .await
     }
 
     async fn legacy_multi_tenant_state() -> ApiState {
@@ -1658,6 +1757,28 @@ persistence:
                         "type": "webrtc",
                         "config": {"signaling_uri": "wss://signal.example.test/private-session"}
                     }
+                }
+            ]
+        })
+    }
+
+    fn provider_create_body(provider: &str, account_profile: &str) -> Value {
+        json!({
+            "legs": [
+                {
+                    "direction": "outbound",
+                    "endpoint": {
+                        "type": "provider",
+                        "config": {
+                            "provider": provider,
+                            "account_profile": account_profile,
+                            "destination": "+12065550100"
+                        }
+                    }
+                },
+                {
+                    "direction": "inbound",
+                    "endpoint": {"type": "sip", "config": {"uri": null}}
                 }
             ]
         })
@@ -2000,15 +2121,14 @@ persistence:
         let received_at = DateTime::parse_from_rfc3339("2026-07-12T12:35:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let account = ProviderAccountKey::parse("test-provider:account-a").unwrap();
+        let account = ProviderAccountKey::parse("test-profile").unwrap();
         let mut left = verified_event("event-canonical", Some("call-canonical"));
         let mut right = left.clone();
         left.raw = serde_json::from_str(r#"{"z":1,"a":{"y":2,"b":3}}"#).unwrap();
         right.raw = serde_json::from_str(r#"{"a":{"b":3,"y":2},"z":1}"#).unwrap();
 
-        let left =
-            provider_event_input(account.clone(), "test-provider", &left, received_at).unwrap();
-        let right = provider_event_input(account, "test-provider", &right, received_at).unwrap();
+        let left = provider_event_input(account.clone(), "twilio", &left, received_at).unwrap();
+        let right = provider_event_input(account, "twilio", &right, received_at).unwrap();
 
         assert_eq!(left.event_digest, right.event_digest);
         assert_eq!(left.payload_digest, right.payload_digest);
@@ -2056,6 +2176,112 @@ persistence:
         let conflict_body = response_json(conflict).await;
         assert_eq!(conflict_body["error"]["code"], "provider_event_conflict");
         assert!(!conflict_body.to_string().contains("must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn verified_webhook_reaches_only_the_matching_provider_profile_and_kind() {
+        let state = call_api_test_state(8).await;
+        install_verified_test_provider(&state, Arc::new(AtomicUsize::new(0)));
+        let runtime = state.call_runtime().unwrap();
+        let matching_endpoint = ProviderEndpointConfig {
+            provider: ProviderKind::Twilio,
+            account_profile: "test-profile".into(),
+            destination: Some("+12065550100".into()),
+        };
+        assert!(state.providers.resolve_endpoint(&matching_endpoint).is_ok());
+        for endpoint in [
+            ProviderEndpointConfig {
+                account_profile: "other-profile".into(),
+                ..matching_endpoint.clone()
+            },
+            ProviderEndpointConfig {
+                provider: ProviderKind::Telnyx,
+                ..matching_endpoint.clone()
+            },
+        ] {
+            assert!(matches!(
+                state.providers.resolve_endpoint(&endpoint),
+                Err(ProviderError::AccountProfileMismatch)
+            ));
+        }
+        let app = router(state);
+        let event = verified_event("event-linked", Some("call-linked"));
+        assert_eq!(
+            post_verified_webhook(&app, &event).await.status(),
+            StatusCode::ACCEPTED
+        );
+        let created = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["provider-profile-match"],
+            provider_create_body("twilio", "test-profile"),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = response_json(created).await;
+        let call_id = created["call_id"].as_str().unwrap().parse().unwrap();
+        let provider_leg = created["legs"][0]["leg_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let outcome = reconcile_provider_start(
+            runtime.as_ref(),
+            call_id,
+            provider_leg,
+            "test-profile",
+            "call-linked",
+        )
+        .await
+        .unwrap();
+        let EffectResultOutcome::Reconciled(view) = outcome else {
+            panic!("first provider reference must reconcile")
+        };
+        assert!(matches!(
+            view.released_provider_events.as_slice(),
+            [released]
+                if released.target.as_ref().is_some_and(|target|
+                    target.call_id == call_id
+                        && target.leg_id == provider_leg
+                        && released.state == ProviderEventState::Ready)
+        ));
+
+        let state = call_api_test_state(8).await;
+        install_verified_test_provider(&state, Arc::new(AtomicUsize::new(0)));
+        let runtime = state.call_runtime().unwrap();
+        let app = router(state);
+        assert_eq!(
+            post_verified_webhook(&app, &event).await.status(),
+            StatusCode::ACCEPTED
+        );
+        let created = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["provider-profile-mismatch"],
+            provider_create_body("twilio", "other-profile"),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = response_json(created).await;
+        let call_id = created["call_id"].as_str().unwrap().parse().unwrap();
+        let provider_leg = created["legs"][0]["leg_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            reconcile_provider_start(
+                runtime.as_ref(),
+                call_id,
+                provider_leg,
+                "test-profile",
+                "call-linked",
+            )
+            .await,
+            Err(RepositoryError::ProviderReferenceConflict)
+        );
     }
 
     #[tokio::test]

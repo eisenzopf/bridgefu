@@ -1,6 +1,6 @@
 //! Native programmable-voice control adapters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use bridgefu::call_engine::ProviderAccountKey;
+use bridgefu::call_service::{ProviderEndpointConfig, ProviderKind};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -54,6 +55,8 @@ pub struct ProviderConfigs {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TwilioConfig {
+    #[serde(default = "default_twilio_account_profile")]
+    pub account_profile: String,
     pub account_sid: String,
     pub auth_token: SecretRef,
     #[serde(default = "twilio_base_url")]
@@ -62,6 +65,8 @@ pub struct TwilioConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TelnyxConfig {
+    #[serde(default = "default_telnyx_account_profile")]
+    pub account_profile: String,
     pub api_key: SecretRef,
     pub connection_id: String,
     pub webhook_public_key: SecretRef,
@@ -71,6 +76,8 @@ pub struct TelnyxConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct VonageConfig {
+    #[serde(default = "default_vonage_account_profile")]
+    pub account_profile: String,
     pub application_id: String,
     /// PEM-encoded RSA private key or `env:VARIABLE` containing it.
     pub private_key: SecretRef,
@@ -81,6 +88,15 @@ pub struct VonageConfig {
 
 fn twilio_base_url() -> String {
     "https://api.twilio.com/2010-04-01".into()
+}
+fn default_twilio_account_profile() -> String {
+    "twilio".into()
+}
+fn default_telnyx_account_profile() -> String {
+    "telnyx".into()
+}
+fn default_vonage_account_profile() -> String {
+    "vonage".into()
 }
 fn telnyx_base_url() -> String {
     "https://api.telnyx.com/v2".into()
@@ -164,9 +180,10 @@ impl WebhookRequest {
 #[async_trait]
 pub trait ProviderControl: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Stable credential/account namespace used by durable webhook and call
-    /// reference reconciliation. The value is validated when the adapter is
-    /// constructed and its `Debug` representation is always redacted.
+    fn kind(&self) -> ProviderKind;
+    /// Exact configured account-profile key used by durable webhook and call
+    /// reference reconciliation. It is deliberately distinct from provider
+    /// credential identifiers and its `Debug` representation is redacted.
     fn account_key(&self) -> ProviderAccountKey;
     fn capabilities(&self) -> ProviderCapabilities;
     async fn originate(&self, command: OriginateCommand) -> Result<ProviderCall, ProviderError>;
@@ -186,21 +203,39 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     pub fn from_config(config: &ProviderConfigs) -> Result<Self, ProviderError> {
+        config.validate_account_profiles()?;
         let registry = Self::default();
         if let Some(config) = &config.twilio {
-            registry.insert(Arc::new(TwilioProvider::new(config.clone())?));
+            registry.insert(Arc::new(TwilioProvider::new(config.clone())?))?;
         }
         if let Some(config) = &config.telnyx {
-            registry.insert(Arc::new(TelnyxProvider::new(config.clone())?));
+            registry.insert(Arc::new(TelnyxProvider::new(config.clone())?))?;
         }
         if let Some(config) = &config.vonage {
-            registry.insert(Arc::new(VonageProvider::new(config.clone())?));
+            registry.insert(Arc::new(VonageProvider::new(config.clone())?))?;
         }
         Ok(registry)
     }
 
-    pub fn insert(&self, provider: Arc<dyn ProviderControl>) {
+    pub fn insert(&self, provider: Arc<dyn ProviderControl>) -> Result<(), ProviderError> {
+        if provider.name() != provider_kind_name(provider.kind())
+            || self.providers.contains_key(provider.name())
+        {
+            return Err(ProviderError::Configuration(
+                "provider registry identity is inconsistent".into(),
+            ));
+        }
+        let account = provider.account_key();
+        if self.providers.iter().any(|configured| {
+            configured.value().account_key() == account
+                && configured.value().name() != provider.name()
+        }) {
+            return Err(ProviderError::Configuration(
+                "provider account profiles must be globally unique".into(),
+            ));
+        }
         self.providers.insert(provider.name().to_string(), provider);
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn ProviderControl>> {
@@ -218,6 +253,49 @@ impl ProviderRegistry {
         names.sort();
         names
     }
+
+    pub fn resolve_endpoint(
+        &self,
+        endpoint: &ProviderEndpointConfig,
+    ) -> Result<Arc<dyn ProviderControl>, ProviderError> {
+        let provider = self
+            .get(provider_kind_name(endpoint.provider))
+            .ok_or(ProviderError::AccountProfileMismatch)?;
+        if provider.kind() != endpoint.provider
+            || provider.account_key().as_str() != endpoint.account_profile
+        {
+            return Err(ProviderError::AccountProfileMismatch);
+        }
+        Ok(provider)
+    }
+}
+
+impl ProviderConfigs {
+    pub fn validate_account_profiles(&self) -> Result<(), ProviderError> {
+        let mut profiles = BTreeSet::new();
+        for profile in [
+            self.twilio
+                .as_ref()
+                .map(|config| config.account_profile.as_str()),
+            self.telnyx
+                .as_ref()
+                .map(|config| config.account_profile.as_str()),
+            self.vonage
+                .as_ref()
+                .map(|config| config.account_profile.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_account_profile(profile)?;
+            if !profiles.insert(profile) {
+                return Err(ProviderError::Configuration(
+                    "provider account profiles must be globally unique".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct TwilioProvider {
@@ -229,7 +307,9 @@ struct TwilioProvider {
 
 impl TwilioProvider {
     fn new(config: TwilioConfig) -> Result<Self, ProviderError> {
-        let account_key = provider_account_key("twilio", &config.account_sid)?;
+        validate_account_profile(&config.account_profile)?;
+        let account_key = ProviderAccountKey::parse(config.account_profile.clone())
+            .map_err(|_| ProviderError::Configuration("invalid provider account profile".into()))?;
         Ok(Self {
             auth_token: config.auth_token.resolve()?,
             config,
@@ -256,6 +336,9 @@ impl TwilioProvider {
 impl ProviderControl for TwilioProvider {
     fn name(&self) -> &'static str {
         "twilio"
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Twilio
     }
     fn account_key(&self) -> ProviderAccountKey {
         self.account_key.clone()
@@ -379,6 +462,11 @@ impl ProviderControl for TwilioProvider {
                     .collect(),
             )
         };
+        validate_payload_credential(
+            &raw,
+            &["AccountSid", "account_sid"],
+            &self.config.account_sid,
+        )?;
         let call_id = raw
             .get("CallSid")
             .or_else(|| raw.get("call_sid"))
@@ -414,7 +502,9 @@ struct TelnyxProvider {
 
 impl TelnyxProvider {
     fn new(config: TelnyxConfig) -> Result<Self, ProviderError> {
-        let account_key = provider_account_key("telnyx", &config.connection_id)?;
+        validate_account_profile(&config.account_profile)?;
+        let account_key = ProviderAccountKey::parse(config.account_profile.clone())
+            .map_err(|_| ProviderError::Configuration("invalid provider account profile".into()))?;
         let webhook_key = base64::engine::general_purpose::STANDARD
             .decode(config.webhook_public_key.resolve()?)
             .map_err(|_| {
@@ -442,6 +532,9 @@ impl TelnyxProvider {
 impl ProviderControl for TelnyxProvider {
     fn name(&self) -> &'static str {
         "telnyx"
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Telnyx
     }
     fn account_key(&self) -> ProviderAccountKey {
         self.account_key.clone()
@@ -522,6 +615,7 @@ impl ProviderControl for TelnyxProvider {
         let raw = request.json()?;
         let data = raw.get("data").unwrap_or(&raw);
         let payload = data.get("payload").unwrap_or(data);
+        validate_payload_credential(payload, &["connection_id"], &self.config.connection_id)?;
         Ok(NormalizedProviderEvent {
             provider: self.name().into(),
             event_id: data
@@ -574,7 +668,9 @@ struct VonageWebhookClaims {
 
 impl VonageProvider {
     fn new(config: VonageConfig) -> Result<Self, ProviderError> {
-        let account_key = provider_account_key("vonage", &config.application_id)?;
+        validate_account_profile(&config.account_profile)?;
+        let account_key = ProviderAccountKey::parse(config.account_profile.clone())
+            .map_err(|_| ProviderError::Configuration("invalid provider account profile".into()))?;
         Ok(Self {
             private_key: config.private_key.resolve()?.into_bytes(),
             signature_secret: config.signature_secret.resolve()?,
@@ -615,6 +711,9 @@ impl VonageProvider {
 impl ProviderControl for VonageProvider {
     fn name(&self) -> &'static str {
         "vonage"
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Vonage
     }
     fn account_key(&self) -> ProviderAccountKey {
         self.account_key.clone()
@@ -692,6 +791,7 @@ impl ProviderControl for VonageProvider {
             }
         }
         let raw = request.json()?;
+        validate_payload_credential(&raw, &["application_id"], &self.config.application_id)?;
         let call_id = raw.get("uuid").and_then(Value::as_str).map(str::to_string);
         let event_type = raw
             .get("status")
@@ -772,20 +872,42 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn provider_account_key(
-    provider: &'static str,
-    configured_account: &str,
-) -> Result<ProviderAccountKey, ProviderError> {
-    if configured_account.is_empty()
-        || configured_account.trim() != configured_account
-        || configured_account.chars().any(char::is_control)
+fn validate_account_profile(profile: &str) -> Result<(), ProviderError> {
+    let mut bytes = profile.bytes();
+    if profile.len() > 256
+        || !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
     {
         return Err(ProviderError::Configuration(
-            "invalid provider account identifier".into(),
+            "invalid provider account profile".into(),
         ));
     }
-    ProviderAccountKey::parse(format!("{provider}:{configured_account}"))
-        .map_err(|_| ProviderError::Configuration("invalid provider account identifier".into()))
+    Ok(())
+}
+
+const fn provider_kind_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Twilio => "twilio",
+        ProviderKind::Telnyx => "telnyx",
+        ProviderKind::Vonage => "vonage",
+    }
+}
+
+fn validate_payload_credential(
+    payload: &Value,
+    fields: &[&str],
+    expected: &str,
+) -> Result<(), ProviderError> {
+    for field in fields {
+        if let Some(value) = payload.get(field) {
+            if value.as_str() != Some(expected) {
+                return Err(ProviderError::InvalidSignature);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn xml_escape(value: &str) -> String {
@@ -810,6 +932,8 @@ pub enum ProviderError {
     MissingField(&'static str),
     #[error("invalid provider webhook signature")]
     InvalidSignature,
+    #[error("provider account profile does not match the requested provider leg")]
+    AccountProfileMismatch,
     #[error("provider operation is not supported")]
     Unsupported,
 }
@@ -817,6 +941,43 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn twilio_config(account_profile: &str) -> TwilioConfig {
+        TwilioConfig {
+            account_profile: account_profile.into(),
+            account_sid: "AC-account".into(),
+            auth_token: SecretRef("secret".into()),
+            base_url: twilio_base_url(),
+        }
+    }
+
+    fn signed_twilio_webhook(account_sid: &str) -> WebhookRequest {
+        let url = "https://bridgefu.test/v1/providers/twilio/webhooks";
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("AccountSid", account_sid)
+            .append_pair("CallSid", "CA-call")
+            .append_pair("CallStatus", "completed")
+            .finish();
+        let mut params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        params.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut signed = url.to_owned();
+        for (key, value) in params {
+            signed.push_str(&key);
+            signed.push_str(&value);
+        }
+        let mut mac = HmacSha1::new_from_slice(b"secret").unwrap();
+        mac.update(signed.as_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        WebhookRequest {
+            url: url.into(),
+            headers: BTreeMap::from([("X-Twilio-Signature".into(), signature)]),
+            content_type: "application/x-www-form-urlencoded".into(),
+            body: body.into_bytes(),
+        }
+    }
 
     #[test]
     fn secret_ref_reads_environment() {
@@ -837,16 +998,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_account_keys_are_stable_and_namespaced() {
-        let twilio = TwilioProvider::new(TwilioConfig {
-            account_sid: "AC-account".into(),
-            auth_token: SecretRef("secret".into()),
-            base_url: twilio_base_url(),
-        })
-        .unwrap();
-        assert_eq!(twilio.account_key().as_str(), "twilio:AC-account");
+    fn provider_account_keys_are_exact_configured_profiles() {
+        let twilio = TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap();
+        assert_eq!(twilio.account_key().as_str(), "twilio-sandbox");
 
         let telnyx = TelnyxProvider::new(TelnyxConfig {
+            account_profile: "telnyx-sandbox".into(),
             api_key: SecretRef("secret".into()),
             connection_id: "connection-a".into(),
             webhook_public_key: SecretRef(
@@ -855,30 +1012,119 @@ mod tests {
             base_url: telnyx_base_url(),
         })
         .unwrap();
-        assert_eq!(telnyx.account_key().as_str(), "telnyx:connection-a");
+        assert_eq!(telnyx.account_key().as_str(), "telnyx-sandbox");
 
         let vonage = VonageProvider::new(VonageConfig {
+            account_profile: "vonage-sandbox".into(),
             application_id: "application-a".into(),
             private_key: SecretRef("not-used-by-this-test".into()),
             signature_secret: SecretRef("secret".into()),
             base_url: vonage_base_url(),
         })
         .unwrap();
-        assert_eq!(vonage.account_key().as_str(), "vonage:application-a");
+        assert_eq!(vonage.account_key().as_str(), "vonage-sandbox");
     }
 
     #[test]
-    fn provider_account_keys_reject_empty_configured_identifiers() {
-        let error = TwilioProvider::new(TwilioConfig {
-            account_sid: String::new(),
-            auth_token: SecretRef("secret".into()),
-            base_url: twilio_base_url(),
-        })
-        .err()
-        .expect("empty account is rejected");
+    fn provider_account_keys_reject_empty_profiles() {
+        let error = TwilioProvider::new(twilio_config(""))
+            .err()
+            .expect("empty account is rejected");
         assert_eq!(
             error.to_string(),
-            "provider configuration error: invalid provider account identifier"
+            "provider configuration error: invalid provider account profile"
         );
+    }
+
+    #[test]
+    fn provider_profiles_default_validate_and_remain_globally_unique() {
+        let defaults: ProviderConfigs = serde_yaml::from_str(
+            r#"
+twilio:
+  account_sid: AC-account
+  auth_token: secret
+telnyx:
+  api_key: secret
+  connection_id: connection-a
+  webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+vonage:
+  application_id: application-a
+  private_key: private
+  signature_secret: secret
+"#,
+        )
+        .unwrap();
+        assert_eq!(defaults.twilio.as_ref().unwrap().account_profile, "twilio");
+        assert_eq!(defaults.telnyx.as_ref().unwrap().account_profile, "telnyx");
+        assert_eq!(defaults.vonage.as_ref().unwrap().account_profile, "vonage");
+        defaults.validate_account_profiles().unwrap();
+
+        let duplicate = ProviderConfigs {
+            twilio: Some(twilio_config("shared-profile")),
+            telnyx: Some(TelnyxConfig {
+                account_profile: "shared-profile".into(),
+                api_key: SecretRef("secret".into()),
+                connection_id: "connection-a".into(),
+                webhook_public_key: SecretRef(
+                    base64::engine::general_purpose::STANDARD.encode([0_u8; 32]),
+                ),
+                base_url: telnyx_base_url(),
+            }),
+            vonage: None,
+        };
+        assert!(duplicate
+            .validate_account_profiles()
+            .unwrap_err()
+            .to_string()
+            .contains("globally unique"));
+    }
+
+    #[test]
+    fn provider_registry_resolves_only_the_matching_kind_and_profile() {
+        let registry = ProviderRegistry::default();
+        registry
+            .insert(Arc::new(
+                TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap(),
+            ))
+            .unwrap();
+        let matching = ProviderEndpointConfig {
+            provider: ProviderKind::Twilio,
+            account_profile: "twilio-sandbox".into(),
+            destination: Some("+12065550100".into()),
+        };
+        assert_eq!(
+            registry.resolve_endpoint(&matching).unwrap().account_key(),
+            ProviderAccountKey::parse("twilio-sandbox").unwrap()
+        );
+
+        for endpoint in [
+            ProviderEndpointConfig {
+                account_profile: "twilio-production".into(),
+                ..matching.clone()
+            },
+            ProviderEndpointConfig {
+                provider: ProviderKind::Telnyx,
+                ..matching.clone()
+            },
+        ] {
+            assert!(matches!(
+                registry.resolve_endpoint(&endpoint),
+                Err(ProviderError::AccountProfileMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn signed_twilio_webhook_rejects_a_credential_account_mismatch() {
+        let provider = TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap();
+        let accepted = provider
+            .verify_webhook(&signed_twilio_webhook("AC-account"))
+            .unwrap();
+        assert_eq!(accepted.provider_call_id.as_deref(), Some("CA-call"));
+
+        assert!(matches!(
+            provider.verify_webhook(&signed_twilio_webhook("AC-other-account")),
+            Err(ProviderError::InvalidSignature)
+        ));
     }
 }

@@ -10,3 +10,11 @@
 Provider WebSocket media is intentionally deferred. Unsupported semantics
 return `unsupported_capability`; Bridgefu does not pretend one provider's
 operation has another provider's guarantees.
+
+Each configured provider has an `account_profile` referenced by provider call
+legs. Profiles are bounded and globally unique across provider families. The
+defaults are `twilio`, `telnyx`, and `vonage`; deployments should use explicit
+names such as `twilio-sandbox` when configuration is promoted between
+environments. Credential identifiers carried by signed callbacks must match
+the configured provider credentials before the event can enter durable call
+reconciliation.

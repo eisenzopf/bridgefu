@@ -329,6 +329,9 @@ impl Config {
                 "generic_bridge requires api.enabled, api.bearer_token, and api.control_hmac_key"
             ));
         }
+        self.providers
+            .validate_account_profiles()
+            .map_err(|error| anyhow!(error.to_string()))?;
         self.validate_persistence()?;
         if !matches!(
             self.broadcast.default_transport.as_str(),
@@ -1419,6 +1422,87 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
         ));
         configured.validate().unwrap();
         std::env::remove_var(VARIABLE);
+    }
+
+    #[test]
+    fn provider_account_profiles_match_schema_defaults_and_are_globally_unique() {
+        let configured = parse(&format!(
+            r#"{LEGACY}
+providers:
+  twilio:
+    account_sid: AC-account
+    auth_token: secret
+  telnyx:
+    api_key: secret
+    connection_id: connection-a
+    webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  vonage:
+    application_id: application-a
+    private_key: private
+    signature_secret: secret
+"#
+        ));
+        configured.validate().unwrap();
+        assert_eq!(
+            configured
+                .providers
+                .twilio
+                .as_ref()
+                .unwrap()
+                .account_profile,
+            "twilio"
+        );
+        assert_eq!(
+            configured
+                .providers
+                .telnyx
+                .as_ref()
+                .unwrap()
+                .account_profile,
+            "telnyx"
+        );
+        assert_eq!(
+            configured
+                .providers
+                .vonage
+                .as_ref()
+                .unwrap()
+                .account_profile,
+            "vonage"
+        );
+
+        let duplicate = parse(&format!(
+            r#"{LEGACY}
+providers:
+  twilio:
+    account_profile: shared-profile
+    account_sid: AC-account
+    auth_token: secret
+  telnyx:
+    account_profile: shared-profile
+    api_key: secret
+    connection_id: connection-a
+    webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+"#
+        ));
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("globally unique"));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../config/schema.json")).unwrap();
+        for (provider, default) in [
+            ("twilio", "twilio"),
+            ("telnyx", "telnyx"),
+            ("vonage", "vonage"),
+        ] {
+            let profile = &schema["properties"]["providers"]["properties"][provider]["properties"]
+                ["account_profile"];
+            assert_eq!(profile["default"], default);
+            assert_eq!(profile["pattern"], "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$");
+        }
     }
 
     #[test]
