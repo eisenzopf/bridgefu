@@ -140,7 +140,18 @@ bridgefu --config bridgefu.yaml print-effective-config  # secrets redacted
 
 The versioned API is served with health and Prometheus on the configured HTTP
 bind. Provider webhooks authenticate with provider signatures; all other `/v1`
-routes use `api.bearer_token` when configured.
+routes require the configured `api.bearer_token`.
+
+Transactional call routes additionally require `api.control_hmac_key` (at
+least 32 bytes). With the compatibility shared API key, set
+`api.static_tenant` when more than one tenant is configured. Mutating call
+requests require exactly one visible-ASCII `Idempotency-Key` header; receipts
+are tenant-bound and retained for 24 hours. `POST /v1/calls` accepts exactly two
+typed SIP, WebRTC, WHIP/WHEP, Amazon Connect, or provider-controlled legs.
+Missing API authentication makes every protected route fail closed with `503`;
+missing call-control key material makes the call routes fail with `503`. The
+existing StandardCharter listener and public health/metrics endpoints continue
+to start normally.
 
 ```bash
 curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \

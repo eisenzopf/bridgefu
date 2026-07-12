@@ -141,6 +141,7 @@ pub enum LegEndpointConfig {
     /// SIP/RTP endpoint.
     Sip(SipEndpointConfig),
     /// Interactive WebRTC endpoint.
+    #[serde(rename = "webrtc", alias = "web_rtc")]
     WebRtc(WebRtcEndpointConfig),
     /// WHIP endpoint.
     Whip(WhipEndpointConfig),
@@ -153,7 +154,9 @@ pub enum LegEndpointConfig {
 }
 
 impl LegEndpointConfig {
-    fn kind(&self) -> LegKind {
+    /// Signaling/provider kind represented by this endpoint.
+    #[must_use]
+    pub fn kind(&self) -> LegKind {
         match self {
             Self::Sip(_) => LegKind::Sip,
             Self::WebRtc(_) => LegKind::InteractiveWebRtc,

@@ -72,6 +72,10 @@ runtime:
 api:
   enabled: true
   bearer_token: env:BRIDGEFU_API_TOKEN
+  # At least 32 bytes. Required for transactional /v1/calls operations.
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  # Required with the compatibility shared key when multiple tenants exist.
+  # static_tenant: banking
 
 context:
   allow_headers:

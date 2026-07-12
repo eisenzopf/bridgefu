@@ -352,6 +352,7 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
             service_call: StoredServiceCall {
                 call,
                 plan: service_call.plan,
+                attachments: service_call.attachments,
             },
             outbound_bind,
         },

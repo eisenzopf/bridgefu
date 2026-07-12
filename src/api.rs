@@ -1,12 +1,15 @@
 //! Versioned Bridgefu control and broadcast API.
 
-use std::collections::BTreeMap;
+mod calls;
+
+use std::collections::BTreeSet;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{OriginalUri, Path, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -28,12 +31,21 @@ use subtle::ConstantTimeEq;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+use zeroize::Zeroize;
+
+use bridgefu::api_principal::{
+    ApiBearerAuthenticator, ApiPrincipalError, ConfiguredApiKeyValidator, MAX_API_BEARER_BYTES,
+};
+use bridgefu::call_engine::{CallRepository, RegisterWorker, RepositoryError, WorkerId};
+use bridgefu::call_service::{
+    CallService, CallServiceCrypto, CallServiceError, CallTimeoutPolicy, ControlCryptoError,
+    FixedWorkerPlacement, SamePrincipalAttachmentResolver, SystemCallServiceClock,
+};
+use bridgefu::persistence::MemoryRepository;
 
 use crate::config::Config;
 use crate::context::ContextPolicy;
-use crate::providers::{
-    NormalizedProviderEvent, OriginateCommand, ProviderError, ProviderRegistry, WebhookRequest,
-};
+use crate::providers::{NormalizedProviderEvent, ProviderError, ProviderRegistry, WebhookRequest};
 use crate::runtime::GenericBridgeRuntime;
 use crate::screen_pop_evidence::{
     ScreenPopEvidence, ScreenPopEvidenceStore, DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY,
@@ -44,15 +56,15 @@ use crate::screen_pop_evidence::{
 pub struct ApiState {
     server: Arc<ConnectScreenPopServer>,
     providers: ProviderRegistry,
-    calls: Arc<DashMap<String, CallRecord>>,
     broadcasts: Arc<DashMap<String, Arc<ActiveBroadcast>>>,
     webhook_events: Arc<DashMap<String, DateTime<Utc>>>,
     metrics: PrometheusHandle,
     tenants: Vec<String>,
-    bearer_token: Option<String>,
+    bearer_authenticator: Option<ApiBearerAuthenticator>,
+    legacy_bearer_token: Option<Arc<LegacyBearerToken>>,
+    call_service: Option<Arc<CallService>>,
     token_secret: Arc<Vec<u8>>,
     token_ttl: Duration,
-    max_calls: usize,
     max_broadcasts: usize,
     default_transport: BroadcastKind,
     public_endpoint: String,
@@ -60,6 +72,20 @@ pub struct ApiState {
     context_policy: ContextPolicy,
     generic_runtime: Option<Arc<GenericBridgeRuntime>>,
     screen_pop_evidence: ScreenPopEvidenceStore,
+}
+
+struct LegacyBearerToken(Vec<u8>);
+
+impl fmt::Debug for LegacyBearerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegacyBearerToken([redacted])")
+    }
+}
+
+impl Drop for LegacyBearerToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 struct ActiveBroadcast {
@@ -70,7 +96,7 @@ struct ActiveBroadcast {
 }
 
 impl ApiState {
-    pub fn from_config(
+    pub async fn from_config(
         config: &Config,
         server: Arc<ConnectScreenPopServer>,
         metrics: PrometheusHandle,
@@ -78,7 +104,7 @@ impl ApiState {
         generic_runtime: Option<Arc<GenericBridgeRuntime>>,
     ) -> anyhow::Result<Self> {
         let providers = ProviderRegistry::from_config(&config.providers)?;
-        let bearer_token = config
+        let mut bearer_token = config
             .api
             .bearer_token
             .as_ref()
@@ -98,6 +124,63 @@ impl ApiState {
                 "control API has no bearer token; configure api.bearer_token in production"
             );
         }
+
+        let static_tenant = config
+            .api
+            .static_tenant
+            .clone()
+            .or_else(|| (tenants.len() == 1).then(|| tenants[0].clone()));
+        let bearer_authenticator = match (bearer_token.take(), static_tenant.as_deref()) {
+            (Some(token), Some(tenant)) => Some(ApiBearerAuthenticator::new(Arc::new(
+                ConfiguredApiKeyValidator::new(token, [tenant])?,
+            ))),
+            (Some(token), None) => {
+                tracing::warn!(
+                    "transactional call API is disabled: api.static_tenant is required with multiple tenants"
+                );
+                bearer_token = Some(token);
+                None
+            }
+            (None, _) => None,
+        };
+        let legacy_bearer_token = bearer_token
+            .map(String::into_bytes)
+            .map(LegacyBearerToken)
+            .map(Arc::new);
+
+        let call_service = if let (Some(_), Some(control_key)) =
+            (&bearer_authenticator, &config.api.control_hmac_key)
+        {
+            let repository = Arc::new(MemoryRepository::new());
+            let worker = repository
+                .register_worker(RegisterWorker {
+                    worker_id: WorkerId::new(),
+                    max_calls: config.runtime.max_concurrent_calls,
+                    capabilities: BTreeSet::new(),
+                    at: Utc::now(),
+                })
+                .await?;
+            let crypto = CallServiceCrypto::new(control_key.resolve()?.into_bytes())?;
+            Some(Arc::new(CallService::new(
+                repository,
+                Arc::new(FixedWorkerPlacement::new(worker.lease)),
+                Arc::new(SamePrincipalAttachmentResolver),
+                crypto,
+                Arc::new(SystemCallServiceClock),
+                CallTimeoutPolicy {
+                    setup: Duration::from_secs(config.runtime.setup_timeout_secs),
+                    transfer: Duration::from_secs(30),
+                    ending: Duration::from_secs(config.runtime.drain_timeout_secs.max(1)),
+                },
+            )))
+        } else {
+            if config.api.enabled {
+                tracing::warn!(
+                    "transactional call API is unavailable until api.bearer_token, one static tenant, and api.control_hmac_key are configured"
+                );
+            }
+            None
+        };
         let screen_pop_evidence = ScreenPopEvidenceStore::new(
             DEFAULT_SCREEN_POP_EVIDENCE_TTL,
             DEFAULT_SCREEN_POP_EVIDENCE_CAPACITY,
@@ -105,15 +188,15 @@ impl ApiState {
         Ok(Self {
             server,
             providers,
-            calls: Arc::new(DashMap::new()),
             broadcasts: Arc::new(DashMap::new()),
             webhook_events: Arc::new(DashMap::new()),
             metrics,
             tenants,
-            bearer_token,
+            bearer_authenticator,
+            legacy_bearer_token,
+            call_service,
             token_secret: Arc::new(token_secret),
             token_ttl: Duration::from_secs(config.broadcast.token_ttl_secs),
-            max_calls: config.runtime.max_concurrent_calls,
             max_broadcasts: config.broadcast.max_active,
             default_transport: config.broadcast.default_transport.parse()?,
             public_endpoint: config
@@ -136,12 +219,15 @@ impl ApiState {
 
 pub fn router(state: ApiState) -> Router {
     let protected = if state.api_enabled {
+        let calls = Router::new()
+            .route("/v1/calls", post(calls::create_call))
+            .route("/v1/calls/:call_id", get(calls::get_call))
+            .route("/v1/calls/:call_id/hangup", post(calls::hangup_call))
+            .route("/v1/calls/:call_id/transfer", post(calls::transfer_call))
+            .route("/v1/calls/:call_id/dtmf", post(calls::dtmf_call))
+            .layer(DefaultBodyLimit::max(64 * 1024));
         Router::new()
-            .route("/v1/calls", post(create_call))
-            .route("/v1/calls/:call_id", get(get_call))
-            .route("/v1/calls/:call_id/hangup", post(hangup_call))
-            .route("/v1/calls/:call_id/transfer", post(transfer_call))
-            .route("/v1/calls/:call_id/dtmf", post(dtmf_call))
+            .merge(calls)
             .route(
                 "/v1/providers/:provider/capabilities",
                 get(provider_capabilities),
@@ -196,28 +282,58 @@ pub async fn serve(
 
 async fn require_api_auth(
     State(state): State<ApiState>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(expected) = &state.bearer_token {
-        let supplied = request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        if !supplied
-            .map(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
-            .unwrap_or(false)
+    if let Some(authenticator) = &state.bearer_authenticator {
+        let principal = authenticator
+            .authenticate(request.headers(), Utc::now())
+            .await
+            .map_err(ApiError::from)?;
+        request.extensions_mut().insert(principal);
+    } else if let Some(expected) = &state.legacy_bearer_token {
+        if !legacy_bearer(request.headers())
+            .is_some_and(|value| constant_time_eq(value.as_bytes(), &expected.0))
         {
             metrics::counter!("bridgefu_auth_failures_total", "surface" => "api").increment(1);
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "valid Bearer token required",
-            ));
+            )
+            .with_header(axum::http::header::WWW_AUTHENTICATE, "Bearer"));
         }
+    } else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "control API authentication is not configured",
+        ));
     }
     Ok(next.run(request).await)
+}
+
+fn legacy_bearer(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    if value.contains(',') {
+        return None;
+    }
+    let (scheme, credential) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || credential.is_empty()
+        || credential.len() > MAX_API_BEARER_BYTES
+        || credential
+            .bytes()
+            .any(|byte| !(0x21..=0x7e).contains(&byte))
+    {
+        return None;
+    }
+    Some(credential)
 }
 
 async fn health(State(state): State<ApiState>) -> Json<Value> {
@@ -226,246 +342,6 @@ async fn health(State(state): State<ApiState>) -> Json<Value> {
 
 async fn metrics(State(state): State<ApiState>) -> String {
     state.metrics.render()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum LegSpec {
-    Sip {
-        uri: String,
-    },
-    WebRtc {
-        endpoint: Option<String>,
-    },
-    AmazonConnect {
-        tenant_id: String,
-    },
-    Provider {
-        provider: String,
-        from: String,
-        to: String,
-        answer_url: Option<String>,
-        event_url: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateCallRequest {
-    #[serde(default)]
-    tenant_id: Option<String>,
-    legs: Vec<LegSpec>,
-    #[serde(default)]
-    metadata: BTreeMap<String, String>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct CallRecord {
-    call_id: String,
-    tenant_id: String,
-    state: String,
-    legs: Vec<LegSpec>,
-    provider: Option<String>,
-    provider_call_id: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-async fn create_call(
-    State(state): State<ApiState>,
-    Json(request): Json<CreateCallRequest>,
-) -> Result<(StatusCode, Json<CallRecord>), ApiError> {
-    if state.calls.len() + state.server.active_call_ids().len() >= state.max_calls {
-        metrics::counter!("bridgefu_admission_rejections_total", "resource" => "calls")
-            .increment(1);
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "capacity_exceeded",
-            "worker call capacity reached",
-        ));
-    }
-    if request.legs.len() != 1 {
-        return Err(ApiError::capability(
-            "1.0 originate currently requires exactly one provider-controlled leg",
-        ));
-    }
-    let LegSpec::Provider {
-        provider,
-        from,
-        to,
-        answer_url,
-        event_url,
-    } = &request.legs[0]
-    else {
-        return Err(ApiError::capability("direct SIP/WebRTC legs are accepted by the signaling listeners, not the provider originate API"));
-    };
-    let adapter = state
-        .providers
-        .get(provider)
-        .ok_or_else(|| ApiError::not_found("provider is not configured"))?;
-    let call_id = Uuid::new_v4().to_string();
-    let provider_call = adapter
-        .originate(OriginateCommand {
-            from: from.clone(),
-            to: to.clone(),
-            answer_url: answer_url.clone(),
-            event_url: event_url.clone(),
-            idempotency_key: request.idempotency_key.unwrap_or_else(|| call_id.clone()),
-            metadata: request.metadata,
-        })
-        .await?;
-    let now = Utc::now();
-    let record = CallRecord {
-        call_id: call_id.clone(),
-        tenant_id: request.tenant_id.unwrap_or_else(|| "default".into()),
-        state: provider_call.state,
-        legs: request.legs,
-        provider: Some(provider_call.provider),
-        provider_call_id: Some(provider_call.provider_call_id),
-        created_at: now,
-        updated_at: now,
-    };
-    state.calls.insert(call_id, record.clone());
-    metrics::counter!("bridgefu_call_operations_total", "operation" => "originate", "result" => "ok").increment(1);
-    Ok((StatusCode::CREATED, Json(record)))
-}
-
-async fn get_call(
-    State(state): State<ApiState>,
-    Path(call_id): Path<String>,
-) -> Result<Json<CallRecord>, ApiError> {
-    if let Some(call) = state.calls.get(&call_id) {
-        return Ok(Json(call.clone()));
-    }
-    if state
-        .server
-        .active_call_ids()
-        .iter()
-        .any(|id| id == &call_id)
-    {
-        let now = Utc::now();
-        return Ok(Json(CallRecord {
-            call_id,
-            tenant_id: "routed".into(),
-            state: "connected".into(),
-            legs: vec![
-                LegSpec::Sip {
-                    uri: "inbound".into(),
-                },
-                LegSpec::AmazonConnect {
-                    tenant_id: "routed".into(),
-                },
-            ],
-            provider: Some("amazon-connect".into()),
-            provider_call_id: None,
-            created_at: now,
-            updated_at: now,
-        }));
-    }
-    Err(ApiError::not_found("call not found"))
-}
-
-async fn hangup_call(
-    State(state): State<ApiState>,
-    Path(call_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    if let Some(mut call) = state.calls.get_mut(&call_id) {
-        let provider_name = call
-            .provider
-            .clone()
-            .ok_or_else(|| ApiError::capability("call has no provider control adapter"))?;
-        let provider_id = call
-            .provider_call_id
-            .clone()
-            .ok_or_else(|| ApiError::capability("call has no provider call ID"))?;
-        state
-            .providers
-            .get(&provider_name)
-            .ok_or_else(|| ApiError::not_found("provider is not configured"))?
-            .hangup(&provider_id)
-            .await?;
-        call.state = "ended".into();
-        call.updated_at = Utc::now();
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    if state.server.end_by_call_id(&call_id).await {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    Err(ApiError::not_found("call not found"))
-}
-
-#[derive(Debug, Deserialize)]
-struct TransferRequest {
-    target: String,
-}
-
-async fn transfer_call(
-    State(state): State<ApiState>,
-    Path(call_id): Path<String>,
-    Json(request): Json<TransferRequest>,
-) -> Result<StatusCode, ApiError> {
-    let call = state
-        .calls
-        .get(&call_id)
-        .ok_or_else(|| ApiError::capability("native transfer is unavailable for this call type"))?;
-    let provider_name = call
-        .provider
-        .as_deref()
-        .ok_or_else(|| ApiError::capability("call has no provider control adapter"))?;
-    let provider_id = call
-        .provider_call_id
-        .as_deref()
-        .ok_or_else(|| ApiError::capability("call has no provider call ID"))?;
-    state
-        .providers
-        .get(provider_name)
-        .ok_or_else(|| ApiError::not_found("provider is not configured"))?
-        .transfer(provider_id, &request.target)
-        .await?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-#[derive(Debug, Deserialize)]
-struct DtmfRequest {
-    digits: String,
-}
-
-async fn dtmf_call(
-    State(state): State<ApiState>,
-    Path(call_id): Path<String>,
-    Json(request): Json<DtmfRequest>,
-) -> Result<StatusCode, ApiError> {
-    if request.digits.is_empty()
-        || !request.digits.chars().all(|c| {
-            c.is_ascii_digit() || matches!(c, '*' | '#' | 'A'..='D' | 'a'..='d' | ',' | 'w' | 'W')
-        })
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_dtmf",
-            "digits contain unsupported characters",
-        ));
-    }
-    let call = state
-        .calls
-        .get(&call_id)
-        .ok_or_else(|| ApiError::capability("native DTMF is unavailable for this call type"))?;
-    let provider_name = call
-        .provider
-        .as_deref()
-        .ok_or_else(|| ApiError::capability("call has no provider control adapter"))?;
-    let provider_id = call
-        .provider_call_id
-        .as_deref()
-        .ok_or_else(|| ApiError::capability("call has no provider call ID"))?;
-    state
-        .providers
-        .get(provider_name)
-        .ok_or_else(|| ApiError::not_found("provider is not configured"))?
-        .send_dtmf(provider_id, &request.digits)
-        .await?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn provider_capabilities(
@@ -528,14 +404,6 @@ async fn provider_webhook(
     {
         metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "duplicate").increment(1);
         return Ok((StatusCode::OK, Json(event)));
-    }
-    if let Some(provider_call_id) = &event.provider_call_id {
-        for mut call in state.calls.iter_mut() {
-            if call.provider_call_id.as_deref() == Some(provider_call_id) {
-                call.state = event.event_type.clone();
-                call.updated_at = Utc::now();
-            }
-        }
     }
     metrics::counter!("bridgefu_provider_webhooks_total", "provider" => provider, "result" => "accepted").increment(1);
     Ok((StatusCode::ACCEPTED, Json(event)))
@@ -762,7 +630,7 @@ async fn diagnostics(State(state): State<ApiState>) -> Json<Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "active_amazon_calls": state.server.active_call_ids(),
-        "controlled_calls": state.calls.len(),
+        "transactional_call_api": state.call_service.is_some(),
         "providers": state.providers.names(),
         "broadcasts": broadcasts,
         "moqt_target_draft": rvoip_moq::TARGET_MOQT_DRAFT,
@@ -815,6 +683,7 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    headers: Vec<(axum::http::header::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl ApiError {
@@ -823,7 +692,13 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            headers: Vec::new(),
         }
+    }
+    fn with_header(mut self, name: axum::http::header::HeaderName, value: &'static str) -> Self {
+        self.headers
+            .push((name, axum::http::HeaderValue::from_static(value)));
+        self
     }
     fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
@@ -838,11 +713,144 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let headers = self.headers.into_iter().collect::<HeaderMap>();
         (
             self.status,
+            headers,
             Json(json!({"error": {"code": self.code, "message": self.message}})),
         )
             .into_response()
+    }
+}
+
+impl From<ApiPrincipalError> for ApiError {
+    fn from(error: ApiPrincipalError) -> Self {
+        match error {
+            ApiPrincipalError::MissingCredential
+            | ApiPrincipalError::MalformedCredential
+            | ApiPrincipalError::InvalidCredential
+            | ApiPrincipalError::ExpiredCredential
+            | ApiPrincipalError::TenantRequired => Self::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid Bearer token required",
+            )
+            .with_header(axum::http::header::WWW_AUTHENTICATE, "Bearer"),
+            ApiPrincipalError::MissingScope(_) | ApiPrincipalError::TenantOverrideForbidden => {
+                Self::new(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "authenticated principal is not authorized for this operation",
+                )
+            }
+            ApiPrincipalError::InvalidTenant => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_tenant",
+                "tenant identifier is invalid",
+            ),
+            ApiPrincipalError::AuthenticationUnavailable
+            | ApiPrincipalError::AmbiguousStaticTenant
+            | ApiPrincipalError::InvalidStaticApiKey
+            | ApiPrincipalError::InvalidFingerprintKey => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_unavailable",
+                "authentication service is unavailable",
+            ),
+        }
+    }
+}
+
+impl From<RepositoryError> for ApiError {
+    fn from(error: RepositoryError) -> Self {
+        match error {
+            RepositoryError::NotFound => Self::not_found("call not found"),
+            RepositoryError::CapacityExceeded => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+                "worker call capacity reached",
+            )
+            .with_header(axum::http::header::RETRY_AFTER, "1"),
+            RepositoryError::InvalidInput(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "call request is invalid",
+            ),
+            RepositoryError::StaleWorkerFence
+            | RepositoryError::CounterExhausted
+            | RepositoryError::Unavailable => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "call_service_unavailable",
+                "call service is unavailable",
+            ),
+            RepositoryError::VersionConflict
+            | RepositoryError::CommandConflict
+            | RepositoryError::IdempotencyConflict
+            | RepositoryError::AttachmentRejected
+            | RepositoryError::AttachmentConflict
+            | RepositoryError::ProviderEventConflict
+            | RepositoryError::ProviderReferenceConflict
+            | RepositoryError::StaleClaim
+            | RepositoryError::DomainRejected => Self::new(
+                StatusCode::CONFLICT,
+                "call_conflict",
+                "call state or idempotency receipt conflicts with this request",
+            ),
+        }
+    }
+}
+
+impl From<ControlCryptoError> for ApiError {
+    fn from(error: ControlCryptoError) -> Self {
+        match error {
+            ControlCryptoError::MissingIdempotencyKey
+            | ControlCryptoError::DuplicateIdempotencyKey
+            | ControlCryptoError::MalformedIdempotencyKey => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                error.to_string(),
+            ),
+            ControlCryptoError::InvalidControlKey | ControlCryptoError::TimestampOverflow => {
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "call_service_unavailable",
+                    "call service is unavailable",
+                )
+            }
+        }
+    }
+}
+
+impl From<CallServiceError> for ApiError {
+    fn from(error: CallServiceError) -> Self {
+        match error {
+            CallServiceError::Principal(error) => Self::from(error),
+            CallServiceError::Crypto(error) => Self::from(error),
+            CallServiceError::Repository(error) => Self::from(error),
+            CallServiceError::CapacityExceeded => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+                "worker call capacity reached",
+            )
+            .with_header(axum::http::header::RETRY_AFTER, "1"),
+            CallServiceError::DependencyUnavailable => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "call_service_unavailable",
+                "call service is unavailable",
+            ),
+            CallServiceError::AttachmentPrincipalUnresolved => {
+                Self::capability("inbound leg has no configured authenticated signaling profile")
+            }
+            CallServiceError::InvalidInput(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "call request is invalid",
+            ),
+            CallServiceError::InvalidTransition => Self::new(
+                StatusCode::CONFLICT,
+                "invalid_transition",
+                "call state does not allow this operation",
+            ),
+        }
     }
 }
 
@@ -907,6 +915,28 @@ mod tests {
     }
 
     async fn diagnostics_test_state() -> ApiState {
+        test_state(false, 100, true).await
+    }
+
+    async fn call_api_test_state(max_calls: usize) -> ApiState {
+        test_state(true, max_calls, true).await
+    }
+
+    async fn no_auth_test_state() -> ApiState {
+        test_state(false, 100, false).await
+    }
+
+    async fn test_state(call_control: bool, max_calls: usize, bearer_enabled: bool) -> ApiState {
+        let control = if call_control {
+            "  control_hmac_key: \"0123456789abcdef0123456789abcdef\"\n"
+        } else {
+            ""
+        };
+        let bearer = if bearer_enabled {
+            "  bearer_token: diagnostics-secret\n"
+        } else {
+            ""
+        };
         let yaml = format!(
             r#"
 aws:
@@ -920,7 +950,8 @@ sip:
   media_public_ip: 127.0.0.1
 api:
   enabled: true
-  bearer_token: diagnostics-secret
+{bearer}{control}runtime:
+  max_concurrent_calls: {max_calls}
 broadcast:
   token_secret: test-broadcast-secret
 "#,
@@ -943,7 +974,52 @@ broadcast:
             config.tenant_names().unwrap(),
             None,
         )
+        .await
         .expect("diagnostics API state builds")
+    }
+
+    async fn legacy_multi_tenant_state() -> ApiState {
+        let yaml = format!(
+            r#"
+aws:
+  region: us-west-2
+sip:
+  bind_ip: 127.0.0.1
+  port: {}
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+tenants:
+  tenant-a:
+    instance_id: instance-a
+    contact_flow_id: flow-a
+  tenant-b:
+    instance_id: instance-b
+    contact_flow_id: flow-b
+api:
+  enabled: true
+  bearer_token: diagnostics-secret
+broadcast:
+  token_secret: test-broadcast-secret
+"#,
+            available_udp_port()
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let server_config = config
+            .into_server_config_with_starter(Arc::new(UnusedStarter))
+            .await
+            .unwrap();
+        let server = ConnectScreenPopServer::build(server_config).await.unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        ApiState::from_config(
+            &config,
+            server,
+            recorder.handle(),
+            config.tenant_names().unwrap(),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn get(app: &Router, uri: &str, bearer: Option<&str>) -> Response {
@@ -957,11 +1033,92 @@ broadcast:
             .expect("diagnostics request completes")
     }
 
+    async fn raw_get(
+        app: &Router,
+        uri: &str,
+        authorization: &[axum::http::HeaderValue],
+    ) -> Response {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        for value in authorization {
+            request
+                .headers_mut()
+                .append(axum::http::header::AUTHORIZATION, value.clone());
+        }
+        app.clone().oneshot(request).await.unwrap()
+    }
+
     async fn response_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("diagnostics response body");
         serde_json::from_slice(&bytes).expect("diagnostics response JSON")
+    }
+
+    async fn post_json(
+        app: &Router,
+        uri: &str,
+        bearer: Option<&str>,
+        idempotency_keys: &[&str],
+        body: Value,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        if let Some(token) = bearer {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+        }
+        for key in idempotency_keys {
+            request.headers_mut().append(
+                "idempotency-key",
+                axum::http::HeaderValue::from_str(key).unwrap(),
+            );
+        }
+        app.clone()
+            .oneshot(request)
+            .await
+            .expect("call API request completes")
+    }
+
+    async fn post_empty(app: &Router, uri: &str, bearer: &str, idempotency_key: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {bearer}"),
+                    )
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn create_body() -> Value {
+        json!({
+            "legs": [
+                {
+                    "direction": "inbound",
+                    "endpoint": {"type": "sip", "config": {"uri": null}}
+                },
+                {
+                    "direction": "outbound",
+                    "endpoint": {
+                        "type": "webrtc",
+                        "config": {"signaling_uri": "wss://signal.example.test/private-session"}
+                    }
+                }
+            ]
+        })
     }
 
     #[tokio::test]
@@ -1007,5 +1164,321 @@ broadcast:
         assert_eq!(body["stages"]["sip_invite_received"]["observed"], true);
         assert_eq!(body["stages"]["attributes_mapped"]["observed"], true);
         assert!(body["stages"]["sip_invite_received"]["at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn durable_call_routes_require_auth_idempotency_and_replay_exactly() {
+        let app = router(call_api_test_state(1).await);
+        assert_eq!(
+            post_json(&app, "/v1/calls", None, &["create-1"], create_body())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthorized = post_json(
+            &app,
+            "/v1/calls",
+            Some("wrong-secret"),
+            &["create-1"],
+            create_body(),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthorized
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer"
+        );
+        assert_eq!(
+            post_json(
+                &app,
+                "/v1/calls",
+                Some("diagnostics-secret"),
+                &[],
+                create_body(),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_json(
+                &app,
+                "/v1/calls",
+                Some("diagnostics-secret"),
+                &["duplicate", "duplicate"],
+                create_body(),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let created = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["create-1"],
+            create_body(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        let call_id = created_body["call_id"].as_str().unwrap().to_owned();
+        let token = created_body["legs"][0]["attachment"]["token"]
+            .as_str()
+            .unwrap();
+        assert_eq!(token.len(), 43);
+        let serialized = serde_json::to_string(&created_body).unwrap();
+        assert!(!serialized.contains("private-session"));
+        assert!(!serialized.contains("signaling_uri"));
+
+        let replayed = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["create-1"],
+            create_body(),
+        )
+        .await;
+        assert_eq!(replayed.status(), StatusCode::CREATED);
+        assert_eq!(response_json(replayed).await, created_body);
+
+        let loaded = get(
+            &app,
+            &format!("/v1/calls/{call_id}"),
+            Some("diagnostics-secret"),
+        )
+        .await;
+        assert_eq!(loaded.status(), StatusCode::OK);
+        let loaded_body = response_json(loaded).await;
+        assert!(loaded_body["legs"][0].get("attachment").is_none());
+
+        let mut changed = create_body();
+        changed["legs"][1]["endpoint"]["config"]["signaling_uri"] =
+            Value::String("wss://signal.example.test/changed".into());
+        assert_eq!(
+            post_json(
+                &app,
+                "/v1/calls",
+                Some("diagnostics-secret"),
+                &["create-1"],
+                changed,
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        let capacity = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["create-2"],
+            create_body(),
+        )
+        .await;
+        assert_eq!(capacity.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            capacity
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_routes_map_malformed_forbidden_and_invalid_transition_without_fallback() {
+        let app = router(call_api_test_state(4).await);
+        assert_eq!(
+            post_json(
+                &app,
+                "/v1/calls",
+                Some("diagnostics-secret"),
+                &["bad-shape"],
+                json!({"legs": []}),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut override_body = create_body();
+        override_body["tenant_id"] = Value::String("other-tenant".into());
+        assert_eq!(
+            post_json(
+                &app,
+                "/v1/calls",
+                Some("diagnostics-secret"),
+                &["override"],
+                override_body,
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let created = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["create-transition"],
+            create_body(),
+        )
+        .await;
+        let call_id = response_json(created).await["call_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            post_json(
+                &app,
+                &format!("/v1/calls/{call_id}/transfer"),
+                Some("diagnostics-secret"),
+                &["transfer-invalid"],
+                json!({"target": {"type": "sip", "uri": "sip:queue@sip.example.test"}}),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_json(
+                &app,
+                &format!("/v1/calls/{call_id}/hangup"),
+                Some("diagnostics-secret"),
+                &[],
+                json!({}),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_empty(
+                &app,
+                &format!("/v1/calls/{call_id}/hangup"),
+                "diagnostics-secret",
+                "hangup-empty",
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let unconfigured = router(diagnostics_test_state().await);
+        let unavailable = post_json(
+            &unconfigured,
+            "/v1/calls/00000000-0000-4000-8000-000000000001/hangup",
+            Some("diagnostics-secret"),
+            &["no-fallback"],
+            json!({}),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let oversized = post_json(
+            &app,
+            "/v1/calls",
+            Some("diagnostics-secret"),
+            &["oversized"],
+            json!({"legs": [], "padding": "x".repeat(70_000)}),
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn protected_routes_fail_closed_without_auth_configuration() {
+        let app = router(no_auth_test_state().await);
+        for path in [
+            "/diagnostics",
+            "/v1/diagnostics/screen-pop/missing",
+            "/v1/providers/twilio/capabilities",
+            "/v1/broadcasts/00000000-0000-4000-8000-000000000001",
+            "/v1/calls/00000000-0000-4000-8000-000000000001",
+        ] {
+            assert_eq!(
+                get(&app, path, None).await.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "protected route was reachable: {path}"
+            );
+        }
+        let id = "00000000-0000-4000-8000-000000000001";
+        for (path, body) in [
+            ("/v1/calls".to_owned(), create_body()),
+            (format!("/v1/calls/{id}/hangup"), json!({})),
+            (
+                format!("/v1/calls/{id}/transfer"),
+                json!({"target": {"type": "sip", "uri": "sip:test@example.test"}}),
+            ),
+            (
+                format!("/v1/calls/{id}/dtmf"),
+                json!({"leg_id": id, "digits": "1"}),
+            ),
+            (
+                format!("/v1/calls/{id}/broadcasts"),
+                json!({"source_leg_id": "sip"}),
+            ),
+            (format!("/v1/broadcasts/{id}/tokens"), json!({})),
+        ] {
+            assert_eq!(
+                post_json(&app, &path, None, &[], body).await.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "protected route was reachable: {path}"
+            );
+        }
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/broadcasts/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get(&app, "/healthz", None).await.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/metrics", None).await.status(), StatusCode::OK);
+        let webhook = post_json(
+            &app,
+            "/v1/providers/not-configured/webhooks",
+            None,
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(webhook.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn legacy_bearer_rejects_duplicate_merged_and_malformed_credentials() {
+        let app = router(legacy_multi_tenant_state().await);
+        let valid = axum::http::HeaderValue::from_static("bEaReR diagnostics-secret");
+        assert_eq!(
+            raw_get(&app, "/diagnostics", &[valid]).await.status(),
+            StatusCode::OK
+        );
+        for values in [
+            vec![
+                axum::http::HeaderValue::from_static("Bearer diagnostics-secret"),
+                axum::http::HeaderValue::from_static("Bearer diagnostics-secret"),
+            ],
+            vec![axum::http::HeaderValue::from_static(
+                "Bearer diagnostics-secret,Bearer diagnostics-secret",
+            )],
+            vec![axum::http::HeaderValue::from_static(
+                "Bearer diagnostics-secret extra",
+            )],
+            vec![axum::http::HeaderValue::from_bytes(b"Bearer \xff").unwrap()],
+        ] {
+            assert_eq!(
+                raw_get(&app, "/diagnostics", &values).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 }

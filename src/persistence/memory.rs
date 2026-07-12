@@ -2473,6 +2473,45 @@ impl CallRepository for MemoryRepository {
 
 #[async_trait]
 impl CallServiceRepository for MemoryRepository {
+    async fn load_create_replay(
+        &self,
+        tenant_id: &TenantId,
+        key_digest: crate::call_engine::IdempotencyKeyDigest,
+        request_digest: crate::call_engine::RequestDigest,
+        at: DateTime<Utc>,
+    ) -> Result<Option<StoredServiceCall>, RepositoryError> {
+        self.read(|state| {
+            let Some(existing) = state.idempotency.get(&(tenant_id.clone(), key_digest)) else {
+                return Ok(None);
+            };
+            if existing.expires_at <= at {
+                return Ok(None);
+            }
+            if existing.request_digest != request_digest
+                || !matches!(&existing.receipt, OperationIdempotencyReceipt::CreateCall)
+            {
+                return Err(RepositoryError::IdempotencyConflict);
+            }
+            let call = original_create_snapshot(state, existing.call_id)?;
+            if call.aggregate.tenant_id() != tenant_id {
+                return Err(RepositoryError::Unavailable);
+            }
+            let plan = state
+                .execution_plans
+                .get(&existing.call_id)
+                .cloned()
+                .ok_or(RepositoryError::Unavailable)?;
+            plan.validate_against(&call.aggregate)
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let attachments = original_create_attachments(state, existing.call_id)?;
+            Ok(Some(StoredServiceCall {
+                call,
+                plan,
+                attachments,
+            }))
+        })
+    }
+
     async fn create_with_plan(
         &self,
         request: ServiceCreateTransaction,
@@ -2482,10 +2521,11 @@ impl CallServiceRepository for MemoryRepository {
             let plan = request.plan;
             match create_call_in_state(state, request.create)? {
                 CreateCallOutcome::Created(call) => {
-                    if !state.service_managed_calls.insert(call.aggregate.id())
+                    let call_id = call.aggregate.id();
+                    if !state.service_managed_calls.insert(call_id)
                         || state
                             .execution_plans
-                            .insert(call.aggregate.id(), plan.clone())
+                            .insert(call_id, plan.clone())
                             .is_some()
                     {
                         return Err(RepositoryError::Unavailable);
@@ -2493,6 +2533,7 @@ impl CallServiceRepository for MemoryRepository {
                     Ok(ServiceCreateOutcome::Created(StoredServiceCall {
                         call,
                         plan,
+                        attachments: original_create_attachments(state, call_id)?,
                     }))
                 }
                 CreateCallOutcome::Replayed(call) => {
@@ -2508,6 +2549,7 @@ impl CallServiceRepository for MemoryRepository {
                     Ok(ServiceCreateOutcome::Replayed(StoredServiceCall {
                         call: original_create_snapshot(state, call_id)?,
                         plan: original,
+                        attachments: original_create_attachments(state, call_id)?,
                     }))
                 }
             }
@@ -2529,7 +2571,12 @@ impl CallServiceRepository for MemoryRepository {
                 .get(&call_id)
                 .cloned()
                 .ok_or(RepositoryError::NotFound)?;
-            Ok(StoredServiceCall { call, plan })
+            let attachments = original_create_attachments(state, call_id)?;
+            Ok(StoredServiceCall {
+                call,
+                plan,
+                attachments,
+            })
         })
     }
 
@@ -2686,17 +2733,31 @@ fn original_create_snapshot(
     state: &MemoryState,
     call_id: CallId,
 ) -> Result<StoredCall, RepositoryError> {
+    Ok(original_create_result(state, call_id)?.call.clone())
+}
+
+fn original_create_attachments(
+    state: &MemoryState,
+    call_id: CallId,
+) -> Result<Vec<AttachmentIssue>, RepositoryError> {
+    Ok(original_create_result(state, call_id)?
+        .command
+        .attachments
+        .clone())
+}
+
+fn original_create_result(
+    state: &MemoryState,
+    call_id: CallId,
+) -> Result<&CommandCommitView, RepositoryError> {
     let mut matching = state.command_results.values().filter(|result| {
         result.command.call_id == call_id && result.command.observed_version.value() == 0
     });
-    let call = matching
-        .next()
-        .map(|result| result.call.clone())
-        .ok_or(RepositoryError::Unavailable)?;
+    let result = matching.next().ok_or(RepositoryError::Unavailable)?;
     if matching.next().is_some() {
         return Err(RepositoryError::Unavailable);
     }
-    Ok(call)
+    Ok(result)
 }
 
 fn replay_service_operation(

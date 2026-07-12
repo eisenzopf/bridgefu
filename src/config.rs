@@ -96,6 +96,14 @@ pub struct ApiCfg {
     /// Optional shared Bearer API key. Use `env:VARIABLE` in production.
     #[serde(default)]
     pub bearer_token: Option<SecretRef>,
+    /// HMAC key for durable idempotency digests and attachment tokens.
+    /// The call API remains unavailable when this is unset.
+    #[serde(default)]
+    pub control_hmac_key: Option<SecretRef>,
+    /// Explicit tenant assigned to the compatibility shared API key.
+    /// Required when more than one routing tenant is configured.
+    #[serde(default)]
+    pub static_tenant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,6 +478,7 @@ fn redact_secrets(value: &mut serde_yaml::Value) {
                             | "signature_secret"
                             | "token_secret"
                             | "bearer_token"
+                            | "control_hmac_key"
                             | "password"
                     )
                 });
@@ -659,6 +668,8 @@ impl Default for ApiCfg {
         Self {
             enabled: true,
             bearer_token: None,
+            control_hmac_key: None,
+            static_tenant: None,
         }
     }
 }
@@ -850,5 +861,18 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
             parse(LEGACY).tenant_names().unwrap(),
             vec![LEGACY_TENANT.to_string()]
         );
+    }
+
+    #[test]
+    fn effective_config_redacts_control_hmac_key() {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(
+            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\n",
+        )
+        .unwrap();
+        redact_secrets(&mut value);
+        let rendered = serde_yaml::to_string(&value).unwrap();
+        assert!(!rendered.contains("bearer-private"));
+        assert!(!rendered.contains("hmac-private"));
+        assert_eq!(rendered.matches("[redacted]").count(), 2);
     }
 }

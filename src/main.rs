@@ -95,7 +95,8 @@ async fn main() -> Result<()> {
     };
 
     let api_state =
-        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, generic_runtime.clone())?;
+        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, generic_runtime.clone())
+            .await?;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut lifecycle_task = screen_pop_evidence::spawn_lifecycle_ingest(
         lifecycle_events,

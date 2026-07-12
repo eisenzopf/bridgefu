@@ -8,9 +8,9 @@ use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
-    AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration, CommandCommit,
-    CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId, FailureDetails,
-    IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
+    AttachmentIssue, AttachmentTransport, BindingGeneration, CallCommand, CallId, ClaimGeneration,
+    CommandCommit, CommandCommitView, CommandId, ConnectionBinding, CreateCall, EffectId,
+    FailureDetails, IdempotencyKeyDigest, LegId, OutboxRecord, OutboxState, PrincipalFingerprint,
     ProviderEventEnvelope, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
 };
 
@@ -23,6 +23,8 @@ pub struct StoredServiceCall {
     pub call: StoredCall,
     /// Immutable endpoint and leg execution configuration.
     pub plan: CallExecutionPlan,
+    /// Immutable initial inbound attachment descriptors. Raw tokens are never stored.
+    pub attachments: Vec<AttachmentIssue>,
 }
 
 /// Atomic call creation plus its execution plan.
@@ -464,6 +466,19 @@ pub enum EffectResultOutcome {
 /// Durable service companion. Implementations perform no provider or rvoip I/O.
 #[async_trait]
 pub trait CallServiceRepository: Send + Sync {
+    /// Returns an unexpired exact create receipt before worker placement.
+    ///
+    /// Implementations do not mutate retention state during this preflight.
+    /// A retained tenant/key with a different request or receipt kind returns
+    /// [`RepositoryError::IdempotencyConflict`].
+    async fn load_create_replay(
+        &self,
+        tenant_id: &TenantId,
+        key_digest: IdempotencyKeyDigest,
+        request_digest: RequestDigest,
+        at: DateTime<Utc>,
+    ) -> Result<Option<StoredServiceCall>, RepositoryError>;
+
     /// Creates the core call and immutable execution plan atomically.
     async fn create_with_plan(
         &self,
