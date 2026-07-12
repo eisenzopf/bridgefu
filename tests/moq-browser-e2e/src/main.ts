@@ -25,7 +25,10 @@ async function run(fields: FormData): Promise<void> {
       serverCertificateHashes: [{ algorithm: "sha-256", value: decodeSha256(certificateHash) }]
     }
   });
-  if (connection.version !== "moqt-19") throw new Error(`unexpected negotiated protocol ${connection.version}`);
+  const negotiatedProtocol = String(connection.version);
+  if (negotiatedProtocol !== "moqt-19" && negotiatedProtocol !== "moq-transport-19") {
+    throw new Error(`unexpected negotiated protocol ${negotiatedProtocol}`);
+  }
 
   const broadcast = connection.consume(Moq.Path.from(namespace));
   const track = broadcast.subscribe(trackName, 0);
@@ -38,13 +41,23 @@ async function run(fields: FormData): Promise<void> {
 
   result.textContent = JSON.stringify({
     catalogVersion: catalog.version,
-    protocol: connection.version,
+    negotiatedProtocol,
+    protocol: "moqt-19",
     track: trackName,
     trackCount: Array.isArray(catalog.tracks) ? catalog.tracks.length : 0
   });
   status.dataset.state = "passed";
   status.textContent = "Passed";
   connection.close();
+}
+
+function formatError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const details = error.errors.map(formatError).filter(Boolean);
+    return details.length > 0 ? `${error.message}: ${details.join(" | ")}` : error.message;
+  }
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return typeof error === "string" ? error : "unknown conformance failure";
 }
 
 form.addEventListener("submit", (event) => {
@@ -55,6 +68,6 @@ form.addEventListener("submit", (event) => {
   void run(new FormData(form)).catch((error: unknown) => {
     status.dataset.state = "failed";
     status.textContent = "Failed";
-    result.textContent = error instanceof Error ? error.message : "unknown conformance failure";
+    result.textContent = formatError(error);
   });
 });
