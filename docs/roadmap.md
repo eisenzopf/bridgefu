@@ -895,7 +895,10 @@ not hide an earlier adapter side effect behind a nominally staged API.
      method, branch, message, event, error, and route log sink. Parser
      failures expose only offsets, error classes, and remaining byte counts;
      they never log the unparsed remainder because it may contain credentials,
-     malformed headers, or a body.
+     malformed headers, or a body. Typed-header conversion errors and successful
+     parser diagnostics are included: they expose header class and extent only,
+     never owned nom input, Content-Disposition, Authorization, or arbitrary
+     extension-header values.
      Legacy dialog/API/manager/protocol logs follow the same rule: From, To,
      target, resolver, Contact, REFER, Route, and Via URIs; arbitrary response
      reasons; transaction identifiers; complete messages; and lower parser or
@@ -924,6 +927,15 @@ not hide an earlier adapter side effect behind a nominally staged API.
      and authenticated-retry INVITE wrapper: no wrapper may relay a lower
      builder/parser error string, and pre-dispatch CreateDialog actions expose
      only endpoint presence/length before calling the lower dialog manager.
+     Registration diagnostics apply the same rule to From URI, username, AoR,
+     and registrar-auth errors. `HeaderPolicyViolation`, method-bearing session
+     errors, and authentication challenge/decision containers have manual,
+     metadata-only diagnostics; no `Method::Extension`, realm, nonce, challenge,
+     or rejected header value appears in `Debug`/`Display`.
+     Opt-in transport/dialog timing diagnostics correlate calls through a
+     bounded opaque identifier derived after the configured Call-ID keep/redact/
+     drop decision; their maps and snapshots never store or return raw peer
+     Call-ID values.
    - [ ] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
@@ -1111,6 +1123,58 @@ Gate 7 progress evidence recorded on 2026-07-12:
   and lower dialog manager still log raw endpoints, while legacy, extra-header,
   and authenticated-retry adapter wrappers still relay lower builder/parser
   source text. Those two P1 paths are part of the active diagnostic closure.
+- The independent transaction audit at rvoip revision
+  `a3e44a5a97a7dae54a7d91c43519e58e431c2ad7` keeps 2a open after finding two
+  source-scan false negatives: a raw transaction key named `tx_key` and a raw
+  lower error named `err`. Malformed `TransactionKey` parse errors also echo the
+  complete key or invalid side before a legacy event-hub path relays them.
+  Identifier spelling is not a security boundary; scans and canaries must cover
+  typed operands and the complete parse/error path rather than a short variable
+  name list. Diagnostic return values are included: retention/capacity
+  breakdowns may expose only the safe standard-method class or `extension`,
+  never `Method::Extension` text or an unbounded method label. Static scans must
+  be field/type-aware enough to reject `tx_key`, positional events, lower errors,
+  and arbitrary dialog identifiers without treating every unrelated numeric
+  variable named `id` as a transaction secret.
+- The parallel INVITE-wrapper audit at the same revision confirms endpoint
+  logs, all eight dialog dispatch wrappers, absent-From behavior, header order,
+  and wire behavior are correct, but finds one earlier P1: Digest challenge
+  algorithm text or an arbitrary AKA-provider error can cross the authorization
+  construction boundary, become a terminal failure reason, and then reach logs
+  and application events before the safe resend wrapper. Authorization
+  construction must map every lower error to a fixed auth class at the action
+  boundary, and terminal event/log diagnostics must expose only that class.
+  Sanitization occurs before normal-path `TransitionRecord`/`ActionRecord`
+  construction: in-memory history and JSON/CSV export may retain only the fixed
+  `AuthRequired` class, status, presence/length metadata, and safe standard
+  method or `extension`. Raw challenges, authorization values, arbitrary AKA
+  errors, and peer or public-API CSeq extension spellings may never enter a
+  history record. Functional cross-crate delivery may retain the challenge only
+  for authentication computation, but its `Debug` view and every history/export
+  projection are metadata-only; diagnostic serialization is never the runtime
+  payload type.
+- The outer-dialog audit at rvoip revision
+  `7e5a185e2de2a0627f32056c9ab7e776cab1e412` keeps 2a open for four additional
+  legacy shapes: an INVITE-handler transaction key, extension methods embedded
+  in outward dialog errors, STIR/SHAKEN verification outcomes whose derived
+  `Debug` contains arbitrary reasons, and event-hub transaction parse/operation
+  errors relayed verbatim. Safe source scans must cover typed derived values and
+  outward error constructors, not only obvious tracing field names.
+- The outbound-auth audit at rvoip revision
+  `6effbbe1b6757201c53af9ce22de1e0cdcfe5d53` confirms construction mapping and
+  terminal CallFailed reasons are fixed-class, but finds two normal-path P1
+  retention gaps: serialized transition history still clones the complete
+  `AuthRequired` event, and extension CSeq methods still enter auth
+  retry/missing-credential errors and action history. History is enabled by
+  default, so both values must be classified before the record is created.
+- The complete item 2a security audit at rvoip revision
+  `a7da8b59e8f529b0ece1a02a0ececd167eb69bf9` finds no remaining typed-wire
+  injection and confirms raw sends are the sole intentional bypass, but keeps
+  2a open for six diagnostic groups: parser/header conversion values;
+  REFER/transaction legacy logs; resolver/TLS plus registration identities;
+  transport/header-policy/method/action errors; raw Call-ID timing snapshots;
+  and value-bearing auth challenge containers. These are release blockers,
+  not deferred observability cleanup.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
