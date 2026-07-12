@@ -1,5 +1,7 @@
 # Rust
 /target
+/tests/moq-browser-e2e/node_modules
+/tests/moq-browser-e2e/dist
 
 # Logs
 *.log
