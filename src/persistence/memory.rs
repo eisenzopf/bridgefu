@@ -1935,7 +1935,8 @@ impl CallRepository for MemoryRepository {
         request: AttachmentLookup,
     ) -> Result<AttachmentCandidate, RepositoryError> {
         self.read(|state| {
-            ensure_worker(state, request.worker, true, request.at)
+            let authorization_at = authoritative_time(state, request.at);
+            ensure_worker(state, request.worker, true, authorization_at)
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
             let row = state
                 .attachments
@@ -1946,7 +1947,7 @@ impl CallRepository for MemoryRepository {
                 || row.transport != request.transport
                 || row.expected_principal != request.principal_fingerprint
                 || row.worker != request.worker
-                || row.expires_at <= request.at
+                || row.expires_at <= authorization_at
                 || row.consumed_at.is_some()
                 || row.revoked_at.is_some()
             {
@@ -1984,8 +1985,15 @@ impl CallRepository for MemoryRepository {
         request: AttachmentConsume,
     ) -> Result<ConsumedAttachment, RepositoryError> {
         self.transaction(|state| {
-            ensure_worker(state, request.candidate.worker, true, request.at)
+            let authorization_at = authoritative_time(state, request.at);
+            ensure_worker(state, request.candidate.worker, true, authorization_at)
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
+            if request
+                .principal_expires_at
+                .is_some_and(|expires_at| expires_at <= authorization_at)
+            {
+                return Err(RepositoryError::AttachmentRejected);
+            }
             validate_attachment_consume_command(&request)?;
             if state.commands.contains_key(&request.command_id)
                 || command_id_conflicts_with_service_namespace(state, request.command_id)
@@ -2005,7 +2013,7 @@ impl CallRepository for MemoryRepository {
                 || row.expected_principal != request.candidate.expected_principal
                 || row.expected_principal != request.principal_fingerprint
                 || row.worker != request.candidate.worker
-                || row.expires_at <= request.at
+                || row.expires_at <= authorization_at
                 || row.consumed_at.is_some()
                 || row.revoked_at.is_some()
             {
@@ -6277,6 +6285,7 @@ mod tests {
                 },
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(5),
             })
             .await,
@@ -6291,6 +6300,101 @@ mod tests {
             })
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn attachment_consume_uses_transaction_authority_for_all_expiry_checks() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 2).await;
+        let owner = tenant("tenant-authoritative-expiry");
+        let request = create_request(new_call(owner.clone()), worker.lease, 148, 149);
+        let token_digest = request.attachments[0].token_digest;
+        let token_expires_at = request.attachments[0].expires_at;
+        let call = created(repo.create_call(request).await.unwrap());
+        let lookup = AttachmentLookup {
+            token_digest,
+            tenant_id: owner,
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: service_principal(),
+            worker: worker.lease,
+            at: at(3),
+        };
+        let candidate = repo.inspect_attachment(lookup.clone()).await.unwrap();
+        let snapshot = repo.snapshot().unwrap();
+
+        let principal_expired =
+            MemoryRepository::from_snapshot_at(snapshot.clone(), at(4)).unwrap();
+        assert_eq!(
+            principal_expired
+                .consume_attachment(AttachmentConsume {
+                    candidate: candidate.clone(),
+                    command_id: CommandId::new(),
+                    command: CallCommand::SetLegState {
+                        at: at(3),
+                        leg_id: candidate.leg_id(),
+                        binding_generation: candidate.binding_generation(),
+                        state: LegState::Signaling,
+                        failure: None,
+                    },
+                    connection_id: ConnectionId::new(),
+                    principal_fingerprint: service_principal(),
+                    principal_expires_at: Some(at(4)),
+                    at: at(3),
+                })
+                .await,
+            Err(RepositoryError::AttachmentRejected)
+        );
+
+        let token_expired =
+            MemoryRepository::from_snapshot_at(snapshot.clone(), token_expires_at).unwrap();
+        assert_eq!(
+            token_expired
+                .consume_attachment(AttachmentConsume {
+                    candidate: candidate.clone(),
+                    command_id: CommandId::new(),
+                    command: CallCommand::SetLegState {
+                        at: at(3),
+                        leg_id: candidate.leg_id(),
+                        binding_generation: candidate.binding_generation(),
+                        state: LegState::Signaling,
+                        failure: None,
+                    },
+                    connection_id: ConnectionId::new(),
+                    principal_fingerprint: service_principal(),
+                    principal_expires_at: None,
+                    at: at(3),
+                })
+                .await,
+            Err(RepositoryError::AttachmentRejected)
+        );
+        assert!(matches!(
+            token_expired.inspect_attachment(lookup).await,
+            Err(RepositoryError::AttachmentRejected)
+        ));
+
+        let valid = MemoryRepository::from_snapshot_at(snapshot, at(3)).unwrap();
+        let consumed = valid
+            .consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: call.aggregate.legs()[0].id(),
+                    binding_generation: call.aggregate.legs()[0].binding_generation(),
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: ConnectionId::new(),
+                principal_fingerprint: service_principal(),
+                principal_expires_at: Some(at(4)),
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            consumed.commit.call.aggregate.legs()[0].state(),
+            LegState::Signaling
+        );
     }
 
     #[tokio::test]
@@ -6348,6 +6452,7 @@ mod tests {
                 },
                 connection_id: connection_id.clone(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(4),
             })
             .await
@@ -6380,6 +6485,7 @@ mod tests {
                 },
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: crate::call_engine::PrincipalFingerprint::new(digest(73)),
+                principal_expires_at: None,
                 at: at(5),
             })
             .await,
@@ -6428,6 +6534,7 @@ mod tests {
                 candidate,
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(5),
             })
             .await,
@@ -6482,6 +6589,7 @@ mod tests {
             candidate: first,
             connection_id: shared_connection.clone(),
             principal_fingerprint: service_principal(),
+            principal_expires_at: None,
             at: at(4),
         })
         .await
@@ -6501,6 +6609,7 @@ mod tests {
                 candidate: second.clone(),
                 connection_id: shared_connection,
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(4),
             })
             .await,
@@ -6526,6 +6635,7 @@ mod tests {
                 candidate: second,
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(5),
             })
             .await
@@ -6566,6 +6676,7 @@ mod tests {
                 candidate,
                 connection_id: old_connection.clone(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(4),
             })
             .await
@@ -6646,6 +6757,7 @@ mod tests {
                 candidate: candidate.clone(),
                 connection_id: old_connection,
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(7),
             })
             .await,
@@ -6676,6 +6788,7 @@ mod tests {
                 candidate,
                 connection_id: new_connection.clone(),
                 principal_fingerprint: service_principal(),
+                principal_expires_at: None,
                 at: at(7),
             })
             .await
@@ -6752,6 +6865,7 @@ mod tests {
                         candidate,
                         connection_id: connection_id.clone(),
                         principal_fingerprint: service_principal(),
+                        principal_expires_at: None,
                         at: at(4),
                     })
                     .await

@@ -502,6 +502,13 @@ pub struct AttachmentConsume {
     pub connection_id: ConnectionId,
     /// Redacted authenticated ownership fingerprint.
     pub principal_fingerprint: PrincipalFingerprint,
+    /// Absolute expiry of the authenticated principal, when bounded.
+    ///
+    /// Repositories must compare this deadline with their authoritative time
+    /// inside the same transaction that consumes the attachment. A caller-side
+    /// expiry observation is not sufficient because the transaction may wait
+    /// behind database or lock contention.
+    pub principal_expires_at: Option<DateTime<Utc>>,
     /// Binding and persistence time.
     pub at: DateTime<Utc>,
 }
@@ -515,6 +522,10 @@ impl fmt::Debug for AttachmentConsume {
             .field("command", &self.command)
             .field("connection_id", &self.connection_id)
             .field("principal_fingerprint", &"[redacted]")
+            .field(
+                "principal_expires_at",
+                &self.principal_expires_at.as_ref().map(|_| "[redacted]"),
+            )
             .field("at", &self.at)
             .finish()
     }
@@ -1095,6 +1106,9 @@ pub trait CallRepository: Send + Sync {
     ) -> Result<AttachmentCandidate, RepositoryError>;
 
     /// Consumes an attachment and commits its exact connection binding atomically.
+    ///
+    /// Implementations must enforce both the durable attachment expiry and the
+    /// supplied principal expiry against transaction-authoritative time.
     async fn consume_attachment(
         &self,
         request: AttachmentConsume,

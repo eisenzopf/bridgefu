@@ -198,6 +198,7 @@ async fn shared_repository_conformance(repo: Repository) {
             candidate,
             connection_id: connection_id.clone(),
             principal_fingerprint: principal(),
+            principal_expires_at: None,
             at: at(4),
         })
         .await
@@ -1873,6 +1874,7 @@ async fn prepare_active_binding<R: CallRepository>(repository: &R) -> WorkerId {
             candidate,
             connection_id: ConnectionId::from_string("conn_column_drift_active"),
             principal_fingerprint: principal(),
+            principal_expires_at: None,
             at: at(47),
         })
         .await

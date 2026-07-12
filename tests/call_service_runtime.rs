@@ -212,6 +212,7 @@ async fn assert_consumed_expired_replay_and_capacity(
             },
             connection_id: ConnectionId::new(),
             principal_fingerprint: stored.attachments[0].expected_principal,
+            principal_expires_at: None,
             at: at(1),
         })
         .await

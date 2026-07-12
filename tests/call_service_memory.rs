@@ -285,6 +285,7 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
             candidate,
             connection_id: ConnectionId::from_string(format!("inbound-{key}")),
             principal_fingerprint: principal(1),
+            principal_expires_at: None,
             at: at(3),
         })
         .await
@@ -1633,6 +1634,7 @@ async fn command_ids_conflict_across_control_core_and_attachment_paths() {
                 candidate,
                 connection_id: ConnectionId::from_string("collision-connection"),
                 principal_fingerprint: principal(1),
+                principal_expires_at: None,
                 at: at(3),
             })
             .await,

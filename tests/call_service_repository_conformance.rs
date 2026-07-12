@@ -153,6 +153,148 @@ fn sip_webrtc_create(
     )
 }
 
+fn raw_attachment_create(
+    owner: TenantId,
+    worker: WorkerLease,
+    seed: u8,
+    created_at: DateTime<Utc>,
+    attachment_expires_at: DateTime<Utc>,
+) -> (CreateCall, AttachmentTokenDigest, LegId) {
+    let initial = CallAggregate::new(
+        owner,
+        [
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::Sip,
+            },
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::InteractiveWebRtc,
+            },
+        ],
+        created_at,
+    );
+    let inbound_leg = initial.legs()[0].id();
+    let token_digest = AttachmentTokenDigest::new(digest(seed));
+    let command_at = created_at + chrono::Duration::seconds(1);
+    (
+        CreateCall {
+            initial,
+            command_id: CommandId::new(),
+            command: CallCommand::StartConnecting {
+                at: command_at,
+                setup_deadline: command_at + chrono::Duration::seconds(30),
+            },
+            worker,
+            idempotency_key: IdempotencyKeyDigest::new(digest(seed.wrapping_add(1))),
+            request_digest: RequestDigest::new(digest(seed.wrapping_add(2))),
+            attachments: vec![AttachmentIssue {
+                attachment_id: AttachmentId::new(),
+                token_digest,
+                leg_id: inbound_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                transport: AttachmentTransport::Sip,
+                expected_principal: principal(1),
+                expires_at: attachment_expires_at,
+            }],
+            at: command_at,
+        },
+        token_digest,
+        inbound_leg,
+    )
+}
+
+async fn assert_database_authoritative_attachment_expiry<R>(
+    repository: &R,
+    database_now: DateTime<Utc>,
+) where
+    R: CallRepository + Sync,
+{
+    let worker = register(repository, 2).await;
+    let logical_now = database_now - chrono::Duration::seconds(60);
+
+    let owner = tenant("database-authority-principal");
+    let (create, token_digest, inbound_leg) = raw_attachment_create(
+        owner.clone(),
+        worker,
+        210,
+        logical_now,
+        database_now + chrono::Duration::seconds(60),
+    );
+    repository.create_call(create).await.unwrap();
+    let lookup = AttachmentLookup {
+        token_digest,
+        tenant_id: owner,
+        transport: AttachmentTransport::Sip,
+        principal_fingerprint: principal(1),
+        worker,
+        at: logical_now + chrono::Duration::seconds(2),
+    };
+    let candidate = repository.inspect_attachment(lookup.clone()).await.unwrap();
+    assert_eq!(
+        repository
+            .consume_attachment(AttachmentConsume {
+                candidate: candidate.clone(),
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: lookup.at,
+                    leg_id: inbound_leg,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: ConnectionId::from_string("database-authority-expired-principal"),
+                principal_fingerprint: principal(1),
+                principal_expires_at: Some(database_now - chrono::Duration::seconds(1)),
+                at: lookup.at,
+            })
+            .await,
+        Err(RepositoryError::AttachmentRejected)
+    );
+    repository.inspect_attachment(lookup.clone()).await.unwrap();
+    repository
+        .consume_attachment(AttachmentConsume {
+            candidate,
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: lookup.at,
+                leg_id: inbound_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                state: LegState::Signaling,
+                failure: None,
+            },
+            connection_id: ConnectionId::from_string("database-authority-valid-principal"),
+            principal_fingerprint: principal(1),
+            principal_expires_at: None,
+            at: lookup.at,
+        })
+        .await
+        .unwrap();
+
+    let owner = tenant("database-authority-token");
+    let (create, expired_token_digest, _) = raw_attachment_create(
+        owner.clone(),
+        worker,
+        220,
+        logical_now,
+        database_now - chrono::Duration::seconds(1),
+    );
+    repository.create_call(create).await.unwrap();
+    assert!(matches!(
+        repository
+            .inspect_attachment(AttachmentLookup {
+                token_digest: expired_token_digest,
+                tenant_id: owner,
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: principal(1),
+                worker,
+                at: logical_now + chrono::Duration::seconds(2),
+            })
+            .await,
+        Err(RepositoryError::AttachmentRejected)
+    ));
+}
+
 fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCreateTransaction {
     let initial = CallAggregate::new(
         owner,
@@ -308,6 +450,7 @@ where
             candidate,
             connection_id: ConnectionId::from_string("service-inbound"),
             principal_fingerprint: principal(1),
+            principal_expires_at: None,
             at: at(3),
         })
         .await
@@ -1141,6 +1284,55 @@ async fn memory_service_repository_conformance() {
     let effect_id = view.effect.effect_id;
     assert_reused_key_restart(&repository, request, view).await;
     assert_control_retirement_receipt(&repository, &evidence, effect_id).await;
+}
+
+#[tokio::test]
+async fn sqlite_attachment_expiry_uses_database_authority() {
+    let (url, path) = sqlite_database("attachment-authority");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let database_now =
+        sqlx::query_scalar::<_, String>("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    let database_now = DateTime::parse_from_rfc3339(&database_now)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_database_authoritative_attachment_expiry(&repository, database_now).await;
+    repository.pool().close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_attachment_expiry_uses_database_authority() {
+    let Some(url) = std::env::var("BRIDGEFU_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("bridgefu_attachment_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let repository = PostgresRepository::connect(scoped.as_str()).await.unwrap();
+    let database_now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+    assert_database_authoritative_attachment_expiry(&repository, database_now).await;
+    repository.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
 }
 
 #[tokio::test]

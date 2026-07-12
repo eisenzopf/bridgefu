@@ -556,7 +556,8 @@ impl CallService {
     /// [`InboundAttachmentError::ProofRejected`]. Only a true repository
     /// availability failure remains distinguishable. The complete rvoip
     /// principal is validated before the first await, then its expiry and the
-    /// candidate token expiry are observed again after inspection and before
+    /// candidate token expiry are observed again after inspection. Their
+    /// absolute deadlines are also enforced against authoritative time inside
     /// the atomic binding transaction.
     pub async fn consume_inbound_attachment(
         &self,
@@ -614,6 +615,7 @@ impl CallService {
                 },
                 connection_id: request.connection_id.clone(),
                 principal_fingerprint,
+                principal_expires_at: principal.authenticated().expires_at,
                 at: consume_at,
             })
             .await
@@ -1499,20 +1501,28 @@ mod tests {
     #[derive(Debug)]
     struct BlockingAttachmentRepository {
         inner: Arc<MemoryRepository>,
+        clock: Arc<TestClock>,
         block_next_inspection: AtomicBool,
+        block_next_consumption: AtomicBool,
         unavailable: AtomicBool,
-        entered: tokio::sync::Notify,
-        release: tokio::sync::Notify,
+        inspection_entered: tokio::sync::Notify,
+        inspection_release: tokio::sync::Notify,
+        consumption_entered: tokio::sync::Notify,
+        consumption_release: tokio::sync::Notify,
     }
 
     impl BlockingAttachmentRepository {
-        fn new(inner: Arc<MemoryRepository>) -> Self {
+        fn new(inner: Arc<MemoryRepository>, clock: Arc<TestClock>) -> Self {
             Self {
                 inner,
+                clock,
                 block_next_inspection: AtomicBool::new(false),
+                block_next_consumption: AtomicBool::new(false),
                 unavailable: AtomicBool::new(false),
-                entered: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
+                inspection_entered: tokio::sync::Notify::new(),
+                inspection_release: tokio::sync::Notify::new(),
+                consumption_entered: tokio::sync::Notify::new(),
+                consumption_release: tokio::sync::Notify::new(),
             }
         }
 
@@ -1521,11 +1531,23 @@ mod tests {
         }
 
         async fn wait_until_inspection(&self) {
-            self.entered.notified().await;
+            self.inspection_entered.notified().await;
         }
 
         fn release_inspection(&self) {
-            self.release.notify_one();
+            self.inspection_release.notify_one();
+        }
+
+        fn block_next_consumption(&self) {
+            self.block_next_consumption.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_consumption(&self) {
+            self.consumption_entered.notified().await;
+        }
+
+        fn release_consumption(&self) {
+            self.consumption_release.notify_one();
         }
 
         fn set_unavailable(&self, unavailable: bool) {
@@ -1543,8 +1565,8 @@ mod tests {
                 return Err(RepositoryError::Unavailable);
             }
             if self.block_next_inspection.swap(false, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.inspection_entered.notify_one();
+                self.inspection_release.notified().await;
             }
             self.inner.inspect_inbound_attachment(request).await
         }
@@ -1553,6 +1575,18 @@ mod tests {
             &self,
             request: AttachmentConsume,
         ) -> Result<ConsumedAttachment, RepositoryError> {
+            if self.block_next_consumption.swap(false, Ordering::SeqCst) {
+                self.consumption_entered.notify_one();
+                self.consumption_release.notified().await;
+            }
+            let authorization_at = self.clock.now();
+            if request.candidate.expires_at() <= authorization_at
+                || request
+                    .principal_expires_at
+                    .is_some_and(|expires_at| expires_at <= authorization_at)
+            {
+                return Err(RepositoryError::AttachmentRejected);
+            }
             self.inner.consume_inbound_attachment(request).await
         }
 
@@ -1823,6 +1857,7 @@ mod tests {
                     },
                     connection_id: ConnectionId::new(),
                     principal_fingerprint: service.crypto.principal_fingerprint(owner),
+                    principal_expires_at: None,
                     at: observed_at,
                 })
                 .await
@@ -2219,6 +2254,7 @@ mod tests {
                 },
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: service.crypto.principal_fingerprint(&owner),
+                principal_expires_at: None,
                 at: at(1),
             })
             .await
@@ -2445,7 +2481,7 @@ mod tests {
         let (_, _, token_expiring, token_expires_at) =
             take_first_attachment(&mut token_expiry_call);
 
-        let blocking = Arc::new(BlockingAttachmentRepository::new(repository));
+        let blocking = Arc::new(BlockingAttachmentRepository::new(repository, clock.clone()));
         let service = Arc::new(CallService::new(
             blocking.clone(),
             Arc::new(FixedWorkerPlacement::new(worker)),
@@ -2521,6 +2557,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_attachment_rejects_expiry_while_atomic_consumption_is_blocked() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 4,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let creator = CallService::new(
+            repository.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x73; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let owner = principal("tenant-a");
+        let mut principal_expiry_call = creator
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-atomic-principal-expiry").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let mut token_expiry_call = creator
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("service-atomic-token-expiry").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let (_, _, principal_token, _) = take_first_attachment(&mut principal_expiry_call);
+        let principal_retry_token = principal_token.clone();
+        let (_, _, token_expiring, token_expires_at) =
+            take_first_attachment(&mut token_expiry_call);
+        let blocking = Arc::new(BlockingAttachmentRepository::new(repository, clock.clone()));
+        let service = Arc::new(CallService::new(
+            blocking.clone(),
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(SamePrincipalAttachmentResolver),
+            CallServiceCrypto::new(vec![0x73; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        ));
+
+        clock.set(at(1));
+        blocking.block_next_consumption();
+        let principal_expiry_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        Some(at(2)),
+                        Some(principal_token),
+                        AttachmentTransport::Sip,
+                        worker,
+                        ConnectionId::new(),
+                    ))
+                    .await
+            })
+        };
+        blocking.wait_until_consumption().await;
+        clock.set(at(2));
+        blocking.release_consumption();
+        assert_eq!(
+            principal_expiry_task.await.unwrap(),
+            Err(InboundAttachmentError::ProofRejected)
+        );
+        service
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(principal_retry_token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .unwrap();
+
+        clock.set(token_expires_at - chrono::Duration::seconds(1));
+        blocking.block_next_consumption();
+        let token_expiry_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .consume_inbound_attachment(inbound_request(
+                        "tenant-a",
+                        "subject-tenant-a",
+                        None,
+                        Some(token_expiring),
+                        AttachmentTransport::Sip,
+                        worker,
+                        ConnectionId::new(),
+                    ))
+                    .await
+            })
+        };
+        blocking.wait_until_consumption().await;
+        clock.set(token_expires_at);
+        blocking.release_consumption();
+        assert_eq!(
+            token_expiry_task.await.unwrap(),
+            Err(InboundAttachmentError::ProofRejected)
+        );
+    }
+
+    #[tokio::test]
     async fn inbound_attachment_exposes_only_true_repository_unavailability() {
         let repository = Arc::new(MemoryRepository::new());
         let clock = Arc::new(TestClock::new(at(0)));
@@ -2553,7 +2708,7 @@ mod tests {
             .unwrap();
         let (_, _, token, _) = take_first_attachment(&mut created);
         let retry_token = token.clone();
-        let blocking = Arc::new(BlockingAttachmentRepository::new(repository));
+        let blocking = Arc::new(BlockingAttachmentRepository::new(repository, clock.clone()));
         let service = CallService::new(
             blocking.clone(),
             Arc::new(FixedWorkerPlacement::new(worker)),
@@ -2985,6 +3140,7 @@ mod tests {
                 },
                 connection_id: ConnectionId::new(),
                 principal_fingerprint: service.crypto.principal_fingerprint(&owner),
+                principal_expires_at: None,
                 at: at(1),
             })
             .await
