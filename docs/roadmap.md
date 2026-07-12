@@ -177,11 +177,9 @@ Gate 3 evidence recorded on 2026-07-11:
 Exit: auth-negative, cross-tenant, replay, expiry, cap, and leak tests pass on
 every supported substrate.
 
-### Gate 4 — Release UCTP 0.2 (`pending`)
+### Gate 4 — Release UCTP 0.2 (`in progress`)
 
 - [ ] Finalize the eight-byte UCTP header followed by a complete RTP packet.
-- [ ] Add golden byte vectors and packet-capture conformance tests.
-- [ ] Version UCTP, QUIC, and WebTransport crates as 0.2.
 - [ ] Route simultaneous sessions on one QUIC/WebTransport peer by an
   authenticated core-session mapping and peer-global stream-local-ID
   allocation; remove the first-session reader context and first-route lookup.
@@ -191,6 +189,9 @@ every supported substrate.
   session packet tests.
 - [ ] Register MediaGraph virtual publishers through the existing Orchestrator
   publisher/subscriber path and authorize real network listeners.
+- [ ] Add golden byte vectors and packet-capture conformance tests.
+- [ ] Version UCTP, QUIC, and WebTransport crates as 0.2 only after the wire,
+  routing, listener, and compatibility suites pass.
 
 Exit: authenticated QUIC and WebTransport listeners receive media and the 0.2
 wire suite passes.
