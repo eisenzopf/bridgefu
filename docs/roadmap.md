@@ -338,7 +338,7 @@ hint for SIP and WebRTC connections.
    IDs, exact call and leg states, directions, typed leg kinds, UTC deadlines,
    binding generations, sanitized failures, transition invariants, and
    serializable effect intents. Keep the frozen Amazon runtime untouched.
-3. [ ] Add high-level atomic repository contracts and a memory implementation
+3. [x] Add high-level atomic repository contracts and a memory implementation
    covering capacity reservation, tenant-scoped load, optimistic command/outbox
    commit, attachment consumption, provider-event deduplication, deadlines,
    and restart claims. Use one lock across all memory indexes so tests exercise
@@ -392,6 +392,21 @@ Gate 6 progress evidence recorded on 2026-07-12:
   tests. It covers interleaving, queue saturation, fast-auto-accept cleanup,
   principal expiry, tenantless principals, reserved-header denial, and
   cross-principal update/delete isolation.
+- Bridgefu revisions `952a01adcf41a2bc2c73a4999521876533bfb87d`,
+  `c758981fd4726810fdec3135eb730c9bf082c471`, and
+  `ad3dbec819335d5afb82425125af94769a009384` add the backend-neutral atomic
+  repository contract and one-lock memory backend, then close all independent
+  review findings. Durable intents cover worker capacity and fencing,
+  tenant-scoped idempotency, optimistic commands, ordered outbox work,
+  attachment consumption, provider receipt/claim/completion, deadlines, and
+  restart recovery.
+- Repository qualification passes 28 focused tests, including 64-way
+  idempotency, N+1 admission, concurrent CAS and outbox races, interleaved
+  attachments, wrong-leg provider rollback, callback-before-reference ordering,
+  exact lost-response replay, terminal callback recovery, permanent connection
+  ID tombstones, and capacity-safe terminal cleanup. The complete locked suite
+  passes 49 library, 20 binary, and 14 StandardCharter tests; strict library
+  Clippy and warning-free library rustdoc pass.
 
 Gate 6 qualification must include interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
