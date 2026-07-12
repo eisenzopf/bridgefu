@@ -953,6 +953,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rvoip-amazon-connect",
+ "rvoip-auth-core",
  "rvoip-core",
  "rvoip-moq",
  "rvoip-quic",
@@ -973,6 +974,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

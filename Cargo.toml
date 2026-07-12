@@ -12,6 +12,7 @@ publish = false
 # (rvoip-core / -sip / -media-core), currently the 0.2.5 beta train.
 # 0.1.3 adds the per-call router hook (multi-tenant SIP-URI routing, §8.1).
 rvoip-amazon-connect = { path = "../rvoip/crates/webrtc/rvoip-amazon-connect", version = "0.1.3", features = ["server", "aws-control"] }
+rvoip-auth-core = { path = "../rvoip/crates/identity/auth-core", version = "0.2.5" }
 rvoip-core = { path = "../rvoip/crates/foundation/rvoip-core", version = "0.2.5" }
 rvoip-moq = { path = "../rvoip/crates/moq/rvoip-moq", version = "0.1.0" }
 rvoip-quic = { path = "../rvoip/crates/uctp/rvoip-quic", version = "0.2.0" }
@@ -43,6 +44,7 @@ thiserror = "1"
 subtle = "2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 

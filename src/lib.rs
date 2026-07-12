@@ -4,5 +4,6 @@
 //! free of process-global state so they can also be used by workers, gateways,
 //! tests, and administrative tools.
 
+pub mod api_principal;
 pub mod call_engine;
 pub mod persistence;
