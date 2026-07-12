@@ -18,3 +18,11 @@ names such as `twilio-sandbox` when configuration is promoted between
 environments. Credential identifiers carried by signed callbacks must match
 the configured provider credentials before the event can enter durable call
 reconciliation.
+
+Twilio status callbacks use `CallSid`, canonicalized `SequenceNumber`, and
+`CallStatus` in the durable event identity. When Twilio omits
+`SequenceNumber`, Bridgefu uses an explicit `no-sequence` identity: exact
+redelivery of the same call/status deduplicates, while different statuses stay
+distinct. Missing or malformed statuses and sequence values are rejected.
+Telnyx callbacks require a nonblank signed `data.id`; no provider normalizer
+persists an `unknown` sentinel.

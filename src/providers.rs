@@ -21,6 +21,10 @@ use bridgefu::call_service::{ProviderEndpointConfig, ProviderKind};
 
 type HmacSha1 = Hmac<Sha1>;
 
+const MAX_PROVIDER_EVENT_ID_BYTES: usize = 512;
+const MAX_PROVIDER_EVENT_KIND_BYTES: usize = 128;
+const MAX_TWILIO_SEQUENCE_DIGITS: usize = 20;
+
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct SecretRef(String);
@@ -467,21 +471,38 @@ impl ProviderControl for TwilioProvider {
             &["AccountSid", "account_sid"],
             &self.config.account_sid,
         )?;
-        let call_id = raw
-            .get("CallSid")
-            .or_else(|| raw.get("call_sid"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let event_type = raw
-            .get("CallStatus")
-            .or_else(|| raw.get("call_status"))
-            .and_then(Value::as_str)
-            .unwrap_or("callback")
-            .to_string();
+        let call_id = required_webhook_string(
+            &raw,
+            &["CallSid", "call_sid"],
+            "CallSid",
+            MAX_PROVIDER_EVENT_ID_BYTES,
+        )?;
+        let event_type = required_webhook_string(
+            &raw,
+            &["CallStatus", "call_status"],
+            "CallStatus",
+            MAX_PROVIDER_EVENT_KIND_BYTES,
+        )?;
+        if event_type.eq_ignore_ascii_case("callback") {
+            return Err(ProviderError::InvalidWebhookField("CallStatus"));
+        }
+        let sequence = optional_twilio_sequence(&raw)?;
+        // Twilio documents SequenceNumber for status callbacks, but older or
+        // customized callback producers can omit it. The explicit fallback is
+        // deterministic: repeated sequence-less delivery of one call/status
+        // deduplicates, while different statuses remain distinct.
+        let event_id = match sequence {
+            Some(sequence) => {
+                format!("twilio-status-v1:{call_id}:sequence:{sequence}:{event_type}")
+            }
+            None => format!("twilio-status-v1:{call_id}:no-sequence:{event_type}"),
+        };
+        let event_id =
+            validated_webhook_string(&event_id, "durable event ID", MAX_PROVIDER_EVENT_ID_BYTES)?;
         Ok(NormalizedProviderEvent {
             provider: self.name().into(),
-            event_id: format!("{}:{}", call_id.as_deref().unwrap_or("unknown"), event_type),
-            provider_call_id: call_id,
+            event_id,
+            provider_call_id: Some(call_id),
             event_type,
             occurred_at: raw
                 .get("Timestamp")
@@ -616,22 +637,25 @@ impl ProviderControl for TelnyxProvider {
         let data = raw.get("data").unwrap_or(&raw);
         let payload = data.get("payload").unwrap_or(data);
         validate_payload_credential(payload, &["connection_id"], &self.config.connection_id)?;
+        let event_id =
+            required_webhook_string(data, &["id"], "data.id", MAX_PROVIDER_EVENT_ID_BYTES)?;
+        let provider_call_id = required_webhook_string(
+            payload,
+            &["call_control_id"],
+            "data.payload.call_control_id",
+            MAX_PROVIDER_EVENT_ID_BYTES,
+        )?;
+        let event_type = required_webhook_string(
+            data,
+            &["event_type"],
+            "data.event_type",
+            MAX_PROVIDER_EVENT_KIND_BYTES,
+        )?;
         Ok(NormalizedProviderEvent {
             provider: self.name().into(),
-            event_id: data
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .into(),
-            provider_call_id: payload
-                .get("call_control_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            event_type: data
-                .get("event_type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .into(),
+            event_id,
+            provider_call_id: Some(provider_call_id),
+            event_type,
             occurred_at: data
                 .get("occurred_at")
                 .and_then(Value::as_str)
@@ -792,16 +816,16 @@ impl ProviderControl for VonageProvider {
         }
         let raw = request.json()?;
         validate_payload_credential(&raw, &["application_id"], &self.config.application_id)?;
-        let call_id = raw.get("uuid").and_then(Value::as_str).map(str::to_string);
-        let event_type = raw
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("callback")
-            .to_string();
+        let event_id =
+            validated_webhook_string(&claims.jti, "JWT jti", MAX_PROVIDER_EVENT_ID_BYTES)?;
+        let call_id =
+            required_webhook_string(&raw, &["uuid"], "uuid", MAX_PROVIDER_EVENT_ID_BYTES)?;
+        let event_type =
+            required_webhook_string(&raw, &["status"], "status", MAX_PROVIDER_EVENT_KIND_BYTES)?;
         Ok(NormalizedProviderEvent {
             provider: self.name().into(),
-            event_id: claims.jti,
-            provider_call_id: call_id,
+            event_id,
+            provider_call_id: Some(call_id),
             event_type,
             occurred_at: raw
                 .get("timestamp")
@@ -910,6 +934,65 @@ fn validate_payload_credential(
     Ok(())
 }
 
+fn required_webhook_string(
+    payload: &Value,
+    fields: &[&str],
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<String, ProviderError> {
+    let value = fields
+        .iter()
+        .find_map(|field| payload.get(field))
+        .and_then(Value::as_str)
+        .ok_or(ProviderError::InvalidWebhookField(label))?;
+    validated_webhook_string(value, label, max_bytes)
+}
+
+fn validated_webhook_string(
+    value: &str,
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<String, ProviderError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        Err(ProviderError::InvalidWebhookField(label))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn optional_twilio_sequence(payload: &Value) -> Result<Option<String>, ProviderError> {
+    let Some(value) = payload
+        .get("SequenceNumber")
+        .or_else(|| payload.get("sequence_number"))
+    else {
+        return Ok(None);
+    };
+    let digits = match value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value
+            .as_u64()
+            .map(|value| value.to_string())
+            .ok_or(ProviderError::InvalidWebhookField("SequenceNumber"))?,
+        _ => return Err(ProviderError::InvalidWebhookField("SequenceNumber")),
+    };
+    if digits.is_empty()
+        || digits.len() > MAX_TWILIO_SEQUENCE_DIGITS
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ProviderError::InvalidWebhookField("SequenceNumber"));
+    }
+    let canonical = digits.trim_start_matches('0');
+    Ok(Some(if canonical.is_empty() {
+        "0".into()
+    } else {
+        canonical.into()
+    }))
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -932,6 +1015,8 @@ pub enum ProviderError {
     MissingField(&'static str),
     #[error("invalid provider webhook signature")]
     InvalidSignature,
+    #[error("provider webhook field {0} is missing or invalid")]
+    InvalidWebhookField(&'static str),
     #[error("provider account profile does not match the requested provider leg")]
     AccountProfileMismatch,
     #[error("provider operation is not supported")]
@@ -941,6 +1026,7 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::KeyPair;
 
     fn twilio_config(account_profile: &str) -> TwilioConfig {
         TwilioConfig {
@@ -951,13 +1037,22 @@ mod tests {
         }
     }
 
-    fn signed_twilio_webhook(account_sid: &str) -> WebhookRequest {
+    fn signed_twilio_webhook(
+        account_sid: &str,
+        status: Option<&str>,
+        sequence: Option<&str>,
+    ) -> WebhookRequest {
         let url = "https://bridgefu.test/v1/providers/twilio/webhooks";
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("AccountSid", account_sid)
-            .append_pair("CallSid", "CA-call")
-            .append_pair("CallStatus", "completed")
-            .finish();
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.append_pair("AccountSid", account_sid);
+        body.append_pair("CallSid", "CA-call");
+        if let Some(status) = status {
+            body.append_pair("CallStatus", status);
+        }
+        if let Some(sequence) = sequence {
+            body.append_pair("SequenceNumber", sequence);
+        }
+        let body = body.finish();
         let mut params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
             .into_owned()
             .collect();
@@ -977,6 +1072,38 @@ mod tests {
             content_type: "application/x-www-form-urlencoded".into(),
             body: body.into_bytes(),
         }
+    }
+
+    fn signed_telnyx_webhook(data: Value) -> (TelnyxProvider, WebhookRequest) {
+        let random = ring::rand::SystemRandom::new();
+        let encoded = ring::signature::Ed25519KeyPair::generate_pkcs8(&random).unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(encoded.as_ref()).unwrap();
+        let provider = TelnyxProvider::new(TelnyxConfig {
+            account_profile: "telnyx-sandbox".into(),
+            api_key: SecretRef("secret".into()),
+            connection_id: "connection-a".into(),
+            webhook_public_key: SecretRef(
+                base64::engine::general_purpose::STANDARD.encode(key_pair.public_key().as_ref()),
+            ),
+            base_url: telnyx_base_url(),
+        })
+        .unwrap();
+        let body = serde_json::to_vec(&json!({"data": data})).unwrap();
+        let timestamp = unix_seconds().to_string();
+        let mut signed = timestamp.as_bytes().to_vec();
+        signed.push(b'|');
+        signed.extend_from_slice(&body);
+        let signature = base64::engine::general_purpose::STANDARD.encode(key_pair.sign(&signed));
+        let request = WebhookRequest {
+            url: "https://bridgefu.test/v1/providers/telnyx/webhooks".into(),
+            headers: BTreeMap::from([
+                ("Telnyx-Signature-Ed25519".into(), signature),
+                ("Telnyx-Timestamp".into(), timestamp),
+            ]),
+            content_type: "application/json".into(),
+            body,
+        };
+        (provider, request)
     }
 
     #[test]
@@ -1118,13 +1245,129 @@ vonage:
     fn signed_twilio_webhook_rejects_a_credential_account_mismatch() {
         let provider = TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap();
         let accepted = provider
-            .verify_webhook(&signed_twilio_webhook("AC-account"))
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("completed"),
+                Some("7"),
+            ))
             .unwrap();
         assert_eq!(accepted.provider_call_id.as_deref(), Some("CA-call"));
 
         assert!(matches!(
-            provider.verify_webhook(&signed_twilio_webhook("AC-other-account")),
+            provider.verify_webhook(&signed_twilio_webhook(
+                "AC-other-account",
+                Some("completed"),
+                Some("7"),
+            )),
             Err(ProviderError::InvalidSignature)
         ));
+    }
+
+    #[test]
+    fn twilio_status_event_ids_dedupe_exact_replays_and_separate_sequences() {
+        let provider = TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap();
+        let sequence_seven = provider
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("in-progress"),
+                Some("7"),
+            ))
+            .unwrap();
+        let exact_replay = provider
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("in-progress"),
+                Some("7"),
+            ))
+            .unwrap();
+        let sequence_eight = provider
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("in-progress"),
+                Some("8"),
+            ))
+            .unwrap();
+        assert_eq!(sequence_seven.event_id, exact_replay.event_id);
+        assert_ne!(sequence_seven.event_id, sequence_eight.event_id);
+        assert!(sequence_seven.event_id.contains(":sequence:7:"));
+
+        let fallback = provider
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("completed"),
+                None,
+            ))
+            .unwrap();
+        let fallback_replay = provider
+            .verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("completed"),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(fallback.event_id, fallback_replay.event_id);
+        assert!(fallback.event_id.contains(":no-sequence:completed"));
+    }
+
+    #[test]
+    fn twilio_status_callbacks_require_status_and_bounded_digit_sequences() {
+        let provider = TwilioProvider::new(twilio_config("twilio-sandbox")).unwrap();
+        assert!(matches!(
+            provider.verify_webhook(&signed_twilio_webhook("AC-account", None, Some("1"),)),
+            Err(ProviderError::InvalidWebhookField("CallStatus"))
+        ));
+        assert!(matches!(
+            provider.verify_webhook(&signed_twilio_webhook(
+                "AC-account",
+                Some("callback"),
+                Some("1"),
+            )),
+            Err(ProviderError::InvalidWebhookField("CallStatus"))
+        ));
+        for sequence in ["", "not-digits", "123456789012345678901"] {
+            assert!(matches!(
+                provider.verify_webhook(&signed_twilio_webhook(
+                    "AC-account",
+                    Some("completed"),
+                    Some(sequence),
+                )),
+                Err(ProviderError::InvalidWebhookField("SequenceNumber"))
+            ));
+        }
+    }
+
+    #[test]
+    fn telnyx_verified_callbacks_reject_missing_or_blank_event_ids() {
+        let valid_data = json!({
+            "id": "event-a",
+            "event_type": "call.answered",
+            "payload": {
+                "call_control_id": "call-control-a",
+                "connection_id": "connection-a"
+            }
+        });
+        let (provider, request) = signed_telnyx_webhook(valid_data.clone());
+        assert_eq!(
+            provider.verify_webhook(&request).unwrap().event_id,
+            "event-a"
+        );
+
+        for invalid in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("  ".into()),
+        ] {
+            let mut data = valid_data.clone();
+            if invalid.is_null() {
+                data.as_object_mut().unwrap().remove("id");
+            } else {
+                data["id"] = invalid;
+            }
+            let (provider, request) = signed_telnyx_webhook(data);
+            assert!(matches!(
+                provider.verify_webhook(&request),
+                Err(ProviderError::InvalidWebhookField("data.id"))
+            ));
+        }
     }
 }
