@@ -825,18 +825,19 @@ moves Amazon behind the common engine.
 Exit: state/repository tests pass and unrelated concurrent calls cannot
 cross-connect.
 
-### Gate 7 — Complete SIP/WebRTC and Amazon paths (`pending`)
+### Gate 7 — Complete SIP/WebRTC and Amazon paths (`in progress`)
 
 The 2026-07-12 interface audit established the following implementation order.
 These prerequisites are intentionally sequential: later call-engine work must
 not hide an earlier adapter side effect behind a nominally staged API.
 
-1. [ ] Extend rvoip origination with an opaque, typed, and redaction-safe
+1. [x] Extend rvoip origination with an opaque, typed, and redaction-safe
    adapter context plus stable activation and external-connection references.
-   Define transport-owned `SipOriginateContext`, `WebRtcOriginateContext`, and
-   `AmazonConnectOriginateContext` values behind the core request seam without
-   exposing transport types through Bridgefu's durable domain. Context secrets
-   must never appear in logs, diagnostics, equality output, or metrics.
+   Concrete transport-owned `SipOriginateContext`, `WebRtcOriginateContext`,
+   and `AmazonConnectOriginateContext` values are delivered by items 2, 3, and
+   5 behind this core seam, without exposing transport types through
+   Bridgefu's durable domain. Context secrets must never appear in logs,
+   diagnostics, equality output, or metrics.
 2. [ ] Make SIP origination genuinely dormant. `prepare_outbound` may reserve
    bounded in-process identifiers, routes, and capacity, but it must perform no
    coordinator call, DNS lookup, socket connection, RTP allocation, timer
@@ -929,6 +930,24 @@ only by a minimal failing engine conformance test (directional RTP,
 rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
 such patch remains on an exact reviewed revision; no upstream issue or pull
 request is created before owner review.
+
+Gate 7 progress evidence recorded on 2026-07-12:
+
+- rvoip revision `ff248a243dfa9c6db0a79e09e9505f4dc8b1a685` completes
+  item 1. `OriginateContext`, bounded redacted external references, activation
+  receipts, request builders, and the compatibility activation hook are owned
+  by core. Provisional receipts are cleared and the final receipt is exposed
+  only after activation, route/lifecycle/session liveness, authoritative-event
+  health, and prepared-supervisor completion. Both prepared and legacy paths
+  fail closed and compensate if authority is lost while activation is awaited.
+- rvoip-core-traits passes 16 tests; rvoip-core passes 77 library and 79
+  orchestrator-dispatch tests plus its remaining integration and doctest
+  suites. Split all-target workspace checks, the comprehensive WebRTC feature
+  check, strict core Clippy and rustdoc, rustfmt, and diff checks pass. An
+  independent P0/P1 audit found and verified the legacy event-health race fix,
+  then reported no remaining release blocker. The two unsplit workspace check
+  failures are pre-existing feature-configuration defects outside this change
+  and are recorded for Gate 7 cleanup rather than represented as new evidence.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
