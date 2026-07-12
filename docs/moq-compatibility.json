@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "auditedAt": "2026-07-11",
+  "auditedAt": "2026-07-12",
   "standards": {
     "transport": {
       "name": "draft-ietf-moq-transport",
@@ -22,30 +22,44 @@
     "upstream": "cloudflare/moq-rs",
     "fork": "eisenzopf/moq-rs",
     "portBaseRevision": "c7e80e49f4189efd1e55e2533eab36adf0e8f4b4",
-    "reviewedForkRevision": "612cc6fe4550a02092c932c3bdfbe4da8fed8694",
-    "status": "draft-19-request-data-publish-retention-and-secure-relay-checkpoint"
+    "reviewedForkRevision": "ef52ac8656513bb3b07b4b9b80152ac24bb2467e",
+    "status": "draft-19-wire-retention-discovery-and-least-privilege-relay"
   },
   "rvoipIntegration": {
-    "revision": "a3eed0d730502093384a90680d15f0e64665f9f6",
-    "wireRevision": "612cc6fe4550a02092c932c3bdfbe4da8fed8694",
-    "status": "opaque-peer-identity-and-explicit-publication-acceptance-integrated"
+    "revision": "7d83b66545789d55471c13a7c68eb54a9493cc0a",
+    "wireRevision": "ef52ac8656513bb3b07b4b9b80152ac24bb2467e",
+    "status": "managed-origin-browser-and-external-relay-qualified"
   },
   "gate5": {
-    "status": "in-progress",
-    "remaining": [
-      "complete enforced logical retained-state bounds, cleanup, and eviction or backpressure",
-      "complete the FETCH state machine and hand objects off from the bounded retention cache",
-      "use one stream per MSF object and complete catalog publication semantics",
-      "add rvoip SessionAdmission and await replay-tombstone persistence before successful admission",
-      "authorize production token subscribers and pass a real-browser WebTransport end-to-end test",
-      "complete raw-QUIC and WebTransport relay traversal and pass interoperability against an independent draft-19 implementation"
+    "status": "complete",
+    "evidence": [
+      "bounded draft-19 wire, retained Joining FETCH, namespace discovery, and exact protocol rejection",
+      "rvoip-owned LOC Opus, MSF catalog, sanitized event timeline, authorization, replay, lifecycle, health, and drain",
+      "managed raw-QUIC and WebTransport relay traversal plus standalone two-topology mTLS relay chaining",
+      "real browser WebTransport authentication and MSF-01 catalog parsing",
+      "packet capture with moqt-19 and h3 ALPN handshakes",
+      "independent moq-dev draft-19 WebTransport namespace, subscription, and live-object interoperability"
+    ],
+    "knownLimitations": [
+      "dynamic standalone-relay routes are process-local until Gate 10 distributes them through the clustered control plane",
+      "the audited independent peer does not expose conforming native PATH/AUTHORITY or retained FETCH in its current high-level client"
     ],
     "upstreamContact": "none-pending-user-review"
   },
   "independentInterop": {
-    "implementation": "facebookexperimental/moxygen",
-    "auditedRevision": "bdf5ac341f152d69e25eec753ef4fc77ba603b6a",
-    "maximumTransportRevision": "18",
-    "status": "awaiting-independent-draft-19-support"
+    "implementation": "moq-dev/moq",
+    "auditedRevision": "ea97ce44470e35a49f5f18acf8ad96daa37aabea",
+    "maximumTransportRevision": "19",
+    "status": "webtransport-namespace-subscribe-and-live-object-pass",
+    "limitations": [
+      "native client omits mandatory PATH/AUTHORITY",
+      "high-level subscriber does not expose retained FETCH",
+      "structured SETUP authorization requires the checked-in browser test adapter"
+    ],
+    "additionalAudit": {
+      "implementation": "facebookexperimental/moxygen",
+      "auditedRevision": "bdf5ac341f152d69e25eec753ef4fc77ba603b6a",
+      "maximumTransportRevision": "18"
+    }
   }
 }

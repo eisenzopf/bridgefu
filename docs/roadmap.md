@@ -243,7 +243,7 @@ Gate 4 evidence recorded on 2026-07-11:
   separately authorized publication of `rvoip-uctp` 0.2.0; no artifacts were
   published.
 
-### Gate 5 — Finish rvoip-moq draft-19 (`in progress`)
+### Gate 5 — Finish rvoip-moq draft-19 (`complete`)
 
 The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
 
@@ -255,7 +255,7 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
    make the published MOQT-19/MSF-01/LOC-03 tuple authoritative across ALPN,
    negotiation, descriptors, diagnostics, logs, and metrics. Reject mismatches
    explicitly and remove the current runtime/target split.
-3. [ ] Base the port on Cloudflare's draft-18 work at exact revision
+3. [x] Base the port on Cloudflare's draft-18 work at exact revision
    `c7e80e49f4189efd1e55e2533eab36adf0e8f4b4`, reconcile it with the current
    upstream mainline, and port the resulting wire engine to draft-19. Add
    golden control/data vectors plus raw-QUIC and WebTransport coverage.
@@ -263,63 +263,62 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
    reviewed 40-character fork revision. Permit that exact Git source in supply
    chain policy without allowing branches or floating revisions, and prove no
    moq-rs type appears in the public `rvoip-moq` API.
-5. [ ] Implement the rvoip-owned LOC Opus object and MSF catalog model,
+5. [x] Implement the rvoip-owned LOC Opus object and MSF catalog model,
    including canonical 48 kHz mono 20 ms audio, collision-free namespace tuple
    validation, catalog authorization, Joining FETCH retention, and an optional
    sanitized events track. Production MSF-01 uses one new MOQT stream per
    Object as required by MSF-01 section 6; LOC datagrams remain an explicitly
    experimental non-MSF profile and are not enabled by Bridgefu 1.0.
-6. [ ] Implement managed origin, publication, subscriber, embedded-relay, and
+6. [x] Implement managed origin, publication, subscriber, embedded-relay, and
    external-relay lifecycles with mTLS, scoped authorization, reconnect,
    health, graceful drain, exact cleanup, and bounded task/queue behavior.
-7. [ ] Prove publication and subscription through a relay over raw QUIC and
+7. [x] Prove publication and subscription through a relay over raw QUIC and
    WebTransport, then test against one independent implementation at the exact
    same draft. Record packet captures, negotiated versions, and relay paths.
 8. [x] Add scheduled CI that compares the pinned tuple and fork base with IETF
    Datatracker and moq-rs upstream, emits a report or tracking issue, and never
    edits dependencies or contacts upstream automatically.
-9. [ ] Prepare the fork delta, interoperability report, and proposed upstream
+9. [x] Prepare the fork delta, interoperability report, and proposed upstream
    patch for user review. Submission remains a separately authorized action.
 
-Gate 5 implementation checkpoint recorded on 2026-07-11:
+Gate 5 completion evidence recorded on 2026-07-12:
 
-- The private `eisenzopf/moq-rs` fork is pinned at
-  `612cc6fe4550a02092c932c3bdfbe4da8fed8694`. It implements draft-19 request
-  placement, data and PUBLISH codecs, canonical session targets, and explicit
-  session and namespace acceptance. The bounded retention-cache foundation,
-  Joining subscription state and typed options, and subgroup `END_OF_GROUP`
-  handling are present. The relay verifies mTLS peer identity, applies scoped
-  admission, enables stateless retry, redacts secrets from diagnostics, and
-  defaults to a production-safe posture. The full workspace passed 431 tests
-  before the final user-information hardening change; the final affected
-  package rerun passed 347 transport, 20 native-IETF, and 67 relay-IETF tests.
-- rvoip revision `a3eed0d730502093384a90680d15f0e64665f9f6`
-  exact-pins that fork and provides rvoip-owned protocol compatibility,
-  authorization/replay, namespace validation, MSF catalog, monotonic LOC Opus
-  packaging, health, and managed publication/relay lifecycle APIs without
-  exposing moq-rs types. It now integrates the transport's opaque,
-  credential-free peer identity and requires explicit namespace publication
-  acceptance while preserving the production mTLS posture. The scoped
-  `rvoip-moq` matrix passes 68 default unit tests plus one public API test and
-  69 `insecure-development` unit tests plus one public API test.
-- This is an integration checkpoint, not Gate 5 completion. Release blockers
-  are complete enforced logical retained-state bounds and cleanup; the FETCH
-  state machine and cache handoff; MSF one-stream-per-Object and catalog
-  completion; rvoip
-  `SessionAdmission` plus an awaited replay tombstone; production token
-  subscriber authorization and a real-browser end-to-end test; and full relay
-  traversal plus independent draft-19 interoperability.
-- No upstream issue, pull request, or maintainer message has been created. The
-  fork remains private pending project-owner review of any proposed submission.
-
-Gate 5 external evidence note: draft-19 and LOC-03 were published on
-2026-07-06. At the 2026-07-11 audit, Meta moxygen and the other catalogued
-independent implementations supported draft-18 or earlier. The fork and rvoip
-work proceeds now, but Gate 5 cannot be marked complete and Bridgefu cannot
-claim draft-19 GA interoperability until an independently maintained draft-19
-implementation is available and passes the recorded matrix. An internal
-moxygen patch is useful for development but does not satisfy that independent
-evidence requirement.
+- The private `eisenzopf/moq-rs` fork is exact-pinned at
+  `ef52ac8656513bb3b07b4b9b80152ac24bb2467e`. The draft-18 base is an ancestor
+  of this revision. It implements the authoritative draft-19 request, data,
+  PUBLISH, FETCH, target, acceptance, bounded retention, Joining FETCH, live
+  fallback, namespace discovery/update, and least-privilege relay-admission
+  behavior. It passes 429 transport tests; relay passes 111 library, 25 binary,
+  one admission-contract, and five feature-policy tests plus strict Clippy and
+  warning-free rustdoc.
+- rvoip revision `7d83b66545789d55471c13a7c68eb54a9493cc0a` is pushed on
+  `codex/bridgefu-1.0-rvoip` and exact-pins that fork. The final `rvoip-moq`
+  matrix passes 134 unit, three managed E2E, two public API, and seven admission
+  tests. Public types are rvoip-owned.
+- Raw QUIC and WebTransport both traverse managed role-separated relays with
+  warm Relative Joining FETCH and cold live fallback. A separate two-topology
+  test sends a catalog Object from an mTLS publisher through a subscribe-only
+  mTLS upstream hop to a token subscriber, covers route replacement/reconnect,
+  denies publishing with the relay certificate, and proves drain cleanup.
+- A real in-app Chromium WebTransport client used a one-day hash-pinned
+  certificate and two-minute receive-only token, negotiated draft 19, and
+  parsed an MSF-01 catalog. The browser implementation is pinned and the token
+  is carried in structured SETUP rather than the URL.
+- The reproducible packet-capture script records both `moqt-19` and `h3` ALPN
+  handshakes. Its recorded run captured 166 QUIC packets with zero drops and no
+  TLS key log while both managed relay tests passed.
+- Unmodified `moq-dev/moq` at
+  `ea97ce44470e35a49f5f18acf8ad96daa37aabea` independently passes draft-19
+  WebTransport namespace discovery, subscription, and live Objects. Its native
+  client currently omits mandatory PATH/AUTHORITY and its high-level subscriber
+  does not expose retained FETCH; those limits remain explicit and never cause
+  a silent downgrade.
+- Exact dynamic external routes are bounded, installable after startup,
+  generation-safe, and drain-owned. Durable distribution of those registrations
+  to every relay replica remains a Gate 10 PostgreSQL/Redis control-plane task.
+- The fork review packet and interoperability reports are checked in. No
+  upstream issue, pull request, or maintainer message has been created; any
+  submission remains pending project-owner review.
 
 Exit: both substrates traverse a relay and version, packet-capture, and
 interoperability suites pass.

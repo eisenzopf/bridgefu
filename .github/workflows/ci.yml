@@ -22,7 +22,7 @@ jobs:
           # Coordinated Bridgefu 1.0 foundation revision. Update this only
           # after the matching rvoip change set is green and available on
           # the remote; never replace it with a floating branch.
-          ref: a3eed0d730502093384a90680d15f0e64665f9f6
+          ref: 7d83b66545789d55471c13a7c68eb54a9493cc0a
           path: rvoip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -60,6 +60,12 @@ jobs:
           --no-deps
           -- -D warnings
         working-directory: rvoip
+      - name: rvoip MOQT Gate 5 matrix
+        run: |
+          cargo test -p rvoip-moq --all-features -- --test-threads=1
+          cargo clippy -p rvoip-moq --all-targets --all-features -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p rvoip-moq --all-features --no-deps
+        working-directory: rvoip
       - name: rvoip peer lifecycle saturation test
         run: cargo test -p rvoip-websocket --test lifecycle_capacity
         working-directory: rvoip
@@ -89,7 +95,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: eisenzopf/rvoip
-          ref: a3eed0d730502093384a90680d15f0e64665f9f6
+          ref: 7d83b66545789d55471c13a7c68eb54a9493cc0a
           path: rvoip
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6

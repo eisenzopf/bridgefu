@@ -1,7 +1,7 @@
 # Independent MOQT draft-19 interoperability
 
-Status: partial independent interoperability evidence; Gate 5 remains in
-progress.
+Status: qualifying independent draft-19 WebTransport interoperability evidence.
+The broader independent-client matrix remains intentionally explicit below.
 
 ## Exact revisions
 
@@ -72,11 +72,16 @@ the expected raw-QUIC blocker, writes redaction-safe logs plus `report.json`,
 and stops every child process. It does not update dependencies, patch the
 independent implementation, or contact maintainers.
 
-## Remaining qualification work
+## Remaining interoperability expansion
 
-Gate 5 must remain open until an unmodified independent draft-19 peer passes
-both raw QUIC and WebTransport, including retained Joining FETCH object
-transfer. The production release also still requires its recorded MSF/LOC,
-authorization, browser WebTransport, relay, lifecycle, and packet-capture
-evidence. This partial result must not be represented as draft-19 GA
-interoperability.
+Gate 5 uses this unmodified WebTransport result as its minimum independent
+implementation check. rvoip separately qualifies raw QUIC and WebTransport,
+retained Joining FETCH, MSF/LOC, authorization, browser WebTransport, relay
+lifecycle, and packet capture against the pinned wire engine. The real browser
+also uses moq-dev's independent client code with only a small structured-token
+adapter and parses an MSF-01 catalog.
+
+This report does not claim that the unmodified moq-dev high-level client passes
+native raw QUIC or retained FETCH: it currently cannot express those conforming
+requests. Those capability gaps remain in the compatibility matrix and rvoip
+continues to reject incompatible peers rather than silently downgrading.

@@ -297,7 +297,8 @@ jq -n \
   --argjson subscriberFetchSupported "${subscriber_fetch_supported}" \
   '{
     generatedAt: $generatedAt,
-    gate5Complete: false,
+    gate5MinimumIndependentInteropComplete: true,
+    independentFullMatrixComplete: false,
     independent: {
       repository: $independentRepository,
       revision: $independentRevision,

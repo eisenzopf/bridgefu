@@ -6,57 +6,62 @@
 | WebRTC | Opus, WHIP/WHEP, WS/WSS signaling, arbitrary labeled DataChannels |
 | Context | `bridgefu.control.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
 | UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet |
-| MOQT wire library | Private `eisenzopf/moq-rs` draft-19 port pinned at `612cc6fe4550a02092c932c3bdfbe4da8fed8694`; request placement, data/PUBLISH codecs, canonical targets, explicit acceptance, and secure relay admission are implemented; Gate 5 remains in progress |
+| MOQT wire library | Private `eisenzopf/moq-rs` draft-19 port pinned at `ef52ac8656513bb3b07b4b9b80152ac24bb2467e`; Gate 5 wire, retention, discovery, and least-privilege relay qualification is complete |
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
-MOQT draft churn is isolated in `rvoip-moq`. The reviewed private fork now
-implements draft-19 request-stream placement, data and PUBLISH codecs,
-canonical raw-QUIC/WebTransport session targets, and explicit session and
-namespace acceptance. It also has the bounded retention-cache foundation,
-Joining subscription state and typed options, and subgroup `END_OF_GROUP`
-handling. The relay path verifies mTLS identities, enforces scoped admission,
-uses stateless retry, redacts secrets from diagnostics, and defaults to a
-production-safe posture.
+MOQT draft churn is isolated in `rvoip-moq`. The reviewed private fork
+implements draft-19 request-stream placement, control/data/PUBLISH/FETCH
+codecs, canonical raw-QUIC/WebTransport session targets, explicit session and
+namespace acceptance, bounded retention, warm Joining FETCH, cold live
+fallback, and subgroup `END_OF_GROUP` handling. Namespace discovery has a
+bounded initial snapshot plus live Added/Removed updates and fails closed on
+overflow or prefix overlap.
 
-The fork's full workspace passed 431 tests before the final user-information
-hardening change. The final affected-package rerun passed 347 transport tests,
-20 native-IETF tests, and 67 relay-IETF tests. These are checkpoint counts, not
-the Gate 5 interoperability exit evidence.
+The relay path verifies mTLS identities, enforces exact scopes, uses stateless
+retry, redacts secrets, and defaults to a production-safe posture. Publisher
+certificates are publish-only. External relay certificates are subscribe-only
+and cannot announce or publish a namespace.
+
+The reviewed fork passes 429 transport tests. Its relay package passes 111
+library, 25 binary, one admission-contract, and five feature-policy tests with
+all features, plus strict Clippy and warning-free rustdoc. Golden vectors cover
+draft-19 setup, request/response, subgroup, datagram, FETCH, object, status,
+padding, and authorization encodings.
 
 The matching rvoip revision is
-`a3eed0d730502093384a90680d15f0e64665f9f6`. It exposes rvoip-owned
-authorization, catalog, LOC, compatibility, health, and lifecycle types without
-leaking moq-rs types. The integration accepts an opaque, credential-free relay
-peer identity from the transport, requires explicit publication acceptance,
-and retains production mTLS, bounded reconnect, health reporting, graceful
-drain, and deterministic cleanup. The scoped `rvoip-moq` matrix passes 68
-default unit tests plus one public API test and 69 `insecure-development` unit
-tests plus one public API test.
+`7d83b66545789d55471c13a7c68eb54a9493cc0a`. It exposes only rvoip-owned
+authorization, catalog, LOC, events, compatibility, health, topology, and
+lifecycle types. Its final Gate 5 matrix passes 134 unit, three managed relay
+E2E, two public API, and seven admission tests. The E2E matrix includes warm
+Relative Joining FETCH, cold live fallback, raw QUIC, WebTransport, a real
+two-topology external mTLS relay chain, route replacement/reconnect, publish
+denial for relay credentials, and drain cleanup.
 
-Gate 5 remains in progress. The remaining wire and interoperability work is:
+The real-browser run negotiates draft 19, authenticates through a structured
+receive-only SETUP token, traverses WebTransport, and parses the MSF-01 catalog.
+The packet-capture suite records both `moqt-19` and `h3` ALPN handshakes without
+enabling a TLS key log. Unmodified `moq-dev/moq` independently passes draft-19
+WebTransport namespace discovery, subscription, and live Objects. Its current
+native client omits mandatory PATH/AUTHORITY and its high-level subscriber does
+not expose retained FETCH; rvoip rejects those unsupported paths explicitly
+rather than downgrading.
 
-- complete enforced logical retained-state bounds, cleanup, and eviction or
-  backpressure;
-- complete the FETCH state machine and cache-to-request handoff;
-- emit one stream per MSF Object and complete catalog publication semantics;
-- add rvoip `SessionAdmission` and await replay-tombstone persistence before
-  reporting admission success;
-- authorize production token subscribers and pass a real-browser WebTransport
-  end-to-end test; and
-- complete relay traversal and pass the recorded matrix against an independent
-  draft-19 implementation.
+Gate 5 is complete. Dynamic route registrations for standalone relays are
+runtime-safe, bounded, exact-namespace, generation-safe, and drain-owned. They
+remain local to one process until Gate 10's PostgreSQL/Redis control plane
+distributes route changes across relay replicas.
 
-Bridgefu must not be called GA for draft-19 until those checks pass. No upstream
-issue, pull request, or maintainer contact has been made; any proposed upstream
-submission remains subject to project-owner review.
+No upstream issue, pull request, or maintainer contact has been made. The
+private fork review packet is in `moq-fork-review.md`; any submission remains
+subject to project-owner review.
 
-The reviewed inputs are recorded in `docs/moq-compatibility.json`. A scheduled,
+The reviewed inputs are recorded in `moq-compatibility.json`. A scheduled,
 report-only CI workflow compares those pins with IETF Datatracker and moq-rs
 upstream. It never updates a dependency or contacts an upstream maintainer.
 
 Bridgefu's production MSF-01 profile maps each audio Object to a new MOQT
-stream, as required by MSF-01 section 6. LOC datagrams are retained only as an
-explicit experimental non-MSF profile.
+stream, as required by MSF-01 section 6. LOC datagrams remain an explicit
+experimental non-MSF profile and are not enabled by Bridgefu 1.0.
 
 RoQ remains an adapter seam. It is point-to-point RTP/RTCP carriage and is not
 used as a broadcast fanout protocol.

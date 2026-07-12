@@ -23,6 +23,13 @@ also documented in
 [protocol compatibility](docs/protocol-compatibility.md) and
 [BENCHMARKS.md](BENCHMARKS.md).
 
+MOQT draft-19 qualification is recorded in the
+[independent interop report](docs/moq-independent-interop.md),
+[real-browser WebTransport report](docs/moq-browser-interop.md),
+[packet-capture report](docs/moq-packet-capture.md), and the private
+[fork review packet](docs/moq-fork-review.md). No upstream submission has been
+made.
+
 ---
 
 ## How it's built and deployed

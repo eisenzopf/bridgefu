@@ -2892,14 +2892,14 @@ dependencies = [
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37b2942560ba97d9ec63ae10e382d6f50ebac45b58e35853feb3a37a53270eb1"
+version = "0.8.0"
+source = "git+https://github.com/eisenzopf/moq-rs?rev=ef52ac8656513bb3b07b4b9b80152ac24bb2467e#ef52ac8656513bb3b07b4b9b80152ac24bb2467e"
 dependencies = [
  "anyhow",
  "clap",
  "futures",
  "hex",
+ "http 1.4.2",
  "moq-transport",
  "quinn",
  "rand 0.8.6",
@@ -2918,9 +2918,8 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26a363e1f04a4651f97b711f3ece1b0b9f2beeddcbdf502dc3c648001558cb3d"
+version = "0.14.2"
+source = "git+https://github.com/eisenzopf/moq-rs?rev=ef52ac8656513bb3b07b4b9b80152ac24bb2467e#ef52ac8656513bb3b07b4b9b80152ac24bb2467e"
 dependencies = [
  "bytes",
  "futures",
@@ -2931,6 +2930,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "web-transport",
 ]
@@ -4540,19 +4540,22 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "metrics",
  "moq-native-ietf",
  "moq-transport",
- "rustls 0.23.41",
- "rustls-native-certs 0.7.3",
- "rustls-pemfile",
- "rvoip-core",
+ "rvoip-auth-core",
+ "rvoip-core-traits",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
+ "web-transport",
+ "zeroize",
 ]
 
 [[package]]
