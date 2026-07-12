@@ -204,7 +204,12 @@ async fn recover_before_listeners(
     runtime: Arc<CallServiceRuntime>,
 ) -> Result<(), RepositoryError> {
     let worker = runtime.worker().lease;
-    let (_, shutdown) = watch::channel(ActorShutdown::Running);
+    // Recovery is already cancelled as one future by the runtime-health
+    // guard installed by `recover_before_listeners_with_health`. Keep this
+    // sender alive so nested bound-state commits see `Running` rather than a
+    // closed watch channel, which is deliberately interpreted as authority
+    // loss by normal live actors.
+    let (_recovery_authority, shutdown) = watch::channel(ActorShutdown::Running);
     loop {
         let claims = runtime
             .repository()

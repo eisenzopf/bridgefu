@@ -10,7 +10,7 @@ use bridgefu::call_engine::{CallId, CallState, LegDirection, LegId, LegState, Te
 use bridgefu::call_service::{
     build_call_service_runtime, CallExecutionSupervisor, CallRepositoryBackendConfig,
     CallServiceCoordinationConfig, CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy,
-    CreateCallInput, IdempotencyKey, LegEndpointConfig, RequestedLeg,
+    CreateCallInput, IdempotencyKey, InboundAttachmentRequest, LegEndpointConfig, RequestedLeg,
     SamePrincipalAttachmentResolver, SipEndpointConfig, SystemCallServiceClock,
     WebRtcEndpointConfig,
 };
@@ -727,6 +727,44 @@ async fn startup_recovery_finishes_old_fence_and_cleanup_before_returning() {
         .await
         .unwrap();
     let call_id = created.value.call.call_id;
+    let bound_leg_id = created.value.call.legs[0].leg_id;
+    let attachment = created.value.call.legs[0].attachment.as_ref().unwrap();
+    let bound_connection_id = ConnectionId::new();
+    first
+        .service()
+        .consume_inbound_attachment(InboundAttachmentRequest::new(
+            principal().authenticated().clone(),
+            Some(attachment.token.clone()),
+            attachment.transport,
+            first.worker().lease,
+            bound_connection_id.clone(),
+        ))
+        .await
+        .unwrap();
+    let tenant = TenantId::parse("execution-tenant").unwrap();
+    let before_restart = first
+        .service_repository()
+        .load_service_call(&tenant, call_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_restart
+            .call
+            .bindings
+            .get(&bound_leg_id)
+            .unwrap()
+            .connection_id,
+        bound_connection_id
+    );
+    assert_eq!(
+        before_restart
+            .call
+            .aggregate
+            .leg(bound_leg_id)
+            .unwrap()
+            .state(),
+        LegState::Signaling
+    );
     let first_fence = first.worker().lease.fence;
     drop(first);
 
@@ -746,7 +784,6 @@ async fn startup_recovery_finishes_old_fence_and_cleanup_before_returning() {
     .await
     .unwrap();
 
-    let tenant = TenantId::parse("execution-tenant").unwrap();
     let recovered = second
         .service_repository()
         .load_service_call(&tenant, call_id)
@@ -756,6 +793,12 @@ async fn startup_recovery_finishes_old_fence_and_cleanup_before_returning() {
         recovered.call.aggregate.state(),
         CallState::Ended | CallState::Failed
     ));
+    let recovered_bound_leg = recovered.call.aggregate.leg(bound_leg_id).unwrap();
+    assert_eq!(recovered_bound_leg.state(), LegState::Failed);
+    assert_eq!(
+        recovered_bound_leg.failure().map(|failure| failure.code()),
+        Some("worker_restarted")
+    );
     assert!(second
         .repository()
         .claim_outbox(
