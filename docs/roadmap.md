@@ -167,7 +167,7 @@ MediaGraph stress tests pass.
   before delivering replies or commands.
 - [x] Enforce caps and deterministic peer cleanup on QUIC, WebTransport, and
   WebSocket substrates.
-- [ ] Treat a denied SIP authentication reservation as a terminal admission
+- [x] Treat a denied SIP authentication reservation as a terminal admission
   decision. A denied initial challenge must not mint or persist a Digest nonce,
   call a credential/challenge/audit provider, or return another 401/407.
   Preserve the released exhaustive auth-decision enums through an additive
@@ -2261,6 +2261,21 @@ Gate 7 progress evidence recorded on 2026-07-12:
   can report a false zero before the 90-second TTL expires. Item 2e now lists
   the ordered remediation and acceptance races. No Gate 3 or SIP item is closed
   solely from the green pre-audit suite.
+- rvoip revision `0eaebd68` closes the challenge-budget P1 without changing
+  the released exhaustive auth-decision enums. A crate-private richer
+  evaluation retains the limiter hint, performs no nonce, credential,
+  challenge, audit, or completion-provider work after denial, and projects an
+  empty rejection for legacy callers. The listener emits `503` with a typed,
+  ceiling-rounded `Retry-After` clamped to 1–3,600 seconds and no auth header.
+  Counting-provider unit tests, normal challenge regressions, tenant-bound
+  Digest, and a real UDP wire test pass.
+- rvoip revision `3d6b321e` removes redacted trace output from the three
+  header-propagation baseline assertions. A raw UDP capture UAS now verifies
+  the legacy BYE auto-emit value and both synthetic and real B2BUA INVITE
+  carry-through values on actual datagrams; semantic PAI lookup accepts its
+  canonical typed header name. All three exact tests pass while production
+  trace redaction remains unchanged. The verified-mTLS adapter handoff is the
+  sole remaining test in the original four-test baseline failure set.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
