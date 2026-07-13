@@ -107,23 +107,29 @@ Exit: all existing work is accounted for and the baseline is reproducible.
 - [x] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
 - [x] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
   StartWebRTCContact attributes.
-- [ ] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
+- [x] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
   teardown.
 - [ ] Add a protected non-production Vapi-to-Connect smoke workflow and a
   drain/rollback runbook.
 - [x] Keep the existing production path isolated.
 
 The Gate 7 Amazon audit reopened this gate at Bridgefu revision `6e30708`.
-`tests/standardcharter_contract.rs` proves the real localhost SIP fixture,
-tenant routing, allowlisted correlation/attributes, `180`, `200`, and SDP
-shape, but its starter deliberately fails immediately after capturing
-StartWebRTCContact and the test aborts `serve`. It therefore does not prove a
-Chime session, PCMU↔Opus frames, screen-pop progression, StopContact,
-bidirectional teardown, or process drain. The checked-in workflows contain no
-protected Vapi-to-Connect smoke job. Strengthen the hermetic golden flow and
-link an owner-authorized protected non-production workflow before restoring
-either checkbox; keep all external AWS execution review-only until separately
-authorized.
+Bridgefu revision `eb9932c` and rvoip revisions `84f84fbf`, `869e20d6`, and
+`a18df977` close the hermetic media and lifecycle gap without changing the
+production connector default. `tests/standardcharter_contract.rs` now enters
+through the real localhost SIP listener, completes INVITE/180/200/ACK, sends
+real PCMU RTP through the production MediaGraph to a credential-free fake
+Connect Opus session, loops Opus back to real PCMU RTP, and proves ordered
+screen-pop stages, exactly-once StopContact, and both Vapi- and
+Connect-originated teardown. The end-to-end test exposed and now guards two
+reusable rvoip defects: bridge handles must retain transport-owning media
+streams, and decoded audio callbacks must preserve source RTP timestamps.
+
+Focused evidence passes 247 media-core tests, 62 Amazon Connect library tests,
+3 Amazon media-bridge tests, and all 34 locked StandardCharter contract tests.
+The checked-in workflows still contain no protected Vapi-to-Connect smoke job
+or owner-authorized external AWS execution. That live non-production evidence
+and its drain/rollback runbook remain the only open Gate 1 item.
 
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
