@@ -1600,6 +1600,38 @@ Gate 7 progress evidence recorded on 2026-07-12:
   non-exhaustive boundaries or a coordinated semver-breaking version with
   migration evidence. These compatibility decisions must be executable and
   documented before the next exact-revision audit.
+- The fifth exact audit at clean rvoip revision
+  `c626879057066e6c043e511e639a8e19a64175e4` confirms that bounded connection
+  internals are no longer sufficient while the layers above them collapse a
+  secure flow back to one socket address. `WebSocketTransport` does not expose
+  live-flow lookup to the standard multiplexer, so structured and cached raw
+  WS/WSS responses can fall through to UDP instead of the inbound WebSocket.
+  The resolver retains address and transport but discards the authenticated
+  next-hop authority selected from Route/outbound-proxy/SRV, causing TLS/WSS
+  SNI, HTTP Host, pool identity, and single-flight identity to be derived from
+  the Request-URI callee rather than the actual proxy authority. Ingress,
+  response/raw-send, pong, and close events likewise carry no opaque flow ID;
+  their address-only fallback can select another authority/direction at the
+  same address or fail every dialog sharing that address. Carry a normalized
+  authority-bearing route and opaque flow ID end-to-end through resolver,
+  transport events, transactions, cached responses, and lifecycle indexes.
+  Require the exact flow for responses; reject ambiguous raw routing. Give
+  lifecycle/control events reserved bounded delivery so media/message
+  backpressure cannot erase teardown.
+
+  Public WebSocket supervision has three remaining boundary defects. A peer
+  Close changes writer state before `close()` can enqueue its close command,
+  retaining admission until the write timeout; complete peer-initiated close
+  promptly and prove permit release. One recoverable accept error currently
+  returns from `serve_concurrent` and drops every active session; retry with
+  bounded backoff while preserving children, and terminate only on shutdown or
+  a fatal listener error. Finally, making the formerly functional public
+  `accept()` always fail at runtime is not a patch-compatible migration. Either
+  retain a supervised compatibility path or publish an explicit coordinated
+  sip-transport 0.3 migration with release notes and replacement examples.
+  Multiplexer-level WS/WSS request-to-structured-response, cached-response,
+  multi-authority, close-event, and accept-recovery tests are required before
+  another exact audit.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
