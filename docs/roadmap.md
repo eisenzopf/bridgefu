@@ -1993,6 +1993,17 @@ Gate 7 progress evidence recorded on 2026-07-12:
   `TransportRoute` and every ACK must use that same route. Add correct/wrong
   UDP source, TLS/WS flow/authority, expiry, and exact-route ACK tests.
 
+  rvoip revision `80a4b41d` lands that transaction-core prerequisite. Bounded
+  90-second, 65,536-entry tombstones retain only the immutable INVITE request
+  and exact route after a successfully sent client transaction retires;
+  late-response admission revalidates the UDP tuple or exact stream flow, a
+  valid late 2xx reaches the transaction user, and ACK uses the retained route.
+  Expiry/prune, wrong-route rejection, success delivery, and exact ACK tests
+  pass within the 387-test sip-dialog suite, with strict Clippy and rvoip-sip
+  library check clean. This is not Timer-B failover: dialog-level attempt
+  planning, 503 advancement, orphan ACK/BYE cleanup, and CANCEL races remain
+  required before timeout retry can be enabled.
+
   Candidate selection also changes the socket transport without stamping that
   transport and advertised sent-by into the request: a TCP candidate can carry
   a UDP Via and a stack-default UDP Contact. Materialize the selected route
