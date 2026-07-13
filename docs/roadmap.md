@@ -1456,6 +1456,17 @@ Gate 7 progress evidence recorded on 2026-07-12:
   cancellation and joined close/drain semantics, and nonce admission that never
   evicts an active challenge (plus pre-challenge source limiting or stateless
   signed nonces for exposed listeners). Re-audit the exact remediated revision.
+  The parallel compatibility audit records two additional P1 public-contract
+  breaks at the same revision. Users-core added required public fields to
+  `api::AuthContext`, breaking every downstream struct literal; keep token
+  revocation metadata behind an internal extractor/session context or provide
+  an explicit versioned constructor/migration. Registrar `UserStore` retained
+  `get_password`/`get_credentials` signatures but now silently returns
+  `None`/an empty password for existing users. HA1-only storage is required,
+  but false legacy success semantics can make downstream authentication fail as
+  though the user vanished; remove or explicitly version the incompatible
+  secret-retrieval contract with a migration to `get_digest_secret` rather than
+  silently lying through the old API.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
