@@ -2149,6 +2149,18 @@ Gate 7 progress evidence recorded on 2026-07-12:
   evidence against this slice. Item 2b still needs capture-UAS coverage and an
   independent audit on the exact combined revision.
 
+  The clean-baseline failures are now precisely classified. Verified mTLS
+  reaches the TLS listener but times out waiting for the authenticated adapter
+  handoff after the anonymous/untrusted negatives complete; diagnose the
+  principal/observation race and add a bounded positive handoff test. The
+  legacy BYE auto-emit and one B2BUA carry-through test assert secret values by
+  reading the intentionally redacted trace (`X-AutoEmit`, History-Info,
+  Diversion, PAI, and X-Customer-ID). Preserve redaction and replace those
+  assertions with a capture socket/UAS that inspects actual wire bytes. The
+  other B2BUA case produces no staged PAI where exactly one is expected and
+  requires a product-path diagnosis rather than an observation rewrite. These
+  four exact tests must pass honestly before item 2e or Gate 3 closes.
+
   Lower findings to close with these P1s include dialog-layer rejection of
   stack-owned Via/Route/Record-Route extras, semantic routing for structured
   `Other` Route values, singleton `Session-Expires`/`Min-SE`, lossless Contact
