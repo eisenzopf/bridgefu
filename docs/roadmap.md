@@ -1266,6 +1266,171 @@ Gate 7 progress evidence recorded on 2026-07-12:
   transport/header-policy/method/action errors; raw Call-ID timing snapshots;
   and value-bearing auth challenge containers. These are release blockers,
   not deferred observability cleanup.
+- The independent public-diagnostic audit at rvoip revision
+  `3ab1e1b58e9051367ca24842726dc49ffe1b95e9` adds six P1 groups to item 2a
+  before closure: consolidated public session/CDR types retaining From, To,
+  Call-ID, SDP, MESSAGE/NOTIFY bodies, transfer/registration targets, reasons,
+  and asserted identities; state-machine helper/executor events retaining
+  caller, error, custom-event, and media-address payloads; negotiated media
+  configuration retaining RTP addresses and codec values; public TCP
+  `ReceivedFrame` retaining byte-exact SIP credentials/body; `ViaRewrite`
+  retaining arbitrary pushed bytes; and direct infra support enum diagnostics
+  retaining termination/registration error strings. The outer cross-crate
+  wrapper is already safe, but every public/direct diagnostic container must
+  be safe independently. These findings are recorded before remediation and
+  keep 2a open.
+  The same audit also finds three P1 control/error paths: boxed lower errors
+  can bypass dedicated authentication redaction when flattened into
+  `SessionError::Other`; the public TLS certificate-error class is dead while
+  certificate parse/config/verification failures collapse into the generic
+  handshake class; and SIP WS/WSS subprotocol negotiation is fail-open on both
+  server and client when the peer omits or refuses `sip`/`sips`. Preserve lower
+  errors only for typed matching, route certificate failures to their declared
+  class without rendering rustls detail, and fail the WebSocket upgrade/dial
+  with a typed protocol error unless the peer explicitly negotiates the exact
+  required subprotocol.
+  User callback and coordinator-shutdown failures are also in this P1 closure:
+  production logs currently render raw `SessionError` values at each callback
+  stage, so arbitrary application/provider strings can escape even after the
+  enclosing callback types are safe. Log only a fixed callback operation and
+  typed error class; retain the original error solely in the live return path.
+- The independent SIP-core/framing audit at rvoip revision
+  `c0cc324151819394e3c107d48f018b64854e91d7` confirms the compact-alias,
+  duplicate, bounds, checked-arithmetic, and TCP/TLS smuggling defenses, but
+  adds six P1 compatibility/diagnostic findings before 2a can close: direct
+  Digest/authentication-info parameter and extension-scheme diagnostics still
+  expose credential values; low-level `Header`/`HeaderValue`/`HeaderName`
+  diagnostics bypass the safe `TypedHeader` view; SDP simulcast diagnostics
+  expose RID identifiers; remaining registrar API/presence/registry logs expose
+  subscriber/contact identities or arbitrary event errors; the shared scanner
+  rejects valid SIP HCOLON whitespace before `:`; and the transport-neutral
+  complete-message parser incorrectly applies the stream-only requirement for
+  an explicit Content-Length instead of accepting an absent length as a
+  zero-byte body. Keep strict explicit-length framing for TCP/TLS while adding
+  a complete-message policy for UDP/direct parsing, and cover both modes with
+  regression tests.
+- The final exact-combined SIP audit at rvoip revision
+  `a327bfb2` remains nonzero and records two additional P1 public-diagnostic
+  boundaries before remediation: `EndpointCall` and `EndpointIncomingCall`
+  directly render raw Call-ID and From/To values, and the registrar's public
+  `UserCredentials` diagnostic renders its plaintext password. The same audit
+  is continuing across registrar events, public types, and errors; every
+  consolidated finding must be recorded here and independently re-audited at
+  the remediated exact revision before Gate 3 or item 2a can close.
+  It also records P1 authentication/lifecycle defects: the legacy registrar
+  validates Digest response arithmetic without proving server nonce issuance,
+  expiry, or nonce-count freshness, so a captured REGISTER authorization can be
+  replayed. Its `UserStore` retains and clones plaintext passwords. The primary
+  SIP Digest services keep unbounded local issued-nonce and nonce-count maps and
+  remove an expired nonce only when that exact value is later presented,
+  allowing unauthenticated challenge traffic to grow memory indefinitely.
+  Registrar authentication must use issued, expiring, replay-protected nonces
+  and verifier/HA1-backed secrets; all local replay stores need hard capacity,
+  periodic expiry, and coupled nonce-count cleanup.
+  Responses that omit an offered Digest `qop` currently bypass nonce-count
+  enforcement, and response comparison uses ordinary early-exit string
+  equality. Require the negotiated `qop` contract, enforce monotonic nonce
+  counts whenever offered, and compare response digests in constant time.
+  The audit additionally finds the WebSocket frame cap is declared but not
+  supplied to either server or client tungstenite configuration; already-large
+  frames are then copied during processing, leaving an allocation/double-copy
+  DoS path. Configure bounded message/frame/write limits before the handshake
+  on WS and WSS and reject oversize frames without another full-size copy.
+  RFC 7118 also requires exactly one SIP message per WebSocket message, but the
+  WS/WSS boundary uses the lenient complete parser and accepts the first request
+  from a frame containing a second SIP message while retaining both in raw
+  bytes. Use strict full-frame parsing with zero trailing bytes and add a
+  packet-capture request-smuggling regression canary.
+  The complete-message framing policy also incorrectly treats an absent
+  Content-Length as a zero-byte body. RFC 3261 message-oriented transports and
+  RFC 7118 WebSockets define the packet/frame remainder as the body when the
+  length is absent. Preserve that remainder for CL-less SDP/MESSAGE bodies;
+  when UDP has an explicit shorter length, retain only the consumed message in
+  `raw_bytes` and discard datagram excess so the advertised raw SBC path cannot
+  forward a smuggled second request. WS/WSS must reject, rather than discard,
+  any bytes beyond one complete message.
+  UDP currently declares the legal 65,507-byte packet maximum but receives into
+  only 8,192 bytes on both awaited and nonblocking paths, allowing the OS to
+  silently truncate a datagram that can then be parsed as valid. Receive the
+  complete supported datagram size or detect `MSG_TRUNC` and drop it before SIP
+  parsing; add oversized-body and truncated-request regressions for both paths.
+  Typed WS/WSS outbound sends also use lossy UTF-8 conversion unconditionally,
+  mutating binary SIP bodies and potentially invalidating Content-Length. Per
+  RFC 7118, send Text only when the complete serialized SIP message is valid
+  UTF-8; otherwise send the exact bytes in a Binary WebSocket message.
+  `TlsPeerIdentity`, `TransportConnectionMetadata`, and the enclosing SIP
+  ingress context still derive diagnostics over the complete client-certificate
+  fingerprint. Retain the fingerprint for mTLS policy matching, but expose only
+  presence, length, verification state, and certificate-chain count.
+  TLS failure classification must include certificate revocation failures and
+  certificate-related peer alerts, not only `InvalidCertificate` and
+  `NoCertificatesPresented`; preserve a fixed certificate-vs-handshake class
+  without rendering rustls details.
+  Remaining public diagnostic P1s include sip-core `CallId`, `Address`,
+  `Error`, and `LocationAwareError`; sip-dialog `DialogError`, `RecoveryError`,
+  and `ApiError`; and registrar errors, events, and public registration/presence
+  types. Each currently derives or displays retained caller IDs, addresses,
+  parameters, reasons, messages, or arbitrary details. Preserve live typed
+  fields for matching and wire behavior, but make all direct `Debug`, `Display`,
+  error-source, and diagnostic serialization projections metadata-only.
+  A production adapter warning also logs the authenticated principal subject;
+  it must use only fixed principal-presence and ownership metadata.
+- The exact-combined compatibility audit at rvoip revision `a327bfb2` records
+  four P1 regressions before remediation. Legacy incoming-call standard header
+  keys and staged REGISTER response header names incorrectly use the newly safe
+  `HeaderName` `Debug` view as functional wire data; both must use a canonical
+  header-name API while retaining extension names only in the live value.
+  Bearer fallback subjects similarly use the safe `IdentityAssurance` `Debug`
+  view, collapsing distinct pseudonymous keys and same-length DTLS fingerprints
+  into one ownership subject; identity derivation needs a typed stable digest.
+  Finally, WSS now requires the nonstandard WebSocket subprotocol token `sips`,
+  while RFC 7118 requires `sip` for both WS and WSS. Keep the secure URL and
+  transport classification, but advertise and require the exact `sip` token on
+  both substrates. The remaining compatibility surfaces inspected by this
+  audit had no additional P0/P1 findings.
+- The final exact-combined credential/ownership audit at rvoip revision
+  `a327bfb2` records two P0 users-core authorization failures before
+  remediation. A non-admin `PUT /users/{id}` may update the caller's own
+  `roles` and `active` fields, allowing self-promotion or bypass of account
+  lifecycle policy. Separately, API-key authentication loads the owning user's
+  roles but handler authorization never enforces the key's own permission set,
+  so a least-privilege key owned by an administrator receives administrator
+  authority. Split self-service profile updates from administrative role/state
+  mutations and propagate/enforce the credential's effective permissions at
+  every protected handler before Gate 3 can close. The audit is continuing and
+  all consolidated findings must be closed and re-audited at an exact revision.
+  The same audit records three P1 ownership failures. AAuth unions actor scopes
+  into a subject principal without requiring compatible issuer, tenant, or an
+  explicit delegation relationship, allowing cross-tenant scope elevation when
+  a validator spans tenants. Orchestrator `complete_step_up` accepts an
+  arbitrary connection ID, authenticates a credential, and emits an assurance
+  event without verifying the route owner or updating the connection principal.
+  The users REST JWT extractor also bypasses users-core token revocation and
+  active-user checks, leaving revoked or deactivated sessions authorized until
+  token expiry. Delegation must be explicit and tenant/issuer constrained;
+  step-up must be an atomic owner-bound principal transition; and every JWT API
+  path must enforce revocation plus current user state.
+  A third P0 in the users API lets an authorized caller create a key through
+  their own `/users/{id}` path while supplying a different `user_id` in the
+  request body. Combined with the ignored key-permission defect, a normal user
+  can mint an administrator-owned key and exercise administrator authority.
+  The path identity must be authoritative (or the body identity removed), and
+  ownership plus requested permissions must be validated transactionally.
+  The completed credential audit also finds unrestricted authenticated user
+  enumeration of emails, roles, and status. It records remaining P1 diagnostic
+  boundaries across auth-core (Bearer/DPoP/HTTP-signature errors and payloads,
+  user/actor contexts, and JWKS logs), core traits/runtime (erased adapter
+  errors, arbitrary `DataMessage` bytes/labels, reachability and fingerprint
+  identities), UCTP (custom scope maps, required scopes, participant identities,
+  lower transport/TLS errors), the unified client (arbitrary URI/protocol/server
+  error JSON), users-core (enclosing database/JWT/validation/internal errors,
+  public identity/passkey/update/auth contexts, and background task errors), and
+  WebRTC (SDP/ICE/signaling events, lower errors returned by WHIP, TLS logs,
+  route-owner legacy subjects, and DTLS fingerprints). IMS-AKA and LDAP have no
+  remaining P0/P1 in this audit, and UCTP's issuer+tenant+subject binding
+  comparisons are sound. All listed public diagnostics and remote error bodies
+  must become fixed class/shape metadata while functional values remain
+  available only to their authorized live paths.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
