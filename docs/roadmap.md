@@ -102,16 +102,28 @@ Active calls remain pinned and are drained rather than migrated.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
 
-### Gate 1 — Freeze StandardCharter (`complete`)
+### Gate 1 — Freeze StandardCharter (`in progress — reopened`)
 
 - [x] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
 - [x] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
   StartWebRTCContact attributes.
-- [x] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
+- [ ] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
   teardown.
-- [x] Add a protected non-production Vapi-to-Connect smoke workflow and a
+- [ ] Add a protected non-production Vapi-to-Connect smoke workflow and a
   drain/rollback runbook.
 - [x] Keep the existing production path isolated.
+
+The Gate 7 Amazon audit reopened this gate at Bridgefu revision `6e30708`.
+`tests/standardcharter_contract.rs` proves the real localhost SIP fixture,
+tenant routing, allowlisted correlation/attributes, `180`, `200`, and SDP
+shape, but its starter deliberately fails immediately after capturing
+StartWebRTCContact and the test aborts `serve`. It therefore does not prove a
+Chime session, PCMU↔Opus frames, screen-pop progression, StopContact,
+bidirectional teardown, or process drain. The checked-in workflows contain no
+protected Vapi-to-Connect smoke job. Strengthen the hermetic golden flow and
+link an owner-authorized protected non-production workflow before restoring
+either checkbox; keep all external AWS execution review-only until separately
+authorized.
 
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
@@ -1169,6 +1181,71 @@ not hide an earlier adapter side effect behind a nominally staged API.
    reconciliation; default targets, empty attributes, or a newly generated
    retry token are not compatible evidence. Operational events must cover
    liveness, remote termination, activation failure, and drain cleanup.
+   - [ ] 5a — Add redacted validated `ConnectProfileId`, exact
+     `AmazonConnectTarget`, `ConnectClientToken`, and
+     `AmazonConnectOriginateContext` containing target, attributes, display
+     name, optional description, and stable token. Generic originate requires
+     that exact context before I/O. Preserve legacy `ConnectConfig`,
+     `ContactTarget`, and `client_token=None` wrapper semantics for the frozen
+     path.
+   - [ ] 5b — Add one adapter-owned non-secret profile resolver so the selected
+     AWS account/region starter also owns StopContact. Validate request bounds
+     and every required AWS response field, redact/zeroize sensitive request,
+     connection, mapping, and error diagnostics, and replace rendered-SDK
+     string matching with typed retry/already-ended classes. Reconcile an
+     ambiguous Start only with the byte-equivalent request and stable token.
+   - [ ] 5c — Add an injectable `ConnectMediaConnector`/session lifecycle seam
+     backed in production by Chime plus rvoip WebRTC. Own PONG/activity,
+     distinct remote terminal/error causes, joined task, absolute-deadline
+     close, streams, hold/resume/DTMF, and secret-free logs. Use the existing
+     hermetic Chime server to test the adapter without another media library.
+   - [ ] 5d — Implement a retained `AmazonOutboundRoute` with local-only
+     prepare, immutable context, single-flight activation/cleanup, bounded FIFO
+     plus first terminal, authoritative liveness/fallback, stable deferred
+     stream, owned tasks, and `amazon-connect.contact-id` receipt. A known
+     contact is stopped exactly once on every post-Start failure, cancellation,
+     remote end, peer failure, PONG expiry, or repeated local end; route becomes
+     non-live before terminal delivery.
+   - [ ] 5e — Add bounded adapter and `ConnectScreenPopServer` admission,
+     `begin_drain`/absolute-deadline drain, owned JoinSets, terminal fallback,
+     cancellation/join for the metrics updater, and explicit pending-cleanup
+     records after hard local abort. Bridgefu shuts this path down by draining,
+     never by merely aborting `serve`.
+   - [ ] 5f — Persist a redaction-safe Bridgefu Amazon start spec containing
+     profile, exact instance/flow, attributes, display, and optional
+     description. Derive the token deterministically from immutable effect ID
+     with a versioned domain prefix; callers never supply it and durable state
+     never contains credentials. Migrate plan schema explicitly rather than
+     defaulting legacy records into runnable work.
+   - [ ] 5g — Execute Amazon StartLeg through exact durable effect authority:
+     build context, prepare, transactionally bind the exact Connection ID, then
+     activate and reconcile its contact reference. Bind failure produces zero
+     Start. Restart never migrates old media; an ambiguous Start repeats the
+     identical token/request only to recover and stop the same contact, then
+     fails the old leg. Register one profile-resolving adapter only after rvoip
+     lifecycle tests pass.
+   - [ ] 5h — Keep the legacy listener/default runtime byte- and behavior-
+     compatible while adding a separate false-by-default authenticated canary
+     listener/tenant allowlist. Require trusted Vapi principal, matching
+     tenant/correlation, and atomic durable create/attach/dedup. Add full fake-
+     Connect/fake-Chime PCMU↔Opus golden teardown/drain tests, repository crash-
+     barrier tests, canary replay/cross-tenant negatives, and a manually
+   protected non-production workflow that verifies AWS token idempotency
+   before any production switch.
+
+   The pre-item-5 audit at rvoip revision `7c1902eb` confirms that current
+   generic `originate` eagerly performs StartWebRTCContact, Chime signaling,
+   and ICE/DTLS using a default target, empty attributes, and no client token
+   before durable ownership. The adapter advertises no lifecycle capabilities;
+   remote terminal/failure can leave routes, media, contact, and detached tasks
+   alive; configured idle TTL is unused; event saturation loses terminal
+   cleanup; and neither adapter nor screen-pop server drains active work.
+   Bridgefu persists only instance/flow and cannot yet execute Amazon StartLeg
+   through its durable actor. Sensitive attributes, tokens, URLs, SDP, and raw
+   AWS/Chime errors also remain in several default diagnostics. The reusable
+   control starter, started-contact cleanup guard, Chime test server,
+   ContactRegistry races, core prepared-commit seam, and frozen listener stay
+   in place while 5a–5h replace these behaviors.
 6. [ ] Add an initial-context readiness barrier. Durable
    `bridgefu.context.v1` metadata must be validated and available before an
    outbound SIP activation so allowlisted values are present on the first
