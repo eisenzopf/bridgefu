@@ -980,6 +980,11 @@ not hide an earlier adapter side effect behind a nominally staged API.
      consumed. TCP and TLS tests cover both duplicate orders and prove no
      request-smuggling/desynchronization; WS/WSS use the same core singleton
      rule even though their message frame supplies an outer boundary.
+     The shared scanner enforces bounded header bytes, line/header counts, body
+     bytes, and total message bytes with checked arithmetic. TLS must not grow an
+     unbounded `BytesMut` while waiting for a terminator or attacker-declared
+     body; endless headers and huge/overflow lengths close the connection under
+     deterministic tests.
      History snapshots sanitize every payload-bearing state-machine event before
      insertion, not only `AuthRequired`. SDP, SIP identities, targets, contacts,
      reasons, custom strings, media paths, transaction identifiers, and other
