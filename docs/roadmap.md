@@ -1126,6 +1126,58 @@ not hide an earlier adapter side effect behind a nominally staged API.
      signal or abort that driver instead of leaking its subscription/callback.
      Barriered failure, delayed-terminal activation, and constructor-cancel
      churn tests are mandatory.
+
+     The post-implementation cancellation audit adds one canonical lifetime
+     prerequisite before those tests may qualify 2b. `SessionStore` must own a
+     unique generation and an operation/resource supervisor for every live SIP
+     session. Inbound setup, the complete state-machine action loop, outbound
+     dialog creation, media/SRTP/callback creation, adapter activation/bind,
+     timers/retries, and every spawned task acquire that exact generation before
+     side effects. Retirement atomically changes `Active` to `Quiescing`, rejects
+     new leases and commits, signals cancellation, and waits without holding a
+     synchronous lock. A creator lease is released only after an atomic
+     current-generation commit or rollback of the exact dialog, transaction,
+     media, callback, or task handle it created. Caller cancellation cannot drop
+     owned work between those outcomes. Long-lived resources remain registered
+     to the generation until exact unregister, cancellation, and join complete.
+
+     Quiesce timeout must not become false reclamation. It moves the lifetime to
+     a bounded, non-expiring `PendingCleanup`/quarantine class, preserves the
+     identifier, generation, exact handles, cancellation authority, and retained
+     continuation, returns a sticky cleanup failure, and remains charged against
+     an explicit lifecycle/resource limit. Admission counts active, quiescing,
+     quarantined, and anti-reuse records; overload rejects new work, while
+     diagnostics expose counts, oldest age, and fixed reason class. Same-ID reuse
+     is allowed only after all creator/resource leases are zero, exact cleanup is
+     complete, and the SIP anti-reuse horizon expires. Queued dialog/media/bus
+     events and callbacks carry the generation or another unique route identity;
+     deterministic Call-ID and media identifiers include that identity, or their
+     cleanup uses an exact generation-bound handle. Remove-by-Session-ID alone is
+     not completion evidence.
+
+     Replace `SessionRegistry`'s single global current/pending slots with keyed
+     per-session-and-generation entries plus exact dialog/media secondary
+     indexes. Modern pending request, transport, principal, and call accessors
+     require the lifecycle key; legacy current-session accessors may remain only
+     as explicit compatibility wrappers. Two simultaneously interleaved inbound
+     calls must retain independent dialog, media, request, transport, principal,
+     and attachment context, and teardown of either call must not clear the
+     other. Repeat the barriers with a late old-generation completion after
+     same-ID reuse.
+
+     Teardown qualification records independent facts for peer signaling and
+     local resource release. Zero-wire and observed-remote-terminal paths may be
+     successful without a local teardown request; otherwise only a confirmed
+     `hangup` dispatch can satisfy the wire result. Timeout or error remains a
+     failure even when local reclamation succeeds. Cancellation-safe dialog
+     cleanup must retain the exact lower descriptor across every await. The
+     capture UAS must establish a legal dialog with a stable To tag, UAS Contact,
+     SDP answer, ACK, and teardown delivered to the advertised UAS target. A
+     blocked-before-wire teardown and a sent-but-no-terminal teardown are both
+     deterministic acceptance cases. TTS playback started by the shared
+     orchestrator also requires a cooperative owned supervisor: output rejection,
+     output closure, detach, or the competing input loop ending must invoke the
+     provider cancellation path before the playback future is released.
    - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
      both directions, with validated internal label/message-ID headers and
      explicit reliability capability errors.
@@ -1379,6 +1431,21 @@ only by a minimal failing engine conformance test (directional RTP,
 rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
 such patch remains on an exact reviewed revision; no upstream issue or pull
 request is created before owner review.
+
+The private TURN hardening work is complete locally at WebRTC revision
+`4a2f64c4a10562bfbcf6e406afb197642e72c442` with `rtc` submodule revision
+`4aa775a2c7d308b15075b544eaf667eba8584a6f`. The reviewed scope includes real
+UDP relay-only gathering and routing, allocation/permission/refresh/release,
+authenticated responses, stale-nonce and ICE-restart recovery, exact inbound
+TURN tuple enforcement, bounded peer state, IPv6 related-address handling,
+and cancellation-safe coalesced PeerConnection shutdown. Its focused unit,
+TURN end-to-end, strict library Clippy, formatting, and independent P0/P1/P2
+audit evidence is green. These revisions have not been pushed, submitted
+upstream, or pinned into rvoip: owner review and an owner-approved private
+remote are prerequisites for changing the fetchable dependency. The existing
+rvoip `rtc` revision therefore remains authoritative until that review; no
+roadmap item may claim the local TURN fork is integrated before the exact pin
+and downstream WebRTC qualification pass.
 
 The pre-item-3 client audit at committed rvoip revision `e982e36b` confirms
 that the authenticated WS/WSS and WHIP/WHEP server roles are present, but the
