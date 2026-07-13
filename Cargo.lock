@@ -4645,6 +4645,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -4667,6 +4668,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -4713,6 +4715,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
@@ -4887,11 +4890,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "strum",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4914,7 +4919,7 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-dialog"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4969,11 +4974,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "rvoip-sip-transport"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
