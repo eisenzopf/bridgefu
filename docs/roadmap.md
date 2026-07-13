@@ -1496,6 +1496,15 @@ Gate 7 progress evidence recorded on 2026-07-12:
   non-upgradeable restricted context or issue permission-constrained,
   key-bound, accurately expired tokens whose refresh lineage is durably stored
   and revoked with the originating key/user.
+  Users-core also fails open when the public `AuthenticationService::new`
+  constructor is used without its optional security store: password changes,
+  logout, access/refresh revocation, and JTI checks silently succeed or treat
+  absent state as active. `create_router` accepts that service, so custom or
+  PostgreSQL construction can expose credential-retirement endpoints that
+  return success while old passwords and tokens remain valid. Make the security
+  store a required constructor dependency for any API-capable service, or make
+  every retirement/validation path return a typed unavailable error rather than
+  silently weakening policy; add non-SQLite fail-closed tests.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
