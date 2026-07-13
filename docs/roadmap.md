@@ -1098,6 +1098,19 @@ not hide an earlier adapter side effect behind a nominally staged API.
    and sink halves independently optional, negotiate Opus/PCMU/PCMA from the
    actual SDP/transceiver rather than configuration guesses, and validate the
    complete directional bridge plan before consuming any one-shot receiver.
+
+   The pre-item-4 media-contract audit at rvoip revision `41649dbb` finds a
+   release-blocking representation mismatch: `SipMediaStream` emits codec
+   payload bytes, the WebRTC pump emits a complete RTP wire image, and the
+   shared transcoder expects codec payload bytes. The SIP stream also reports
+   and decodes PCMU unconditionally instead of the codec negotiated for the
+   exact SDP leg. Define one transport-neutral `MediaFrame` invariant with RTP
+   sequence/timestamp/payload-type metadata represented separately, strip and
+   packetize only at adapter boundaries, and derive PCMU/PCMA/Opus stream
+   codecs from negotiated media. Add packet-vector and real loopback tests so
+   no full RTP header can reach a payload transcoder and no leg is decoded with
+   a configured guess. Existing adapter lifecycle tests do not prove generic
+   SIP/WebRTC audio interoperability.
 5. [ ] Give the Amazon adapter the same prepare/bind/activate/terminal/drain
    lifecycle. Its typed per-call context must contain the actual Connect
    target, attributes, display name, and a stable client token reused during
