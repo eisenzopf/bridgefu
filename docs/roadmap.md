@@ -1383,6 +1383,14 @@ Gate 7 progress evidence recorded on 2026-07-12:
   Bearer fallback subjects similarly use the safe `IdentityAssurance` `Debug`
   view, collapsing distinct pseudonymous keys and same-length DTLS fingerprints
   into one ownership subject; identity derivation needs a typed stable digest.
+  Follow-up at the compatibility patch boundary finds the centralized default
+  `BearerValidator::validate_principal` path still uses
+  `AuthenticatedPrincipal::from_assurance`: it collapses every anonymous and
+  keyless pseudonymous assurance to a shared owner, derives identified fallback
+  identity from diagnostics, and exposes raw DTLS material. Reject a successful
+  Bearer result that provides no credential-derived owner, and centralize a
+  typed, stable, credential-free digest for assurance variants with real binding
+  material so all transports inherit the same collision-resistant ownership.
   Finally, WSS now requires the nonstandard WebSocket subprotocol token `sips`,
   while RFC 7118 requires `sip` for both WS and WSS. Keep the secure URL and
   transport classification, but advertise and require the exact `sip` token on
