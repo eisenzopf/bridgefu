@@ -1774,6 +1774,31 @@ Gate 7 progress evidence recorded on 2026-07-12:
   effect, retain authorization per protection space/header kind, and require a
   TLS/WSS first hop for every SIPS request.
 
+  The independent review of that remediation found five additional P1s before
+  commit. Redirect handling could replay origin or precomputed credentials to
+  a new Contact; credentials must retain an exact protection target and a 3xx
+  target change must invalidate old-origin material while preserving only an
+  unchanged proxy protection space. Candidate failover and the initial INVITE
+  path also classified an error string containing `Transaction terminated` as
+  success; only typed success or verified response state may suppress failover.
+  Add redirect-to-new-origin credential canaries and a transport failure with
+  that exact phrase followed by a successful second candidate.
+
+  The 3xx and 422 paths bypassed the authoritative INVITE plan, losing proxy,
+  body, From/Contact, 100rel, extras, or accumulated authorization across
+  redirect/auth/session-timer chains. Every initial, 401/407, 3xx, and 422
+  attempt must derive from one immutable snapshot; a redirect creates a new
+  origin-scoped plan and a timer retry changes only timer fields. Several
+  in-dialog INFO/NOTIFY/PRACK/BYE paths also resolved an exact top Route and
+  then fell back to the remote target. They must fail closed or perform
+  candidate failover only within that exact Route. Finally, persist a secure-
+  dialog requirement from a dialog-forming SIPS request and reject plaintext
+  Contact or Record-Route downgrade before mutating dialog state. Acceptance
+  covers auth-to-422 and 422-to-auth through global/per-leg proxies, zero
+  remote-target packets after an unreachable mandatory Route, unique branches
+  with exact-route candidate failover, and TLS/WSS-only ACK/BYE/INFO/PRACK for
+  SIPS dialogs.
+
   The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
   still sends INVITE before durable activation, and its current activation
   starts media before event-stage admission can fail. `run_bind` can overwrite
