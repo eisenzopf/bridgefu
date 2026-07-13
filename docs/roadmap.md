@@ -2294,8 +2294,20 @@ Gate 7 progress evidence recorded on 2026-07-12:
   return a typed activation error instead of replaying a cached receipt, and
   dropping the final public `SipMediaStream` owner signals and aborts an
   in-flight driver. Focused real cleanup plus 100-caller/100-driver churn tests
-  pass. The retired-client exact-route transition P1 and the verified-SIPS
-  default-stack overflow remain open before combined qualification.
+  pass. The retired-client exact-route transition P1 remains open before
+  combined qualification; the verified-SIPS stack finding is closed below.
+- rvoip revision `e8d99a5a` closes the last original baseline failure and its
+  masked product defect. The verified mTLS fixture now advertises a SIPS
+  Contact and retains rejected-client transport receivers deterministically.
+  LLDB localized the subsequent default-stack abort to a 79-frame nested async
+  response path, not recursion or the INVITE planner. `SendSIPResponse` now
+  owns and awaits a fresh-stack task, aborts that task if its parent is
+  cancelled, and maps join/panic failure to one fixed error class. The exact
+  default 2 MiB and 16 MiB mTLS/SIPS tests, trusted-CIDR, Digest, all five
+  listener fixtures, 335 rvoip-sip library tests, and the combined 403-test
+  sip-dialog library tree pass. All four clean-baseline qualification failures
+  are therefore closed without weakening trace redaction or requiring a hidden
+  `RUST_MIN_STACK` setting.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
