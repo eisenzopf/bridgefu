@@ -1194,7 +1194,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
      connection, mapping, and error diagnostics, and replace rendered-SDK
      string matching with typed retry/already-ended classes. Reconcile an
      ambiguous Start only with the byte-equivalent request and stable token.
-   - [ ] 5c — Add an injectable `ConnectMediaConnector`/session lifecycle seam
+   - [x] 5c — Add an injectable `ConnectMediaConnector`/session lifecycle seam
      backed in production by Chime plus rvoip WebRTC. Own PONG/activity,
      distinct remote terminal/error causes, joined task, absolute-deadline
      close, streams, hold/resume/DTMF, and secret-free logs. Use the existing
@@ -1230,8 +1230,8 @@ not hide an earlier adapter side effect behind a nominally staged API.
      tenant/correlation, and atomic durable create/attach/dedup. Add full fake-
      Connect/fake-Chime PCMU↔Opus golden teardown/drain tests, repository crash-
      barrier tests, canary replay/cross-tenant negatives, and a manually
-   protected non-production workflow that verifies AWS token idempotency
-   before any production switch.
+     protected non-production workflow that verifies AWS token idempotency
+     before any production switch.
 
    The pre-item-5 audit at rvoip revision `7c1902eb` confirms that current
    generic `originate` eagerly performs StartWebRTCContact, Chime signaling,
@@ -1259,6 +1259,19 @@ not hide an earlier adapter side effect behind a nominally staged API.
    default/AWS-control checks. Generic originate remains intentionally dormant
    and returns a typed unsupported result until 5d; malformed-response cleanup
    whose compensating Stop also fails remains owned by 5d/5e retained cleanup.
+
+   rvoip revision `bbdef330` completes 5c. A public injectable
+   `ConnectMediaConnector`/`ConnectMediaSession` is backed in production by the
+   existing Chime plus rvoip WebRTC stack and exposes streams, negotiated
+   codecs, DTMF, hold/resume, typed terminal/health state, and close to one
+   absolute deadline. Chime now owns and joins its loop, classifies remote
+   leave/error/transport causes, tracks activity/PONG, responds to server PING,
+   and aborts on Drop/deadline without logging wire payloads, SDP, or ICE.
+   Sixty-nine all-feature tests include a local Chime WebSocket with two real
+   rvoip WebRTC peers and an injected non-cooperative connector; strict all-
+   target/all-feature Clippy, rustdoc, and diff checks pass. Route-level
+   non-live/Stop/terminal authority, PONG-expiry policy, and adapter drain
+   remain explicitly in 5d/5e.
 6. [ ] Add an initial-context readiness barrier. Durable
    `bridgefu.context.v1` metadata must be validated and available before an
    outbound SIP activation so allowlisted values are present on the first
@@ -2017,6 +2030,20 @@ Gate 7 progress evidence recorded on 2026-07-12:
   planning, 503 advancement, orphan ACK/BYE cleanup, and CANCEL races remain
   required before timeout retry can be enabled.
 
+  rvoip revision `915bce0d` completes the retained dialog-level failover
+  implementation. One capped/expiring plan and exact attempt index serialize
+  503 and Timer-B advancement, current-attempt CANCEL, provisional/no-retry
+  policy, duplicate selected 2xx re-ACK, and superseded late-2xx ACK-then-BYE
+  cleanup. ACK failure blocks BYE and a retransmitted 2xx serially retries the
+  cleanup; old terminal events cannot unlink the winner. Candidate and plan
+  caps are atomic, maintenance is nonblocking, prune/drain reaches zero, and
+  every attempt shares one immutable logical setup deadline. The 393-test
+  sip-dialog library suite, 21 RFC 3263 tests, exact wrong-route tests, strict
+  all-target/all-feature Clippy, concurrent CANCEL/timeout orders, and default-
+  stack Digest reproduction pass. Timeout failover was enabled only after
+  tombstone validation and orphan cleanup gates passed. An independent exact-
+  revision cross-audit remains required before the P1 is closed.
+
   Candidate selection also changes the socket transport without stamping that
   transport and advertised sent-by into the request: a TCP candidate can carry
   a UDP Via and a stack-default UDP Contact. Materialize the selected route
@@ -2038,15 +2065,15 @@ Gate 7 progress evidence recorded on 2026-07-12:
   audit point. This checkpoint does not claim asynchronous 503/Timer-B or
   late-2xx safety; the retained-plan/tombstone work above remains open.
 
-  Qualification also exposes a default-stack failure: the 422/fast-response
-  integration family and the tenant-bound listener test can overflow Tokio's
-  default 2 MiB debug worker stack and currently require
-  `RUST_MIN_STACK=16777216`. Reproduce at the exact pre-remediation baseline,
-  identify recursion or oversized async frames/types, and either remove the
-  excess stack use or make a justified bounded runtime-stack setting explicit
-  in every shipped process mode. Add default/release/long-churn evidence; no
-  release candidate may rely on an undocumented test-only environment flag or
-  retain a plausible production worker-stack crash.
+  Qualification exposed a default-stack failure: the retained initial-INVITE
+  diff enlarged the finite `execute_action` poll frame to about 1.34 MiB and
+  overflowed Tokio's default 2 MiB debug worker stack after the authenticated
+  second INVITE. Revision `915bce0d` heap-pins the heavy state machine at the
+  candidate-plan boundary. The exact tenant-bound Digest reproducer now passes
+  on the default stack both locally and under independent revalidation with the
+  adapter lifecycle diff. Keep default/release/long-churn stack evidence in the
+  final combined qualification; no release candidate may regress to a hidden
+  `RUST_MIN_STACK` dependency.
 
   The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
   still sends INVITE before durable activation, and its current activation
@@ -2107,6 +2134,20 @@ Gate 7 progress evidence recorded on 2026-07-12:
   `Drop` remains best-effort only. A retained-coordinator capture-UAS test must
   drop/drain the adapter and observe required CANCEL/BYE plus zero sessions,
   audio receivers, transactions, routes, and tasks.
+
+  rvoip revision `3ca4644d` remediates the independent retained-route findings.
+  Paired maps carry exact generations and terminal enqueue/retirement is
+  linearized; a fast terminal marks the route non-live and fails every
+  activation waiter before any receipt; bounded TTL/order tombstones replace
+  permanent admission poisoning; and retained production tasks participate in
+  public async drain/shutdown with phase-aware compensation. The rvoip-sip
+  library suite passes 328 tests, including 100-waiter fast terminal, stale-
+  generation churn, explicit drain/join/zero-wire cases, lifecycle/auth/audio,
+  and the default-stack Digest reproducer. Full-package mTLS timeout,
+  auto-emit redaction, and two B2BUA carry-through failures reproduce at clean
+  pre-change revision `5ad5ffe1`; they remain baseline qualification debt, not
+  evidence against this slice. Item 2b still needs capture-UAS coverage and an
+  independent audit on the exact combined revision.
 
   Lower findings to close with these P1s include dialog-layer rejection of
   stack-owned Via/Route/Record-Route extras, semantic routing for structured
