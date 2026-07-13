@@ -1538,6 +1538,68 @@ Gate 7 progress evidence recorded on 2026-07-12:
   WebRTC correctly rejects. Add an issuer-controlled tenant model/claim or an
   explicit configured single-tenant binding adapter; never derive tenant from
   untrusted client input.
+- The fourth exact cross-audit at clean rvoip revision
+  `82d414235c1020a59664cc6bf45d6ebb961a3554` remains nonzero after the third
+  remediation. The combined selected library suite is green at that revision
+  (including 300 rvoip-sip, 2,114 sip-core plus one ignored, 364 dialog, 120
+  transport, 54 WebRTC, 34 UCTP, 24 registrar, 79 core, 39 auth-core, 24
+  core-traits, and 6 client tests), but the independent audit found further
+  release-blocking boundary and resource failures that those suites do not yet
+  model.
+
+  Outbound TLS and WSS pools/single-flight keys use only `SocketAddr`, so two
+  authorities resolving to one address can reuse a connection authenticated
+  for the wrong SNI; WSS also sends the socket address as `Host`. Key every
+  route, pool, in-flight dial, and eviction by normalized authority, address,
+  trust context, and direction, and derive the HTTP authority from the same
+  authenticated identity. Extend one end-to-end deadline through connection
+  registration, never await a writer/channel while holding the connection-map
+  lock, and make failure single-flight share a bounded result/backoff rather
+  than serialize a retry storm. Bound pending dial waiters/tasks before task
+  creation and bound established inbound and outbound sockets/tasks/maps with
+  authentication/idle deadlines and deterministic permit release. WebSocket
+  sends and close still hold a shared writer lock across unbounded network
+  writes, so a non-reading peer can prevent drain; move writes to an owned
+  bounded/cancellable writer or enforce repeatable send/close deadlines. The
+  public listener's sequential `accept()` still lets one slow upgrade consume
+  each timeout interval; move concurrent upgrade supervision inside the public
+  surface or deprecate it in favor of the bounded transport supervisor with an
+  explicit migration.
+
+  Clustered Digest remains unbounded: even rate-limit denial records a fresh
+  Redis nonce, Redis admits unlimited nonce/cnonce keys, and nonce-count TTL is
+  independent of the issued nonce lifetime, so captured proofs can become
+  replayable while their nonce remains valid. Extend the shared replay-store
+  contract with atomic bounded/fair nonce admission/reuse and an atomic
+  active-nonce-plus-count update whose TTL covers the nonce's remaining valid
+  and stale-retention window. Enforce tenant, user, nonce, and aggregate
+  quotas. Local and registrar replay maps likewise need fair per-principal and
+  per-nonce caps: one valid user must not fill the global 16,384-entry cnonce
+  budget and deny every other identity. Preserve exact replay rejection within
+  `(username, nonce, cnonce)`.
+
+  Users-core API-key attenuation still has a logout hole: a read-only or empty
+  key can revoke all interactive refresh sessions for its owner. Require an
+  explicit revocation permission or reject API keys for that endpoint.
+  Configured tenant identity must be checked by direct access-token validation,
+  carried and checked through refresh tokens, and enforced before a token from
+  another deployment sharing issuer/key can be exchanged into the local
+  tenant. Public router embedding must require real peer metadata or expose a
+  peer-aware make-service; it may not collapse missing `ConnectInfo` into one
+  attacker-exhaustible `unknown` bucket. Limiter cleanup tasks must terminate
+  when their owner is dropped. IPv6 identities must be normalized to a safe
+  prefix, and capacity pressure must use bounded hashed/overflow buckets or
+  safe low-volume eviction rather than globally rejecting every unseen real
+  client after 16,384 rotating addresses.
+
+  Finally, do not hide source breaks in patch releases. The new cnonce-aware
+  replay contract needs an additive legacy adapter that fails closed until a
+  store opts into client-aware replay, or an explicitly versioned breaking
+  release and migration. Public users-core `UserClaims`, `JwtConfig`, and
+  exhaustive rate-limit error changes likewise need compatible constructors/
+  non-exhaustive boundaries or a coordinated semver-breaking version with
+  migration evidence. These compatibility decisions must be executable and
+  documented before the next exact-revision audit.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
