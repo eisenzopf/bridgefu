@@ -941,6 +941,26 @@ not hide an earlier adapter side effect behind a nominally staged API.
      validator/provider/store errors expose only fixed stage/class and
      presence/length metadata through `Debug`, `Display`, and `SessionError`.
      Their live values remain available only through the functional API.
+     This applies transitively to every cross-crate and public application
+     event: SIP headers, bodies, SDP, principals, REGISTER identities,
+     authentication challenges, REFER targets/transactions, and raw requests
+     remain functional/serializable but custom `Debug` exposes only event kind,
+     safe status, and bounded presence/length/count metadata. Core principal,
+     credential, listener-mapping, URI, SIP request, policy, and service
+     containers follow the same rule; bearer/access/ID tokens, Digest nonce or
+     response, signed material, deprecated URI passwords, raw URI/header/body,
+     tenant/subject/issuer/scope, and extension-scheme spelling never appear in
+     default diagnostics.
+     Lower SDP/parser errors are classified at their source and again at the
+     media-adapter/executor/log boundary. A malformed inbound offer can never
+     reach a normal log through `SDPNegotiationFailed` or a generic string
+     session error. Outbound REGISTER/refresh logs likewise expose only URI and
+     Contact presence/length and fixed stage metadata, including authenticated
+     retries and NAT rewrites.
+     Header-policy identity is canonical and case-insensitive: an `Other`
+     spelling equal to Authorization, Proxy-Authorization, or any other
+     reserved/stack-managed name receives the same classification as its typed
+     variant. Generic header staging cannot become an untyped credential path.
      History snapshots sanitize every payload-bearing state-machine event before
      insertion, not only `AuthRequired`. SDP, SIP identities, targets, contacts,
      reasons, custom strings, media paths, transaction identifiers, and other
