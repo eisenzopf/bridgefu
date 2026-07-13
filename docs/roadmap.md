@@ -1845,6 +1845,15 @@ Gate 7 progress evidence recorded on 2026-07-12:
   compatibility, Redis error-enum compatibility, tenant-bound listener
   principals, verified Redis TLS/cluster behavior, cached bounded connections,
   and atomic/cardinality-bounded admission.
+- rvoip revision `ea77dde5` remediates that P1 with a distinct
+  `SipChallenge` admission kind, a configurable per-peer challenge budget,
+  missing-subject cohorts bound to the known peer, missing-peer cohorts bound
+  to the known subject, fail-closed handling when both are absent, realm-
+  independent grouping, and versioned stable Redis key/kind tags. Auth-core
+  passes 115 tests, rvoip-redis passes 13 unit and 12 live Redis 7.2 tests, SIP
+  auth passes 48 tests, and strict auth-core/rvoip-redis all-target Clippy is
+  clean. Gate 3 remains open until an independent audit of the exact combined
+  revision reports no P0/P1 regression.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
