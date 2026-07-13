@@ -174,7 +174,7 @@ Gate 2 evidence recorded on 2026-07-10:
 Exit: validator parity, ownership isolation, DataMessage round trips, and
 MediaGraph stress tests pass.
 
-### Gate 3 — Harden rvoip authentication and lifecycle (`in progress — reopened`)
+### Gate 3 — Harden rvoip authentication and lifecycle (`complete`)
 
 - [x] Authenticate WS/WSS before upgrade and enforce full route ownership.
 - [x] Enforce SIP Digest, Bearer, trusted-CIDR, and server-verified mTLS at the
@@ -191,7 +191,7 @@ MediaGraph stress tests pass.
   `Retry-After` clamped to 1–3,600 seconds and no auth challenge. Prove the
   legacy empty-rejection projection plus real-wire absent, subsecond, and huge
   retry hints with counting providers and replay stores.
-- [ ] Close the release-wide credential diagnostic boundary found by the final
+- [x] Close the release-wide credential diagnostic boundary found by the final
   SIP integration audit. Every direct and enclosing auth container in
   auth-core, core/core-traits, client, UCTP, WebRTC, IMS-AKA, LDAP, and
   users-core must preserve live/serialized values while exposing only
@@ -200,11 +200,11 @@ MediaGraph stress tests pass.
   challenge/nonce/response/cnonce/HA1, AKA vectors, bind/TURN credentials,
   signed credentials, signature headers, step-up payloads, WebSocket query auth,
   and mapped principals.
-- [ ] Replace production registrar and UCTP auth log relays with metadata-only
+- [x] Replace production registrar and UCTP auth log relays with metadata-only
   fields. Boxed/erased auth errors must enter the same typed stage classifier as
   direct conversions; no `Other(err.to_string())` or provider error can bypass
   the boundary. Add source guards and malicious first-party canaries.
-- [ ] Make all UCTP/core/client outer event, envelope, payload, and state Debug
+- [x] Make all UCTP/core/client outer event, envelope, payload, and state Debug
   implementations metadata-only while retaining serde and routing behavior.
   Re-run negative auth, transport, and lifecycle suites before Gate 3 is closed
   again.
@@ -231,6 +231,26 @@ Gate 3 evidence recorded on 2026-07-11:
   targets/features, for SIP transport/dialog/proxy, and for the focused WebRTC
   signaling library/tests. Migration guidance is in rvoip's
   `docs/BRIDGEFU_FOUNDATIONS_MIGRATION.md`.
+- Final closure is at local rvoip revision
+  `85b932e46267e59fbdb16864f47a37bdac9ae2f5`. Revisions `2238c70d` and
+  `9dacd544` close the remaining WebRTC DataChannel/packet and UCTP correlation
+  diagnostic surfaces. An independent combined-revision audit closes all three
+  reopened diagnostic items; 194 credential, registrar, erased-error,
+  core/client, and UCTP source-guard/canary tests pass.
+- QUIC, WebTransport, and WebSocket all-feature suites pass after the final
+  UCTP change. The WebSocket saturation test now fills the atomic source queue,
+  forces critical-event pump shutdown, proves lifecycle fallback and exact
+  permit release, and admits a second authenticated peer.
+- The final `cargo test -p rvoip-sip --no-fail-fast` run exits zero at the exact
+  revision above: 337 library tests and every executable integration target
+  pass, including default-stack Endpoint auth, redirect and 422 retry,
+  listener mTLS/tenant binding, CANCEL, PRACK, session timers, real audio and
+  three-peer bridge media, admission hysteresis, and secure wire diagnostics.
+  Doctests pass 213/213 with seven explicitly documented examples ignored.
+  No `RUST_MIN_STACK` override is used.
+- The exact closure revision is intentionally local pending owner review. It
+  has not been pushed, submitted upstream, or substituted into Bridgefu CI;
+  the existing remotely available exact CI pin remains unchanged.
 
 Exit: auth-negative, cross-tenant, replay, expiry, cap, and leak tests pass on
 every supported substrate.
