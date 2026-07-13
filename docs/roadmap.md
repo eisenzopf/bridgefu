@@ -1942,6 +1942,29 @@ Gate 7 progress evidence recorded on 2026-07-12:
   until the shared INVITE planner work, complete capture-UAS qualification, and
   an independent exact-revision audit also pass.
 
+  That independent retained-route review confirms two additional P1s. API
+  translation resolves a Session ID and then terminal delivery re-looks up the
+  route without holding one atomic mapping decision while cleanup can retire
+  it concurrently. This can deliver a second terminal or forward Connected/
+  progress after terminal. Make resolution, terminal claim, and retirement
+  generation-aware and monotonic; add barriered CallEnded/CallAnswered versus
+  local-end/media-cleanup races proving exactly one terminal and no later
+  public event. Also replace permanent `retired_sessions` accumulation: at the
+  default 262,144 entries it permanently poisons admission after about 7.3
+  hours at 10 calls per second. Use bounded expiring/generation tombstones that
+  still reject delayed events for the retired route, reclaim safely under
+  steady churn, expose capacity/expiry metrics, and test delayed replay across
+  reuse plus multi-hour equivalent churn without poisoning the worker.
+
+  Fast terminal activation is also currently reported as success: after the
+  staged FIFO observes a retained terminal, `run_outbound_activation` wakes
+  waiters with a Call-ID receipt before cleanup makes the route non-live. A
+  caller can therefore pass the core liveness check for a route already known
+  terminal. Mark the route sticky non-live and complete activation as failure
+  before waking any waiter. A barriered test with 100 concurrent activators
+  must expose no receipt, deliver exactly one terminal, and retire every map,
+  stream, and task.
+
   Lower findings to close with these P1s include dialog-layer rejection of
   stack-owned Via/Route/Record-Route extras, semantic routing for structured
   `Other` Route values, singleton `Session-Expires`/`Min-SE`, lossless Contact
