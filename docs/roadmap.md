@@ -1663,6 +1663,32 @@ Gate 7 progress evidence recorded on 2026-07-12:
   registrar, SIP examples/binaries, formatting, and diff checks pass. A fresh
   exact-revision independent flow audit is still required before this evidence
   closes the fifth-audit findings.
+- That independent flow audit at `388652d0` reports zero P0 and four remaining
+  P1 code defects. Legacy multiplexer APIs still make address-only first-match
+  choices and use synchronous `try_lock` flow probes; contention can fall
+  through to UDP, and co-addressed TCP/TLS/WS flows can be selected by fixed
+  priority instead of identity. Make flowless connection-oriented response and
+  raw routing fail closed, remove `try_lock` from correctness decisions, and
+  migrate every production caller to an explicit `TransportRoute`.
+
+  The rvoip-sip symmetric REGISTER keepalive path still resolves only a socket
+  address, starts an address-only ping, and later probes for a flow
+  synchronously. It can miss the flow or ping another authority at the same
+  address; retain the exact route returned by the REGISTER transaction and use
+  it for keepalive, pong, and close correlation. Transport messages, pong, and
+  close also share one bounded event lane. A saturated payload lane can delay
+  teardown and retain sockets/permits indefinitely, so add independently
+  reserved lifecycle/control capacity through transport and transaction
+  dispatch and prove prompt delivery under saturation. Finally, TLS listener
+  accept errors immediately reiterate; add bounded retry/backoff while keeping
+  active sessions alive.
+
+  Required evidence now includes live TLS and WSS exact structured/cached-raw
+  response tests, end-to-end NAPTR/SRV/A authority-to-SNI/Host failover,
+  adapter-level exact-flow REGISTER keepalive, saturated payload/control
+  delivery, TLS accept-fault recovery, and co-addressed/lock-contention
+  fail-closed routing. Address-only server-transaction facades remain a lower
+  severity migration risk and should be removed from production call sites.
 - The independent credential/replay audit of `07f387ff` (whose changes are
   included in `388652d0`) reports zero P0 and six P1 findings. First, the
   released 0.2 `DigestReplayStore::accept_nonce_count` signature was actually
