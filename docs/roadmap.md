@@ -1779,6 +1779,20 @@ Gate 7 progress evidence recorded on 2026-07-12:
   handling, validation before CSeq/tag/DNS mutation, honoring
   `with_supported_100rel`, and eliminating the remaining address-only
   server-transaction facade call sites.
+- The independent credential/replay re-audit at committed rvoip baseline
+  `8baa81f3` reports zero P0 and one remaining P1. Rate admission happens
+  before SIP credential parsing, and every normal unauthenticated Digest
+  challenge has no subject. Redis maps that absent dimension to one shared
+  `subject=_` cohort and retains `MissingCredential` as a failure, so ten
+  ordinary initial challenges exhaust a tenant-wide cohort for the default
+  60-second window. Bind an unknown subject to the known peer (and an unknown
+  peer to a bounded subject cohort), or omit that aggregate until the dimension
+  is known; give protocol-normal challenge issuance an explicit per-peer
+  budget. Add missing-subject, missing-peer, distributed-concurrency, and
+  recovery tests. The re-audit otherwise confirms released Digest trait source
+  compatibility, Redis error-enum compatibility, tenant-bound listener
+  principals, verified Redis TLS/cluster behavior, cached bounded connections,
+  and atomic/cardinality-bounded admission.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
