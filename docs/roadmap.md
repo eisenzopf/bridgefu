@@ -951,6 +951,13 @@ not hide an earlier adapter side effect behind a nominally staged API.
      response, signed material, deprecated URI passwords, raw URI/header/body,
      tenant/subject/issuer/scope, and extension-scheme spelling never appear in
      default diagnostics.
+     No runtime parser may depend on a value-bearing `Debug` string. Retire the
+     dialog event-hub fallback that formats `SessionToDialogEvent` and reparses
+     `StoreDialogMapping`/`ReferResponse`; match the typed variants directly,
+     preserve the functional identifiers and application reason in memory, and
+     make their direct and `RvoipCrossCrateEvent` diagnostics metadata-only.
+     Compatibility tests assert typed delivery behavior rather than exact raw
+     `Debug` text.
      Lower SDP/parser errors are classified at their source and again at the
      media-adapter/executor/log boundary. A malformed inbound offer can never
      reach a normal log through `SDPNegotiationFailed` or a generic string
