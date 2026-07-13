@@ -1965,6 +1965,17 @@ Gate 7 progress evidence recorded on 2026-07-12:
   must expose no receipt, deliver exactly one terminal, and retire every map,
   stream, and task.
 
+  Adapter shutdown currently closes local streams but does not hang up or
+  finalize active outbound SIP sessions when another owner retains the public
+  coordinator. The media monitor treats `Closing` as normal and no cleanup
+  supervisor takes network authority, leaving an orphaned dialog/session.
+  Make the optional drain hook required for SIP: freeze admission, compensate
+  each prepared/possible/sent route with the phase-appropriate no-wire/CANCEL/
+  BYE action, join route/media/translator tasks, and report incomplete drain.
+  `Drop` remains best-effort only. A retained-coordinator capture-UAS test must
+  drop/drain the adapter and observe required CANCEL/BYE plus zero sessions,
+  audio receivers, transactions, routes, and tasks.
+
   Lower findings to close with these P1s include dialog-layer rejection of
   stack-owned Via/Route/Record-Route extras, semantic routing for structured
   `Other` Route values, singleton `Session-Expires`/`Min-SE`, lossless Contact
