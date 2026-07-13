@@ -2276,6 +2276,26 @@ Gate 7 progress evidence recorded on 2026-07-12:
   canonical typed header name. All three exact tests pass while production
   trace redaction remains unchanged. The verified-mTLS adapter handoff is the
   sole remaining test in the original four-test baseline failure set.
+- rvoip revision `4118681f` closes retained-planner findings A–D. Active plan
+  reservations are independent from bounded tombstone retention; manager
+  lifecycle is latched and joins its dispatch workers; attempt I/O no longer
+  holds the plan mutex and is generation/deadline/cancel/drain guarded; and
+  registration, prune, and captured-event advancement use one atomic ownership
+  decision. Deterministic blocked pre/send/post-send, concurrent registration,
+  prune, abort, and stop tests pass, followed by 400/400 sip-dialog library
+  tests and the full package unit/integration/documentation suite.
+- rvoip revision `f5ff5c1a` closes planner diagnostic finding F. All five
+  planner counters and retired client transactions are present in runtime/perf
+  snapshots, live ownership is separated from expected tombstones, and soak
+  drain evidence spans the 90-second retention horizon. The exact snapshot and
+  two retention performance tests pass.
+- rvoip revision `e3b596b6` closes the three adapter/media re-audit findings.
+  The first destructive drain failure is sticky, terminal/draining routes
+  return a typed activation error instead of replaying a cached receipt, and
+  dropping the final public `SipMediaStream` owner signals and aborts an
+  in-flight driver. Focused real cleanup plus 100-caller/100-driver churn tests
+  pass. The retired-client exact-route transition P1 and the verified-SIPS
+  default-stack overflow remain open before combined qualification.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
