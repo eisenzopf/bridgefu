@@ -1799,6 +1799,26 @@ Gate 7 progress evidence recorded on 2026-07-12:
   with exact-route candidate failover, and TLS/WSS-only ACK/BYE/INFO/PRACK for
   SIPS dialogs.
 
+  The review then found two more candidate-lifecycle P1s. The current helper
+  exhausts only synchronous send failures and commits to the first enqueued
+  transaction, so a pre-provisional Timer B/F timeout or retry-eligible `503`
+  cannot advance to the next RFC 3263 candidate. Retain the candidate plan
+  until a typed terminal outcome; retry only before any provisional response,
+  within the overall deadline, and never during cancellation, drain, semantic
+  auth/redirect/422 retry, or terminal dialog state. Each attempt gets a fresh
+  branch and transaction, atomically replaces the canonical mapping, and
+  retires late events. Test a black-holed first candidate and an eligible 503
+  followed by a successful second candidate, plus the provisional and terminal
+  no-retry boundaries.
+
+  Candidate selection also changes the socket transport without stamping that
+  transport and advertised sent-by into the request: a TCP candidate can carry
+  a UDP Via and a stack-default UDP Contact. Materialize the selected route
+  before lifecycle signing, regenerate stack-owned Via and default Contact per
+  attempt, and preserve only a caller-explicit validated Contact. Packet tests
+  must assert that actual transport, Via transport/sent-by, and default Contact
+  agree for every UDP/TCP/TLS/WS/WSS candidate.
+
   The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
   still sends INVITE before durable activation, and its current activation
   starts media before event-stage admission can fail. `run_bind` can overwrite
@@ -1852,8 +1872,11 @@ Gate 7 progress evidence recorded on 2026-07-12:
   independent grouping, and versioned stable Redis key/kind tags. Auth-core
   passes 115 tests, rvoip-redis passes 13 unit and 12 live Redis 7.2 tests, SIP
   auth passes 48 tests, and strict auth-core/rvoip-redis all-target Clippy is
-  clean. Gate 3 remains open until an independent audit of the exact combined
-  revision reports no P0/P1 regression.
+  clean. Its first implementation added the challenge budget as a new public
+  `RedisAuthConfig` field, which breaks released exhaustive struct literals;
+  move that setting to private provider state with an additive builder before
+  qualification. Gate 3 remains open until that compatibility follow-up and an
+  independent audit of the exact combined revision report no P0/P1 regression.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
