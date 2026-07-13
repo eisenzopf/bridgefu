@@ -1505,6 +1505,39 @@ Gate 7 progress evidence recorded on 2026-07-12:
   store a required constructor dependency for any API-capable service, or make
   every retirement/validation path return a typed unavailable error rather than
   silently weakening policy; add non-SQLite fail-closed tests.
+- The third exact cross-audit at rvoip revision
+  `98b87099029d9fd6ac6fe1ef6bc718f706e994ea` remains nonzero after the second
+  remediation. Outbound TLS and WSS TCP/TLS/HTTP handshakes still have no
+  deadline, global/per-destination admission, task ownership, or close/drain
+  cancellation. Concurrent pool misses also dial the same destination in
+  parallel; WS overwrites the map and an older reader unconditionally removes
+  the newer route, while TLS teardown removes every duplicate for the address.
+  Add managed outbound admission/deadlines, per-destination single-flight, and
+  generation/identity-checked eviction so close joins dials and a stale reader
+  cannot erase its replacement. The publicly exported `WebSocketListener`
+  likewise retains a sequential `accept()` that performs the full unbounded
+  TLS/HTTP upgrade outside the hardened transport supervisor; make the low-level
+  API explicitly configured and bounded or move it behind a breaking migration.
+  Digest saturation now preserves active state, but nonce-count replay keys use
+  only `(username, nonce)`. When saturated clients share the reused nonce, a
+  first legitimate proof with `nc=1` locks out later clients with different
+  `cnonce` values until expiry. Key replay state by username, nonce, and cnonce
+  (with the same aggregate cap/cleanup), and test multiple new legitimate
+  clients after saturation rather than only one preexisting unused proof.
+  Users-core still lets a write-only API key owned by an administrator use
+  `PUT /users/{id}` to mutate any user's roles/active state because owner roles
+  satisfy `is_admin` without explicit key `admin` permission. All cross-user and
+  role/state mutations must require non-key admin authority or an explicit key
+  admin grant. Its default Axum server omits real peer `ConnectInfo`; rate
+  limiting therefore trusts spoofable `x-real-ip` or places every client in one
+  `unknown` bucket, while IP and failed-login maps are unbounded by
+  attacker-controlled addresses/usernames. Wire socket peer identity, trust
+  forwarding headers only from configured proxies, and cap/expire every limiter
+  keyspace. Finally, users-core access JWTs carry no tenant claim, so the
+  first-party auth-core bridge creates a tenantless principal that secure
+  WebRTC correctly rejects. Add an issuer-controlled tenant model/claim or an
+  explicit configured single-tenant binding adapter; never derive tenant from
+  untrusted client input.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
