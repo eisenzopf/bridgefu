@@ -1993,6 +1993,19 @@ Gate 7 progress evidence recorded on 2026-07-12:
   must assert that actual transport, Via transport/sent-by, and default Contact
   agree for every UDP/TCP/TLS/WS/WSS candidate.
 
+  rvoip revision `05091c8b` lands the safe planner checkpoint: one immutable
+  initial INVITE plan across proxy/auth/redirect/422 paths, exact SDP/options,
+  per-protection-space credentials, fresh candidate branches, pre-allocation
+  validation/compensation, fail-closed exact next hops, persisted SIPS
+  confidentiality, and candidate-specific Via/sent-by/default-Contact wire
+  materialization. It passes 2,115 sip-core tests (one ignored), 385 dialog
+  tests, 325 rvoip-sip tests, 11 RFC 3263 tests, and focused redirect,
+  per-leg-proxy, 100rel, and chained 407→401→422→200 suites. The additive
+  `CandidateWirePlan` API keeps the legacy failover wrapper; requiring a
+  structured Via at finalization is retained as an explicit compatibility
+  audit point. This checkpoint does not claim asynchronous 503/Timer-B or
+  late-2xx safety; the retained-plan/tombstone work above remains open.
+
   The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
   still sends INVITE before durable activation, and its current activation
   starts media before event-stage admission can fail. `run_bind` can overwrite
