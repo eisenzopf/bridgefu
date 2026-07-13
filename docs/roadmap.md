@@ -146,7 +146,7 @@ Gate 2 evidence recorded on 2026-07-10:
 Exit: validator parity, ownership isolation, DataMessage round trips, and
 MediaGraph stress tests pass.
 
-### Gate 3 — Harden rvoip authentication and lifecycle (`complete`)
+### Gate 3 — Harden rvoip authentication and lifecycle (`in progress — reopened`)
 
 - [x] Authenticate WS/WSS before upgrade and enforce full route ownership.
 - [x] Enforce SIP Digest, Bearer, trusted-CIDR, and server-verified mTLS at the
@@ -155,6 +155,23 @@ MediaGraph stress tests pass.
   before delivering replies or commands.
 - [x] Enforce caps and deterministic peer cleanup on QUIC, WebTransport, and
   WebSocket substrates.
+- [ ] Close the release-wide credential diagnostic boundary found by the final
+  SIP integration audit. Every direct and enclosing auth container in
+  auth-core, core/core-traits, client, UCTP, WebRTC, IMS-AKA, LDAP, and
+  users-core must preserve live/serialized values while exposing only
+  scheme/stage, presence/length/count, and fixed classes in `Debug`/`Display`.
+  This includes bearer/access/refresh/ID/DPoP tokens, passwords/hashes, Digest
+  challenge/nonce/response/cnonce/HA1, AKA vectors, bind/TURN credentials,
+  signed credentials, signature headers, step-up payloads, WebSocket query auth,
+  and mapped principals.
+- [ ] Replace production registrar and UCTP auth log relays with metadata-only
+  fields. Boxed/erased auth errors must enter the same typed stage classifier as
+  direct conversions; no `Other(err.to_string())` or provider error can bypass
+  the boundary. Add source guards and malicious first-party canaries.
+- [ ] Make all UCTP/core/client outer event, envelope, payload, and state Debug
+  implementations metadata-only while retaining serde and routing behavior.
+  Re-run negative auth, transport, and lifecycle suites before Gate 3 is closed
+  again.
 
 Gate 3 evidence recorded on 2026-07-11:
 
@@ -991,6 +1008,21 @@ not hide an earlier adapter side effect behind a nominally staged API.
      peer/application values become fixed event kind plus bounded metadata in
      retained `TransitionRecord`, JSON, and CSV output. Live events remain
      unchanged, and CSV output must quote/escape all diagnostic fields safely.
+     The public diagnostic boundary is safe before insertion as well:
+     directly constructed/deserialized `EventType`, `TransitionRecord`,
+     `GuardResult`, and `ActionRecord` cannot expose raw payloads through
+     `Debug` or diagnostic serialization. Lifecycle, callback, prepared/live
+     call, endpoint trace/registration, and parallel legacy wrappers receive
+     the same metadata-only diagnostics as the primary application `Event`.
+     Direct SIP auth challenge/authentication-info headers, Digest models,
+     typed SDP/ICE/SRTP keying, URI, Request, Response, and Message diagnostics
+     never render nonce/realm/proof, ICE password, crypto key, fingerprint,
+     header, reason, or body values. Every `TypedHeader` diagnostic delegates to
+     a safe structural view rather than wire `Display`.
+     All remaining `RvoipCrossCrateEvent` families, including media/RTP,
+     orchestration, and core events, provide metadata-only inner Debug so the
+     outer wrapper cannot reopen arbitrary errors, file paths, transcript text,
+     targets, or details. Serde and live routing fields remain unchanged.
      Opt-in transport/dialog timing diagnostics correlate calls through a
      bounded opaque identifier derived after the configured Call-ID keep/redact/
      drop decision; their maps and snapshots never store or return raw peer
