@@ -1823,9 +1823,18 @@ Gate 7 progress evidence recorded on 2026-07-12:
   within the overall deadline, and never during cancellation, drain, semantic
   auth/redirect/422 retry, or terminal dialog state. Each attempt gets a fresh
   branch and transaction, atomically replaces the canonical mapping, and
-  retires late events. Test a black-holed first candidate and an eligible 503
-  followed by a successful second candidate, plus the provisional and terminal
-  no-retry boundaries.
+  retires late events. Transaction core currently discards or swallows a late
+  2xx after Timer B and retains no authenticated route tombstone; therefore do
+  not enable timeout failover until each superseded attempt retains bounded
+  route/security/CSeq/branch state, a late 2xx is validated against that state,
+  and the stack sends the required ACK followed by BYE without promoting the
+  superseded dialog. Race this cleanup against CANCEL, drain, a winning
+  candidate, and tombstone expiry. An eligible 503 retry may land first while
+  retaining its old transaction for ACK, but it does not substitute for the
+  Timer-B safety work. Test a black-holed first candidate and an eligible 503
+  followed by a successful second candidate, delayed 2xx from every losing
+  attempt, plus the provisional, cancellation, terminal, and expiry no-retry
+  boundaries.
 
   Candidate selection also changes the socket transport without stamping that
   transport and advertised sent-by into the request: a TCP candidate can carry
