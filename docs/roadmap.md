@@ -1181,14 +1181,14 @@ not hide an earlier adapter side effect behind a nominally staged API.
    reconciliation; default targets, empty attributes, or a newly generated
    retry token are not compatible evidence. Operational events must cover
    liveness, remote termination, activation failure, and drain cleanup.
-   - [ ] 5a — Add redacted validated `ConnectProfileId`, exact
+   - [x] 5a — Add redacted validated `ConnectProfileId`, exact
      `AmazonConnectTarget`, `ConnectClientToken`, and
      `AmazonConnectOriginateContext` containing target, attributes, display
      name, optional description, and stable token. Generic originate requires
      that exact context before I/O. Preserve legacy `ConnectConfig`,
      `ContactTarget`, and `client_token=None` wrapper semantics for the frozen
      path.
-   - [ ] 5b — Add one adapter-owned non-secret profile resolver so the selected
+   - [x] 5b — Add one adapter-owned non-secret profile resolver so the selected
      AWS account/region starter also owns StopContact. Validate request bounds
      and every required AWS response field, redact/zeroize sensitive request,
      connection, mapping, and error diagnostics, and replace rendered-SDK
@@ -1246,6 +1246,19 @@ not hide an earlier adapter side effect behind a nominally staged API.
    control starter, started-contact cleanup guard, Chime test server,
    ContactRegistry races, core prepared-commit seam, and frozen listener stay
    in place while 5a–5h replace these behaviors.
+
+   rvoip revision `5ad5ffe1` completes 5a and 5b. New generic calls carry an
+   opaque validated/redacted profile, exact target, stable token, attributes,
+   display, and description; a bounded exact profile resolver retains the same
+   starter for Start, Stop, and pending cleanup. Missing/wrong/unknown context
+   fails before I/O, critical request/response fields are bounded, SDK retry/
+   already-ended decisions are typed, and diagnostics are metadata-only.
+   Legacy screen-pop wrappers preserve defaults, empty attributes, and
+   `client_token=None`. Fifty-nine all-feature Amazon unit/integration/source-
+   compatibility tests pass with strict all-target/all-feature Clippy and
+   default/AWS-control checks. Generic originate remains intentionally dormant
+   and returns a typed unsupported result until 5d; malformed-response cleanup
+   whose compensating Stop also fails remains owned by 5d/5e retained cleanup.
 6. [ ] Add an initial-context readiness barrier. Durable
    `bridgefu.context.v1` metadata must be validated and available before an
    outbound SIP activation so allowlisted values are present on the first
