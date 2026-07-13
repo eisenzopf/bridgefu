@@ -964,6 +964,10 @@ not hide an earlier adapter side effect behind a nominally staged API.
      session error. Outbound REGISTER/refresh logs likewise expose only URI and
      Contact presence/length and fixed stage metadata, including authenticated
      retries and NAT rewrites.
+     TLS and WSS handshake failures are also fixed stage/class diagnostics:
+     rustls errors are never string-flattened because name-mismatch errors can
+     contain both the requested SNI and presented certificate SANs. Socket
+     addresses may remain; expected/presented DNS values may not.
      Header-policy identity is canonical and case-insensitive: an `Other`
      spelling equal to Authorization, Proxy-Authorization, or any other
      reserved/stack-managed name receives the same classification as its typed
