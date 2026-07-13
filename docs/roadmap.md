@@ -167,6 +167,14 @@ MediaGraph stress tests pass.
   before delivering replies or commands.
 - [x] Enforce caps and deterministic peer cleanup on QUIC, WebTransport, and
   WebSocket substrates.
+- [ ] Treat a denied SIP authentication reservation as a terminal admission
+  decision. A denied initial challenge must not mint or persist a Digest nonce,
+  call a credential/challenge/audit provider, or return another 401/407.
+  Preserve the released exhaustive auth-decision enums through an additive
+  richer evaluation path; the listener returns a bounded `503` with a typed
+  `Retry-After` clamped to 1–3,600 seconds and no auth challenge. Prove the
+  legacy empty-rejection projection plus real-wire absent, subsecond, and huge
+  retry hints with counting providers and replay stores.
 - [ ] Close the release-wide credential diagnostic boundary found by the final
   SIP integration audit. Every direct and enclosing auth container in
   auth-core, core/core-traits, client, UCTP, WebRTC, IMS-AKA, LDAP, and
@@ -1074,6 +1082,14 @@ not hide an earlier adapter side effect behind a nominally staged API.
      core receipt and prepared-commit interfaces are sufficient; do not make a
      breaking core API change. A generic adapter drain hook remains optional,
      while SIP exposes a concrete drain method for Bridgefu worker shutdown.
+     Before 2b closes, remediate the exact-revision lifecycle re-audit:
+     failed route/media compensation during drain remains sticky or is truly
+     retried; a route that has entered termination can never return its cached
+     successful activation receipt; and cancellation of the sole
+     `SipMediaStream::new`/bind owner after driver spawn must synchronously
+     signal or abort that driver instead of leaking its subscription/callback.
+     Barriered failure, delayed-terminal activation, and constructor-cancel
+     churn tests are mandatory.
    - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
      both directions, with validated internal label/message-ID headers and
      explicit reliability capability errors.
@@ -1085,6 +1101,18 @@ not hide an earlier adapter side effect behind a nominally staged API.
      an independent P0/P1 audit before item 2 is complete. Property/fuzz
      evidence must show that no accepted header or auth value can serialize an
      additional SIP header line.
+     The retained INVITE planner must also pass the exact-revision ownership
+     audit: separate active-plan admission from 90-second tombstone capacity;
+     make `stop` a latched joinable drain; release the plan mutex around every
+     signer/send/hook await and race each attempt against deadline/cancel/drain;
+     make prune, registration, and event advancement generation-atomic; and
+     expose every live-plan, attempt, tombstone, and retired-transaction count
+     in qualification snapshots. Transaction retirement must atomically move
+     the exact request route from Active to Retired and authenticate one
+     ingress decision against that retained UDP tuple or stream flow. Tests run
+     at the real capacity=100/10-CPS configuration for longer than the 90-second
+     retention window and include blocked awaits, concurrent stop/prune/setup,
+     same-address distinct-flow late 2xx, and normal-stack auth/redirect chains.
 3. [ ] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
    WHEP, while retaining the corresponding authenticated server roles. Local
    SDP offer construction is not an outbound client. Pin WHIP to
@@ -2201,6 +2229,38 @@ Gate 7 progress evidence recorded on 2026-07-12:
   handling, recovery, and wrong-CA rejection. Strict rvoip-redis all-target
   Clippy and the enterprise example are clean. Only the independent combined-
   revision audit remains before this finding can close.
+- Exact combined-revision qualification at rvoip `3ca4644d` passes 2,115
+  sip-core tests (one ignored), 393 sip-dialog tests, 21 retained failover
+  tests, 328 rvoip-sip library tests, the default-stack tenant-bound Digest
+  handoff, and 69 all-feature Amazon Connect tests. A workspace-wide strict
+  all-feature Clippy invocation remains unusable as release evidence because
+  it enters the unrelated legacy G.729 implementation and fails on 993
+  pre-existing pedantic lints; qualification uses scoped `--no-deps` strict
+  linting and records that workspace debt separately rather than weakening the
+  lint boundary.
+- The independent auth/adapter re-audit at `3ca4644d` reports zero P0 and four
+  P1s. Challenge-budget denial still calls `rejected_async`, minting and
+  persisting a fresh nonce while discarding `retry_after`; this is now the
+  explicit Gate 3 checklist item above. A failed adapter drain removes route
+  ownership before reporting compensation failure, allowing a second drain to
+  return a false success. A post-terminal activation can fall through to a
+  previously cached successful receipt. Cancellation of the sole public media
+  constructor/bind owner after its detached driver is spawned can leak the
+  driver and subscription. These three adapter/media findings are mandatory
+  2b closures with deterministic failure/race tests.
+- The independent retained-planner audit at the same revision reports zero P0
+  and six P1s. Its 90-second retained plans share the active-dialog capacity,
+  so the real capacity=100 configuration can reject healthy 10-CPS traffic
+  after roughly 51 seconds. Manager stop is a sleep-and-clear operation rather
+  than a latched joined drain. External pre-send/send/post-send awaits hold the
+  plan mutex and can starve deadline, CANCEL, and shutdown. Prune, registration,
+  and event advancement do not share one generation-atomic ownership decision.
+  Client retirement briefly removes its route before publishing a tombstone,
+  authenticates the response twice, and can lose an exact stream flow. Finally,
+  performance/soak snapshots omit planner and retired-transaction ownership and
+  can report a false zero before the 90-second TTL expires. Item 2e now lists
+  the ordered remediation and acceptance races. No Gate 3 or SIP item is closed
+  solely from the green pre-audit suite.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
