@@ -1888,8 +1888,16 @@ Gate 7 progress evidence recorded on 2026-07-12:
   clean. Its first implementation added the challenge budget as a new public
   `RedisAuthConfig` field, which breaks released exhaustive struct literals;
   move that setting to private provider state with an additive builder before
-  qualification. Gate 3 remains open until that compatibility follow-up and an
-  independent audit of the exact combined revision report no P0/P1 regression.
+  qualification.
+- rvoip revision `e982e36b` completes that compatibility follow-up. The public
+  `RedisAuthConfig` field set is restored exactly, an external-crate exhaustive
+  struct-literal sentinel compiles, and the challenge setting is private
+  provider state with an additive builder/getter. Redis passes 13 unit, 12 live
+  single-node, and seven password-authenticated mTLS three-primary cluster
+  tests, including distributed missing-dimension isolation, real MOVED
+  handling, recovery, and wrong-CA rejection. Strict rvoip-redis all-target
+  Clippy and the enterprise example are clean. Only the independent combined-
+  revision audit remains before this finding can close.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
