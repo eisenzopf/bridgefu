@@ -1632,6 +1632,26 @@ Gate 7 progress evidence recorded on 2026-07-12:
   Multiplexer-level WS/WSS request-to-structured-response, cached-response,
   multi-authority, close-event, and accept-recovery tests are required before
   another exact audit.
+- The independent users-core and Digest replay cross-audit at the same clean
+  rvoip revision (`c626879057066e6c043e511e639a8e19a64175e4`) is also nonzero:
+  zero P0 and three P1 findings remain. `UsersCoreAuthProvider` compares the
+  access-token tenant only when the bridge is configured with a tenant, so an
+  unbound bridge accepts a tenant-bearing token even though the native JWT
+  issuer enforces exact `Option` equality. Compare the tenant options
+  unconditionally so tenant-bound and tenantless issuers cannot cross that
+  boundary.
+
+  The claimed additive `DigestReplayStore` compatibility layer changed the
+  original `accept_nonce_count(username, nonce, cnonce, nonce_count)` method by
+  removing `cnonce`; existing downstream implementations therefore stop
+  compiling. Restore the exact legacy signature and make only the secure
+  client-nonce-aware extensions additive and fail-closed until implemented.
+  The Redis replay implementation also advertises clustered deployment and
+  uses cluster-safe hash tags, but it owns a single-node `redis::Client` and
+  lacks the async cluster feature. Hash-slot compatibility alone does not
+  process `MOVED`, topology changes, or failover. Add a seed-based
+  `ClusterClient` mode and exercise the replay Lua scripts against a real
+  multi-node Redis Cluster before the next exact-revision audit.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
