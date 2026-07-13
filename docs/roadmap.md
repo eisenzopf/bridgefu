@@ -1652,6 +1652,44 @@ Gate 7 progress evidence recorded on 2026-07-12:
   process `MOVED`, topology changes, or failover. Add a seed-based
   `ClusterClient` mode and exercise the replay Lua scripts against a real
   multi-node Redis Cluster before the next exact-revision audit.
+- rvoip revision `388652d0fe51a2c4d9b7add067c6c81a0e2d124f` implements
+  exact transport-flow routing and an explicit coordinated SIP transport and
+  dialog 0.3 migration. Authority and opaque flow identity now cross RFC 3263
+  resolution, request/response routing, transaction caches, and lifecycle
+  teardown; TCP/TLS/WS/WSS connection supervision is bounded and flow-aware.
+  At that revision, the full SIP transport suite (144 library tests plus all
+  integrations), SIP dialog suite (372 library tests plus integrations and 172
+  passing documentation tests), strict Clippy for both crates, proxy,
+  registrar, SIP examples/binaries, formatting, and diff checks pass. A fresh
+  exact-revision independent flow audit is still required before this evidence
+  closes the fifth-audit findings.
+- The independent credential/replay audit of `07f387ff` (whose changes are
+  included in `388652d0`) reports zero P0 and six P1 findings. First, the
+  released 0.2 `DigestReplayStore::accept_nonce_count` signature was actually
+  `(username, nonce, nonce_count)`; adding `cnonce` is still a patch-level
+  source break, and the compatibility test merely reimplements the new shape.
+  Restore the exact released method and keep the client-nonce-aware secure path
+  in the additive default-fail-closed method already used by production SIP.
+  Second, adding variants to the public exhaustive `RedisAuthError` in
+  rvoip-redis 0.1.3 is also a source break; preserve exhaustiveness or perform
+  an explicit semver migration.
+
+  Third, listener Digest authentication and static CIDR/mTLS principals can
+  remain tenantless even though `SipAdapter` requires a tenant, making the
+  authenticated Bridgefu ingress unusable and leaving ownership ambiguous.
+  Bind every listener policy to an explicit validated tenant and require that
+  tenant on every admitted principal. Fourth, rvoip-redis enables asynchronous
+  cluster support without a Redis TLS runtime feature, so `rediss://` cannot be
+  used. Fifth, each auth operation constructs a new single-node socket or full
+  cluster topology and has no bounded command deadline; cache the production
+  connection/manager and configure finite connect, response, and retry bounds.
+  Sixth, Redis rate limiting separates its read admission from later failure
+  recording and keys only one attacker-controlled subject/realm/peer tuple, so
+  concurrent or rotating guesses bypass it and create unbounded TTL keys. Use
+  one atomic admission/reservation operation, a peer-level aggregate limit,
+  bounded subject cohorts, and deterministic expiry/cardinality tests. Cluster
+  qualification must fail rather than silently skip construction errors and
+  must exercise redirection/topology change plus TLS/authenticated deployments.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
