@@ -1773,6 +1773,19 @@ Gate 7 progress evidence recorded on 2026-07-12:
   authoritative teardown. Add deterministic bind/close, mismatched-target,
   activation-failure, cache-retirement, pump-exit, and bounded-drain tests.
 
+  rvoip revisions `884a27ad`, `a1a41fb8`, and `41649dbb` implement that
+  retained-route/media-lifecycle remediation. They introduce one retained
+  outbound route, dormant single-flight activation, actual wire Call-ID
+  receipts, bounded FIFO staging, cancellation compensation, immutable bind
+  targets, atomic cache retirement, and authoritative teardown on bind or pump
+  failure. Incomplete driver shutdown remains truthfully `Closing` instead of
+  publishing a false `Closed`. The rvoip-sip library suite passes 325 tests,
+  including zero-wire prepare/end, 100 concurrent activators with one INVITE,
+  cancelled waiters, backpressure, bind/close races, 100 bind callers, target
+  mismatch, cache retirement, and media-failure teardown. Item 2b remains open
+  until the shared INVITE planner work, complete capture-UAS qualification, and
+  an independent exact-revision audit also pass.
+
   Lower findings to close with these P1s include dialog-layer rejection of
   stack-owned Via/Route/Record-Route extras, semantic routing for structured
   `Other` Route values, singleton `Session-Expires`/`Min-SE`, lossless Contact
