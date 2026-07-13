@@ -2038,6 +2038,16 @@ Gate 7 progress evidence recorded on 2026-07-12:
   audit point. This checkpoint does not claim asynchronous 503/Timer-B or
   late-2xx safety; the retained-plan/tombstone work above remains open.
 
+  Qualification also exposes a default-stack failure: the 422/fast-response
+  integration family and the tenant-bound listener test can overflow Tokio's
+  default 2 MiB debug worker stack and currently require
+  `RUST_MIN_STACK=16777216`. Reproduce at the exact pre-remediation baseline,
+  identify recursion or oversized async frames/types, and either remove the
+  excess stack use or make a justified bounded runtime-stack setting explicit
+  in every shipped process mode. Add default/release/long-churn evidence; no
+  release candidate may rely on an undocumented test-only environment flag or
+  retain a plausible production worker-stack crash.
+
   The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
   still sends INVITE before durable activation, and its current activation
   starts media before event-stage admission can fail. `run_bind` can overwrite
