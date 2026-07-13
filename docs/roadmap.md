@@ -1484,6 +1484,18 @@ Gate 7 progress evidence recorded on 2026-07-12:
   tuples to collide on one ownership key. Use domain-separated,
   length-prefixed hashing (or a typed ownership key) for every composite
   fallback subject and add adversarial delimiter-collision tests.
+  The same audit finds a separate API-key exchange P1: public
+  `AuthenticationService::authenticate_api_key` discards the validated key and
+  its permissions, issues ordinary role-derived access and refresh JWTs, fails
+  to store the refresh JTI, and reports a five-minute expiry while the token
+  uses the configured access TTL (fifteen minutes by default). Because missing
+  refresh rows are treated as active and REST JWTs receive full permissions, a
+  read-only key can exchange itself into unrestricted user/admin authority and
+  an untracked thirty-day refresh token that survives key revocation, logout,
+  and password revocation. API-key authentication must either remain a
+  non-upgradeable restricted context or issue permission-constrained,
+  key-bound, accurately expired tokens whose refresh lineage is durably stored
+  and revoked with the originating key/user.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
