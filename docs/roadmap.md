@@ -1439,6 +1439,23 @@ Gate 7 progress evidence recorded on 2026-07-12:
   comparisons are sound. All listed public diagnostics and remote error bodies
   must become fixed class/shape metadata while functional values remain
   available only to their authorized live paths.
+- The post-remediation cross-audit at rvoip production revision
+  `d46fd91a993129d312d95849d3046525398812b2` (unchanged by test-only descendant
+  `ac9d75549f6f78cab0e87fc918075c02b17bc0da`) reports zero P0 but three new P1
+  lifecycle/admission gaps before Gate 3 or item 2a can close. WS/WSS performs
+  TLS and HTTP upgrade inline in the sole accept loop without a deadline, so
+  one slow peer blocks every later connection; direct TLS spawns every accepted
+  handshake without a deadline or admission bound, allowing task/FD/memory
+  exhaustion. `TlsTransport::close` only flips a flag while its detached accept
+  loop and live readers continue accepting and emitting events, defeating
+  drain, reconfiguration, and port rebinding. Finally, unauthenticated Digest
+  challenge churn can fill the 4,096-entry stateful nonce sets and evict active
+  challenges in both registrar and local rvoip-sip fallbacks, indefinitely
+  starving legitimate clients when rate limiting is absent. Add bounded
+  concurrent handshake supervision with deadlines, owned listener/connection
+  cancellation and joined close/drain semantics, and nonce admission that never
+  evicts an active challenge (plus pre-challenge source limiting or stateless
+  signed nonces for exposed listeners). Re-audit the exact remediated revision.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
