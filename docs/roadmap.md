@@ -102,14 +102,14 @@ Active calls remain pinned and are drained rather than migrated.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
 
-### Gate 1 — Freeze StandardCharter (`in progress — reopened`)
+### Gate 1 — Freeze StandardCharter (`complete`)
 
 - [x] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
 - [x] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
   StartWebRTCContact attributes.
 - [x] Assert G.711 to/from Opus media, screen-pop events, and bidirectional
   teardown.
-- [ ] Add a protected non-production Vapi-to-Connect smoke workflow and a
+- [x] Add a protected non-production Vapi-to-Connect smoke workflow and a
   drain/rollback runbook.
 - [x] Keep the existing production path isolated.
 
@@ -127,9 +127,19 @@ streams, and decoded audio callbacks must preserve source RTP timestamps.
 
 Focused evidence passes 247 media-core tests, 62 Amazon Connect library tests,
 3 Amazon media-bridge tests, and all 34 locked StandardCharter contract tests.
-The checked-in workflows still contain no protected Vapi-to-Connect smoke job
-or owner-authorized external AWS execution. That live non-production evidence
-and its drain/rollback runbook remain the only open Gate 1 item.
+Bridgefu revision `84d760e` adds the manual-only workflow, its fixed
+`standardcharter-nonproduction` GitHub environment boundary, exact confirmation
+and owner-authorization gates, secret-only targets, offline-default validation,
+redacted lifecycle evidence, and the executable drain/rollback runbook. The CI
+artifact check parses the workflow and scripts, executes synthetic offline
+preflight/plan paths, and proves that production-marked targets, option-looking
+targets, and unauthorized execution are rejected. The locked 34-test
+StandardCharter contract remains green after the artifact change.
+
+No AWS, Vapi, SSH, deployment, or rollback operation was executed to close this
+gate. An owner-authorized run of the protected non-production workflow remains
+explicitly unchecked Gate 11 release-qualification evidence; checking in a safe
+and locally verifiable workflow does not claim that external result.
 
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
@@ -2361,6 +2371,9 @@ cleanly.
 
 ### Gate 11 — Qualification and release candidate (`pending`)
 
+- [ ] Run the owner-authorized protected non-production Vapi-to-Connect smoke
+  and retain only the redacted workflow, revision, approval, account, and
+  artifact evidence required by the runbook.
 - [ ] Sustain 100 transcoded calls at 10 attempts/second for one hour.
 - [ ] Sustain one UCTP publisher to 1,000 listeners for one hour.
 - [ ] Sustain one MOQT origin through relays to 10,000 listeners for one hour.
