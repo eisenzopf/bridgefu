@@ -1090,6 +1090,55 @@ not hide an earlier adapter side effect behind a nominally staged API.
    install its owner before returning `201` and emitting the operational event.
    Rejection, expiry, replay, disconnect, or abandonment must close the
    provisional connection and erase its context.
+   - [ ] 3a — Add redacted `WebRtcOriginateContext`, an explicit signaling
+     protocol, per-exchange ICE policy, async bearer credential provider, and
+     bounded target/redirect policy. Reject userinfo, query credentials,
+     fragments, disallowed schemes/ports/resolved addresses, TLS downgrade,
+     ambiguous create retries, and cross-origin credential forwarding before
+     DNS or network I/O. Keep released exhaustive `WebRtcConfig` source-
+     compatible through additive types/builders.
+   - [ ] 3b — Replace the separate outbound stage with one private retained
+     `WebRtcOutboundRoute` modeled on `SipOutboundRoute`. Preparation is local-
+     only; one activation driver owns signaling, candidate pumps, FIFO plus
+     reserved terminal, exact receipt, cancellation compensation, cleanup,
+     setup deadline, health, and drain. `accept` never initiates outbound
+     signaling, and cancelled waiters cannot cancel or re-enter the driver.
+   - [ ] 3c — Replace per-operation `WsSignaler` sockets with one persistent,
+     authenticated WS/WSS connection carrying request-correlated logical
+     sessions, scoped candidates, and BYE. Require and echo exactly
+     `rvoip.webrtc.v1`; never echo private auth/attachment subprotocol values.
+     Track socket-leased routes so one BYE affects one route while disconnect,
+     pong expiry, or drain closes and joins every owned route/task. Keep legacy
+     `Signaler` APIs only as truthful compatibility wrappers and key any pool
+     by sanitized origin, TLS profile, and opaque credential partition.
+   - [ ] 3d — Add production rustls WHIP HTTP clients with automatic redirects
+     disabled. Own canonical endpoint, bounded relative/absolute `Location`,
+     strong rotating `ETag`, conditional serialized PATCH/DELETE, response
+     bounds, ordered pre-resource candidate buffering/completion, and no retry
+     after an ambiguous POST. Harden the server to require content type and
+     preconditions and rotate ETags on mutation/restart.
+   - [ ] 3e — Add the minimal alpha-engine
+     offer→rollback→counter-offer→answer conformance test before implementing
+     canonical WHEP-04 and typed `406`. Use an owner-reviewed private exact-
+     revision fork only if that test fails; create no upstream issue or PR.
+     Make draft-04 the default and place empty-POST/server-offer behavior
+     behind explicit legacy configuration and a warning/metric.
+   - [ ] 3f — Route attachable WHEP through authenticated provisional inbound
+     admission. Convert the tag to a bounded routing hint, consume a hashed
+     single-use attachment token, bind the exact generated Connection ID and
+     owner transactionally before `201`, and clean every replay loser,
+     rejection, expiry, timeout, disconnect, or abandonment.
+   - [ ] 3g — Add tracked HTTP/WS/peer-session supervisors, actual abort after
+     drain deadline, route-owned `LocalIceEvent::{Candidate, Complete,
+     Overflow}`, bounded task/resource counters, redacted diagnostics, and
+     churn/soak leak tests. Global `WebRtcConfig.trickle_ice` must not choose
+     policy for all exchanges.
+   - [ ] 3h — Qualify real HTTP/HTTPS and WS/WSS client-to-rvoip loopbacks with
+     ICE/DTLS/media/teardown; redirect and credential isolation; ETag races;
+     WHEP-04 success and exact 406 fixtures; concurrent attachment replay;
+     stalled-peer shutdown; and zero leaked routes, contexts, tasks, socket
+     leases, or candidate pumps. Server-role and local-offer tests alone do not
+     satisfy item 3.
 4. [ ] Persist signaling role independently from media direction using
    `SignalingInitiator` and `MediaFlow` (`send_only`, `receive_only`, or
    `send_recv`). Derive offerer/answerer behavior from the protocol and
@@ -1164,7 +1213,7 @@ rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
 such patch remains on an exact reviewed revision; no upstream issue or pull
 request is created before owner review.
 
-The pre-item-3 client audit at committed rvoip revision `41649dbb` confirms
+The pre-item-3 client audit at committed rvoip revision `e982e36b` confirms
 that the authenticated WS/WSS and WHIP/WHEP server roles are present, but the
 outbound adapter is still local-only. `WebRtcAdapter::originate` creates a peer,
 offer, and route without contacting `OriginateRequest::target`.
@@ -1175,8 +1224,16 @@ client retaining `Location`/`ETag`, applying conditional PATCH/DELETE, or
 constraining redirects and credential forwarding. The current WHEP server is
 the legacy empty-POST/server-offer flow, and the base `Signaler::send_ice`
 method cannot scope a candidate to a resource. Item 3 must replace these seams
-with target-contacting, resource-owning client sessions; existing loopback and
-server-role tests are not completion evidence for outbound interoperability.
+with target-contacting, resource-owning client sessions. It also finds that the
+current server accepts/echoes an inexact WS subprotocol, does not own all routes
+or child tasks by socket, does not actually abort every task at drain deadline,
+uses one global trickle policy, and lacks route-versioned ETag/If-Match on all
+WHIP/WHEP mutations. Direct WHEP activation bypasses Orchestrator durable
+binding, and generic targets currently have no SSRF or redirect credential
+boundary. The reusable pre-upgrade auth, route ownership, provisional inbound
+context, SDP/ICE primitives, and core prepared-commit seam remain the base for
+the ordered 3a–3h work. Existing loopback and server-role tests are not
+completion evidence for outbound interoperability.
 
 Gate 7 progress evidence recorded on 2026-07-12:
 
