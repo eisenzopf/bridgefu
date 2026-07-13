@@ -1985,6 +1985,14 @@ Gate 7 progress evidence recorded on 2026-07-12:
   only. Cap and expire live plans, attempt indexes, and late-response archives,
   expose their counts, and drain them without launching another candidate.
 
+  The transaction-core implementation audit also confirmed that the old
+  post-retirement path accepted a response carrying a forgeable transaction
+  key after its route state had been removed, without revalidating the UDP
+  tuple or exact stream flow; its ACK then used an address-only/default
+  transport. Retired-attempt admission must authenticate the exact retained
+  `TransportRoute` and every ACK must use that same route. Add correct/wrong
+  UDP source, TLS/WS flow/authority, expiry, and exact-route ACK tests.
+
   Candidate selection also changes the socket transport without stamping that
   transport and advertised sent-by into the request: a TCP candidate can carry
   a UDP Via and a stack-default UDP Contact. Materialize the selected route
