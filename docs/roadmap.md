@@ -1148,6 +1148,20 @@ rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
 such patch remains on an exact reviewed revision; no upstream issue or pull
 request is created before owner review.
 
+The pre-item-3 client audit at committed rvoip revision `41649dbb` confirms
+that the authenticated WS/WSS and WHIP/WHEP server roles are present, but the
+outbound adapter is still local-only. `WebRtcAdapter::originate` creates a peer,
+offer, and route without contacting `OriginateRequest::target`.
+`WsSignaler` opens a separate socket for offer, answer, and each candidate,
+while `SignalingPool` only caches the object and therefore does not provide the
+documented persistent multiplexed connection. There is no WHIP or WHEP HTTP
+client retaining `Location`/`ETag`, applying conditional PATCH/DELETE, or
+constraining redirects and credential forwarding. The current WHEP server is
+the legacy empty-POST/server-offer flow, and the base `Signaler::send_ice`
+method cannot scope a candidate to a resource. Item 3 must replace these seams
+with target-contacting, resource-owning client sessions; existing loopback and
+server-role tests are not completion evidence for outbound interoperability.
+
 Gate 7 progress evidence recorded on 2026-07-12:
 
 - rvoip revision `ff248a243dfa9c6db0a79e09e9505f4dc8b1a685` completes
