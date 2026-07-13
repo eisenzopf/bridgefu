@@ -50,6 +50,9 @@ jobs:
           # the remote; never replace it with a floating branch.
           ref: 1ec7b370e82ed3ba646e795b343a117466667e48
           path: rvoip
+      - name: StandardCharter protected smoke artifact validation
+        run: bash scripts/check-standardcharter-smoke-artifacts.sh
+        working-directory: bridgefu
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

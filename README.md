@@ -24,6 +24,8 @@ also documented in
 [BENCHMARKS.md](BENCHMARKS.md).
 The Gate 6 SQL transaction model and its deterministic PostgreSQL runner are
 documented in [durable repository backends](docs/repository-backends.md).
+The protected StandardCharter staging procedure is documented in the
+[non-production smoke, drain, and rollback runbook](docs/standardcharter-smoke-runbook.md).
 
 MOQT draft-19 qualification is recorded in the
 [independent interop report](docs/moq-independent-interop.md),
