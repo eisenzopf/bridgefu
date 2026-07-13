@@ -1836,6 +1836,21 @@ Gate 7 progress evidence recorded on 2026-07-12:
   attempt, plus the provisional, cancellation, terminal, and expiry no-retry
   boundaries.
 
+  Implement this with one bounded `InviteFailoverPlan` per logical dialog and
+  INVITE CSeq plus a transaction-key attempt index. The plan retains the
+  immutable unsigned request, remaining candidates, current attempt, exact
+  signed request/route for every attempt, provisional state, monotonic outcome,
+  and expiry; authentication, redirect, and 422 semantic retries start a new
+  plan. Intercept typed transaction events before normal dialog delivery,
+  serialize candidate advancement with CANCEL, and ensure an old terminated
+  attempt can never remove the current mapping. Bounded transaction-core
+  tombstones retain exact source/flow/authority and request route after timeout
+  or supersession. A matching late 2xx is ACKed; a superseded, failed, or
+  cancelled attempt also creates a response-derived fork only long enough to
+  send BYE and never emits `CallAnswered`. A winning duplicate 2xx is re-ACKed
+  only. Cap and expire live plans, attempt indexes, and late-response archives,
+  expose their counts, and drain them without launching another candidate.
+
   Candidate selection also changes the socket transport without stamping that
   transport and advertised sent-by into the request: a TCP candidate can carry
   a UDP Via and a stack-default UDP Contact. Materialize the selected route
