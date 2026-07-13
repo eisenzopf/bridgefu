@@ -932,6 +932,21 @@ not hide an earlier adapter side effect behind a nominally staged API.
      errors, and authentication challenge/decision containers have manual,
      metadata-only diagnostics; no `Method::Extension`, realm, nonce, challenge,
      or rejected header value appears in `Debug`/`Display`.
+     Redaction must not collapse the public typed-header conversion error enum:
+     callers retain the pre-hardening `InvalidHeader`, `Utf8Error`, `ParseError`,
+     and incomplete-input variant semantics while every attached string is
+     replaced by fixed class and bounded extent metadata. Direct authentication
+     configuration and service containers are also in scope: `AuthIdentity`,
+     extension schemes, client headers, configured realms/scopes, and lower
+     validator/provider/store errors expose only fixed stage/class and
+     presence/length metadata through `Debug`, `Display`, and `SessionError`.
+     Their live values remain available only through the functional API.
+     History snapshots sanitize every payload-bearing state-machine event before
+     insertion, not only `AuthRequired`. SDP, SIP identities, targets, contacts,
+     reasons, custom strings, media paths, transaction identifiers, and other
+     peer/application values become fixed event kind plus bounded metadata in
+     retained `TransitionRecord`, JSON, and CSV output. Live events remain
+     unchanged, and CSV output must quote/escape all diagnostic fields safely.
      Opt-in transport/dialog timing diagnostics correlate calls through a
      bounded opaque identifier derived after the configured Call-ID keep/redact/
      drop decision; their maps and snapshots never store or return raw peer
