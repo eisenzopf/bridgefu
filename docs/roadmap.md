@@ -49,6 +49,25 @@ contact, or pull request may be opened without the owner's explicit review and
 approval. A port to a newer upstream revision may remain private on the fork
 until that review.
 
+### Provider scope
+
+Bridgefu 1.0 has one first-class external provider-control integration:
+Telnyx. It uses the published `telnyx` crate pinned as `telnyx = "=0.1.0"`
+with only the Call Control, webhook, tracing, and selected rustls features.
+Bridgefu owns call/leg policy, durable idempotency, SIP attachment routing, and
+normalized events; the SDK owns Telnyx request models, command dispatch,
+command-ID behavior, response errors, and Ed25519 webhook verification. The
+companion `telnyx-axum` crate may be adopted if its extractor fits the final
+HTTP boundary, but it is not required because `telnyx::webhooks::Verifier`
+already accepts the exact raw body and headers retained by Bridgefu.
+
+Twilio and Vonage are deferred beyond 1.0 and are not release blockers. Their
+existing enums, persistence compatibility, and experimental adapter scaffolds
+may remain while stored data is migrated safely, but the 1.0 API, capability
+matrix, examples, live qualification, and production claims must expose only
+Telnyx. A deferred provider request returns an explicit unsupported-capability
+error; it never silently falls back to Telnyx or generic SIP semantics.
+
 ### Transport roles
 
 - UCTP 0.2 over QUIC or WebTransport carries authenticated interactive
@@ -75,7 +94,8 @@ Active calls remain pinned and are drained rather than migrated.
 
 - `POST /v1/calls` creates exactly two explicitly bridged logical legs.
 - Leg kinds are SIP, interactive WebRTC, WHIP/WHEP, Amazon Connect, and
-  provider-controlled Twilio, Telnyx, or Vonage.
+  provider-controlled Telnyx. Persisted Twilio/Vonage discriminants remain
+  readable for compatibility but are not accepted as new 1.0 provider legs.
 - Tenant identity is derived from the authenticated principal.
 - `Idempotency-Key` is retained durably for 24 hours.
 - Inbound legs use hashed, single-use, two-minute attachment tokens; global
@@ -2417,15 +2437,21 @@ unchanged.
 
 ### Gate 8 — Complete provider control and media (`pending`)
 
-- [ ] Complete originate, native bridge, transfer, hangup, DTMF, capability,
-  webhook verification, and event normalization for all three providers.
-- [ ] Connect provider media to unique Bridgefu SIP attachment URIs.
+- [ ] Replace Bridgefu's hand-written Telnyx HTTP models and Ed25519 verifier
+  with exact crates.io dependency `telnyx = "=0.1.0"`; keep Bridgefu-owned tenant,
+  call, leg, idempotency, deadline, redaction, and reconciliation policy.
+- [ ] Complete Telnyx originate, native bridge, transfer, hangup, DTMF,
+  capability discovery, webhook verification, and typed event normalization.
+- [ ] Connect Telnyx media to unique Bridgefu SIP attachment URIs.
 - [ ] Persist deduplication, command IDs, callback reconciliation, and
   idempotency; add deadlines, circuit breakers, redaction, and safe retries.
-- [ ] Pass deterministic mock contracts and restricted live test-account flows.
+- [ ] Reject new Twilio/Vonage provider legs with an explicit deferred
+  capability error while preserving safe reads of existing persisted enums.
+- [ ] Pass deterministic SDK-backed mock contracts and restricted Telnyx live
+  test-account flows.
 
-Exit: Twilio, Telnyx, and Vonage pass control, media, security, retry, and
-outage scenarios.
+Exit: Telnyx passes control, media, security, retry, and outage scenarios using
+the published SDK; Twilio and Vonage are represented consistently as deferred.
 
 ### Gate 9 — Make broadcasts operational (`pending`)
 
@@ -2480,6 +2506,8 @@ rvoip and Bridgefu revisions are release-candidate quality.
 - Broadcast audio is Opus 48 kHz mono in 20 ms frames.
 - Proprietary provider WebSocket media, video, conferencing mixes, listener
   backchannels, and active-call migration are deferred.
+- Twilio and Vonage provider control are deferred beyond Bridgefu 1.0; Telnyx
+  is the only external provider-control release gate.
 - StandardCharter compatibility is release-blocking.
 - External provider/cloud evidence requires test credentials supplied through
   secret references; absence of credentials never converts a pending gate into

@@ -4,7 +4,7 @@ Bridgefu treats every signaling, provider webhook, and broadcast subscription
 as a tenant boundary.
 
 - The control API supports a constant-time compared Bearer credential.
-- Twilio HMAC-SHA1, Telnyx Ed25519, and Vonage signed-JWT webhooks are verified
+- Telnyx Ed25519 webhooks are verified through the pinned `telnyx` SDK
   before parsing an event into call state.
 - `bridgefu.control.v1` only maps configured `X-*` SIP headers. It rejects
   hop-by-hop/auth headers, CR/LF/NUL, oversized names and values, reserved

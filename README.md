@@ -2,8 +2,9 @@
 
 Bridgefu is a programmable Rust SIP/RTP ↔ WebRTC/RTP bridge and the reference
 application for rvoip. It preserves the Vapi → Amazon Connect screen-pop path,
-adds a normal rvoip SIP/WebRTC runtime, native Twilio/Telnyx/Vonage call control,
+adds a normal rvoip SIP/WebRTC runtime, native Telnyx call control,
 safe SIP-header/DataChannel context envelopes, and UCTP or MOQT audio fanout.
+Twilio and Vonage provider control are deferred beyond 1.0.
 
 ```
 PSTN caller ─▶ Vapi app ─(SIP transfer/REFER with X- headers)─▶ bridgefu
@@ -174,7 +175,7 @@ authenticated tenant to match the stored broadcast owner.
 
 ```bash
 curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \
-  http://127.0.0.1:9090/v1/providers/twilio/capabilities
+  http://127.0.0.1:9090/v1/providers/telnyx/capabilities
 ```
 
 ---
