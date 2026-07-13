@@ -1716,6 +1716,69 @@ Gate 7 progress evidence recorded on 2026-07-12:
   bounded subject cohorts, and deterministic expiry/cardinality tests. Cluster
   qualification must fail rather than silently skip construction errors and
   must exercise redirection/topology change plus TLS/authenticated deployments.
+- The remediation sequence through clean rvoip revision
+  `caf1ac933c45c3ede26c65a96dfb05cb01e7b380` closes the previously recorded
+  credential, Redis, and exact-flow implementation findings, adds a unified
+  initial/auth-retry header append path, and introduces dormant retained SIP
+  media binding. Live evidence includes 11 single-node Redis tests, six
+  authenticated mTLS three-node cluster tests with untrusted-CA and real
+  `MOVED` recovery, five auth provider contracts, 13 Redis unit tests, four
+  tenant-bound SIP adapter tests, and the locked 3,216-test cross-crate suite
+  (one ignored) spanning auth, client, core, SIP, UCTP, and WebRTC. This is
+  regression evidence, not completion evidence: two independent audits at the
+  same revision report zero P0 and 15 remaining P1 findings.
+
+  One exact-flow/control-lane P1 also remains: every UDP parse error is routed
+  onto the reserved control lane, but 100 ms of control backpressure causes the
+  transport bridge loop to terminate permanently. A malformed-datagram flood
+  can therefore stop all later valid UDP SIP until restart. Treat malformed
+  packet diagnostics as bounded/drop-safe data, reserve the control lane for
+  lifecycle correctness, and never terminate a healthy listener merely
+  because an error notification cannot be delivered.
+
+  The INVITE planner/retry audit reports eight P1s. A configured global
+  outbound proxy is transient and disappears on authenticated retry, so a 407
+  response can cause `Proxy-Authorization` to be sent toward the callee and can
+  reuse a secure-hop credential decision on a plaintext reconstructed route.
+  Top-Route resolution failure also falls back to the Request-URI address;
+  this leaks callee DNS, fails proxy-only domains, and can bypass a failed
+  security perimeter. REGISTER-learned Service-Route currently precedes the
+  documented first outbound proxy. Preserve one authoritative ordered route
+  plan through every retry and fail closed when its selected next hop cannot be
+  resolved.
+
+  Caller-provided SDP is replaced by regenerated local SDP after a challenge.
+  RFC 3263 candidate failover clones one Via branch into multiple client
+  transactions, allowing a late failed-candidate event to collide with the
+  replacement. Rejected final headers occur after session/media/dialog/mapping
+  allocation and have no rollback or setup timer. Sequential 407 then 401
+  authentication has one global retry budget and drops the earlier protection
+  space. Finally, a `sips:` Request-URI can be downgraded by a plaintext
+  `sip:` Route because only the first Route drives transport security. Retain
+  the exact original body, generate a fresh branch per candidate, validate
+  before allocation with compensating rollback after any possible side
+  effect, retain authorization per protection space/header kind, and require a
+  TLS/WSS first hop for every SIPS request.
+
+  The dormant-media/adapter audit reports six P1s. `SipAdapter::originate`
+  still sends INVITE before durable activation, and its current activation
+  starts media before event-stage admission can fail. `run_bind` can overwrite
+  `Closing` with `Bound` or publish `Closed` before pumps are joined. Cache
+  insertion races route retirement, bind singleflight does not verify that
+  concurrent callers name the same coordinator/session, and a failed bind or
+  later pump exit is only logged while signaling remains connected. Replace
+  the separate context/stage maps with one retained `SipOutboundRoute`; make
+  cache insertion/retirement atomic; bind to one immutable target; make close
+  ownership and terminal state monotonic; and convert bind/pump failure into
+  authoritative teardown. Add deterministic bind/close, mismatched-target,
+  activation-failure, cache-retirement, pump-exit, and bounded-drain tests.
+
+  Lower findings to close with these P1s include dialog-layer rejection of
+  stack-owned Via/Route/Record-Route extras, semantic routing for structured
+  `Other` Route values, singleton `Session-Expires`/`Min-SE`, lossless Contact
+  handling, validation before CSeq/tag/DNS mutation, honoring
+  `with_supported_100rel`, and eliminating the remaining address-only
+  server-transaction facade call sites.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
