@@ -972,6 +972,14 @@ not hide an earlier adapter side effect behind a nominally staged API.
      spelling equal to Authorization, Proxy-Authorization, or any other
      reserved/stack-managed name receives the same classification as its typed
      variant. Generic header staging cannot become an untyped credential path.
+     Inbound stream framing and the core parser share one strict
+     `Content-Length` decision. Long-form and compact `l:` names are
+     case-insensitive aliases; conflicting or repeated singleton values,
+     non-numeric values, overflow, invalid bytes, and framing/parser disagreement
+     reject and close the message/connection before a following request can be
+     consumed. TCP and TLS tests cover both duplicate orders and prove no
+     request-smuggling/desynchronization; WS/WSS use the same core singleton
+     rule even though their message frame supplies an outer boundary.
      History snapshots sanitize every payload-bearing state-machine event before
      insertion, not only `AuthRequired`. SDP, SIP identities, targets, contacts,
      reasons, custom strings, media paths, transaction identifiers, and other
