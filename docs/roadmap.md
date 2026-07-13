@@ -1467,6 +1467,23 @@ Gate 7 progress evidence recorded on 2026-07-12:
   though the user vanished; remove or explicitly version the incompatible
   secret-retrieval contract with a migration to `get_digest_secret` rather than
   silently lying through the old API.
+  A second cross-audit records three further P1 ownership/escalation defects at
+  the same production revision. API-key creation checks only caller `write`
+  permission plus owner/admin status while accepting any requested permission,
+  so an administrator-owned write-only key can mint `*` and regain full admin
+  authority; requested grants must be a subset of the calling key and wildcard
+  or administrative grants require explicit non-key administrator authority.
+  Core step-up authenticates only `(IdentityId, IdentityAssurance)` and then
+  grafts the result onto the connection's existing issuer/tenant/subject after
+  string matching, so a same-name credential from another provider—or an AAuth
+  actor identity—can acquire the subject connection's authority. Step-up
+  providers must return a complete `AuthenticatedPrincipal`, and the atomic
+  transition must compare issuer+tenant+subject ownership before updating.
+  Finally, TaskScoped/UserAuthorized compatibility subjects concatenate
+  unconstrained IDs with delimiters, allowing distinct attacker-chosen field
+  tuples to collide on one ownership key. Use domain-separated,
+  length-prefixed hashing (or a typed ownership key) for every composite
+  fallback subject and add adversarial delimiter-collision tests.
 
 Exit: both bridge directions pass real media tests and StandardCharter remains
 unchanged.
