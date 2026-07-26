@@ -2,7 +2,7 @@
 name = "bridgefu"
 version = "0.1.1"
 edition = "2021"
-description = "Deployable SIP → Amazon Connect screen-pop gateway (Vapi transfer bridge)"
+description = "Programmable SIP/RTP, WebRTC/RTP, provider-control, and QUIC audio bridge"
 license = "MIT"
 publish = false
 
@@ -14,32 +14,47 @@ publish = false
 rvoip-amazon-connect = { path = "../rvoip/crates/webrtc/rvoip-amazon-connect", version = "0.1.3", features = ["server", "aws-control"] }
 rvoip-auth-core = { path = "../rvoip/crates/identity/auth-core", version = "0.2.5" }
 rvoip-core = { path = "../rvoip/crates/foundation/rvoip-core", version = "0.2.5" }
-rvoip-moq = { path = "../rvoip/crates/moq/rvoip-moq", version = "0.1.0" }
+rvoip-moq = { path = "../rvoip/crates/moq/rvoip-moq", version = "0.1.0", features = ["relay-runtime"] }
+rvoip-redis = { path = "../rvoip/crates/extensions/rvoip-redis", version = "0.1.3", features = ["moq"] }
 rvoip-quic = { path = "../rvoip/crates/uctp/rvoip-quic", version = "0.2.0" }
-rvoip-sip = { path = "../rvoip/crates/sip/rvoip-sip", version = "0.2.5" }
-rvoip-webrtc = { path = "../rvoip/crates/webrtc/rvoip-webrtc", version = "0.1.3", features = ["signaling-whip", "signaling-ws"] }
+rvoip-uctp = { path = "../rvoip/crates/uctp/rvoip-uctp", version = "0.2.0" }
+rvoip-sip = { path = "../rvoip/crates/sip/rvoip-sip", version = "0.2.5", features = ["opus"] }
+rvoip-webrtc = { path = "../rvoip/crates/webrtc/rvoip-webrtc", version = "0.1.3", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
+telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls-pemfile = "2"
 
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1.14"
 serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls-ring", "tls-webpki-roots"] }
 axum = "0.7"
+axum-server = { version = "0.7.3", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 serde_json = "1"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "chrono", "uuid", "migrate", "macros"] }
 async-trait = "0.1"
 base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures-util = "0.3"
 hmac = "0.12"
+ipnet = "2.12"
 jsonwebtoken = "9.3"
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-redis = { version = "1.0.4", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "streams"] }
+redis = { version = "1.0.4", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "streams", "script"] }
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "1"
@@ -51,7 +66,10 @@ metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
 [dev-dependencies]
+rvoip-media-core = { path = "../rvoip/crates/media/media-core", version = "0.2.5", features = ["opus"] }
+rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
+webrtc = "=0.20.0-alpha.1"
 
 # Cargo patches are resolved by the top-level build root, so Bridgefu repeats
 # rvoip's exact reviewed rtc fork pin. This ensures container and CI builds use

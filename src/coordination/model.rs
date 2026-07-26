@@ -10,7 +10,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::call_engine::{CallId, WorkerId, WorkerLease};
+use crate::call_engine::{
+    AttachmentTokenDigest, AttachmentTransport, CallId, PrincipalFingerprint, WorkerId, WorkerLease,
+};
 
 const MAX_DEPLOYMENT_BYTES: usize = 63;
 const MAX_NAME_BYTES: usize = 128;
@@ -231,6 +233,37 @@ pub struct CallRouteHint {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Non-authoritative routing projection for one opaque inbound attachment.
+///
+/// The raw bearer, tenant identifier, call identifier, and leg identifier are
+/// deliberately absent. `tenant_binding` is the existing keyed principal
+/// fingerprint (issuer + tenant + subject), so a gateway can reject an
+/// owner/tenant mismatch before opening a private route without turning Redis
+/// into an attachment authorization database. The assigned worker remains
+/// authoritative and must consume the bearer under this exact fence before it
+/// acknowledges the route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentRouteHint {
+    /// SHA-256 digest of the opaque attachment bearer; also the projection key.
+    pub token_digest: AttachmentTokenDigest,
+    /// Exact worker incarnation that issued the attachment.
+    pub worker: WorkerLease,
+    /// Signaling transport the bearer was issued for.
+    pub transport: AttachmentTransport,
+    /// Keyed issuer/tenant/subject binding. Debug output is redacted by type.
+    pub tenant_binding: PrincipalFingerprint,
+    /// Absolute bearer expiry copied from authoritative attachment state.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Exact lookup supplied by an authenticated gateway.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentRouteLookup {
+    pub token_digest: AttachmentTokenDigest,
+    pub transport: AttachmentTransport,
+    pub tenant_binding: PrincipalFingerprint,
+}
+
 /// Short-lived replay hint containing only a derived digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReplayMarker {
@@ -255,6 +288,13 @@ pub enum CoordinationPayload {
     RouteRemoved {
         /// Call whose cached assignment must no longer be returned.
         call_id: CallId,
+    },
+    /// Routes one opaque attachment digest to its exact worker incarnation.
+    AttachmentRoute(AttachmentRouteHint),
+    /// Removes a consumed, revoked, or otherwise retired attachment route.
+    AttachmentRouteRemoved {
+        /// Digest whose cached routing projection must become inactive.
+        token_digest: AttachmentTokenDigest,
     },
     /// Replay digest hint.
     Replay(ReplayMarker),
@@ -301,6 +341,11 @@ impl CoordinationEvent {
                 self.recorded_at,
                 "invalid projected route expiry",
             ),
+            CoordinationPayload::AttachmentRoute(route) => validate_projection_expiry(
+                route.expires_at,
+                self.recorded_at,
+                "invalid projected attachment route expiry",
+            ),
             CoordinationPayload::Replay(marker) => validate_projection_expiry(
                 marker.expires_at,
                 self.recorded_at,
@@ -340,6 +385,8 @@ pub enum WakeupReason {
     ProviderEvents,
     /// Worker assignment or drain state changed.
     Assignment,
+    /// Durable broadcast start/stop commands may have work.
+    Broadcasts,
 }
 
 impl WakeupReason {
@@ -352,6 +399,7 @@ impl WakeupReason {
             Self::Deadlines => "deadlines",
             Self::ProviderEvents => "provider_events",
             Self::Assignment => "assignment",
+            Self::Broadcasts => "broadcasts",
         }
     }
 
@@ -363,6 +411,7 @@ impl WakeupReason {
             "deadlines" => Ok(Self::Deadlines),
             "provider_events" => Ok(Self::ProviderEvents),
             "assignment" => Ok(Self::Assignment),
+            "broadcasts" => Ok(Self::Broadcasts),
             _ => Err(CoordinationError::InvalidData),
         }
     }
@@ -551,6 +600,15 @@ pub trait CoordinationProjection: Send + Sync {
     /// Returns a live route hint or `None`, which triggers database fallback.
     async fn route_hint(&self, call_id: CallId)
         -> Result<Option<CallRouteHint>, CoordinationError>;
+
+    /// Resolves one live, owner-bound attachment route hint.
+    ///
+    /// `None` is fail-closed for clustered gateways. Implementations must also
+    /// verify that the exact projected worker fence is still live.
+    async fn attachment_route_hint(
+        &self,
+        lookup: AttachmentRouteLookup,
+    ) -> Result<Option<AttachmentRouteHint>, CoordinationError>;
 
     /// Returns a live replay hint. Authorization and canonical-result replay remain in DB.
     async fn replay_seen(&self, digest: ReplayDigest) -> Result<bool, CoordinationError>;

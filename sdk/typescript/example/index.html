@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bridgefu browser WebRTC example</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 42rem; margin: 3rem auto; padding: 0 1rem; }
+      label { display: grid; gap: .4rem; margin: 1rem 0; }
+      input, button { font: inherit; padding: .65rem; }
+      .actions { display: flex; gap: .75rem; }
+      #status { padding: .75rem; border: 1px solid currentColor; border-radius: .35rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Bridgefu WebRTC</h1>
+    <p id="status" role="status">Idle</p>
+    <label>
+      Named route
+      <input id="route" value="support" autocomplete="off" />
+    </label>
+    <label>
+      Correlation ID
+      <input id="correlation" value="browser-demo" autocomplete="off" />
+    </label>
+    <div class="actions">
+      <button id="connect" type="button">Connect</button>
+      <button id="hangup" type="button" disabled>Hang up</button>
+      <button id="dtmf" type="button" disabled>Send 1#</button>
+    </div>
+    <audio id="remote" autoplay></audio>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

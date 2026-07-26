@@ -10,14 +10,14 @@ use redis::streams::{
 };
 use zeroize::Zeroize;
 
-use crate::call_engine::{CallId, WorkerId};
+use crate::call_engine::{AttachmentTokenDigest, CallId, WorkerId};
 
 use super::{
-    validate_poll_interval, CallRouteHint, CoordinationError, CoordinationEvent,
-    CoordinationPayload, CoordinationProjection, DatabasePollReason, DeploymentId,
-    ProjectionApplyOutcome, ProjectionSequence, ReplayDigest, ReplayMarker, WakeupConsumer,
-    WakeupMessage, WakeupPoll, WakeupPublisher, WakeupReason, WorkerCoordinationSnapshot,
-    WorkerSelectionRequest,
+    validate_poll_interval, AttachmentRouteHint, AttachmentRouteLookup, CallRouteHint,
+    CoordinationError, CoordinationEvent, CoordinationPayload, CoordinationProjection,
+    DatabasePollReason, DeploymentId, ProjectionApplyOutcome, ProjectionSequence, ReplayDigest,
+    ReplayMarker, WakeupConsumer, WakeupMessage, WakeupPoll, WakeupPublisher, WakeupReason,
+    WorkerCoordinationSnapshot, WorkerSelectionRequest,
 };
 
 const MAX_WORKER_CANDIDATES: usize = 4_096;
@@ -294,7 +294,19 @@ impl RedisKeyspace {
     }
 
     fn replay(&self, digest: ReplayDigest) -> String {
-        format!("{}:replay:{}", self.prefix, encode_digest(digest))
+        format!(
+            "{}:replay:{}",
+            self.prefix,
+            encode_digest(digest.expose_bytes())
+        )
+    }
+
+    fn attachment_route(&self, digest: AttachmentTokenDigest) -> String {
+        format!(
+            "{}:attachment-route:{}",
+            self.prefix,
+            encode_digest(digest.expose_bytes())
+        )
     }
 
     fn wakeup_sequence(&self, worker_id: WorkerId) -> String {
@@ -513,6 +525,26 @@ impl CoordinationProjection for RedisCoordinator {
                 )
                 .await
             }
+            CoordinationPayload::AttachmentRoute(route) => {
+                self.apply_expiring(
+                    self.keys.attachment_route(route.token_digest),
+                    event.sequence,
+                    route,
+                    route.expires_at,
+                    true,
+                )
+                .await
+            }
+            CoordinationPayload::AttachmentRouteRemoved { token_digest } => {
+                self.apply_expiring(
+                    self.keys.attachment_route(*token_digest),
+                    event.sequence,
+                    token_digest,
+                    event.recorded_at,
+                    false,
+                )
+                .await
+            }
             CoordinationPayload::Replay(marker) => {
                 self.apply_expiring(
                     self.keys.replay(marker.digest),
@@ -616,6 +648,43 @@ impl CoordinationProjection for RedisCoordinator {
             return Ok(None);
         };
         Ok((worker.lease == route.worker && worker.lease_expires_at > now).then_some(route))
+    }
+
+    async fn attachment_route_hint(
+        &self,
+        lookup: AttachmentRouteLookup,
+    ) -> Result<Option<AttachmentRouteHint>, CoordinationError> {
+        let mut connection = self.manager.clone();
+        let (body, active) = redis::cmd("HMGET")
+            .arg(self.keys.attachment_route(lookup.token_digest))
+            .arg("body")
+            .arg("active")
+            .query_async::<(Option<String>, Option<String>)>(&mut connection)
+            .await
+            .map_err(|_| CoordinationError::Unavailable)?;
+        if active.as_deref() == Some("0") {
+            return Ok(None);
+        }
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let route: AttachmentRouteHint =
+            serde_json::from_str(&body).map_err(|_| CoordinationError::InvalidData)?;
+        let now = self.redis_now().await?;
+        if route.token_digest != lookup.token_digest
+            || route.transport != lookup.transport
+            || route.tenant_binding != lookup.tenant_binding
+            || route.expires_at <= now
+        {
+            return Ok(None);
+        }
+        let Some(worker) = self.worker_body(route.worker.worker_id).await? else {
+            return Ok(None);
+        };
+        Ok(
+            (worker.lease == route.worker && worker.lease_expires_at > now && !worker.draining)
+                .then_some(route),
+        )
     }
 
     async fn replay_seen(&self, digest: ReplayDigest) -> Result<bool, CoordinationError> {
@@ -1155,10 +1224,10 @@ fn duration_millis(duration: Duration) -> Result<u64, CoordinationError> {
         .map_err(|_| CoordinationError::InvalidInput("duration is too large"))
 }
 
-fn encode_digest(digest: ReplayDigest) -> String {
+fn encode_digest(digest: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(64);
-    for byte in digest.expose_bytes() {
+    for byte in digest {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }

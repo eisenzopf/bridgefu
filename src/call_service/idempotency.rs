@@ -14,8 +14,8 @@ use zeroize::Zeroize;
 
 use crate::api_principal::{ApiPrincipal, PrincipalFingerprintKey};
 use crate::call_engine::{
-    AttachmentTokenDigest, AttachmentTransport, BindingGeneration, CallId, IdempotencyKeyDigest,
-    LegId, PrincipalFingerprint, RequestDigest, TenantId, WorkerLease,
+    AttachmentPurpose, AttachmentTokenDigest, AttachmentTransport, BindingGeneration, CallId,
+    IdempotencyKeyDigest, LegId, PrincipalFingerprint, RequestDigest, TenantId, WorkerLease,
 };
 
 use super::{OperationIdempotency, ServiceOperationKind};
@@ -63,15 +63,55 @@ pub enum ControlCryptoError {
 #[error("attachment proof rejected")]
 pub struct AttachmentProofRejected;
 
-/// Parses one canonical 256-bit attachment bearer and returns only its digest.
+/// Validated canonical attachment bearer retained only long enough for one
+/// private gateway-to-worker admission request.
 ///
-/// The public token must be the unpadded URL-safe Base64 encoding of exactly
-/// 32 bytes (43 ASCII characters). The owned input and decoded token bytes are
-/// zeroized on every success and failure path; callers never receive the raw
-/// bearer back.
-pub fn digest_presented_attachment_token(
+/// Gateways need both the digest used for the redaction-safe Redis routing
+/// projection and the original opaque bearer that the selected worker will
+/// consume authoritatively. This owned type avoids a second untracked token
+/// copy and zeroizes the bearer on every drop path.
+#[derive(Eq, PartialEq)]
+pub struct PresentedAttachmentToken {
+    token: String,
+    digest: AttachmentTokenDigest,
+}
+
+impl PresentedAttachmentToken {
+    /// Digest safe to use as a coordination key. Debug remains redacted by the
+    /// strong digest type.
+    #[must_use]
+    pub const fn digest(&self) -> AttachmentTokenDigest {
+        self.digest
+    }
+
+    /// Transfers the validated bearer to the internal worker request.
+    #[must_use]
+    pub fn into_secret(mut self) -> String {
+        std::mem::take(&mut self.token)
+    }
+}
+
+impl Drop for PresentedAttachmentToken {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+impl fmt::Debug for PresentedAttachmentToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PresentedAttachmentToken")
+            .field("token", &"[redacted]")
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+/// Parses one canonical attachment bearer while retaining it in a zeroizing
+/// owner for the selected worker.
+pub fn parse_presented_attachment_token(
     mut token: String,
-) -> Result<AttachmentTokenDigest, AttachmentProofRejected> {
+) -> Result<PresentedAttachmentToken, AttachmentProofRejected> {
     let mut raw = [0_u8; 32];
     let decoded = token.len() == 43
         && URL_SAFE_NO_PAD
@@ -89,8 +129,25 @@ pub fn digest_presented_attachment_token(
 
     raw.zeroize();
     canonical.zeroize();
-    token.zeroize();
-    digest.ok_or(AttachmentProofRejected)
+    match digest {
+        Some(digest) => Ok(PresentedAttachmentToken { token, digest }),
+        None => {
+            token.zeroize();
+            Err(AttachmentProofRejected)
+        }
+    }
+}
+
+/// Parses one canonical 256-bit attachment bearer and returns only its digest.
+///
+/// The public token must be the unpadded URL-safe Base64 encoding of exactly
+/// 32 bytes (43 ASCII characters). The owned input and decoded token bytes are
+/// zeroized on every success and failure path; callers never receive the raw
+/// bearer back.
+pub fn digest_presented_attachment_token(
+    token: String,
+) -> Result<AttachmentTokenDigest, AttachmentProofRejected> {
+    parse_presented_attachment_token(token).map(|presented| presented.digest())
 }
 
 /// Validated raw HTTP idempotency key. Debug never exposes the key.
@@ -220,6 +277,8 @@ pub struct AttachmentTokenContext<'a> {
     pub generation: BindingGeneration,
     /// Accepted signaling transport.
     pub transport: AttachmentTransport,
+    /// Public inbound or hidden provider-media purpose.
+    pub purpose: AttachmentPurpose,
     /// Exact assigned worker incarnation.
     pub worker: WorkerLease,
     /// Expected signaling principal.
@@ -237,6 +296,7 @@ impl fmt::Debug for AttachmentTokenContext<'_> {
             .field("leg_id", &self.leg_id)
             .field("generation", &self.generation)
             .field("transport", &self.transport)
+            .field("purpose", &self.purpose)
             .field("worker", &self.worker)
             .field("principal", &"[redacted]")
             .field("created_at", &self.created_at)
@@ -366,6 +426,10 @@ impl CallServiceCrypto {
             AttachmentTransport::Sip => 1,
             AttachmentTransport::WebRtc => 2,
         }]);
+        mac.update(&[match context.purpose {
+            AttachmentPurpose::PublicInbound => 1,
+            AttachmentPurpose::ProviderMedia => 2,
+        }]);
         update_field(&mut mac, context.worker.worker_id.as_uuid().as_bytes());
         mac.update(&context.worker.fence.as_i64().to_be_bytes());
         update_field(&mut mac, context.principal.expose_bytes());
@@ -411,6 +475,7 @@ fn push_bytes(target: &mut Vec<u8>, value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_principal::CallScope;
     use axum::http::HeaderValue;
     use chrono::TimeZone;
     use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod};
@@ -421,7 +486,7 @@ mod tests {
             AuthenticatedPrincipal {
                 subject: "subject-a".into(),
                 tenant: Some("tenant-a".into()),
-                scopes: vec!["*".into()],
+                scopes: vec!["*".into(), CallScope::ArbitraryDestination.as_str().into()],
                 issuer: Some("issuer-a".into()),
                 expires_at: None,
                 method: AuthenticationMethod::Jwt,
@@ -518,6 +583,7 @@ mod tests {
                 leg_id: LegId::new(),
                 generation: BindingGeneration::INITIAL,
                 transport: AttachmentTransport::Sip,
+                purpose: AttachmentPurpose::PublicInbound,
                 worker: WorkerLease {
                     worker_id: crate::call_engine::WorkerId::new(),
                     fence: crate::call_engine::WorkerFence::INITIAL,

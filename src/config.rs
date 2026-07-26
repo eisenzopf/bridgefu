@@ -10,30 +10,78 @@
 //! becomes one catch-all tenant named `default`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use ipnet::IpNet;
+use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod, BearerValidator};
+use rvoip_core::{IdentityAssurance, Jwk, PrincipalOwnershipKey};
+use rvoip_sip::{SipAuthService, SipDigestAuthService, SipListenerAuthPolicy};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroize;
 
+use bridgefu::broadcast::{PublicUctpBindConfig, SanitizedContextEventPolicy};
 use bridgefu::call_engine::{TenantId, WorkerId};
 use bridgefu::call_service::{
-    CallRepositoryBackendConfig, CallServiceCoordinationConfig, MAX_CONTROL_KEY_BYTES,
-    MIN_CONTROL_KEY_BYTES,
+    CallRepositoryBackendConfig, CallServiceCoordinationConfig,
+    ConfiguredAttachmentPrincipalResolver, ConfiguredIceServer, ConfiguredSipOutboundProfile,
+    ConfiguredSipProfileAuth, ConfiguredWebRtcOutboundProfile, LegEndpointConfig,
+    NamedProfileBinding, NamedProfileKind, NamedProfileRole, NamedRouteBinding,
+    OutboundProfileResolver, ProviderKind, RequestedLeg, StaticOutboundProfileResolver,
+    MAX_CONTROL_KEY_BYTES, MIN_CONTROL_KEY_BYTES,
 };
 use bridgefu::coordination::{DeploymentId, RedisCoordinationConfig};
+use bridgefu::gateway_forwarding::{
+    GatewayForwardingConfig, MutualTlsFiles, PrivateForwardingLimits, PrivateForwardingTimeouts,
+    PrivateTokenKey, PrivateWorkerTarget, WorkerForwardingConfig,
+};
+use bridgefu::gateway_native_ingress::{
+    GatewayNativeIngressConfig, GatewayNativeSipConfig, GatewayNativeWebRtcConfig,
+    GatewayNativeWebRtcTlsConfig, SipEgressProfileConfig,
+};
+use bridgefu::gateway_uctp_ingress::GatewayUctpIngressConfig;
+use bridgefu::standardcharter_canary::{StandardCharterCanaryConfig, StandardCharterCanaryPolicy};
 
 use rvoip_amazon_connect::{
-    request_uri_user, to_uri_user, AttributeMapping, AwsConnectStarter, ConnectConfig,
-    ConnectContactStarter, ContactRoute, IncomingCall, RouteDecision, ScreenPopServerConfig,
-    SipConfig, UnmappedPolicy,
+    request_uri_user, to_uri_user, AmazonConnectAdapter, AttributeMapping, AwsConnectStarter,
+    ConnectConfig, ConnectContactStarter, ContactRoute, IncomingCall, RouteDecision,
+    ScreenPopServerConfig, SipConfig, UnmappedPolicy,
 };
 
 use crate::context::ContextPolicy;
-use crate::providers::{ProviderConfigs, SecretRef};
+use crate::providers::{ProviderConfigs, ProviderRegistry, SecretRef};
+
+const MIN_BROADCAST_TOKEN_SECRET_BYTES: usize = 32;
+const MAX_BROADCAST_TOKEN_TTL_SECS: u64 = 15 * 60;
+const MAX_OTLP_ENDPOINT_LENGTH: usize = 2_048;
+const MAX_OTLP_SERVICE_NAME_LENGTH: usize = 128;
+const MAX_OTLP_QUEUE_SIZE: usize = 65_536;
+const MAX_OTLP_EXPORT_BATCH_SIZE: usize = 8_192;
+const MIN_OTLP_SCHEDULE_DELAY_MILLIS: u64 = 100;
+const MAX_OTLP_SCHEDULE_DELAY_MILLIS: u64 = 60_000;
+const MIN_OTLP_EXPORT_TIMEOUT_MILLIS: u64 = 100;
+const MAX_OTLP_EXPORT_TIMEOUT_MILLIS: u64 = 60_000;
+const MAX_GENERIC_ICE_SERVERS: usize = 16;
+const MAX_GENERIC_ICE_URLS_PER_SERVER: usize = 8;
+const MAX_GENERIC_ICE_URL_BYTES: usize = 2_048;
+const MAX_GENERIC_ICE_IDENTITY_BYTES: usize = 1_024;
+const MAX_GENERIC_NAT_IPS: usize = 16;
+const MAX_GENERIC_STUN_TARGET_BYTES: usize = 253;
+const MAX_GENERIC_SIP_DIGEST_IDENTITY_BYTES: usize = 256;
+const MAX_GENERIC_SIP_DIGEST_PASSWORD_BYTES: usize = 1_024;
+const MAX_NAMED_PROFILE_ENTRIES: usize = 256;
+const MAX_NAMED_PROFILE_LIST_ENTRIES: usize = 64;
+const MAX_NAMED_PROFILE_VALUE_BYTES: usize = 2_048;
+const MAX_NAMED_PROFILE_SCOPE_BYTES: usize = 256;
+const MAX_API_REQUESTS_PER_SECOND: u32 = 100_000;
+const MAX_API_BURST: u32 = 1_000_000;
+const MAX_API_TRACKED_IDENTITIES: usize = 100_000;
+const MAX_API_IDENTITY_IDLE_TTL_SECS: u64 = 3_600;
 
 /// Top-level config (see `config/bridgefu.example.yaml`).
 #[derive(Debug, Deserialize)]
@@ -60,6 +108,10 @@ pub struct Config {
     pub tenants: BTreeMap<String, TenantCfg>,
     #[serde(default)]
     pub runtime: RuntimeCfg,
+    /// Private mTLS + UCTP 0.2 transport used only between role-separated
+    /// public gateways and call-pinned workers.
+    #[serde(default)]
+    pub private_forwarding: PrivateForwardingCfg,
     /// Transactional call-state persistence. SQLite is the standalone default;
     /// memory requires an explicit development/test opt-in.
     #[serde(default)]
@@ -68,8 +120,21 @@ pub struct Config {
     pub api: ApiCfg,
     #[serde(default)]
     pub providers: ProviderConfigs,
+    /// Authenticated SIP ingress policies for stock Vapi-managed transfers.
+    #[serde(default)]
+    pub vapi_ingress_profiles: BTreeMap<String, VapiIngressProfileCfg>,
+    /// Outbound SIP destination policies referenced by named routes.
+    #[serde(default)]
+    pub sip_profiles: BTreeMap<String, SipProfileCfg>,
+    /// Browser ingress and outbound interactive-WSS policies.
+    #[serde(default)]
+    pub webrtc_profiles: BTreeMap<String, WebRtcProfileCfg>,
     #[serde(default)]
     pub broadcast: BroadcastCfg,
+    /// Standalone, role-separated MOQT relay listeners. Required only when
+    /// `runtime.mode` is `moq-relay`.
+    #[serde(default)]
+    pub moq_relay: Option<MoqRelayCfg>,
     #[serde(default)]
     pub context: ContextPolicy,
     #[serde(default)]
@@ -86,16 +151,736 @@ pub struct GenericBridgeCfg {
     pub webrtc_ws_bind: String,
     #[serde(default = "default_webrtc_whip_bind")]
     pub webrtc_whip_bind: String,
+    /// SIP/RTP address allocation and bounded symmetric-RTP behavior for the
+    /// generic bridge. The frozen Amazon listener continues using `sip:`.
+    #[serde(default)]
+    pub sip: GenericSipNetworkCfg,
+    /// ICE/DTLS/TURN behavior for normal rvoip WebRTC legs.
+    #[serde(default)]
+    pub webrtc: GenericWebRtcNetworkCfg,
+    /// Protected compatibility route for `sip:<tenant>` plus
+    /// `X-Correlation-Id`. The legacy StandardCharter listener remains the
+    /// default and this route is inert unless explicitly enabled.
+    #[serde(default)]
+    pub standardcharter_canary: StandardCharterCanaryCfg,
     #[serde(default)]
     /// Deprecated compatibility field. Generic signaling must use the exact
     /// validator configured at `api.bearer_token`.
     pub bearer_token: Option<SecretRef>,
 }
 
+#[derive(Clone, Deserialize)]
+pub struct StandardCharterCanaryCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The only SIP Request-URI user that can enter the canary route.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Exact authenticated identity. These defaults match the configured
+    /// static API-key validator; deployments using another validator must set
+    /// both values explicitly.
+    #[serde(default = "default_canary_trusted_subject")]
+    pub trusted_subject: String,
+    #[serde(default = "default_canary_trusted_issuer")]
+    pub trusted_issuer: String,
+    #[serde(default = "default_canary_correlation_header")]
+    pub correlation_header: String,
+    /// Non-secret rvoip Amazon profile selector.
+    #[serde(default = "default_canary_amazon_profile")]
+    pub amazon_profile: String,
+}
+
+impl fmt::Debug for StandardCharterCanaryCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StandardCharterCanaryCfg")
+            .field("enabled", &self.enabled)
+            .field("tenant", &self.tenant)
+            .field("trusted_subject", &"[redacted]")
+            .field("trusted_issuer", &"[redacted]")
+            .field("correlation_header", &self.correlation_header)
+            .field("amazon_profile", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Default for StandardCharterCanaryCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant: None,
+            trusted_subject: default_canary_trusted_subject(),
+            trusted_issuer: default_canary_trusted_issuer(),
+            correlation_header: default_canary_correlation_header(),
+            amazon_profile: default_canary_amazon_profile(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GenericSipNetworkCfg {
+    /// Explicitly permit the shared API Bearer credential on cleartext SIP
+    /// transports. This is false by default because UDP/TCP SIP exposes the
+    /// reusable credential to every on-path observer. Prefer provider Digest;
+    /// enable this only on a separately restricted private/carrier network.
+    #[serde(default)]
+    pub allow_cleartext_bearer: bool,
+    /// Optional first-party Digest identity for a generic SIP peer. This is
+    /// the production alternative to a reusable Bearer on UDP/TCP.
+    #[serde(default)]
+    pub digest: Option<GenericSipDigestCfg>,
+    /// Public Via/Contact socket address. Omit to derive it from the bind.
+    #[serde(default)]
+    pub advertised_addr: Option<String>,
+    /// Public SDP address. Port zero retains each allocated RTP port.
+    #[serde(default)]
+    pub media_public_addr: Option<String>,
+    /// Optional one-shot RTP-side STUN discovery target (`host[:port]`).
+    #[serde(default)]
+    pub stun_server: Option<String>,
+    /// Shared SIP TLS listener used by every secure named-route attachment.
+    /// A route may advertise `sips:` only when this listener is configured.
+    #[serde(default)]
+    pub secure_listener: Option<GenericSipSecureListenerCfg>,
+    /// SDES-SRTP posture for the inbound/default SIP child. Named outbound
+    /// profiles run in independently configured rvoip children.
+    #[serde(default = "default_generic_sip_srtp")]
+    pub srtp: ProfileSrtpPolicy,
+    #[serde(default = "default_generic_rtp_port_start")]
+    pub rtp_port_start: u16,
+    #[serde(default = "default_generic_rtp_port_end")]
+    pub rtp_port_end: u16,
+    #[serde(default)]
+    pub symmetric_rtp: GenericSymmetricRtpCfg,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericSipSecureListenerCfg {
+    /// Dedicated SIP TLS bind. It may share the IP, but not the port, of the
+    /// cleartext SIP listener.
+    pub bind: String,
+    /// Public TLS Via/Contact socket address. Omit only for a concrete bind.
+    #[serde(default)]
+    pub advertised_addr: Option<String>,
+    /// PEM certificate-chain path.
+    pub certificate_chain: String,
+    /// Secret reference resolving to the matching PKCS#8 private-key path.
+    pub private_key: SecretRef,
+    /// Optional PEM CA bundle for inbound client-certificate verification.
+    #[serde(default)]
+    pub client_ca_certificate: Option<String>,
+    /// Require every TLS peer to present a verified client certificate.
+    #[serde(default)]
+    pub require_client_certificate: bool,
+}
+
+impl fmt::Debug for GenericSipSecureListenerCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericSipSecureListenerCfg")
+            .field("bind", &self.bind)
+            .field("advertised_addr", &self.advertised_addr)
+            .field(
+                "certificate_chain_configured",
+                &!self.certificate_chain.is_empty(),
+            )
+            .field("private_key", &self.private_key)
+            .field(
+                "client_ca_configured",
+                &self.client_ca_certificate.is_some(),
+            )
+            .field(
+                "require_client_certificate",
+                &self.require_client_certificate,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct GenericSipDigestCfg {
+    pub realm: String,
+    pub username: String,
+    pub password: SecretRef,
+}
+
+impl fmt::Debug for GenericSipDigestCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericSipDigestCfg")
+            .field("realm_configured", &!self.realm.is_empty())
+            .field("username", &"[redacted]")
+            .field("password", &self.password)
+            .finish()
+    }
+}
+
+impl GenericSipDigestCfg {
+    fn validate(&self) -> Result<()> {
+        let realm_valid = !self.realm.is_empty()
+            && self.realm.len() <= MAX_GENERIC_SIP_DIGEST_IDENTITY_BYTES
+            && self.realm.trim() == self.realm
+            && !self.realm.chars().any(char::is_control);
+        if !realm_valid {
+            return Err(anyhow!(
+                "generic_bridge.sip.digest.realm must be a bounded, trimmed, control-free value"
+            ));
+        }
+        let username_valid = !self.username.is_empty()
+            && self.username.len() <= MAX_GENERIC_SIP_DIGEST_IDENTITY_BYTES
+            && self.username.trim() == self.username
+            && self
+                .username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        if !username_valid {
+            return Err(anyhow!(
+                "generic_bridge.sip.digest.username must contain only ASCII letters, digits, dot, dash, or underscore"
+            ));
+        }
+        let mut password = self
+            .password
+            .resolve()
+            .context("resolving generic_bridge.sip.digest.password")?;
+        let valid = !password.is_empty()
+            && password.len() <= MAX_GENERIC_SIP_DIGEST_PASSWORD_BYTES
+            && !password.bytes().any(|byte| byte.is_ascii_control());
+        password.zeroize();
+        if !valid {
+            return Err(anyhow!(
+                "generic_bridge.sip.digest.password must resolve to 1..={MAX_GENERIC_SIP_DIGEST_PASSWORD_BYTES} control-free bytes"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct GenericSymmetricRtpCfg {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_ip_change: bool,
+    #[serde(default = "default_symmetric_rtp_probation")]
+    pub probation_packets: u8,
+    #[serde(default = "default_symmetric_rtp_rebindings")]
+    pub max_rebindings: u8,
+    #[serde(default = "default_symmetric_rtp_window")]
+    pub rebind_window_secs: u64,
+    #[serde(default = "default_symmetric_rtp_sequence_jump")]
+    pub max_sequence_jump: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GenericWebRtcNetworkCfg {
+    #[serde(default = "default_generic_webrtc_udp_bind")]
+    pub udp_bind: String,
+    /// Primary audio codecs registered by the public WebRTC edge. The
+    /// production default is intentionally Opus-only so a browser answer has
+    /// one deterministic primary RTP payload mapping.
+    #[serde(default = "default_generic_webrtc_audio_codecs")]
+    pub audio_codecs: BTreeSet<GenericWebRtcAudioCodec>,
+    /// Omitted preserves rvoip's default STUN entry; an explicit empty list
+    /// disables external ICE servers.
+    #[serde(default)]
+    pub ice_servers: Option<Vec<GenericIceServerCfg>>,
+    #[serde(default)]
+    pub ice_transport_policy: GenericIceTransportPolicy,
+    #[serde(default)]
+    pub nat_1to1_ips: Vec<String>,
+    #[serde(default)]
+    pub nat_1to1_candidate_type: GenericNatCandidateType,
+    #[serde(default = "default_webrtc_gather_timeout")]
+    pub gather_timeout_secs: u64,
+    #[serde(default = "default_webrtc_connection_timeout")]
+    pub connection_timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub trickle_ice: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+pub enum GenericWebRtcAudioCodec {
+    Opus,
+    Pcmu,
+    Pcma,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GenericIceServerCfg {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<SecretRef>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericIceTransportPolicy {
+    #[default]
+    All,
+    Relay,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericNatCandidateType {
+    #[default]
+    Host,
+    Srflx,
+}
+
+impl GenericBridgeCfg {
+    fn validate_networking(&self) -> Result<()> {
+        let sip_bind = self
+            .sip_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("generic_bridge.sip_bind must be a socket address"))?;
+        self.webrtc_ws_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("generic_bridge.webrtc_ws_bind must be a socket address"))?;
+        self.webrtc_whip_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("generic_bridge.webrtc_whip_bind must be a socket address"))?;
+        self.sip.validate()?;
+        if let Some(tls) = &self.sip.secure_listener {
+            let tls_bind = tls.bind.parse::<SocketAddr>().map_err(|_| {
+                anyhow!("generic_bridge.sip.secure_listener.bind must be a socket address")
+            })?;
+            if tls_bind.port() == 0 || tls_bind == sip_bind {
+                return Err(anyhow!(
+                    "generic_bridge.sip.secure_listener.bind must use a nonzero address distinct from sip_bind"
+                ));
+            }
+        }
+        let _ = self.webrtc.resolved_config()?;
+        Ok(())
+    }
+
+    pub(crate) fn sip_stack_config(
+        &self,
+        name: &str,
+        bind: SocketAddr,
+    ) -> Result<(rvoip_sip::Config, rvoip_sip::SipNatConfig)> {
+        self.sip.runtime_config(name, bind)
+    }
+
+    pub(crate) fn webrtc_stack_config(&self) -> Result<rvoip_webrtc::WebRtcConfig> {
+        self.webrtc.resolved_config()
+    }
+
+    pub(crate) fn sip_auth_service(
+        &self,
+        providers: &ProviderConfigs,
+        validator: Arc<dyn BearerValidator>,
+        bearer_scope: &'static str,
+    ) -> Result<SipAuthService> {
+        self.sip.validate()?;
+        let mut authentication = SipAuthService::new()
+            .with_bearer_validator("bridgefu", validator)
+            .with_bearer_scope(bearer_scope)
+            .with_required_bearer_scope(bearer_scope)
+            .allow_bearer_over_cleartext(self.sip.allow_cleartext_bearer);
+
+        let generic = self.sip.digest.as_ref();
+        let telnyx = providers.telnyx.as_ref();
+        if let Some(realm) = generic
+            .map(|digest| digest.realm.as_str())
+            .or_else(|| telnyx.map(|provider| provider.media_sip_realm.as_str()))
+        {
+            if generic.is_some_and(|digest| digest.realm != realm)
+                || telnyx.is_some_and(|provider| provider.media_sip_realm != realm)
+                || generic.zip(telnyx).is_some_and(|(digest, provider)| {
+                    digest.username == provider.media_sip_username
+                })
+            {
+                return Err(anyhow!(
+                    "generic and Telnyx SIP Digest identities have ambiguous namespaces"
+                ));
+            }
+            let digest_service = SipDigestAuthService::new(realm.to_owned());
+            if let Some(digest) = generic {
+                digest_service.add_user(
+                    digest.username.clone(),
+                    digest
+                        .password
+                        .resolve()
+                        .context("resolving generic gateway SIP Digest credential")?,
+                );
+            }
+            if let Some(provider) = telnyx {
+                digest_service.add_user(
+                    provider.media_sip_username.clone(),
+                    provider
+                        .media_sip_password
+                        .resolve()
+                        .context("resolving gateway Telnyx SIP credential")?,
+                );
+            }
+            authentication = authentication.with_digest_service(digest_service);
+        }
+        Ok(authentication)
+    }
+}
+
+impl GenericSipNetworkCfg {
+    fn validate(&self) -> Result<()> {
+        if let Some(digest) = &self.digest {
+            digest.validate()?;
+        }
+        if self.rtp_port_start < 1_024 || self.rtp_port_end < self.rtp_port_start {
+            return Err(anyhow!(
+                "generic_bridge.sip RTP range must start at or above 1024 and end at or after its start"
+            ));
+        }
+        if self.media_public_addr.is_some() && self.stun_server.is_some() {
+            return Err(anyhow!(
+                "generic_bridge.sip.media_public_addr and stun_server are mutually exclusive"
+            ));
+        }
+        if let Some(value) = &self.advertised_addr {
+            let address = value.parse::<SocketAddr>().map_err(|_| {
+                anyhow!("generic_bridge.sip.advertised_addr must be a socket address")
+            })?;
+            if address.ip().is_unspecified() || address.port() == 0 {
+                return Err(anyhow!(
+                    "generic_bridge.sip.advertised_addr must have a concrete IP and nonzero port"
+                ));
+            }
+        }
+        if let Some(value) = &self.media_public_addr {
+            let address = value.parse::<SocketAddr>().map_err(|_| {
+                anyhow!("generic_bridge.sip.media_public_addr must be a socket address")
+            })?;
+            if address.ip().is_unspecified() {
+                return Err(anyhow!(
+                    "generic_bridge.sip.media_public_addr must have a concrete IP"
+                ));
+            }
+        }
+        if let Some(target) = &self.stun_server {
+            if target.is_empty()
+                || target.len() > MAX_GENERIC_STUN_TARGET_BYTES
+                || target.chars().any(char::is_control)
+                || target.chars().any(char::is_whitespace)
+            {
+                return Err(anyhow!(
+                    "generic_bridge.sip.stun_server must be a bounded host[:port] without whitespace or controls"
+                ));
+            }
+        }
+        if let Some(tls) = &self.secure_listener {
+            let bind = tls.bind.parse::<SocketAddr>().map_err(|_| {
+                anyhow!("generic_bridge.sip.secure_listener.bind must be a socket address")
+            })?;
+            if bind.port() == 0 {
+                return Err(anyhow!(
+                    "generic_bridge.sip.secure_listener.bind must use a nonzero port"
+                ));
+            }
+            if let Some(advertised) = &tls.advertised_addr {
+                let advertised = advertised.parse::<SocketAddr>().map_err(|_| {
+                    anyhow!("generic_bridge.sip.secure_listener.advertised_addr must be a socket address")
+                })?;
+                if advertised.ip().is_unspecified() || advertised.port() == 0 {
+                    return Err(anyhow!(
+                        "generic_bridge.sip.secure_listener.advertised_addr must be concrete"
+                    ));
+                }
+            } else if bind.ip().is_unspecified() {
+                return Err(anyhow!(
+                    "generic_bridge.sip.secure_listener.advertised_addr is required for an unspecified bind"
+                ));
+            }
+            validate_profile_path(
+                &tls.certificate_chain,
+                "generic_bridge.sip.secure_listener.certificate_chain",
+            )?;
+            validate_secret_reference(&tls.private_key)?;
+            if let Some(client_ca) = &tls.client_ca_certificate {
+                validate_profile_path(
+                    client_ca,
+                    "generic_bridge.sip.secure_listener.client_ca_certificate",
+                )?;
+            }
+            if tls.require_client_certificate && tls.client_ca_certificate.is_none() {
+                return Err(anyhow!(
+                    "generic_bridge.sip.secure_listener requires a client CA when client certificates are mandatory"
+                ));
+            }
+        }
+        self.symmetric_rtp
+            .policy()
+            .validate()
+            .map_err(|detail| anyhow!("invalid generic_bridge.sip.symmetric_rtp policy: {detail}"))
+    }
+
+    fn runtime_config(
+        &self,
+        name: &str,
+        bind: SocketAddr,
+    ) -> Result<(rvoip_sip::Config, rvoip_sip::SipNatConfig)> {
+        self.validate()?;
+        let mut config = rvoip_sip::Config::on(name, bind.ip(), bind.port())
+            .with_media_ports(self.rtp_port_start, self.rtp_port_end);
+        if let Some(address) = &self.advertised_addr {
+            config = config.with_sip_advertised_addr(
+                address
+                    .parse()
+                    .map_err(|_| anyhow!("invalid generic SIP advertised address"))?,
+            );
+        }
+        if let Some(address) = &self.media_public_addr {
+            config = config.with_media_public_addr(
+                address
+                    .parse()
+                    .map_err(|_| anyhow!("invalid generic SIP media public address"))?,
+            );
+        }
+        config.stun_server.clone_from(&self.stun_server);
+        if let Some(tls) = &self.secure_listener {
+            let tls_bind = tls
+                .bind
+                .parse()
+                .map_err(|_| anyhow!("invalid generic SIP TLS bind"))?;
+            let mut private_key = tls
+                .private_key
+                .resolve()
+                .context("resolving generic SIP TLS private-key path")?;
+            let private_key_valid = validate_profile_path(
+                &private_key,
+                "generic_bridge.sip.secure_listener.private_key",
+            );
+            if let Err(error) = private_key_valid {
+                private_key.zeroize();
+                return Err(error);
+            }
+            config = config.tls_reachable_contact(
+                tls_bind,
+                tls.certificate_chain.clone(),
+                private_key.clone(),
+            );
+            private_key.zeroize();
+            if let Some(advertised) = &tls.advertised_addr {
+                config.tls_advertised_addr = Some(
+                    advertised
+                        .parse()
+                        .map_err(|_| anyhow!("invalid generic SIP TLS advertised address"))?,
+                );
+            }
+            if let Some(client_ca) = &tls.client_ca_certificate {
+                config = if tls.require_client_certificate {
+                    config.require_tls_client_certificate(client_ca.clone())
+                } else {
+                    config.verify_optional_tls_client_certificate(client_ca.clone())
+                };
+            }
+        }
+        config.offer_srtp = self.srtp != ProfileSrtpPolicy::Disabled;
+        config.srtp_required = self.srtp == ProfileSrtpPolicy::Required;
+        let nat = rvoip_sip::SipNatConfig::default()
+            .with_symmetric_rtp_policy(self.symmetric_rtp.policy());
+        Ok((config, nat))
+    }
+}
+
+impl GenericSymmetricRtpCfg {
+    fn policy(self) -> rvoip_sip::SymmetricRtpPolicy {
+        rvoip_sip::SymmetricRtpPolicy {
+            enabled: self.enabled,
+            allow_ip_change: self.allow_ip_change,
+            probation_packets: self.probation_packets,
+            max_rebindings: self.max_rebindings,
+            rebind_window: Duration::from_secs(self.rebind_window_secs),
+            max_sequence_jump: self.max_sequence_jump,
+        }
+    }
+}
+
+impl GenericWebRtcNetworkCfg {
+    fn resolved_config(&self) -> Result<rvoip_webrtc::WebRtcConfig> {
+        self.udp_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("generic_bridge.webrtc.udp_bind must be a socket address"))?;
+        if !(1..=60).contains(&self.gather_timeout_secs)
+            || !(1..=120).contains(&self.connection_timeout_secs)
+            || self.connection_timeout_secs < self.gather_timeout_secs
+        {
+            return Err(anyhow!(
+                "generic_bridge.webrtc timeouts require gather 1..=60 seconds and connection 1..=120 seconds no shorter than gather"
+            ));
+        }
+        if self.nat_1to1_ips.len() > MAX_GENERIC_NAT_IPS {
+            return Err(anyhow!(
+                "generic_bridge.webrtc.nat_1to1_ips supports at most {MAX_GENERIC_NAT_IPS} addresses"
+            ));
+        }
+        if self.audio_codecs.is_empty() || self.audio_codecs.len() > 3 {
+            return Err(anyhow!(
+                "generic_bridge.webrtc.audio_codecs must contain 1..=3 distinct supported codecs"
+            ));
+        }
+        let mut seen_nat = BTreeSet::new();
+        for raw in &self.nat_1to1_ips {
+            let ip = raw.parse::<IpAddr>().map_err(|_| {
+                anyhow!("generic_bridge.webrtc.nat_1to1_ips must contain IP addresses")
+            })?;
+            if ip.is_unspecified() || ip.is_multicast() || !seen_nat.insert(ip) {
+                return Err(anyhow!(
+                    "generic_bridge.webrtc.nat_1to1_ips must contain distinct concrete unicast addresses"
+                ));
+            }
+        }
+
+        let mut config = rvoip_webrtc::WebRtcConfig::default();
+        let available = std::mem::take(&mut config.capabilities.audio_codecs);
+        config.capabilities.audio_codecs = self
+            .audio_codecs
+            .iter()
+            .map(|configured| {
+                let expected = match configured {
+                    GenericWebRtcAudioCodec::Opus => "opus",
+                    GenericWebRtcAudioCodec::Pcmu => "g.711-mu",
+                    GenericWebRtcAudioCodec::Pcma => "g.711-a",
+                };
+                available
+                    .iter()
+                    .find(|codec| codec.name.eq_ignore_ascii_case(expected))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("rvoip omitted a configured WebRTC audio codec"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        config.udp_bind.clone_from(&self.udp_bind);
+        config.nat_1to1_ips.clone_from(&self.nat_1to1_ips);
+        config.nat_1to1_candidate_type = match self.nat_1to1_candidate_type {
+            GenericNatCandidateType::Host => rvoip_webrtc::Nat1To1CandidateType::Host,
+            GenericNatCandidateType::Srflx => rvoip_webrtc::Nat1To1CandidateType::Srflx,
+        };
+        config.gather_timeout_secs = self.gather_timeout_secs;
+        config.connection_timeout_secs = self.connection_timeout_secs;
+        config.trickle_ice = self.trickle_ice;
+        config.ice_transport_policy = match self.ice_transport_policy {
+            GenericIceTransportPolicy::All => rvoip_webrtc::config::IceTransportPolicy::All,
+            GenericIceTransportPolicy::Relay => rvoip_webrtc::config::IceTransportPolicy::Relay,
+        };
+
+        if let Some(servers) = &self.ice_servers {
+            if servers.len() > MAX_GENERIC_ICE_SERVERS {
+                return Err(anyhow!(
+                    "generic_bridge.webrtc.ice_servers supports at most {MAX_GENERIC_ICE_SERVERS} entries"
+                ));
+            }
+            let mut resolved = Vec::with_capacity(servers.len());
+            for server in servers {
+                resolved.push(server.resolve()?);
+            }
+            config.ice_servers = resolved;
+        }
+
+        let has_turn = config
+            .ice_servers
+            .iter()
+            .flat_map(|server| &server.urls)
+            .any(|url| is_turn_url(url));
+        let has_stun = config
+            .ice_servers
+            .iter()
+            .flat_map(|server| &server.urls)
+            .any(|url| is_stun_url(url));
+        if self.ice_transport_policy == GenericIceTransportPolicy::Relay && !has_turn {
+            return Err(anyhow!(
+                "generic_bridge.webrtc relay policy requires at least one TURN URL"
+            ));
+        }
+        if !self.nat_1to1_ips.is_empty()
+            && self.nat_1to1_candidate_type == GenericNatCandidateType::Srflx
+            && has_stun
+        {
+            return Err(anyhow!(
+                "generic_bridge.webrtc srflx one-to-one NAT mapping cannot be combined with STUN URLs"
+            ));
+        }
+        Ok(config)
+    }
+}
+
+impl GenericIceServerCfg {
+    fn resolve(&self) -> Result<rvoip_webrtc::IceServerConfig> {
+        if self.urls.is_empty() || self.urls.len() > MAX_GENERIC_ICE_URLS_PER_SERVER {
+            return Err(anyhow!(
+                "each generic_bridge.webrtc ICE server requires 1..={MAX_GENERIC_ICE_URLS_PER_SERVER} URLs"
+            ));
+        }
+        let mut has_turn = false;
+        for url in &self.urls {
+            if url.is_empty()
+                || url.len() > MAX_GENERIC_ICE_URL_BYTES
+                || url.chars().any(char::is_control)
+                || url.chars().any(char::is_whitespace)
+                || !(is_stun_url(url) || is_turn_url(url))
+            {
+                return Err(anyhow!(
+                    "generic_bridge.webrtc ICE URLs must use stun, stuns, turn, or turns and be bounded without whitespace or controls"
+                ));
+            }
+            has_turn |= is_turn_url(url);
+        }
+        if self.username.is_some() != self.credential.is_some()
+            || (self.username.is_some() && !has_turn)
+        {
+            return Err(anyhow!(
+                "generic_bridge.webrtc ICE username and credential must be paired and are valid only for TURN"
+            ));
+        }
+        let username = self.username.clone();
+        if username.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_GENERIC_ICE_IDENTITY_BYTES
+                || value.chars().any(char::is_control)
+        }) {
+            return Err(anyhow!(
+                "generic_bridge.webrtc TURN username must be bounded and control-free"
+            ));
+        }
+        let credential = match &self.credential {
+            Some(secret) => {
+                let value = secret.resolve().map_err(|error| {
+                    anyhow!("resolving generic_bridge.webrtc TURN credential: {error}")
+                })?;
+                if value.is_empty()
+                    || value.len() > MAX_GENERIC_ICE_IDENTITY_BYTES
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(anyhow!(
+                        "generic_bridge.webrtc TURN credential must be bounded and control-free"
+                    ));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        Ok(rvoip_webrtc::IceServerConfig {
+            urls: self.urls.clone(),
+            username,
+            credential,
+        })
+    }
+}
+
+fn is_stun_url(value: &str) -> bool {
+    value.starts_with("stun:") || value.starts_with("stuns:")
+}
+
+fn is_turn_url(value: &str) -> bool {
+    value.starts_with("turn:") || value.starts_with("turns:")
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RuntimeCfg {
-    #[serde(default = "default_runtime_mode")]
-    pub mode: String,
+    #[serde(default)]
+    pub mode: RuntimeMode,
     #[serde(default = "default_max_calls")]
     pub max_concurrent_calls: usize,
     #[serde(default = "default_setup_timeout")]
@@ -105,6 +890,128 @@ pub struct RuntimeCfg {
     pub media_idle_timeout_secs: u64,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_secs: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PrivateForwardingCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shared HMAC key for short-lived gateway JWTs. mTLS remains mandatory;
+    /// the token binds worker audience, tenant, gateway subject, scopes, and
+    /// expiry at the UCTP authorization layer.
+    #[serde(default)]
+    pub token_signing_secret: Option<SecretRef>,
+    #[serde(default)]
+    pub gateway: Option<PrivateForwardingGatewayCfg>,
+    #[serde(default)]
+    pub worker: Option<PrivateForwardingWorkerCfg>,
+    #[serde(default)]
+    pub limits: PrivateForwardingLimitsCfg,
+    #[serde(default)]
+    pub timeouts: PrivateForwardingTimeoutsCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrivateForwardingGatewayCfg {
+    pub gateway_id: String,
+    #[serde(default = "default_private_gateway_bind")]
+    pub bind: String,
+    pub tls: PrivateForwardingTlsCfg,
+    pub workers: Vec<PrivateForwardingWorkerTargetCfg>,
+    /// Public UCTP signaling/media listener implemented by the split gateway.
+    /// HTTP call control shares the observability bind; native SIP and WebRTC
+    /// listeners remain disabled until they can forward complete leg state.
+    #[serde(default)]
+    pub public_uctp: Option<PublicUctpListenerCfg>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrivateForwardingWorkerCfg {
+    #[serde(default = "default_private_worker_bind")]
+    pub bind: String,
+    pub tls: PrivateForwardingTlsCfg,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrivateForwardingWorkerTargetCfg {
+    pub worker_id: String,
+    pub endpoint: String,
+    pub server_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrivateForwardingTlsCfg {
+    pub certificate_chain: Vec<String>,
+    pub private_key: String,
+    pub peer_ca_certificates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrivateForwardingLimitsCfg {
+    #[serde(default = "default_private_active_routes")]
+    pub max_active_routes: usize,
+    #[serde(default = "default_private_peer_connections")]
+    pub max_peer_connections: usize,
+    #[serde(default = "default_private_routes_per_peer")]
+    pub max_routes_per_peer: usize,
+    #[serde(default = "default_private_media_queue")]
+    pub media_queue_capacity: usize,
+    #[serde(default = "default_private_reliable_queue")]
+    pub reliable_queue_capacity: usize,
+    #[serde(default = "default_private_inbound_queue")]
+    pub inbound_queue_capacity: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrivateForwardingTimeoutsCfg {
+    #[serde(default = "default_private_connect_timeout")]
+    pub connect_secs: u64,
+    #[serde(default = "default_private_signaling_timeout")]
+    pub signaling_secs: u64,
+    #[serde(default = "default_private_token_ttl")]
+    pub token_ttl_secs: u64,
+    #[serde(default = "default_private_health_interval")]
+    pub health_interval_secs: u64,
+}
+
+/// Process topology selected for this Bridgefu binary.
+///
+/// Keeping this typed prevents an unknown role from reaching startup and makes
+/// it impossible for role dispatch to silently fall back to all-in-one.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    /// Compatibility deployment: public ingress, call execution, and Amazon
+    /// Connect media remain in the existing single process.
+    #[default]
+    AllInOne,
+    /// Public signaling/control edge. This remains fail-closed until the
+    /// PostgreSQL/Redis call-control authority and private authenticated
+    /// gateway-to-worker forwarding dependency are configured and healthy.
+    Gateway,
+    /// Durable call execution worker with no public signaling or control API.
+    Worker,
+    /// Standalone MOQT relay. This remains fail-closed until its production
+    /// TLS/admission configuration can be represented by Bridgefu config.
+    MoqRelay,
+}
+
+impl RuntimeMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllInOne => "all-in-one",
+            Self::Gateway => "gateway",
+            Self::Worker => "worker",
+            Self::MoqRelay => "moq-relay",
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Transactional call-state repository configuration.
@@ -131,7 +1038,9 @@ pub struct PersistenceCfg {
     /// Supervised database renewal cadence.
     #[serde(default = "default_worker_renew_interval")]
     pub worker_renew_interval_secs: u64,
-    /// Capabilities advertised by this worker.
+    /// Capability allowlist requested for this worker. Process construction
+    /// intersects it with the concrete adapters/providers actually installed
+    /// before registration; configuration alone never creates capability.
     #[serde(default = "default_worker_capabilities")]
     pub worker_capabilities: BTreeSet<String>,
     /// Optional secret-bearing Redis URL for projection and wakeup hints.
@@ -164,6 +1073,15 @@ pub enum PersistenceBackend {
 pub struct ApiCfg {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Dedicated public HTTP bind for role-separated gateway call control and
+    /// provider webhooks. Health and metrics remain on
+    /// `observability.http_bind` and are never mounted on this listener.
+    #[serde(default)]
+    pub http_bind: Option<String>,
+    /// Server-side TLS for the split gateway API listener. Plain HTTP is
+    /// permitted only when `http_bind` is a loopback address.
+    #[serde(default)]
+    pub tls: Option<ApiTlsCfg>,
     /// Optional shared Bearer API key. Use `env:VARIABLE` in production.
     #[serde(default)]
     pub bearer_token: Option<SecretRef>,
@@ -175,6 +1093,1850 @@ pub struct ApiCfg {
     /// Required when more than one routing tenant is configured.
     #[serde(default)]
     pub static_tenant: Option<String>,
+    /// Bounded token-bucket admission for authenticated control principals,
+    /// diagnostics, and the unauthenticated provider-webhook ingress.
+    #[serde(default)]
+    pub rate_limit: ApiRateLimitCfg,
+    /// Server-owned route catalog. Public callers select only a map key;
+    /// endpoint and provider details never appear in route-create requests.
+    #[serde(default)]
+    pub routes: BTreeMap<String, NamedRouteCfg>,
+    /// Public signaling descriptors used to materialize one-use attachments.
+    #[serde(default)]
+    pub route_attachments: RouteAttachmentCfg,
+}
+
+/// Public ingress accepted by one named route.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NamedRouteIngress {
+    Sip,
+    Webrtc,
+}
+
+fn default_named_route_ingress() -> BTreeSet<NamedRouteIngress> {
+    BTreeSet::from([NamedRouteIngress::Sip, NamedRouteIngress::Webrtc])
+}
+
+fn default_profile_codecs() -> BTreeSet<ProfileAudioCodec> {
+    BTreeSet::from([ProfileAudioCodec::Pcmu, ProfileAudioCodec::Opus])
+}
+
+fn default_true_profile_policy() -> bool {
+    true
+}
+
+fn default_generic_sip_srtp() -> ProfileSrtpPolicy {
+    ProfileSrtpPolicy::Disabled
+}
+
+/// Audio codecs admitted by a named signaling profile.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ProfileAudioCodec {
+    Pcmu,
+    Pcma,
+    Opus,
+}
+
+/// Vapi-managed SIP ingress authentication, transport, and codec policy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VapiIngressProfileCfg {
+    pub tenant_id: String,
+    pub principal_subject: String,
+    pub issuer: String,
+    #[serde(default)]
+    pub scopes: BTreeSet<String>,
+    pub trusted_signaling_cidrs: Vec<String>,
+    pub tls: ProfileTlsIdentityCfg,
+    #[serde(default)]
+    pub digest: Option<ProfileDigestCfg>,
+    #[serde(default)]
+    pub mtls_peer_ca_certificates: Vec<String>,
+    /// Transport-verified client leaf-certificate SHA-256 fingerprints that
+    /// map to this profile's explicit principal. A trusted CA by itself never
+    /// assigns an application identity.
+    #[serde(default)]
+    pub mtls_leaf_certificate_sha256_fingerprints: Vec<String>,
+    #[serde(default = "default_true_profile_policy")]
+    pub srtp_required: bool,
+    #[serde(default = "default_profile_codecs")]
+    pub codecs: BTreeSet<ProfileAudioCodec>,
+}
+
+/// Runtime-only projection of one referenced Vapi profile into the shared SIP
+/// listener. It deliberately owns rvoip types so Bridgefu's public route and
+/// profile models never expose listener implementation details.
+struct VapiListenerPrincipalProjection {
+    profile_id: String,
+    principal: AuthenticatedPrincipal,
+    trusted_cidrs: Vec<IpNet>,
+    mtls_leaf_fingerprints: Vec<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct VapiProjectedIdentity {
+    ownership: PrincipalOwnershipKey,
+    scopes: Vec<String>,
+}
+
+impl From<&AuthenticatedPrincipal> for VapiProjectedIdentity {
+    fn from(principal: &AuthenticatedPrincipal) -> Self {
+        Self {
+            ownership: principal.ownership_key(),
+            scopes: principal.scopes.clone(),
+        }
+    }
+}
+
+/// TLS certificate identity. Private-key references are excluded from profile
+/// revisions and remain redacted by `SecretRef`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileTlsIdentityCfg {
+    pub certificate_chain: String,
+    #[serde(skip_serializing)]
+    pub private_key: SecretRef,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileDigestCfg {
+    pub realm: String,
+    pub username: String,
+    #[serde(skip_serializing)]
+    pub password: SecretRef,
+}
+
+/// Per-destination SRTP posture enforced by the selected isolated SIP child.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProfileSrtpPolicy {
+    #[default]
+    Required,
+    Preferred,
+    Disabled,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum SipProfileAuthCfg {
+    Digest {
+        realm: Option<String>,
+        username: String,
+        #[serde(skip_serializing)]
+        password: SecretRef,
+    },
+    Bearer {
+        #[serde(skip_serializing)]
+        token: SecretRef,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileClientCertificateCfg {
+    pub certificate_chain: String,
+    #[serde(skip_serializing)]
+    pub private_key: SecretRef,
+}
+
+/// Outbound SIP authorization profile. Targets remain in the server-owned
+/// route, but must be an exact member of this allowlist.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SipProfileCfg {
+    pub allowed_targets: BTreeSet<String>,
+    pub from_uri: String,
+    #[serde(default)]
+    pub outbound_proxy: Option<String>,
+    #[serde(default)]
+    pub auth: Option<SipProfileAuthCfg>,
+    #[serde(default)]
+    pub tls_roots: Vec<String>,
+    #[serde(default)]
+    pub client_certificate: Option<ProfileClientCertificateCfg>,
+    #[serde(default)]
+    pub srtp: ProfileSrtpPolicy,
+    #[serde(default = "default_profile_codecs")]
+    pub codecs: BTreeSet<ProfileAudioCodec>,
+    #[serde(default)]
+    pub metadata_keys: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileIceServerCfg {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub credential: Option<SecretRef>,
+}
+
+/// Interactive WebRTC profile used for browser ingress or an outbound WSS
+/// peer. Route targets must belong to `allowed_signaling_origins`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebRtcProfileCfg {
+    pub allowed_signaling_origins: BTreeSet<String>,
+    #[serde(default, skip_serializing)]
+    pub bearer_token: Option<SecretRef>,
+    #[serde(default)]
+    pub tls_roots: Vec<String>,
+    #[serde(default)]
+    pub ice_servers: Vec<ProfileIceServerCfg>,
+    #[serde(default = "default_profile_codecs")]
+    pub codecs: BTreeSet<ProfileAudioCodec>,
+    #[serde(default = "default_true_profile_policy")]
+    pub data_channels: bool,
+}
+
+/// Existing provider/runtime profile selected by a server-owned route.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum RouteDestinationProfileRef {
+    Sip { profile_id: String },
+    Webrtc { profile_id: String },
+    AmazonConnect { profile_id: String },
+    Telnyx { profile_id: String },
+}
+
+/// One tenant-owned, server-controlled route destination.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamedRouteCfg {
+    pub tenant_id: String,
+    #[serde(default = "default_named_route_ingress")]
+    pub ingress: BTreeSet<NamedRouteIngress>,
+    pub destination: RequestedLeg,
+    /// Required for new stock-Vapi SIP routes.
+    #[serde(default)]
+    pub vapi_ingress_profile: Option<String>,
+    /// Required for new direct-browser routes.
+    #[serde(default)]
+    pub webrtc_ingress_profile: Option<String>,
+    /// Required for new destination definitions.
+    #[serde(default)]
+    pub destination_profile: Option<RouteDestinationProfileRef>,
+    /// Explicit compatibility escape hatch for pre-profile route definitions.
+    #[serde(default)]
+    pub legacy_embedded_destination: bool,
+    /// Populated only in the resolved runtime catalog and persisted with calls.
+    #[serde(skip)]
+    pub profile_bindings: Vec<NamedProfileBinding>,
+    /// Route-local metadata policy derived from the destination profile. `None`
+    /// means the transport has its own bounded DataChannel contract; `Some`
+    /// is enforced before a call or attachment is created.
+    #[serde(skip)]
+    pub context_metadata_allowlist: Option<BTreeSet<String>>,
+    /// Non-secret, revision-bound destination policy used by route discovery.
+    /// Adapter/topology availability is checked separately at request time.
+    #[serde(skip)]
+    pub capability_policy: NamedRouteCapabilityPolicy,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NamedRouteCapabilityPolicy {
+    pub audio_codecs: BTreeSet<ProfileAudioCodec>,
+    pub data_channels: Option<bool>,
+    pub sip_message: Option<bool>,
+}
+
+/// Public attachment endpoints shared by the named route catalog.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RouteAttachmentCfg {
+    /// Complete secure SIP URI template with exactly one `{token}` user part,
+    /// for example `sips:{token}@bridge.example:5061;transport=tls`.
+    #[serde(default)]
+    pub sip_uri_template: Option<String>,
+    #[serde(default)]
+    pub webrtc: Option<RouteWebRtcAttachmentCfg>,
+}
+
+impl fmt::Debug for RouteAttachmentCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteAttachmentCfg")
+            .field(
+                "sip_uri_template_configured",
+                &self.sip_uri_template.is_some(),
+            )
+            .field("webrtc_configured", &self.webrtc.is_some())
+            .finish()
+    }
+}
+
+/// Browser-facing WSS and ICE descriptor. ICE credentials are resolved once
+/// at startup and are never exposed by route discovery or Debug output.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RouteWebRtcAttachmentCfg {
+    pub signaling_uri: String,
+    #[serde(default)]
+    pub ice_servers: Vec<RouteIceServerCfg>,
+}
+
+impl fmt::Debug for RouteWebRtcAttachmentCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteWebRtcAttachmentCfg")
+            .field("signaling_uri", &"[redacted]")
+            .field("ice_server_count", &self.ice_servers.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RouteIceServerCfg {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<SecretRef>,
+}
+
+impl fmt::Debug for RouteIceServerCfg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteIceServerCfg")
+            .field("url_count", &self.urls.len())
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedNamedRoutes {
+    pub routes: BTreeMap<String, NamedRouteCfg>,
+    pub sip_uri_template: Option<String>,
+    pub webrtc: Option<ResolvedRouteWebRtcAttachment>,
+}
+
+impl fmt::Debug for ResolvedNamedRoutes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedNamedRoutes")
+            .field("route_count", &self.routes.len())
+            .field(
+                "sip_attachment_configured",
+                &self.sip_uri_template.is_some(),
+            )
+            .field("webrtc_attachment_configured", &self.webrtc.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedRouteWebRtcAttachment {
+    pub signaling_uri: String,
+    pub ice_servers: Vec<ResolvedRouteIceServer>,
+}
+
+impl fmt::Debug for ResolvedRouteWebRtcAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedRouteWebRtcAttachment")
+            .field("signaling_uri", &"[redacted]")
+            .field("ice_server_count", &self.ice_servers.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedRouteIceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+impl fmt::Debug for ResolvedRouteIceServer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedRouteIceServer")
+            .field("url_count", &self.urls.len())
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl Drop for ResolvedRouteIceServer {
+    fn drop(&mut self) {
+        if let Some(username) = &mut self.username {
+            username.zeroize();
+        }
+        if let Some(credential) = &mut self.credential {
+            credential.zeroize();
+        }
+    }
+}
+
+impl Config {
+    /// Build the inbound/default SIP stack. When named egress profiles are
+    /// present, its RTP range is the first disjoint slice of the configured
+    /// range; each independently secured egress child receives another slice.
+    pub(crate) fn generic_sip_stack_config(
+        &self,
+        name: &str,
+        bind: SocketAddr,
+    ) -> Result<(rvoip_sip::Config, rvoip_sip::SipNatConfig)> {
+        let (mut stack, nat) = self
+            .generic_bridge
+            .sip_stack_config(name, bind)
+            .context("configuring generic SIP stack")?;
+        let profile_count = self.referenced_named_sip_profiles()?.len();
+        if profile_count > rvoip_sip::MAX_INSTALLED_SIP_EGRESS_PROFILES {
+            return Err(anyhow!(
+                "too many referenced named SIP egress profiles are configured"
+            ));
+        }
+        let ranges = partition_rtp_port_range(
+            stack.media_port_start,
+            stack.media_port_end,
+            profile_count.saturating_add(1),
+        )?;
+        stack = stack.with_media_ports(ranges[0].0, ranges[0].1);
+        Ok((stack, nat))
+    }
+
+    /// Resolve every referenced named SIP destination into an isolated child
+    /// stack selected only by its exact durable revision. No TLS identity,
+    /// trust root, SRTP posture, codec set, or metadata policy is projected
+    /// process-wide onto another route.
+    pub(crate) fn sip_egress_profile_configs(
+        &self,
+        name: &str,
+        bind: SocketAddr,
+    ) -> Result<Vec<SipEgressProfileConfig>> {
+        let profiles = self.referenced_named_sip_profiles()?;
+        if profiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        if profiles.len() > rvoip_sip::MAX_INSTALLED_SIP_EGRESS_PROFILES {
+            return Err(anyhow!(
+                "too many referenced named SIP egress profiles are configured"
+            ));
+        }
+        let (base, nat) = self
+            .generic_bridge
+            .sip_stack_config(name, bind)
+            .context("configuring generic SIP egress base")?;
+        let ranges = partition_rtp_port_range(
+            base.media_port_start,
+            base.media_port_end,
+            profiles.len().saturating_add(1),
+        )?;
+        let mut revisions = BTreeSet::new();
+        let mut configured = Vec::with_capacity(profiles.len());
+        for (offset, (profile_id, profile)) in profiles.into_iter().enumerate() {
+            let revision = profile_revision(profile)?;
+            if !revisions.insert(revision.clone()) {
+                return Err(anyhow!(
+                    "referenced sip_profiles must have distinct non-secret revisions"
+                ));
+            }
+            let revision = rvoip_sip::SipProfileRevision::new(revision)
+                .map_err(|_| anyhow!("named SIP profile produced an invalid revision"))?;
+
+            // Clone operational tuning and NAT/media advertisement from the
+            // public stack, but bind an independent signaling endpoint and
+            // remove every inbound TLS-listener credential from the child.
+            let child_name = format!("{name}-egress-{}", offset + 1);
+            let isolated = rvoip_sip::Config::on(&child_name, bind.ip(), 0);
+            let mut stack = base.clone();
+            stack.local_ip = isolated.local_ip;
+            stack.sip_port = isolated.sip_port;
+            stack.bind_addr = isolated.bind_addr;
+            stack.local_uri = isolated.local_uri;
+            stack.sip_advertised_addr = None;
+            stack.sip_tls_mode = rvoip_sip::SipTlsMode::ClientOnly;
+            stack.contact_uri = Some(profile.from_uri.clone());
+            stack.tls_bind_addr = None;
+            stack.tls_advertised_addr = None;
+            stack.tls_cert_path = None;
+            stack.tls_key_path = None;
+            stack.tls_server_client_auth = Default::default();
+            stack.tls_extra_ca_path = profile.tls_roots.first().map(Into::into);
+            stack.tls_client_cert_path = None;
+            stack.tls_client_key_path = None;
+            if let Some(identity) = &profile.client_certificate {
+                let mut private_key = identity
+                    .private_key
+                    .resolve()
+                    .context("resolving named SIP client private-key path")?;
+                if let Err(error) =
+                    validate_profile_path(&private_key, "sip_profiles client private-key path")
+                {
+                    private_key.zeroize();
+                    return Err(error);
+                }
+                stack.tls_client_cert_path = Some(identity.certificate_chain.clone().into());
+                stack.tls_client_key_path = Some(private_key.clone().into());
+                private_key.zeroize();
+            }
+            stack.offer_srtp = profile.srtp != ProfileSrtpPolicy::Disabled;
+            stack.srtp_required = profile.srtp == ProfileSrtpPolicy::Required;
+            stack.offered_codecs = profile
+                .codecs
+                .iter()
+                .map(|codec| match codec {
+                    ProfileAudioCodec::Pcmu => 0,
+                    ProfileAudioCodec::Pcma => 8,
+                    ProfileAudioCodec::Opus => 111,
+                })
+                .chain(std::iter::once(101))
+                .collect();
+            let (media_start, media_end) = ranges[offset + 1];
+            stack = stack.with_media_ports(media_start, media_end);
+            stack
+                .validate()
+                .map_err(|_| anyhow!("named SIP profile produced an invalid child stack"))?;
+
+            let allowed_initial_headers = self
+                .context
+                .allow_headers
+                .iter()
+                .filter(|(_, metadata_key)| profile.metadata_keys.contains(*metadata_key))
+                .map(|(header, _)| header.clone())
+                .collect();
+            configured.push(SipEgressProfileConfig {
+                revision,
+                stack,
+                nat,
+                allowed_initial_headers,
+                sip_message: !profile.metadata_keys.is_empty(),
+            });
+            tracing::debug!(profile_id, "configured isolated named SIP egress profile");
+        }
+        Ok(configured)
+    }
+
+    fn referenced_named_sip_profiles(&self) -> Result<Vec<(&str, &SipProfileCfg)>> {
+        self.api
+            .routes
+            .values()
+            .filter_map(|route| match route.destination_profile.as_ref() {
+                Some(RouteDestinationProfileRef::Sip { profile_id }) => Some(profile_id.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|profile_id| {
+                self.sip_profiles
+                    .get(profile_id)
+                    .map(|profile| (profile_id, profile))
+                    .ok_or_else(|| {
+                        anyhow!("named SIP transport profile disappeared during stack construction")
+                    })
+            })
+            .collect()
+    }
+
+    fn validate_named_profiles(&self) -> Result<()> {
+        let profile_count = self
+            .vapi_ingress_profiles
+            .len()
+            .saturating_add(self.sip_profiles.len())
+            .saturating_add(self.webrtc_profiles.len());
+        if profile_count > MAX_NAMED_PROFILE_ENTRIES {
+            return Err(anyhow!("too many named signaling profiles are configured"));
+        }
+        let tenants = self.tenant_names()?.into_iter().collect::<BTreeSet<_>>();
+
+        for (profile_id, profile) in &self.vapi_ingress_profiles {
+            validate_named_profile_id_for_config(profile_id, NamedProfileKind::VapiIngress)?;
+            let tenant = TenantId::parse(&profile.tenant_id)
+                .map_err(|_| anyhow!("vapi_ingress_profiles contains an invalid tenant_id"))?;
+            if !tenants.contains(tenant.as_str()) {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles tenant_id must name a configured routing tenant"
+                ));
+            }
+            validate_profile_text(
+                &profile.principal_subject,
+                "vapi_ingress_profiles principal_subject",
+            )?;
+            validate_profile_text(&profile.issuer, "vapi_ingress_profiles issuer")?;
+            if profile.scopes.is_empty() || profile.scopes.len() > MAX_NAMED_PROFILE_LIST_ENTRIES {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles scopes must contain a bounded non-empty set"
+                ));
+            }
+            for scope in &profile.scopes {
+                validate_profile_scope(scope, "vapi_ingress_profiles scope")?;
+            }
+            if profile.trusted_signaling_cidrs.is_empty()
+                || profile.trusted_signaling_cidrs.len() > MAX_NAMED_PROFILE_LIST_ENTRIES
+            {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles trusted_signaling_cidrs must contain a bounded non-empty set"
+                ));
+            }
+            let mut seen_cidrs = BTreeSet::new();
+            for cidr in &profile.trusted_signaling_cidrs {
+                validate_profile_cidr(cidr)?;
+                if !seen_cidrs.insert(cidr) {
+                    return Err(anyhow!(
+                        "vapi_ingress_profiles trusted_signaling_cidrs must be unique"
+                    ));
+                }
+            }
+            validate_profile_path(
+                &profile.tls.certificate_chain,
+                "vapi_ingress_profiles tls.certificate_chain",
+            )?;
+            validate_secret_reference(&profile.tls.private_key)?;
+            if let Some(digest) = &profile.digest {
+                validate_profile_text(&digest.realm, "vapi_ingress_profiles digest.realm")?;
+                validate_profile_text(&digest.username, "vapi_ingress_profiles digest.username")?;
+                validate_secret_reference(&digest.password)?;
+            }
+            if profile.mtls_peer_ca_certificates.len() > MAX_NAMED_PROFILE_LIST_ENTRIES {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles has too many mTLS CA certificates"
+                ));
+            }
+            for path in &profile.mtls_peer_ca_certificates {
+                validate_profile_path(path, "vapi_ingress_profiles mTLS CA certificate")?;
+            }
+            if profile.mtls_leaf_certificate_sha256_fingerprints.len()
+                > MAX_NAMED_PROFILE_LIST_ENTRIES
+            {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles has too many mTLS leaf certificate fingerprints"
+                ));
+            }
+            let mut seen_fingerprints = BTreeSet::new();
+            for fingerprint in &profile.mtls_leaf_certificate_sha256_fingerprints {
+                let normalized = validate_mtls_leaf_sha256_fingerprint(fingerprint)?;
+                if !seen_fingerprints.insert(normalized) {
+                    return Err(anyhow!(
+                        "vapi_ingress_profiles mTLS leaf certificate fingerprints must be unique"
+                    ));
+                }
+            }
+            match (
+                profile.mtls_peer_ca_certificates.is_empty(),
+                profile.mtls_leaf_certificate_sha256_fingerprints.is_empty(),
+            ) {
+                (false, true) => {
+                    return Err(anyhow!(
+                        "vapi_ingress_profiles with mtls_peer_ca_certificates must configure mtls_leaf_certificate_sha256_fingerprints; CA verification alone does not assign a principal"
+                    ));
+                }
+                (true, false) => {
+                    return Err(anyhow!(
+                        "vapi_ingress_profiles mtls_leaf_certificate_sha256_fingerprints require mtls_peer_ca_certificates"
+                    ));
+                }
+                _ => {}
+            }
+            if !profile.srtp_required {
+                return Err(anyhow!(
+                    "vapi_ingress_profiles must require SRTP for production attachments"
+                ));
+            }
+            validate_profile_codecs(&profile.codecs, "vapi_ingress_profiles codecs")?;
+            let _ = profile_revision(profile)?;
+        }
+
+        for (profile_id, profile) in &self.sip_profiles {
+            validate_named_profile_id_for_config(profile_id, NamedProfileKind::Sip)?;
+            if profile.allowed_targets.is_empty()
+                || profile.allowed_targets.len() > MAX_NAMED_PROFILE_LIST_ENTRIES
+            {
+                return Err(anyhow!(
+                    "sip_profiles allowed_targets must contain a bounded non-empty set"
+                ));
+            }
+            for target in &profile.allowed_targets {
+                validate_profile_sip_uri(target, "sip_profiles allowed target")?;
+            }
+            validate_profile_sip_uri(&profile.from_uri, "sip_profiles from_uri")?;
+            if let Some(proxy) = &profile.outbound_proxy {
+                validate_profile_sip_uri(proxy, "sip_profiles outbound_proxy")?;
+            }
+            if let Some(auth) = &profile.auth {
+                match auth {
+                    SipProfileAuthCfg::Digest {
+                        realm,
+                        username,
+                        password,
+                    } => {
+                        if let Some(realm) = realm {
+                            validate_profile_text(realm, "sip_profiles auth realm")?;
+                        }
+                        validate_profile_text(username, "sip_profiles auth username")?;
+                        validate_secret_reference(password)?;
+                    }
+                    SipProfileAuthCfg::Bearer { token } => validate_secret_reference(token)?,
+                }
+            }
+            if profile.tls_roots.len() > 1 {
+                return Err(anyhow!(
+                    "sip_profiles currently supports at most one PEM CA bundle path"
+                ));
+            }
+            for root in &profile.tls_roots {
+                validate_profile_path(root, "sip_profiles TLS root")?;
+            }
+            if let Some(certificate) = &profile.client_certificate {
+                validate_profile_path(
+                    &certificate.certificate_chain,
+                    "sip_profiles client certificate",
+                )?;
+                validate_secret_reference(&certificate.private_key)?;
+            }
+            validate_profile_codecs(&profile.codecs, "sip_profiles codecs")?;
+            if profile.metadata_keys.len() > MAX_NAMED_PROFILE_LIST_ENTRIES {
+                return Err(anyhow!("sip_profiles has too many metadata keys"));
+            }
+            for key in &profile.metadata_keys {
+                validate_profile_metadata_key(key)?;
+                if !self.context.allows_metadata_key(key)? {
+                    return Err(anyhow!(
+                        "sip_profiles metadata key is not reachable through context.allow_headers"
+                    ));
+                }
+            }
+            let _ = profile_revision(profile)?;
+        }
+
+        for (profile_id, profile) in &self.webrtc_profiles {
+            validate_named_profile_id_for_config(profile_id, NamedProfileKind::WebRtc)?;
+            if profile.allowed_signaling_origins.is_empty()
+                || profile.allowed_signaling_origins.len() > MAX_NAMED_PROFILE_LIST_ENTRIES
+            {
+                return Err(anyhow!(
+                    "webrtc_profiles allowed_signaling_origins must contain a bounded non-empty set"
+                ));
+            }
+            for origin in &profile.allowed_signaling_origins {
+                validate_profile_wss_origin(origin)?;
+            }
+            if let Some(token) = &profile.bearer_token {
+                validate_secret_reference(token)?;
+            }
+            if profile.tls_roots.len() > MAX_NAMED_PROFILE_LIST_ENTRIES {
+                return Err(anyhow!("webrtc_profiles has too many TLS roots"));
+            }
+            for root in &profile.tls_roots {
+                validate_profile_path(root, "webrtc_profiles TLS root")?;
+            }
+            if profile.ice_servers.len() > MAX_GENERIC_ICE_SERVERS {
+                return Err(anyhow!("webrtc_profiles has too many ICE servers"));
+            }
+            for server in &profile.ice_servers {
+                validate_profile_ice_server(server)?;
+            }
+            validate_profile_codecs(&profile.codecs, "webrtc_profiles codecs")?;
+            let _ = profile_revision(profile)?;
+        }
+        Ok(())
+    }
+
+    fn validate_named_routes(&self) -> Result<()> {
+        if self.api.routes.is_empty() {
+            return Ok(());
+        }
+        if !self.api.enabled
+            || self.api.bearer_token.is_none()
+            || self.api.control_hmac_key.is_none()
+            || !self.generic_bridge.enabled
+        {
+            return Err(anyhow!(
+                "api.routes require api.enabled, API credentials, and generic_bridge.enabled"
+            ));
+        }
+        let configured_tenants = self.tenant_names()?.into_iter().collect::<BTreeSet<_>>();
+        for (route_id, route) in &self.api.routes {
+            NamedRouteBinding::new(route_id.clone(), None)
+                .map_err(|_| anyhow!("api.routes contains an invalid route ID"))?;
+            let tenant = TenantId::parse(&route.tenant_id)
+                .map_err(|_| anyhow!("api.routes tenant_id is invalid"))?;
+            if !configured_tenants.contains(tenant.as_str()) {
+                return Err(anyhow!(
+                    "api.routes tenant_id must name a configured routing tenant"
+                ));
+            }
+            if route.ingress.is_empty() {
+                return Err(anyhow!("api.routes ingress must not be empty"));
+            }
+            route
+                .destination
+                .validate_named_route_destination()
+                .map_err(|_| anyhow!("api.routes destination is invalid"))?;
+            let _ = self.named_route_profile_bindings(route)?;
+            if route.ingress.contains(&NamedRouteIngress::Sip)
+                && self.api.route_attachments.sip_uri_template.is_none()
+            {
+                return Err(anyhow!(
+                    "api.route_attachments.sip_uri_template is required by a SIP route ingress"
+                ));
+            }
+            if route.ingress.contains(&NamedRouteIngress::Sip) {
+                if self.generic_bridge.sip.secure_listener.is_none()
+                    || self.generic_bridge.sip.srtp != ProfileSrtpPolicy::Required
+                {
+                    return Err(anyhow!(
+                        "SIP named-route attachments require a configured SIP TLS listener and mandatory SRTP"
+                    ));
+                }
+            }
+            if route.ingress.contains(&NamedRouteIngress::Webrtc)
+                && self.api.route_attachments.webrtc.is_none()
+            {
+                return Err(anyhow!(
+                    "api.route_attachments.webrtc is required by a WebRTC route ingress"
+                ));
+            }
+        }
+        if let Some(template) = &self.api.route_attachments.sip_uri_template {
+            validate_route_sip_template(template)?;
+        }
+        if let Some(webrtc) = &self.api.route_attachments.webrtc {
+            validate_route_webrtc_attachment(webrtc)?;
+        }
+        if let Some(listener_tenant) = self.vapi_projection_listener_tenant()? {
+            let _ = self.vapi_listener_principal_projections(&listener_tenant)?;
+        }
+        Ok(())
+    }
+
+    fn named_route_profile_bindings(
+        &self,
+        route: &NamedRouteCfg,
+    ) -> Result<Vec<NamedProfileBinding>> {
+        if !route.legacy_embedded_destination {
+            if route.ingress.contains(&NamedRouteIngress::Sip)
+                && route.vapi_ingress_profile.is_none()
+            {
+                return Err(anyhow!(
+                    "new SIP routes require a vapi_ingress_profile reference"
+                ));
+            }
+            if route.ingress.contains(&NamedRouteIngress::Webrtc)
+                && route.webrtc_ingress_profile.is_none()
+            {
+                return Err(anyhow!(
+                    "new WebRTC routes require a webrtc_ingress_profile reference"
+                ));
+            }
+            if route.destination_profile.is_none() {
+                return Err(anyhow!(
+                    "new named routes require a destination_profile reference"
+                ));
+            }
+        }
+
+        let mut bindings = Vec::new();
+        if let Some(profile_id) = &route.vapi_ingress_profile {
+            if !route.ingress.contains(&NamedRouteIngress::Sip) {
+                return Err(anyhow!(
+                    "vapi_ingress_profile is valid only for a SIP route ingress"
+                ));
+            }
+            let profile = self
+                .vapi_ingress_profiles
+                .get(profile_id)
+                .ok_or_else(|| anyhow!("api.routes references an unknown vapi_ingress_profile"))?;
+            if profile.tenant_id != route.tenant_id {
+                return Err(anyhow!(
+                    "api.routes vapi_ingress_profile belongs to another tenant"
+                ));
+            }
+            self.validate_vapi_listener_projection(profile)?;
+            bindings.push(NamedProfileBinding::new(
+                NamedProfileRole::Ingress,
+                NamedProfileKind::VapiIngress,
+                profile_id.clone(),
+                profile_revision(profile)?,
+            )?);
+        }
+        if let Some(profile_id) = &route.webrtc_ingress_profile {
+            if !route.ingress.contains(&NamedRouteIngress::Webrtc) {
+                return Err(anyhow!(
+                    "webrtc_ingress_profile is valid only for a WebRTC route ingress"
+                ));
+            }
+            let profile = self.webrtc_profiles.get(profile_id).ok_or_else(|| {
+                anyhow!("api.routes references an unknown webrtc_ingress_profile")
+            })?;
+            bindings.push(NamedProfileBinding::new(
+                NamedProfileRole::Ingress,
+                NamedProfileKind::WebRtc,
+                profile_id.clone(),
+                profile_revision(profile)?,
+            )?);
+        }
+
+        match (&route.destination_profile, &route.destination.endpoint) {
+            (None, _) => {}
+            (
+                Some(RouteDestinationProfileRef::Sip { profile_id }),
+                LegEndpointConfig::Sip(endpoint),
+            ) => {
+                let profile = self
+                    .sip_profiles
+                    .get(profile_id)
+                    .ok_or_else(|| anyhow!("api.routes references an unknown sip_profile"))?;
+                let target = endpoint.uri.as_ref().ok_or_else(|| {
+                    anyhow!("named SIP destination requires an explicit server-owned target")
+                })?;
+                if !profile.allowed_targets.contains(target) {
+                    return Err(anyhow!(
+                        "named SIP destination is not allowlisted by its sip_profile"
+                    ));
+                }
+                bindings.push(NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::Sip,
+                    profile_id.clone(),
+                    profile_revision(profile)?,
+                )?);
+            }
+            (
+                Some(RouteDestinationProfileRef::Webrtc { profile_id }),
+                LegEndpointConfig::WebRtc(endpoint),
+            ) => {
+                let profile = self
+                    .webrtc_profiles
+                    .get(profile_id)
+                    .ok_or_else(|| anyhow!("api.routes references an unknown webrtc_profile"))?;
+                let target = endpoint.signaling_uri.as_ref().ok_or_else(|| {
+                    anyhow!("named WebRTC destination requires an explicit server-owned target")
+                })?;
+                let origin = normalized_wss_origin(target)?;
+                if !profile.allowed_signaling_origins.contains(&origin) {
+                    return Err(anyhow!(
+                        "named WebRTC destination origin is not allowlisted by its profile"
+                    ));
+                }
+                bindings.push(NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::WebRtc,
+                    profile_id.clone(),
+                    profile_revision(profile)?,
+                )?);
+            }
+            (
+                Some(RouteDestinationProfileRef::AmazonConnect { profile_id }),
+                LegEndpointConfig::AmazonConnect(endpoint),
+            ) => {
+                let start = route
+                    .destination
+                    .amazon_connect_start
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!("named Amazon route is missing its durable start specification")
+                    })?;
+                if start.profile() != profile_id
+                    || endpoint.instance_id != start.instance_id()
+                    || endpoint.contact_flow_id != start.contact_flow_id()
+                {
+                    return Err(anyhow!(
+                        "named Amazon destination does not match its selected profile"
+                    ));
+                }
+                let revision = profile_revision(&serde_json::json!({
+                    "profile_id": profile_id,
+                    "instance_id": start.instance_id(),
+                    "contact_flow_id": start.contact_flow_id(),
+                }))?;
+                bindings.push(NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::AmazonConnect,
+                    profile_id.clone(),
+                    revision,
+                )?);
+            }
+            (
+                Some(RouteDestinationProfileRef::Telnyx { profile_id }),
+                LegEndpointConfig::Provider(endpoint),
+            ) if endpoint.provider == ProviderKind::Telnyx => {
+                let provider = self
+                    .providers
+                    .telnyx
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("named Telnyx route requires providers.telnyx"))?;
+                if endpoint.account_profile != *profile_id
+                    || provider.account_profile != *profile_id
+                {
+                    return Err(anyhow!(
+                        "named Telnyx destination does not match its account profile"
+                    ));
+                }
+                let revision = profile_revision(&serde_json::json!({
+                    "profile_id": profile_id,
+                    "connection_id": provider.connection_id,
+                    "from": provider.from,
+                    "media_sip_authority": provider.media_sip_authority,
+                    "media_sip_username": provider.media_sip_username,
+                    "media_sip_realm": provider.media_sip_realm,
+                    "media_sip_transport": provider.media_sip_transport,
+                    "webhook_url": provider.webhook_url,
+                    "base_url": provider.base_url,
+                    "request_timeout_ms": provider.request_timeout_ms,
+                    "max_retries": provider.max_retries,
+                }))?;
+                bindings.push(NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::Telnyx,
+                    profile_id.clone(),
+                    revision,
+                )?);
+            }
+            (Some(_), _) => {
+                return Err(anyhow!(
+                    "api.routes destination_profile type must match the destination adapter"
+                ));
+            }
+        }
+        Ok(bindings)
+    }
+
+    fn validate_vapi_listener_projection(&self, profile: &VapiIngressProfileCfg) -> Result<()> {
+        let listener = self
+            .generic_bridge
+            .sip
+            .secure_listener
+            .as_ref()
+            .ok_or_else(|| anyhow!("Vapi SIP ingress requires a shared SIP TLS listener"))?;
+        if self.generic_bridge.sip.srtp != ProfileSrtpPolicy::Required
+            || listener.certificate_chain != profile.tls.certificate_chain
+            || !listener
+                .private_key
+                .same_reference(&profile.tls.private_key)
+        {
+            return Err(anyhow!(
+                "Vapi ingress TLS/SRTP policy must exactly match the shared SIP listener"
+            ));
+        }
+        if !profile.mtls_peer_ca_certificates.is_empty() {
+            if profile.mtls_peer_ca_certificates.len() != 1
+                || listener.client_ca_certificate.as_ref()
+                    != profile.mtls_peer_ca_certificates.first()
+            {
+                return Err(anyhow!(
+                    "Vapi ingress mTLS CA must match the shared SIP listener CA"
+                ));
+            }
+        }
+        if let Some(profile_digest) = &profile.digest {
+            let runtime_digest = self.generic_bridge.sip.digest.as_ref().ok_or_else(|| {
+                anyhow!("Vapi ingress Digest policy is not installed on the SIP listener")
+            })?;
+            if runtime_digest.realm != profile_digest.realm
+                || runtime_digest.username != profile_digest.username
+                || !runtime_digest
+                    .password
+                    .same_reference(&profile_digest.password)
+            {
+                return Err(anyhow!(
+                    "Vapi ingress Digest policy must exactly match the SIP listener"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the one tenant-bound SIP listener policy used by both all-in-one
+    /// and gateway roles. Header authentication remains the existing shared
+    /// generic/Telnyx Digest plus Bearer service; referenced Vapi profiles add
+    /// only explicit source-network and verified-leaf-certificate mappings.
+    pub(crate) fn sip_listener_auth_policy(
+        &self,
+        listener_tenant: &str,
+        validator: Arc<dyn BearerValidator>,
+        bearer_scope: &'static str,
+    ) -> Result<SipListenerAuthPolicy> {
+        self.validate_named_profiles()
+            .context("validating SIP listener identity profiles")?;
+        self.validate_named_routes()
+            .context("validating SIP listener route projections")?;
+        let authentication =
+            self.generic_bridge
+                .sip_auth_service(&self.providers, validator, bearer_scope)?;
+        let projections = self.vapi_listener_principal_projections(listener_tenant)?;
+        let mut policy =
+            SipListenerAuthPolicy::authenticated_for_tenant(listener_tenant, authentication)
+                .context("configuring tenant-bound SIP listener authentication")?;
+        for projection in projections {
+            tracing::info!(
+                profile_id = %projection.profile_id,
+                trusted_cidr_count = projection.trusted_cidrs.len(),
+                mtls_leaf_fingerprint_count = projection.mtls_leaf_fingerprints.len(),
+                "installed referenced Vapi ingress principal projection"
+            );
+            for cidr in projection.trusted_cidrs {
+                policy = policy.with_trusted_cidr(cidr, projection.principal.clone());
+            }
+            for fingerprint in projection.mtls_leaf_fingerprints {
+                policy = policy.with_verified_mtls_peer(fingerprint, projection.principal.clone());
+            }
+        }
+        policy
+            .validate()
+            .context("validating projected SIP listener authentication")?;
+        Ok(policy)
+    }
+
+    fn referenced_vapi_profile_ids(&self) -> BTreeSet<&str> {
+        self.api
+            .routes
+            .values()
+            .filter_map(|route| route.vapi_ingress_profile.as_deref())
+            .collect()
+    }
+
+    /// Resolve the process-wide listener tenant only when a route actually
+    /// references Vapi ingress. An unused profile is configuration inventory,
+    /// not ambient network trust.
+    fn vapi_projection_listener_tenant(&self) -> Result<Option<String>> {
+        if self.referenced_vapi_profile_ids().is_empty() {
+            return Ok(None);
+        }
+        if let Some(tenant) = &self.api.static_tenant {
+            return Ok(Some(tenant.clone()));
+        }
+        let tenants = self.tenant_names()?;
+        if tenants.len() == 1 {
+            return Ok(tenants.into_iter().next());
+        }
+        Err(anyhow!(
+            "referenced Vapi ingress profiles require one explicit SIP listener tenant via api.static_tenant"
+        ))
+    }
+
+    fn vapi_listener_principal_projections(
+        &self,
+        listener_tenant: &str,
+    ) -> Result<Vec<VapiListenerPrincipalProjection>> {
+        let mut projections = Vec::new();
+        let mut installed_cidrs: Vec<(String, IpNet, VapiProjectedIdentity)> = Vec::new();
+        let mut installed_fingerprints: BTreeMap<String, (String, VapiProjectedIdentity)> =
+            BTreeMap::new();
+
+        for profile_id in self.referenced_vapi_profile_ids() {
+            let profile = self
+                .vapi_ingress_profiles
+                .get(profile_id)
+                .ok_or_else(|| anyhow!("api.routes references an unknown vapi_ingress_profile"))?;
+            if profile.tenant_id != listener_tenant {
+                return Err(anyhow!(
+                    "referenced Vapi ingress profile tenant must exactly match the SIP listener tenant"
+                ));
+            }
+            let principal = vapi_profile_principal(profile_id, profile);
+            let identity = VapiProjectedIdentity::from(&principal);
+            let mut trusted_cidrs = Vec::with_capacity(profile.trusted_signaling_cidrs.len());
+            for configured in &profile.trusted_signaling_cidrs {
+                let cidr = configured
+                    .parse::<IpNet>()
+                    .map_err(|_| {
+                        anyhow!("vapi_ingress_profiles contains an invalid trusted signaling CIDR")
+                    })?
+                    .trunc();
+                for (installed_profile_id, installed, installed_identity) in &installed_cidrs {
+                    if ip_nets_overlap(&cidr, installed) {
+                        let detail = if installed_identity == &identity {
+                            "ambiguous overlapping trusted signaling CIDRs"
+                        } else {
+                            "overlapping trusted signaling CIDRs assign conflicting identities"
+                        };
+                        return Err(anyhow!(
+                            "Vapi ingress profiles {installed_profile_id:?} and {profile_id:?} have {detail}"
+                        ));
+                    }
+                }
+                installed_cidrs.push((profile_id.to_owned(), cidr, identity.clone()));
+                trusted_cidrs.push(cidr);
+            }
+
+            let mut mtls_leaf_fingerprints =
+                Vec::with_capacity(profile.mtls_leaf_certificate_sha256_fingerprints.len());
+            for configured in &profile.mtls_leaf_certificate_sha256_fingerprints {
+                let fingerprint = validate_mtls_leaf_sha256_fingerprint(configured)?;
+                if let Some((installed_profile_id, installed_identity)) =
+                    installed_fingerprints.get(&fingerprint)
+                {
+                    let detail = if installed_identity == &identity {
+                        "ambiguously duplicate the same mTLS leaf certificate fingerprint"
+                    } else {
+                        "assign the same mTLS leaf certificate fingerprint to conflicting identities"
+                    };
+                    return Err(anyhow!(
+                        "Vapi ingress profiles {installed_profile_id:?} and {profile_id:?} {detail}"
+                    ));
+                }
+                installed_fingerprints.insert(
+                    fingerprint.clone(),
+                    (profile_id.to_owned(), identity.clone()),
+                );
+                mtls_leaf_fingerprints.push(fingerprint);
+            }
+
+            projections.push(VapiListenerPrincipalProjection {
+                profile_id: profile_id.to_owned(),
+                principal,
+                trusted_cidrs,
+                mtls_leaf_fingerprints,
+            });
+        }
+        Ok(projections)
+    }
+
+    /// Build the signaling-attachment resolver from the same configured Vapi
+    /// identity and non-secret profile revision used by the SIP listener and
+    /// durable named-route snapshot.
+    pub(crate) fn attachment_principal_resolver(
+        &self,
+        tenants: &[String],
+    ) -> Result<ConfiguredAttachmentPrincipalResolver> {
+        self.validate_named_profiles()
+            .context("validating attachment identity profiles")?;
+        self.validate_named_routes()
+            .context("validating attachment identity routes")?;
+        let mut resolver = self.providers.attachment_principal_resolver(tenants);
+        for profile_id in self.referenced_vapi_profile_ids() {
+            let profile = self
+                .vapi_ingress_profiles
+                .get(profile_id)
+                .ok_or_else(|| anyhow!("api.routes references an unknown vapi_ingress_profile"))?;
+            if !tenants.iter().any(|tenant| tenant == &profile.tenant_id) {
+                return Err(anyhow!(
+                    "referenced Vapi ingress profile tenant is unavailable to the call runtime"
+                ));
+            }
+            resolver = resolver.with_vapi_ingress(
+                profile_id.to_owned(),
+                profile_revision(profile)?,
+                vapi_profile_principal(profile_id, profile),
+            );
+        }
+        Ok(resolver)
+    }
+
+    pub(crate) fn resolved_named_routes(&self) -> Result<ResolvedNamedRoutes> {
+        self.validate_named_routes()?;
+        let webrtc = self
+            .api
+            .route_attachments
+            .webrtc
+            .as_ref()
+            .map(|configured| {
+                let ice_servers = configured
+                    .ice_servers
+                    .iter()
+                    .map(|server| {
+                        let credential = server
+                            .credential
+                            .as_ref()
+                            .map(SecretRef::resolve)
+                            .transpose()
+                            .map_err(|error| {
+                                anyhow!("resolving named-route ICE credential: {error}")
+                            })?;
+                        Ok(ResolvedRouteIceServer {
+                            urls: server.urls.clone(),
+                            username: server.username.clone(),
+                            credential,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<ResolvedRouteWebRtcAttachment, anyhow::Error>(ResolvedRouteWebRtcAttachment {
+                    signaling_uri: configured.signaling_uri.clone(),
+                    ice_servers,
+                })
+            })
+            .transpose()?;
+        let routes = self
+            .api
+            .routes
+            .iter()
+            .map(|(route_id, route)| {
+                let mut route = route.clone();
+                route.profile_bindings = self.named_route_profile_bindings(&route)?;
+                route.context_metadata_allowlist = match &route.destination_profile {
+                    Some(RouteDestinationProfileRef::Sip { profile_id }) => Some(
+                        self.sip_profiles
+                            .get(profile_id)
+                            .ok_or_else(|| anyhow!("named SIP destination profile disappeared"))?
+                            .metadata_keys
+                            .clone(),
+                    ),
+                    _ => None,
+                };
+                route.capability_policy = match &route.destination_profile {
+                    Some(RouteDestinationProfileRef::Sip { profile_id }) => {
+                        let profile = self
+                            .sip_profiles
+                            .get(profile_id)
+                            .ok_or_else(|| anyhow!("named SIP destination profile disappeared"))?;
+                        NamedRouteCapabilityPolicy {
+                            audio_codecs: profile.codecs.clone(),
+                            data_channels: Some(false),
+                            sip_message: Some(!profile.metadata_keys.is_empty()),
+                        }
+                    }
+                    Some(RouteDestinationProfileRef::Webrtc { profile_id }) => {
+                        let profile = self.webrtc_profiles.get(profile_id).ok_or_else(|| {
+                            anyhow!("named WebRTC destination profile disappeared")
+                        })?;
+                        NamedRouteCapabilityPolicy {
+                            audio_codecs: profile.codecs.clone(),
+                            data_channels: Some(profile.data_channels),
+                            sip_message: Some(false),
+                        }
+                    }
+                    _ => NamedRouteCapabilityPolicy::default(),
+                };
+                Ok((route_id.clone(), route))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(ResolvedNamedRoutes {
+            routes,
+            sip_uri_template: self.api.route_attachments.sip_uri_template.clone(),
+            webrtc,
+        })
+    }
+
+    /// Build the immutable, credential-reference-only catalog used by call
+    /// workers. Secret values and PEM files are intentionally not read here;
+    /// the selected exact profile is resolved only when its owned StartLeg
+    /// effect executes.
+    pub(crate) fn outbound_profile_resolver(&self) -> Result<Arc<dyn OutboundProfileResolver>> {
+        self.validate_named_routes()?;
+        let mut resolver = StaticOutboundProfileResolver::default();
+        for route in self.api.routes.values() {
+            let bindings = self.named_route_profile_bindings(route)?;
+            let destination = bindings
+                .iter()
+                .find(|binding| binding.role() == NamedProfileRole::Destination);
+            let Some(binding) = destination else {
+                continue;
+            };
+            match binding.kind() {
+                NamedProfileKind::Sip => {
+                    let profile = self.sip_profiles.get(binding.profile_id()).ok_or_else(|| {
+                        anyhow!("named SIP destination profile disappeared during resolution")
+                    })?;
+                    let auth = profile.auth.as_ref().map(|auth| match auth {
+                        SipProfileAuthCfg::Digest {
+                            realm,
+                            username,
+                            password,
+                        } => ConfiguredSipProfileAuth::Digest {
+                            realm: realm.clone(),
+                            username: username.clone(),
+                            password: password.clone(),
+                        },
+                        SipProfileAuthCfg::Bearer { token } => ConfiguredSipProfileAuth::Bearer {
+                            token: token.clone(),
+                        },
+                    });
+                    resolver.insert_sip(
+                        binding.profile_id().to_owned(),
+                        binding.revision().to_owned(),
+                        ConfiguredSipOutboundProfile {
+                            from_uri: profile.from_uri.clone(),
+                            outbound_proxy: profile.outbound_proxy.clone(),
+                            auth,
+                        },
+                    );
+                }
+                NamedProfileKind::WebRtc => {
+                    let profile =
+                        self.webrtc_profiles
+                            .get(binding.profile_id())
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "named WebRTC destination profile disappeared during resolution"
+                                )
+                            })?;
+                    resolver.insert_webrtc(
+                        binding.profile_id().to_owned(),
+                        binding.revision().to_owned(),
+                        ConfiguredWebRtcOutboundProfile {
+                            bearer_token: profile.bearer_token.clone(),
+                            tls_roots: profile.tls_roots.clone(),
+                            ice_servers: profile
+                                .ice_servers
+                                .iter()
+                                .map(|server| ConfiguredIceServer {
+                                    urls: server.urls.clone(),
+                                    username: server.username.clone(),
+                                    credential: server.credential.clone(),
+                                })
+                                .collect(),
+                            audio_codecs: profile
+                                .codecs
+                                .iter()
+                                .map(|codec| match codec {
+                                    ProfileAudioCodec::Opus => rvoip_webrtc::WebRtcAudioCodec::Opus,
+                                    ProfileAudioCodec::Pcmu => rvoip_webrtc::WebRtcAudioCodec::Pcmu,
+                                    ProfileAudioCodec::Pcma => rvoip_webrtc::WebRtcAudioCodec::Pcma,
+                                })
+                                .collect(),
+                            data_channels: profile.data_channels,
+                        },
+                    );
+                }
+                NamedProfileKind::VapiIngress
+                | NamedProfileKind::AmazonConnect
+                | NamedProfileKind::Telnyx => {}
+            }
+        }
+        Ok(Arc::new(resolver))
+    }
+}
+
+fn validate_named_profile_id_for_config(value: &str, kind: NamedProfileKind) -> Result<()> {
+    NamedProfileBinding::new(
+        NamedProfileRole::Ingress,
+        kind,
+        value.to_owned(),
+        "0".repeat(64),
+    )
+    .map(|_| ())
+    .map_err(|_| anyhow!("named profile catalog contains an invalid profile ID"))
+}
+
+fn profile_revision<T: Serialize>(profile: &T) -> Result<String> {
+    let encoded = serde_json::to_vec(profile)
+        .map_err(|_| anyhow!("named profile cannot be canonicalized"))?;
+    let digest = Sha256::digest(encoded);
+    let mut revision = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut revision, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(revision)
+}
+
+/// Split one configured RTP range into disjoint even/odd port-pair slices.
+/// Separate rvoip coordinators own separate allocators, so overlapping ranges
+/// would otherwise permit two children to reserve the same socket pair.
+fn partition_rtp_port_range(start: u16, end: u16, partitions: usize) -> Result<Vec<(u16, u16)>> {
+    if partitions == 0 {
+        return Err(anyhow!("RTP range partition count must be nonzero"));
+    }
+    if partitions == 1 {
+        return Ok(vec![(start, end)]);
+    }
+    let first_even = if start % 2 == 0 {
+        start
+    } else {
+        start
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("generic SIP RTP range has no usable port pair"))?
+    };
+    let last_odd = if end % 2 == 1 {
+        end
+    } else {
+        end.checked_sub(1)
+            .ok_or_else(|| anyhow!("generic SIP RTP range has no usable port pair"))?
+    };
+    if first_even >= last_odd {
+        return Err(anyhow!("generic SIP RTP range has no usable port pair"));
+    }
+    let pair_count = ((u32::from(last_odd) - u32::from(first_even) + 1) / 2) as usize;
+    if pair_count < partitions {
+        return Err(anyhow!(
+            "generic SIP RTP range needs at least one port pair for the listener and every referenced SIP profile"
+        ));
+    }
+    let pairs_per_partition = pair_count / partitions;
+    let extra = pair_count % partitions;
+    let mut ranges = Vec::with_capacity(partitions);
+    let mut next = u32::from(first_even);
+    for index in 0..partitions {
+        let pairs = pairs_per_partition + usize::from(index < extra);
+        let width = u32::try_from(pairs)
+            .map_err(|_| anyhow!("generic SIP RTP partition is too large"))?
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("generic SIP RTP partition overflow"))?;
+        let range_end = next
+            .checked_add(width - 1)
+            .ok_or_else(|| anyhow!("generic SIP RTP partition overflow"))?;
+        ranges.push((
+            u16::try_from(next).map_err(|_| anyhow!("generic SIP RTP partition overflow"))?,
+            u16::try_from(range_end).map_err(|_| anyhow!("generic SIP RTP partition overflow"))?,
+        ));
+        next = range_end + 1;
+    }
+    Ok(ranges)
+}
+
+fn validate_profile_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_NAMED_PROFILE_VALUE_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!(
+            "{field} must be a bounded, trimmed, control-free value"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_scope(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_NAMED_PROFILE_SCOPE_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.' | b'*')
+        })
+    {
+        return Err(anyhow!("{field} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_profile_path(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_NAMED_PROFILE_VALUE_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} must be a bounded path"));
+    }
+    Ok(())
+}
+
+fn validate_secret_reference(value: &SecretRef) -> Result<()> {
+    value
+        .validate_reference()
+        .map_err(|_| anyhow!("named profile contains an invalid secret reference"))
+}
+
+fn validate_profile_cidr(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.trim() != value
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(anyhow!(
+            "vapi_ingress_profiles contains an invalid trusted signaling CIDR"
+        ));
+    }
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow!("vapi_ingress_profiles trusted signaling entries must be CIDRs"))?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| anyhow!("vapi_ingress_profiles contains an invalid trusted signaling CIDR"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| anyhow!("vapi_ingress_profiles contains an invalid trusted signaling CIDR"))?;
+    let max = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err(anyhow!(
+            "vapi_ingress_profiles contains an invalid trusted signaling CIDR"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mtls_leaf_sha256_fingerprint(value: &str) -> Result<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "vapi_ingress_profiles mTLS leaf certificate SHA-256 fingerprints must contain exactly 64 hexadecimal characters"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn ip_nets_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => {
+            left.contains(&right.network()) || right.contains(&left.network())
+        }
+        (IpNet::V6(left), IpNet::V6(right)) => {
+            left.contains(&right.network()) || right.contains(&left.network())
+        }
+        _ => false,
+    }
+}
+
+fn vapi_profile_principal(
+    profile_id: &str,
+    profile: &VapiIngressProfileCfg,
+) -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        subject: profile.principal_subject.clone(),
+        tenant: Some(profile.tenant_id.clone()),
+        scopes: profile.scopes.iter().cloned().collect(),
+        issuer: Some(profile.issuer.clone()),
+        expires_at: None,
+        // rvoip currently has no trusted-network authentication-method tag.
+        // `ApiKey` is its existing static-policy identity convention; an mTLS
+        // selector is normalized to `MutualTls` by SipListenerAuthPolicy.
+        method: AuthenticationMethod::ApiKey,
+        assurance: IdentityAssurance::Pseudonymous {
+            ephemeral_key: Jwk(serde_json::json!({
+                "kty": "bridgefu-profile",
+                "profile_id": profile_id,
+            })),
+        },
+    }
+}
+
+fn validate_profile_codecs(codecs: &BTreeSet<ProfileAudioCodec>, field: &str) -> Result<()> {
+    if codecs.is_empty() || codecs.len() > 3 {
+        return Err(anyhow!(
+            "{field} must contain at least one supported audio codec"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_sip_uri(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_NAMED_PROFILE_VALUE_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err(anyhow!("{field} must be a bounded credential-free SIP URI"));
+    }
+    let rest = value
+        .strip_prefix("sips:")
+        .or_else(|| value.strip_prefix("sip:"))
+        .ok_or_else(|| anyhow!("{field} must use sip or sips"))?;
+    if rest.is_empty() || rest.matches('@').count() > 1 {
+        return Err(anyhow!("{field} is invalid"));
+    }
+    let authority = if let Some((user, authority)) = rest.split_once('@') {
+        if user.is_empty() || user.contains(':') {
+            return Err(anyhow!("{field} must not contain credentials"));
+        }
+        authority
+    } else {
+        rest
+    };
+    if authority.split(';').next().unwrap_or_default().is_empty() {
+        return Err(anyhow!("{field} is invalid"));
+    }
+    Ok(())
+}
+
+fn normalized_wss_origin(value: &str) -> Result<String> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| anyhow!("WebRTC signaling target must be a valid WSS URL"))?;
+    if parsed.scheme() != "wss"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "WebRTC signaling target must be a credential-free WSS URL"
+        ));
+    }
+    let host = parsed.host_str().expect("host checked above");
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    Ok(match parsed.port() {
+        Some(port) if port != 443 => format!("wss://{host}:{port}"),
+        _ => format!("wss://{host}"),
+    })
+}
+
+fn validate_profile_wss_origin(value: &str) -> Result<()> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| anyhow!("webrtc_profiles contains an invalid WSS origin"))?;
+    let normalized = normalized_wss_origin(value)?;
+    if parsed.path() != "/" || normalized != value.trim_end_matches('/') {
+        return Err(anyhow!(
+            "webrtc_profiles origins must not contain paths, credentials, queries, or fragments"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_ice_server(server: &ProfileIceServerCfg) -> Result<()> {
+    if server.urls.is_empty()
+        || server.urls.len() > MAX_GENERIC_ICE_URLS_PER_SERVER
+        || server.urls.iter().any(|value| {
+            value.is_empty()
+                || value.len() > MAX_GENERIC_ICE_URL_BYTES
+                || value.chars().any(char::is_control)
+                || value.chars().any(char::is_whitespace)
+                || !matches!(
+                    value.split(':').next(),
+                    Some("stun" | "stuns" | "turn" | "turns")
+                )
+        })
+        || server
+            .username
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_GENERIC_ICE_IDENTITY_BYTES)
+        || server.username.is_some() != server.credential.is_some()
+    {
+        return Err(anyhow!("webrtc_profiles contains an invalid ICE server"));
+    }
+    if let Some(credential) = &server.credential {
+        validate_secret_reference(credential)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_metadata_key(value: &str) -> Result<()> {
+    let normalized = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || matches!(
+            normalized.as_str(),
+            "tenant_id" | "call_id" | "leg_id" | "route_id" | "attachment_token" | "authorization"
+        )
+    {
+        return Err(anyhow!("sip_profiles contains an invalid metadata key"));
+    }
+    Ok(())
+}
+
+fn validate_route_sip_template(template: &str) -> Result<()> {
+    if template.len() > 2_048
+        || template.matches("{token}").count() != 1
+        || template.chars().any(char::is_control)
+        || template.chars().any(char::is_whitespace)
+    {
+        return Err(anyhow!(
+            "api.route_attachments.sip_uri_template must be a bounded SIPS URI with exactly one token placeholder"
+        ));
+    }
+    let rest = template.strip_prefix("sips:").ok_or_else(|| {
+        anyhow!("api.route_attachments.sip_uri_template must use the sips scheme")
+    })?;
+    let (user, target) = rest.split_once('@').ok_or_else(|| {
+        anyhow!("api.route_attachments.sip_uri_template must put the token in the user part")
+    })?;
+    if user != "{token}" || target.contains('@') || target.contains('?') || target.contains('#') {
+        return Err(anyhow!(
+            "api.route_attachments.sip_uri_template must use {{token}} as its complete user part"
+        ));
+    }
+    let authority = target.split(';').next().unwrap_or_default();
+    let parsed = url::Url::parse(&format!("sips://bridgefu-token@{authority}"))
+        .map_err(|_| anyhow!("api.route_attachments.sip_uri_template target is invalid"))?;
+    if parsed.host_str().is_none() || parsed.password().is_some() {
+        return Err(anyhow!(
+            "api.route_attachments.sip_uri_template target is invalid"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_route_webrtc_attachment(config: &RouteWebRtcAttachmentCfg) -> Result<()> {
+    let parsed = url::Url::parse(&config.signaling_uri)
+        .map_err(|_| anyhow!("api.route_attachments.webrtc.signaling_uri is invalid"))?;
+    if parsed.scheme() != "wss"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "api.route_attachments.webrtc.signaling_uri must be a credential-free WSS endpoint"
+        ));
+    }
+    if config.ice_servers.len() > MAX_GENERIC_ICE_SERVERS {
+        return Err(anyhow!(
+            "api.route_attachments.webrtc has too many ICE servers"
+        ));
+    }
+    for server in &config.ice_servers {
+        if server.urls.is_empty()
+            || server.urls.len() > MAX_GENERIC_ICE_URLS_PER_SERVER
+            || server.urls.iter().any(|value| {
+                value.is_empty()
+                    || value.len() > MAX_GENERIC_ICE_URL_BYTES
+                    || value.chars().any(char::is_control)
+                    || value.chars().any(char::is_whitespace)
+                    || !matches!(
+                        value.split(':').next(),
+                        Some("stun" | "stuns" | "turn" | "turns")
+                    )
+            })
+            || server
+                .username
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_GENERIC_ICE_IDENTITY_BYTES)
+            || server.username.is_some() != server.credential.is_some()
+        {
+            return Err(anyhow!(
+                "api.route_attachments.webrtc contains an invalid ICE server"
+            ));
+        }
+        if let Some(secret) = &server.credential {
+            let mut value = secret
+                .resolve()
+                .map_err(|error| anyhow!("resolving named-route ICE credential: {error}"))?;
+            let valid = !value.is_empty()
+                && value.len() <= MAX_GENERIC_ICE_IDENTITY_BYTES
+                && !value.chars().any(char::is_control);
+            value.zeroize();
+            if !valid {
+                return Err(anyhow!(
+                    "api.route_attachments.webrtc ICE credential is invalid"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiRateLimitCfg {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_api_control_rate")]
+    pub control_requests_per_second: u32,
+    #[serde(default = "default_api_control_burst")]
+    pub control_burst: u32,
+    #[serde(default = "default_api_diagnostics_rate")]
+    pub diagnostics_requests_per_second: u32,
+    #[serde(default = "default_api_diagnostics_burst")]
+    pub diagnostics_burst: u32,
+    #[serde(default = "default_api_webhook_rate")]
+    pub webhook_requests_per_second: u32,
+    #[serde(default = "default_api_webhook_burst")]
+    pub webhook_burst: u32,
+    #[serde(default = "default_api_tracked_identities")]
+    pub max_tracked_identities: usize,
+    #[serde(default = "default_api_identity_idle_ttl")]
+    pub identity_idle_ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApiTlsCfg {
+    /// PEM file containing the leaf certificate followed by intermediates.
+    pub certificate_chain: String,
+    /// PEM file containing the matching private key.
+    pub private_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +2951,242 @@ pub struct BroadcastCfg {
     pub public_endpoint: Option<String>,
     #[serde(default)]
     pub token_secret: Option<SecretRef>,
+    /// Dedicated public raw-QUIC listener for receive-only UCTP broadcast
+    /// subscribers. Its endpoint is advertised through `public_endpoint`.
+    #[serde(default)]
+    pub uctp_listener: Option<PublicUctpListenerCfg>,
+    /// Clustered worker origin connection to the separately scalable MOQT
+    /// relay tier. Without this, split-gateway broadcast creation fails
+    /// closed because no advertised subscriber endpoint can reach a worker.
+    #[serde(default)]
+    pub moq_origin_relay: Option<MoqOriginRelayCfg>,
+    /// Explicit per-tenant permission and bounds for the optional MOQT
+    /// sanitized event track. An empty map is the default-off behavior.
+    #[serde(default)]
+    pub sanitized_events: BroadcastSanitizedEventsCfg,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastSanitizedEventsCfg {
+    #[serde(default)]
+    pub tenants: BTreeMap<String, TenantSanitizedEventsCfg>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantSanitizedEventsCfg {
+    pub context_metadata_key: String,
+    #[serde(default = "default_sanitized_event_queue")]
+    pub queue_events: usize,
+    #[serde(default = "default_sanitized_event_history")]
+    pub history_events: usize,
+    #[serde(default = "default_sanitized_event_rate")]
+    pub max_events_per_second: u32,
+}
+
+impl BroadcastSanitizedEventsCfg {
+    pub fn policies(
+        &self,
+        context_policy: &ContextPolicy,
+    ) -> Result<BTreeMap<String, SanitizedContextEventPolicy>> {
+        // The process binary and reusable library compile this configuration
+        // module in separate crate roots. Copy the already validated public
+        // policy shape across that boundary instead of allowing the two
+        // nominally distinct Rust types to drift.
+        let broadcast_context_policy = bridgefu::context::ContextPolicy {
+            allow_headers: context_policy.allow_headers.clone(),
+        };
+        self.tenants
+            .iter()
+            .map(|(tenant, config)| {
+                let policy = SanitizedContextEventPolicy::new(
+                    config.context_metadata_key.clone(),
+                    config.queue_events,
+                    config.history_events,
+                    config.max_events_per_second,
+                    &broadcast_context_policy,
+                )
+                .map_err(|error| anyhow!("broadcast.sanitized_events.tenants.{tenant}: {error}"))?;
+                Ok((tenant.clone(), policy))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PublicUctpListenerCfg {
+    pub bind: String,
+    pub tls: PublicUctpTlsCfg,
+    #[serde(default = "default_public_uctp_connections")]
+    pub max_concurrent_connections: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PublicUctpTlsCfg {
+    pub certificate_chain: Vec<String>,
+    pub private_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoqOriginRelayCfg {
+    /// Local UDP bind for origin-to-relay raw QUIC (port 0 is allowed).
+    pub bind: String,
+    /// Private publisher mTLS ingress reached by worker origins.
+    pub publisher_endpoint: String,
+    /// Public receive-only raw-QUIC or WebTransport listener returned by the
+    /// broadcast API. It must not be the publisher ingress.
+    pub subscriber_endpoint: String,
+    pub root_certificates: Vec<String>,
+    pub client_certificate: String,
+    pub client_private_key: String,
+}
+
+impl MoqOriginRelayCfg {
+    fn validate(&self) -> Result<()> {
+        self.bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("broadcast.moq_origin_relay.bind must be a socket address"))?;
+        let publisher_endpoint = url::Url::parse(&self.publisher_endpoint).map_err(|_| {
+            anyhow!("broadcast.moq_origin_relay.publisher_endpoint must be a valid URL")
+        })?;
+        if publisher_endpoint.scheme() != "moqt"
+            || publisher_endpoint.host_str().is_none()
+            || publisher_endpoint.port().is_none()
+            || !publisher_endpoint.username().is_empty()
+            || publisher_endpoint.password().is_some()
+            || publisher_endpoint.query().is_some()
+            || publisher_endpoint.fragment().is_some()
+        {
+            return Err(anyhow!(
+                "broadcast.moq_origin_relay.publisher_endpoint must be a credential-free moqt:// authority with an explicit port"
+            ));
+        }
+        let subscriber_endpoint = url::Url::parse(&self.subscriber_endpoint).map_err(|_| {
+            anyhow!("broadcast.moq_origin_relay.subscriber_endpoint must be a valid URL")
+        })?;
+        if !matches!(subscriber_endpoint.scheme(), "moqt" | "https")
+            || subscriber_endpoint.host_str().is_none()
+            || subscriber_endpoint.port().is_none()
+            || !subscriber_endpoint.username().is_empty()
+            || subscriber_endpoint.password().is_some()
+            || subscriber_endpoint.query().is_some()
+            || subscriber_endpoint.fragment().is_some()
+        {
+            return Err(anyhow!(
+                "broadcast.moq_origin_relay.subscriber_endpoint must be a credential-free moqt:// or https:// authority with an explicit port"
+            ));
+        }
+        if publisher_endpoint == subscriber_endpoint {
+            return Err(anyhow!(
+                "broadcast.moq_origin_relay publisher and subscriber endpoints must be distinct"
+            ));
+        }
+        if self.root_certificates.is_empty()
+            || self.root_certificates.iter().any(|path| !valid_path(path))
+            || !valid_path(&self.client_certificate)
+            || !valid_path(&self.client_private_key)
+        {
+            return Err(anyhow!(
+                "broadcast.moq_origin_relay requires bounded mTLS certificate paths"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_path(path: &str) -> bool {
+    !path.is_empty() && path.len() <= 4_096 && !path.chars().any(char::is_control)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayCfg {
+    pub publisher: MoqRelayPublisherCfg,
+    pub subscriber_webtransport: MoqRelayListenerCfg,
+    pub subscriber_raw_quic: MoqRelayListenerCfg,
+    pub tls: MoqRelayTlsCfg,
+    pub diagnostics_bearer_token: SecretRef,
+    #[serde(default)]
+    pub limits: MoqRelayLimitsCfg,
+    #[serde(default)]
+    pub timeouts: MoqRelayTimeoutsCfg,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayListenerCfg {
+    pub bind: String,
+    pub advertised_endpoint: String,
+    #[serde(default)]
+    pub advertised_socket_addr: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayPublisherCfg {
+    #[serde(flatten)]
+    pub listener: MoqRelayListenerCfg,
+    pub certificate_bindings: Vec<MoqRelayCertificateBindingCfg>,
+    #[serde(default = "default_moq_sessions_per_certificate")]
+    pub max_active_sessions_per_certificate: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayCertificateBindingCfg {
+    pub certificate_sha256: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayTlsCfg {
+    pub server_certificates: Vec<String>,
+    pub server_private_keys: Vec<String>,
+    pub publisher_client_ca_certificates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayLimitsCfg {
+    #[serde(default = "default_moq_pending_admissions")]
+    pub max_pending_admissions: usize,
+    #[serde(default = "default_moq_active_sessions")]
+    pub max_active_sessions: usize,
+    #[serde(default = "default_moq_tenant_sessions")]
+    pub max_active_sessions_per_tenant: usize,
+    #[serde(default = "default_moq_replay_claims")]
+    pub max_replay_claims: usize,
+    #[serde(default = "default_moq_coordinated_namespaces")]
+    pub max_coordinated_namespaces: usize,
+    #[serde(default = "default_moq_cached_tracks")]
+    pub max_cached_tracks_per_namespace: usize,
+    #[serde(default = "default_moq_pending_tracks")]
+    pub max_pending_track_requests_per_namespace: usize,
+    #[serde(default = "default_moq_upstream_connections")]
+    pub max_upstream_connections: usize,
+    #[serde(default = "default_moq_upstream_tracks")]
+    pub max_upstream_tracks: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MoqRelayTimeoutsCfg {
+    #[serde(default = "default_moq_setup_timeout")]
+    pub setup_secs: u64,
+    #[serde(default = "default_moq_admission_timeout")]
+    pub admission_secs: u64,
+    #[serde(default = "default_moq_admission_operation_timeout")]
+    pub admission_operation_secs: u64,
+    #[serde(default = "default_moq_cleanup_timeout")]
+    pub pre_admission_cleanup_secs: u64,
+    #[serde(default = "default_moq_session_close_timeout")]
+    pub admission_session_close_secs: u64,
+    #[serde(default = "default_moq_revalidation_interval")]
+    pub token_revalidation_interval_secs: u64,
+    #[serde(default = "default_moq_upstream_track_idle")]
+    pub upstream_track_idle_secs: u64,
+    #[serde(default = "default_moq_upstream_connection_idle")]
+    pub upstream_connection_idle_secs: u64,
+    #[serde(default = "default_moq_drop_cleanup")]
+    pub drop_cleanup_secs: u64,
+    #[serde(default = "default_moq_dependency_check_interval")]
+    pub dependency_check_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,14 +3265,117 @@ pub struct ObsCfg {
     pub log_format: String,
     #[serde(default = "default_http_bind")]
     pub http_bind: String,
+    /// Optional OTLP/gRPC trace export. Stdout logs and Prometheus remain
+    /// active independently of this exporter.
+    #[serde(default)]
+    pub otlp: OtlpTracingCfg,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OtlpTracingCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Collector origin, for example `https://otel-collector:4317`. No
+    /// credentials, query parameters, or request headers are accepted here.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_otlp_service_name")]
+    pub service_name: String,
+    /// Parent-based trace-ID sampling ratio in the inclusive range 0.0..=1.0.
+    #[serde(default = "default_otlp_sampling_ratio")]
+    pub sampling_ratio: f64,
+    #[serde(default = "default_otlp_max_queue_size")]
+    pub max_queue_size: usize,
+    #[serde(default = "default_otlp_max_export_batch_size")]
+    pub max_export_batch_size: usize,
+    #[serde(default = "default_otlp_scheduled_delay_millis")]
+    pub scheduled_delay_millis: u64,
+    #[serde(default = "default_otlp_export_timeout_millis")]
+    pub export_timeout_millis: u64,
+}
+
+impl OtlpTracingCfg {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let service_name = self.service_name.trim();
+        if service_name.is_empty() || service_name.chars().count() > MAX_OTLP_SERVICE_NAME_LENGTH {
+            return Err(anyhow!(
+                "observability.otlp.service_name must contain 1 to {MAX_OTLP_SERVICE_NAME_LENGTH} characters"
+            ));
+        }
+        if !self.sampling_ratio.is_finite() || !(0.0..=1.0).contains(&self.sampling_ratio) {
+            return Err(anyhow!(
+                "observability.otlp.sampling_ratio must be between 0.0 and 1.0"
+            ));
+        }
+        if !(1..=MAX_OTLP_QUEUE_SIZE).contains(&self.max_queue_size) {
+            return Err(anyhow!(
+                "observability.otlp.max_queue_size must be between 1 and {MAX_OTLP_QUEUE_SIZE}"
+            ));
+        }
+        if !(1..=MAX_OTLP_EXPORT_BATCH_SIZE).contains(&self.max_export_batch_size)
+            || self.max_export_batch_size > self.max_queue_size
+        {
+            return Err(anyhow!(
+                "observability.otlp.max_export_batch_size must be between 1 and {}, and no greater than max_queue_size",
+                MAX_OTLP_EXPORT_BATCH_SIZE
+            ));
+        }
+        if !(MIN_OTLP_SCHEDULE_DELAY_MILLIS..=MAX_OTLP_SCHEDULE_DELAY_MILLIS)
+            .contains(&self.scheduled_delay_millis)
+        {
+            return Err(anyhow!(
+                "observability.otlp.scheduled_delay_millis must be between {MIN_OTLP_SCHEDULE_DELAY_MILLIS} and {MAX_OTLP_SCHEDULE_DELAY_MILLIS}"
+            ));
+        }
+        if !(MIN_OTLP_EXPORT_TIMEOUT_MILLIS..=MAX_OTLP_EXPORT_TIMEOUT_MILLIS)
+            .contains(&self.export_timeout_millis)
+        {
+            return Err(anyhow!(
+                "observability.otlp.export_timeout_millis must be between {MIN_OTLP_EXPORT_TIMEOUT_MILLIS} and {MAX_OTLP_EXPORT_TIMEOUT_MILLIS}"
+            ));
+        }
+
+        match self.endpoint.as_deref() {
+            None if self.enabled => {
+                return Err(anyhow!(
+                    "observability.otlp.endpoint is required when OTLP tracing is enabled"
+                ));
+            }
+            None => {}
+            Some(endpoint) => validate_otlp_endpoint(endpoint)?,
+        }
+        Ok(())
+    }
+}
+
+fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+    if endpoint.len() > MAX_OTLP_ENDPOINT_LENGTH {
+        return Err(anyhow!(
+            "observability.otlp.endpoint must be at most {MAX_OTLP_ENDPOINT_LENGTH} bytes"
+        ));
+    }
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|_| anyhow!("observability.otlp.endpoint must be a valid http or https URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err(anyhow!(
+            "observability.otlp.endpoint must be an http or https collector origin without credentials, path, query, or fragment"
+        ));
+    }
+    Ok(())
 }
 
 impl Config {
     /// Parse a YAML config file.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let value = effective_value(path)?;
-        let cfg: Self =
-            serde_yaml::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
+        let cfg = deserialize_strict(&value, path)?;
         cfg.validate()?;
         cfg.resolved_tenants()
             .with_context(|| format!("validating {}", path.display()))?;
@@ -285,6 +3386,10 @@ impl Config {
     /// with credential-bearing values replaced by `[redacted]`.
     pub fn redacted_effective_yaml(path: &std::path::Path) -> Result<String> {
         let mut value = effective_value(path)?;
+        // Keep this command useful during secret provisioning: validate the
+        // complete typed shape and reject unknown keys, but do not run the
+        // semantic preflight that resolves `env:...` secret references.
+        let _ = deserialize_strict(&value, path)?;
         redact_secrets(&mut value);
         serde_yaml::to_string(&value).context("serializing effective configuration")
     }
@@ -296,13 +3401,19 @@ impl Config {
                 self.config_version
             ));
         }
-        if !matches!(
-            self.runtime.mode.as_str(),
-            "all-in-one" | "gateway" | "worker" | "moq-relay"
-        ) {
+        if self.aws.region.is_empty() {
+            return Err(anyhow!("aws.region must not be empty"));
+        }
+        if self.sip.port == 0 {
+            return Err(anyhow!("sip.port must be greater than zero"));
+        }
+        if self.contact.signaling_timeout_secs == 0
+            || self.contact.media_connect_timeout_secs == 0
+            || self.contact.keepalive_interval_secs == 0
+            || self.contact.session_idle_ttl_secs == 0
+        {
             return Err(anyhow!(
-                "invalid runtime.mode {}; expected all-in-one|gateway|worker|moq-relay",
-                self.runtime.mode
+                "contact timeout and interval values must be greater than zero"
             ));
         }
         if self.runtime.max_concurrent_calls == 0 {
@@ -310,16 +3421,94 @@ impl Config {
                 "runtime.max_concurrent_calls must be greater than zero"
             ));
         }
+        if self.runtime.setup_timeout_secs == 0 {
+            return Err(anyhow!(
+                "runtime.setup_timeout_secs must be greater than zero"
+            ));
+        }
         if self.runtime.media_idle_timeout_secs == 0 {
             return Err(anyhow!(
                 "runtime.media_idle_timeout_secs must be greater than zero"
             ));
         }
+        if self.runtime.drain_timeout_secs == 0 {
+            return Err(anyhow!(
+                "runtime.drain_timeout_secs must be greater than zero"
+            ));
+        }
+        if self.observability.log_level.is_empty() {
+            return Err(anyhow!("observability.log_level must not be empty"));
+        }
+        if !matches!(self.observability.log_format.as_str(), "json" | "pretty") {
+            return Err(anyhow!("observability.log_format must be json or pretty"));
+        }
+        let observability_bind = self
+            .observability
+            .http_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("observability.http_bind must be a socket address"))?;
+        self.observability.otlp.validate()?;
+        match (self.runtime.mode, self.api.http_bind.as_deref()) {
+            (RuntimeMode::Gateway, Some(bind)) => {
+                let bind = bind
+                    .parse::<SocketAddr>()
+                    .map_err(|_| anyhow!("api.http_bind must be a socket address"))?;
+                if bind.port() == 0 {
+                    return Err(anyhow!("gateway api.http_bind must use a nonzero port"));
+                }
+                if bind == observability_bind {
+                    return Err(anyhow!(
+                        "gateway api.http_bind must differ from observability.http_bind"
+                    ));
+                }
+                if let Some(tls) = &self.api.tls {
+                    tls.validate()?;
+                } else if !bind.ip().is_loopback() {
+                    return Err(anyhow!(
+                        "non-loopback gateway api.http_bind requires api.tls"
+                    ));
+                }
+            }
+            (RuntimeMode::Gateway, None) => {
+                return Err(anyhow!("gateway mode requires api.http_bind"));
+            }
+            (_, Some(_)) => {
+                return Err(anyhow!(
+                    "api.http_bind is currently supported only in gateway mode"
+                ));
+            }
+            (_, None) => {}
+        }
+        if self.runtime.mode != RuntimeMode::Gateway && self.api.tls.is_some() {
+            return Err(anyhow!(
+                "api.tls is currently supported only in gateway mode"
+            ));
+        }
+        self.api.rate_limit.validate()?;
+        self.validate_named_profiles()?;
+        self.validate_named_routes()?;
         if self.generic_bridge.bearer_token.is_some() {
             return Err(anyhow!(
                 "generic_bridge.bearer_token is no longer supported; use api.bearer_token so HTTP, SIP, and WebRTC share one validator"
             ));
         }
+        self.generic_bridge.validate_networking()?;
+        if let (Some(generic), Some(telnyx)) = (
+            self.generic_bridge.sip.digest.as_ref(),
+            self.providers.telnyx.as_ref(),
+        ) {
+            if generic.realm != telnyx.media_sip_realm {
+                return Err(anyhow!(
+                    "generic and Telnyx SIP Digest identities must use one exact shared realm"
+                ));
+            }
+            if generic.username == telnyx.media_sip_username {
+                return Err(anyhow!(
+                    "generic and Telnyx SIP Digest identities must use distinct usernames"
+                ));
+            }
+        }
+        self.validate_standardcharter_canary()?;
         if self.generic_bridge.enabled
             && (!self.api.enabled
                 || self.api.bearer_token.is_none()
@@ -329,8 +3518,32 @@ impl Config {
                 "generic_bridge requires api.enabled, api.bearer_token, and api.control_hmac_key"
             ));
         }
-        self.providers
-            .validate_account_profiles()
+        if self.runtime.mode == RuntimeMode::Gateway && !self.generic_bridge.enabled {
+            return Err(anyhow!(
+                "gateway mode requires generic_bridge.enabled for native SIP/WebRTC ingress"
+            ));
+        }
+        if self.generic_bridge.enabled && self.runtime.setup_timeout_secs > 30 {
+            return Err(anyhow!(
+                "generic_bridge requires runtime.setup_timeout_secs at or below 30"
+            ));
+        }
+        if self.runtime.mode == RuntimeMode::Gateway {
+            let public_webrtc = [
+                self.generic_bridge.webrtc_ws_bind.as_str(),
+                self.generic_bridge.webrtc_whip_bind.as_str(),
+            ]
+            .into_iter()
+            .filter_map(|bind| bind.parse::<SocketAddr>().ok())
+            .any(|bind| !bind.ip().is_loopback());
+            if public_webrtc && self.api.tls.is_none() {
+                return Err(anyhow!(
+                    "non-loopback gateway WebRTC signaling requires api.tls for WSS and HTTPS"
+                ));
+            }
+        }
+        ProviderRegistry::from_config(&self.providers)
+            .map(|_| ())
             .map_err(|error| anyhow!(error.to_string()))?;
         self.validate_persistence()?;
         if !matches!(
@@ -343,6 +3556,91 @@ impl Config {
         }
         if self.broadcast.max_active == 0 {
             return Err(anyhow!("broadcast.max_active must be greater than zero"));
+        }
+        if !(1..=MAX_BROADCAST_TOKEN_TTL_SECS).contains(&self.broadcast.token_ttl_secs) {
+            return Err(anyhow!(
+                "broadcast.token_ttl_secs must be between 1 and {MAX_BROADCAST_TOKEN_TTL_SECS}"
+            ));
+        }
+        if let Some(token_secret) = &self.broadcast.token_secret {
+            let mut resolved = token_secret
+                .resolve()
+                .map_err(|error| anyhow!("resolving broadcast.token_secret: {error}"))?;
+            let valid = resolved.len() >= MIN_BROADCAST_TOKEN_SECRET_BYTES;
+            resolved.zeroize();
+            if !valid {
+                return Err(anyhow!(
+                    "broadcast.token_secret must resolve to at least {MIN_BROADCAST_TOKEN_SECRET_BYTES} bytes"
+                ));
+            }
+        }
+        if let Some(listener) = &self.broadcast.uctp_listener {
+            listener.validate()?;
+            if self.runtime.mode != RuntimeMode::AllInOne || !self.generic_bridge.enabled {
+                return Err(anyhow!(
+                    "broadcast.uctp_listener currently requires runtime.mode=all-in-one and generic_bridge.enabled"
+                ));
+            }
+            if self.broadcast.token_secret.is_none() {
+                return Err(anyhow!(
+                    "broadcast.uctp_listener requires broadcast.token_secret"
+                ));
+            }
+            validate_public_uctp_endpoint(self.broadcast.public_endpoint.as_deref().ok_or_else(
+                || anyhow!("broadcast.uctp_listener requires broadcast.public_endpoint"),
+            )?)?;
+        }
+        if matches!(
+            self.runtime.mode,
+            RuntimeMode::Gateway | RuntimeMode::Worker
+        ) {
+            if self.broadcast.token_secret.is_none() {
+                return Err(anyhow!(
+                    "split gateway/worker UCTP broadcasts require broadcast.token_secret"
+                ));
+            }
+            validate_public_uctp_endpoint(self.broadcast.public_endpoint.as_deref().ok_or_else(
+                || {
+                    anyhow!(
+                        "split gateway/worker UCTP broadcasts require broadcast.public_endpoint"
+                    )
+                },
+            )?)?;
+        }
+        if let Some(origin) = &self.broadcast.moq_origin_relay {
+            origin.validate()?;
+            if !matches!(
+                self.runtime.mode,
+                RuntimeMode::Gateway | RuntimeMode::Worker
+            ) {
+                return Err(anyhow!(
+                    "broadcast.moq_origin_relay is valid only for gateway and worker modes"
+                ));
+            }
+            if self.broadcast.token_secret.is_none() {
+                return Err(anyhow!(
+                    "broadcast.moq_origin_relay requires broadcast.token_secret"
+                ));
+            }
+        }
+        if let Some(relay) = &self.moq_relay {
+            relay.validate()?;
+        } else if self.runtime.mode == RuntimeMode::MoqRelay {
+            return Err(anyhow!(
+                "moq_relay configuration is required when runtime.mode is moq-relay"
+            ));
+        }
+        self.context
+            .validate()
+            .context("validating context allowlist")?;
+        let configured_tenants = self.tenant_names()?.into_iter().collect::<BTreeSet<_>>();
+        let sanitized_event_policies = self.broadcast.sanitized_events.policies(&self.context)?;
+        for tenant in sanitized_event_policies.keys() {
+            if !configured_tenants.contains(tenant) {
+                return Err(anyhow!(
+                    "broadcast.sanitized_events tenant {tenant:?} is not a configured routing tenant"
+                ));
+            }
         }
         if let Some(static_tenant) = &self.api.static_tenant {
             let static_tenant = TenantId::parse(static_tenant)
@@ -368,6 +3666,8 @@ impl Config {
                 ));
             }
         }
+        self.private_forwarding
+            .validate(self.runtime.mode, self.runtime.max_concurrent_calls)?;
         Ok(())
     }
 
@@ -444,9 +3744,10 @@ impl Config {
                         "persistence.database_url is required for the postgres backend"
                     ));
                 }
-                if self.persistence.worker_id.is_none() {
+                if self.persistence.worker_id.is_none() && self.runtime.mode != RuntimeMode::Gateway
+                {
                     return Err(anyhow!(
-                        "persistence.worker_id is required for the postgres backend"
+                        "persistence.worker_id is required for postgres execution workers"
                     ));
                 }
                 if self.persistence.allow_ephemeral_memory {
@@ -455,7 +3756,7 @@ impl Config {
                     ));
                 }
                 if self.persistence.allow_db_only_coordination
-                    && self.runtime.mode.as_str() != "all-in-one"
+                    && self.runtime.mode != RuntimeMode::AllInOne
                 {
                     return Err(anyhow!(
                         "persistence.allow_db_only_coordination is dev/test-only and requires runtime.mode all-in-one"
@@ -661,28 +3962,291 @@ impl Config {
         Ok(self.resolved_tenants()?.0.into_keys().collect())
     }
 
-    /// Build the `rvoip-amazon-connect` server config from this YAML. Async
-    /// because it resolves AWS credentials and may query IMDS for `auto` IPs.
-    pub async fn into_server_config(&self) -> Result<ScreenPopServerConfig> {
-        let starter: Arc<dyn ConnectContactStarter> =
-            Arc::new(AwsConnectStarter::from_env(Some(self.aws.region.clone())).await);
-        self.into_server_config_with_starter(starter).await
+    fn validate_standardcharter_canary(&self) -> Result<()> {
+        let canary = &self.generic_bridge.standardcharter_canary;
+        if !canary.enabled {
+            return Ok(());
+        }
+        if !self.generic_bridge.enabled || self.runtime.mode != RuntimeMode::AllInOne {
+            return Err(anyhow!(
+                "generic_bridge.standardcharter_canary requires generic_bridge.enabled and runtime.mode=all-in-one"
+            ));
+        }
+        let tenant = canary.tenant.as_deref().ok_or_else(|| {
+            anyhow!("generic_bridge.standardcharter_canary.tenant is required when enabled")
+        })?;
+        if self.api.static_tenant.as_deref() != Some(tenant) {
+            return Err(anyhow!(
+                "generic_bridge.standardcharter_canary.tenant must equal api.static_tenant"
+            ));
+        }
+        let context_mapping = self
+            .context
+            .allow_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&canary.correlation_header))
+            .map(|(_, key)| key.as_str());
+        if context_mapping != Some("correlation_id") {
+            return Err(anyhow!(
+                "generic_bridge.standardcharter_canary correlation header must be allowlisted as context key correlation_id"
+            ));
+        }
+        self.build_standardcharter_canary_policy()
+            .map(|_| ())
+            .context("validating generic_bridge.standardcharter_canary")
     }
 
-    /// Build the server config with an explicit Amazon Connect control-plane
-    /// implementation.
+    /// Build the protected durable StandardCharter route. `None` is the
+    /// complete default behavior and leaves the legacy listener untouched.
+    pub(crate) fn standardcharter_canary_policy(
+        &self,
+    ) -> Result<Option<Arc<StandardCharterCanaryPolicy>>> {
+        if !self.generic_bridge.standardcharter_canary.enabled {
+            return Ok(None);
+        }
+        self.build_standardcharter_canary_policy()
+            .map(Arc::new)
+            .map(Some)
+    }
+
+    fn build_standardcharter_canary_policy(&self) -> Result<StandardCharterCanaryPolicy> {
+        let canary = &self.generic_bridge.standardcharter_canary;
+        let tenant = canary.tenant.clone().ok_or_else(|| {
+            anyhow!("generic_bridge.standardcharter_canary.tenant is required when enabled")
+        })?;
+        let (routes, _) = self.resolved_tenants()?;
+        let route = routes.get(&tenant).ok_or_else(|| {
+            anyhow!("generic_bridge.standardcharter_canary.tenant is not configured")
+        })?;
+        let instance_id = route
+            .instance_id
+            .clone()
+            .ok_or_else(|| anyhow!("canary tenant has no Amazon Connect instance"))?;
+        let contact_flow_id = route
+            .contact_flow_id
+            .clone()
+            .ok_or_else(|| anyhow!("canary tenant has no Amazon Connect contact flow"))?;
+        let mapping = self
+            .tenants
+            .get(&tenant)
+            .and_then(|tenant| tenant.mapping.as_ref())
+            .unwrap_or(&self.mapping);
+        let attribute_mapping = attribute_mapping(mapping)?;
+        let canary_probe = attribute_mapping.translate([(
+            canary.correlation_header.as_str(),
+            "bridgefu-canary-correlation",
+        )]);
+        if canary_probe.dropped_for_size != 0
+            || canary_probe
+                .attributes
+                .get("correlation_id")
+                .map(String::as_str)
+                != Some("bridgefu-canary-correlation")
+        {
+            return Err(anyhow!(
+                "canary tenant mapping must translate the correlation header to correlation_id"
+            ));
+        }
+        StandardCharterCanaryPolicy::new(StandardCharterCanaryConfig {
+            tenant,
+            trusted_subject: canary.trusted_subject.clone(),
+            trusted_issuer: canary.trusted_issuer.clone(),
+            correlation_header: canary.correlation_header.clone(),
+            profile: canary.amazon_profile.clone(),
+            instance_id,
+            contact_flow_id,
+            default_display_name: route
+                .default_display_name
+                .clone()
+                .unwrap_or_else(|| self.contact.default_display_name.clone()),
+            attribute_mapping,
+        })
+        .map_err(|_| anyhow!("invalid protected StandardCharter canary policy"))
+    }
+
+    pub(crate) fn gateway_forwarding_config(&self) -> Result<GatewayForwardingConfig> {
+        if self.runtime.mode != RuntimeMode::Gateway || !self.private_forwarding.enabled {
+            return Err(anyhow!(
+                "private_forwarding gateway configuration is not enabled for this role"
+            ));
+        }
+        let gateway =
+            self.private_forwarding.gateway.as_ref().ok_or_else(|| {
+                anyhow!("private_forwarding.gateway is required for gateway mode")
+            })?;
+        let token_key = self.private_forwarding.resolve_token_key()?;
+        let workers = gateway
+            .workers
+            .iter()
+            .map(|worker| {
+                Ok(PrivateWorkerTarget {
+                    worker_id: WorkerId::from_str(&worker.worker_id)
+                        .map_err(|_| anyhow!("private forwarding worker_id is invalid"))?,
+                    endpoint: worker.endpoint.clone(),
+                    server_name: worker.server_name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(GatewayForwardingConfig {
+            gateway_id: gateway.gateway_id.clone(),
+            bind: gateway
+                .bind
+                .parse()
+                .map_err(|_| anyhow!("private forwarding gateway bind is invalid"))?,
+            tls: gateway.tls.runtime(),
+            token_key,
+            workers,
+            limits: self.private_forwarding.limits.runtime(),
+            timeouts: self.private_forwarding.timeouts.runtime(),
+        })
+    }
+
+    pub(crate) fn gateway_uctp_ingress_config(&self) -> Result<GatewayUctpIngressConfig> {
+        if self.runtime.mode != RuntimeMode::Gateway || !self.private_forwarding.enabled {
+            return Err(anyhow!("public UCTP ingress is not enabled for this role"));
+        }
+        let listener = self
+            .private_forwarding
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.public_uctp.as_ref())
+            .ok_or_else(|| anyhow!("private_forwarding.gateway.public_uctp is required"))?;
+        listener.validate()?;
+        Ok(GatewayUctpIngressConfig {
+            bind: listener
+                .bind
+                .parse()
+                .expect("validated gateway public UCTP bind"),
+            certificate_chain: listener
+                .tls
+                .certificate_chain
+                .iter()
+                .map(Into::into)
+                .collect(),
+            private_key: listener.tls.private_key.clone().into(),
+            max_concurrent_connections: listener.max_concurrent_connections,
+            admission_capacity: self
+                .runtime
+                .max_concurrent_calls
+                .checked_mul(2)
+                .and_then(|calls| calls.checked_add(listener.max_concurrent_connections))
+                .ok_or_else(|| anyhow!("gateway UCTP admission capacity overflow"))?,
+            setup_timeout: Duration::from_secs(self.runtime.setup_timeout_secs),
+        })
+    }
+
+    pub(crate) fn gateway_native_ingress_config(
+        &self,
+        authentication: rvoip_sip::SipListenerAuthPolicy,
+        inbound_context: rvoip_sip::SipInboundContextPolicy,
+    ) -> Result<GatewayNativeIngressConfig> {
+        if self.runtime.mode != RuntimeMode::Gateway || !self.generic_bridge.enabled {
+            return Err(anyhow!(
+                "native SIP/WebRTC ingress is not enabled for this role"
+            ));
+        }
+        let sip_bind = self
+            .generic_bridge
+            .sip_bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("generic_bridge.sip_bind must be a socket address"))?;
+        let (stack, nat) = self
+            .generic_sip_stack_config("bridgefu-gateway", sip_bind)
+            .context("configuring gateway SIP/RTP networking")?;
+        let egress_profiles = self
+            .sip_egress_profile_configs("bridgefu-gateway", sip_bind)
+            .context("configuring gateway named SIP egress profiles")?;
+        let webrtc_stack = self
+            .generic_bridge
+            .webrtc_stack_config()
+            .context("configuring gateway WebRTC ICE/DTLS networking")?;
+        let tls = self
+            .api
+            .tls
+            .as_ref()
+            .map(|tls| GatewayNativeWebRtcTlsConfig {
+                certificate_chain: tls.certificate_chain.clone().into(),
+                private_key: tls.private_key.clone().into(),
+            });
+        Ok(GatewayNativeIngressConfig {
+            sip: GatewayNativeSipConfig {
+                stack,
+                nat,
+                authentication,
+                inbound_context,
+                egress_profiles,
+            },
+            webrtc: GatewayNativeWebRtcConfig {
+                stack: webrtc_stack,
+                websocket_bind: self.generic_bridge.webrtc_ws_bind.clone(),
+                whip_whep_bind: self.generic_bridge.webrtc_whip_bind.clone(),
+                tls,
+            },
+            admission_capacity: self
+                .runtime
+                .max_concurrent_calls
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("gateway native admission capacity overflow"))?,
+            setup_timeout: Duration::from_secs(self.runtime.setup_timeout_secs),
+        })
+    }
+
+    pub(crate) fn worker_forwarding_config(&self) -> Result<WorkerForwardingConfig> {
+        if self.runtime.mode != RuntimeMode::Worker || !self.private_forwarding.enabled {
+            return Err(anyhow!(
+                "private_forwarding worker configuration is not enabled for this role"
+            ));
+        }
+        let worker = self
+            .private_forwarding
+            .worker
+            .as_ref()
+            .ok_or_else(|| anyhow!("private_forwarding.worker is required for worker mode"))?;
+        Ok(WorkerForwardingConfig {
+            worker_id: self.call_worker_id()?,
+            bind: worker
+                .bind
+                .parse()
+                .map_err(|_| anyhow!("private forwarding worker bind is invalid"))?,
+            tls: worker.tls.runtime(),
+            token_key: self.private_forwarding.resolve_token_key()?,
+            limits: self.private_forwarding.limits.runtime(),
+            timeouts: self.private_forwarding.timeouts.runtime(),
+        })
+    }
+
+    /// Build the `rvoip-amazon-connect` server config from this YAML. Async
+    /// because it resolves AWS credentials and may query IMDS for `auto` IPs.
+    pub async fn build_server_config(&self) -> Result<ScreenPopServerConfig> {
+        let starter: Arc<dyn ConnectContactStarter> =
+            Arc::new(AwsConnectStarter::from_env(Some(self.aws.region.clone())).await);
+        self.build_server_config_with_starter(starter).await
+    }
+
+    /// Build the outbound-only Amazon Connect adapter used by a split worker.
     ///
-    /// Production uses [`Self::into_server_config`]. This injection seam keeps
-    /// the Vapi SIP -> Connect request contract testable without AWS credentials
-    /// or a live Connect instance.
-    pub async fn into_server_config_with_starter(
+    /// Unlike [`Self::build_server_config`], this path never parses, resolves,
+    /// or binds the public SIP listener. Split workers receive their source
+    /// media over private UCTP and need only Connect control and Chime media.
+    pub async fn build_worker_amazon_connect_adapter(&self) -> Result<Arc<AmazonConnectAdapter>> {
+        let starter: Arc<dyn ConnectContactStarter> =
+            Arc::new(AwsConnectStarter::from_env(Some(self.aws.region.clone())).await);
+        self.build_worker_amazon_connect_adapter_with_starter(starter)
+    }
+
+    /// Hermetic construction seam for the split-worker Amazon adapter.
+    /// Production uses [`Self::build_worker_amazon_connect_adapter`].
+    pub fn build_worker_amazon_connect_adapter_with_starter(
         &self,
         starter: Arc<dyn ConnectContactStarter>,
-    ) -> Result<ScreenPopServerConfig> {
-        let (table, default_tenant) = self.resolved_tenants()?;
+    ) -> Result<Arc<AmazonConnectAdapter>> {
+        Ok(AmazonConnectAdapter::new(
+            self.build_amazon_connect_config()?,
+            starter,
+        ))
+    }
 
-        // --- connect defaults (every real call is routed, so the empty
-        //     instance/flow placeholders are never used to place a contact) ---
+    fn build_amazon_connect_config(&self) -> Result<ConnectConfig> {
         let mut connect = ConnectConfig::new(
             self.aws.instance_id.clone().unwrap_or_default(),
             self.aws.contact_flow_id.clone().unwrap_or_default(),
@@ -695,6 +4259,24 @@ impl Config {
             Duration::from_secs(self.contact.media_connect_timeout_secs);
         connect.keepalive_interval = Duration::from_secs(self.contact.keepalive_interval_secs);
         connect.session_idle_ttl = Duration::from_secs(self.contact.session_idle_ttl_secs);
+        Ok(connect)
+    }
+
+    /// Build the server config with an explicit Amazon Connect control-plane
+    /// implementation.
+    ///
+    /// Production uses [`Self::build_server_config`]. This injection seam keeps
+    /// the Vapi SIP -> Connect request contract testable without AWS credentials
+    /// or a live Connect instance.
+    pub async fn build_server_config_with_starter(
+        &self,
+        starter: Arc<dyn ConnectContactStarter>,
+    ) -> Result<ScreenPopServerConfig> {
+        let (table, default_tenant) = self.resolved_tenants()?;
+
+        // --- connect defaults (every real call is routed, so the empty
+        //     instance/flow placeholders are never used to place a contact) ---
+        let connect = self.build_amazon_connect_config()?;
 
         // --- sip ---
         let bind_ip: IpAddr = self
@@ -750,6 +4332,496 @@ impl Config {
 
         Ok(ScreenPopServerConfig::new(sip, connect, starter).with_router(router))
     }
+}
+
+impl PrivateForwardingCfg {
+    fn validate(&self, mode: RuntimeMode, max_calls: usize) -> Result<()> {
+        let role_requires_forwarding = matches!(mode, RuntimeMode::Gateway | RuntimeMode::Worker);
+        if role_requires_forwarding && !self.enabled {
+            return Err(anyhow!(
+                "runtime.mode {mode} requires private_forwarding.enabled: true"
+            ));
+        }
+        if !self.enabled {
+            if self.gateway.is_some()
+                || self.worker.is_some()
+                || self.token_signing_secret.is_some()
+            {
+                return Err(anyhow!(
+                    "private_forwarding role or secret settings require enabled: true"
+                ));
+            }
+            return Ok(());
+        }
+        if !role_requires_forwarding {
+            return Err(anyhow!(
+                "private_forwarding is valid only for gateway or worker runtime modes"
+            ));
+        }
+        let mut secret = self
+            .token_signing_secret
+            .as_ref()
+            .ok_or_else(|| anyhow!("private_forwarding.token_signing_secret is required"))?
+            .resolve()
+            .map_err(|error| anyhow!("resolving private forwarding token secret: {error}"))?;
+        let key_is_valid = secret.len() >= 32;
+        secret.zeroize();
+        if !key_is_valid {
+            return Err(anyhow!(
+                "private_forwarding.token_signing_secret must resolve to at least 32 bytes"
+            ));
+        }
+        self.limits.validate(max_calls)?;
+        self.timeouts.validate()?;
+        match mode {
+            RuntimeMode::Gateway => {
+                if self.worker.is_some() {
+                    return Err(anyhow!(
+                        "private_forwarding.worker is not valid in gateway mode"
+                    ));
+                }
+                self.gateway
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("private_forwarding.gateway is required"))?
+                    .validate()?;
+            }
+            RuntimeMode::Worker => {
+                if self.gateway.is_some() {
+                    return Err(anyhow!(
+                        "private_forwarding.gateway is not valid in worker mode"
+                    ));
+                }
+                self.worker
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("private_forwarding.worker is required"))?
+                    .validate()?;
+            }
+            RuntimeMode::AllInOne | RuntimeMode::MoqRelay => unreachable!("checked above"),
+        }
+        Ok(())
+    }
+
+    fn resolve_token_key(&self) -> Result<PrivateTokenKey> {
+        let mut secret = self
+            .token_signing_secret
+            .as_ref()
+            .ok_or_else(|| anyhow!("private forwarding token secret is missing"))?
+            .resolve()
+            .map_err(|error| anyhow!("resolving private forwarding token secret: {error}"))?;
+        let key = PrivateTokenKey::new(secret.as_bytes().to_vec())
+            .map_err(|_| anyhow!("private forwarding token secret is invalid"));
+        secret.zeroize();
+        key
+    }
+}
+
+impl PrivateForwardingGatewayCfg {
+    fn validate(&self) -> Result<()> {
+        validate_private_component("gateway_id", &self.gateway_id)?;
+        self.bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("private_forwarding.gateway.bind must be a socket address"))?;
+        self.tls.validate("gateway")?;
+        if let Some(public_uctp) = &self.public_uctp {
+            public_uctp
+                .validate()
+                .context("validating private_forwarding.gateway.public_uctp")?;
+        }
+        if self.workers.is_empty() {
+            return Err(anyhow!(
+                "private_forwarding.gateway.workers must contain at least one target"
+            ));
+        }
+        let mut worker_ids = BTreeSet::new();
+        for worker in &self.workers {
+            WorkerId::from_str(&worker.worker_id).map_err(|_| {
+                anyhow!("private_forwarding.gateway worker_id must be a non-nil UUID")
+            })?;
+            validate_private_worker_endpoint(&worker.endpoint)?;
+            validate_private_server_name(&worker.server_name)?;
+            if !worker_ids.insert(worker.worker_id.as_str()) {
+                return Err(anyhow!(
+                    "private_forwarding.gateway worker_id values must be unique"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PrivateForwardingWorkerCfg {
+    fn validate(&self) -> Result<()> {
+        let bind = self
+            .bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("private_forwarding.worker.bind must be a socket address"))?;
+        if bind.port() == 0 {
+            return Err(anyhow!(
+                "private_forwarding.worker.bind must use an explicit nonzero port"
+            ));
+        }
+        self.tls.validate("worker")
+    }
+}
+
+impl PrivateForwardingTlsCfg {
+    fn validate(&self, role: &str) -> Result<()> {
+        if self.certificate_chain.is_empty() || self.peer_ca_certificates.is_empty() {
+            return Err(anyhow!(
+                "private_forwarding {role} TLS requires a certificate chain and peer CA"
+            ));
+        }
+        for path in self
+            .certificate_chain
+            .iter()
+            .chain(std::iter::once(&self.private_key))
+            .chain(&self.peer_ca_certificates)
+        {
+            if path.is_empty() || path.len() > 4_096 || path.chars().any(char::is_control) {
+                return Err(anyhow!("private_forwarding TLS path is invalid"));
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime(&self) -> MutualTlsFiles {
+        MutualTlsFiles {
+            certificate_chain: self.certificate_chain.iter().map(Into::into).collect(),
+            private_key: self.private_key.clone().into(),
+            peer_ca_certificates: self.peer_ca_certificates.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl PublicUctpListenerCfg {
+    fn validate(&self) -> Result<()> {
+        let bind = self
+            .bind
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow!("public UCTP listener bind must be a socket address"))?;
+        if bind.port() == 0 {
+            return Err(anyhow!(
+                "public UCTP listener bind must use an explicit nonzero port"
+            ));
+        }
+        if self.max_concurrent_connections == 0 {
+            return Err(anyhow!(
+                "public UCTP listener max_concurrent_connections must be greater than zero"
+            ));
+        }
+        if self.tls.certificate_chain.is_empty() {
+            return Err(anyhow!(
+                "public UCTP listener TLS requires a certificate chain"
+            ));
+        }
+        for path in self
+            .tls
+            .certificate_chain
+            .iter()
+            .chain(std::iter::once(&self.tls.private_key))
+        {
+            if path.is_empty() || path.len() > 4_096 || path.chars().any(char::is_control) {
+                return Err(anyhow!("public UCTP listener TLS path is invalid"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn runtime(&self) -> Result<PublicUctpBindConfig> {
+        self.validate()?;
+        Ok(PublicUctpBindConfig {
+            bind: self.bind.parse().expect("validated public UCTP bind"),
+            certificate_chain: self.tls.certificate_chain.iter().map(Into::into).collect(),
+            private_key: self.tls.private_key.clone().into(),
+            max_concurrent_connections: self.max_concurrent_connections,
+        })
+    }
+}
+
+impl PrivateForwardingLimitsCfg {
+    fn validate(&self, max_calls: usize) -> Result<()> {
+        let minimum_routes = max_calls
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("private forwarding route limit overflow"))?;
+        if self.max_active_routes < minimum_routes
+            || self.max_peer_connections == 0
+            || self.max_routes_per_peer == 0
+            || self.max_routes_per_peer > self.max_active_routes
+            || self.media_queue_capacity == 0
+            || self.media_queue_capacity > 1_024
+            || self.reliable_queue_capacity == 0
+            || self.reliable_queue_capacity > 4_096
+            || self.inbound_queue_capacity == 0
+            || self.inbound_queue_capacity > 4_096
+        {
+            return Err(anyhow!(
+                "private_forwarding limits are inconsistent or outside safe bounds"
+            ));
+        }
+        Ok(())
+    }
+
+    fn runtime(&self) -> PrivateForwardingLimits {
+        PrivateForwardingLimits {
+            max_active_routes: self.max_active_routes,
+            max_peer_connections: self.max_peer_connections,
+            max_routes_per_peer: self.max_routes_per_peer,
+            media_queue_capacity: self.media_queue_capacity,
+            reliable_queue_capacity: self.reliable_queue_capacity,
+            inbound_queue_capacity: self.inbound_queue_capacity,
+        }
+    }
+}
+
+impl PrivateForwardingTimeoutsCfg {
+    fn validate(&self) -> Result<()> {
+        if !(1..=60).contains(&self.connect_secs)
+            || !(1..=60).contains(&self.signaling_secs)
+            || !(60..=3_600).contains(&self.token_ttl_secs)
+            || !(1..=300).contains(&self.health_interval_secs)
+            || self.health_interval_secs >= self.token_ttl_secs
+        {
+            return Err(anyhow!(
+                "private_forwarding timeout values are outside safe bounds"
+            ));
+        }
+        Ok(())
+    }
+
+    fn runtime(&self) -> PrivateForwardingTimeouts {
+        PrivateForwardingTimeouts {
+            connect: Duration::from_secs(self.connect_secs),
+            signaling: Duration::from_secs(self.signaling_secs),
+            token_ttl: Duration::from_secs(self.token_ttl_secs),
+            health_interval: Duration::from_secs(self.health_interval_secs),
+        }
+    }
+}
+
+fn validate_private_component(field: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte));
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow!("private_forwarding {field} is invalid"))
+    }
+}
+
+fn validate_private_server_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 253
+        || value.chars().any(char::is_control)
+        || value.contains('/')
+        || value.contains('@')
+    {
+        Err(anyhow!("private_forwarding worker server_name is invalid"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_private_worker_endpoint(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+        || value.contains(['/', '@', '?', '#'])
+    {
+        return Err(anyhow!(
+            "private_forwarding worker endpoint authority is invalid"
+        ));
+    }
+    let parsed = url::Url::parse(&format!("uctp+quic://{value}"))
+        .map_err(|_| anyhow!("private_forwarding worker endpoint authority is invalid"))?;
+    if parsed.host_str().is_none() || parsed.port().is_none() {
+        return Err(anyhow!(
+            "private_forwarding worker endpoint requires an explicit host and port"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_uctp_endpoint(value: &str) -> Result<()> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| anyhow!("broadcast.public_endpoint must be a valid UCTP URL"))?;
+    if parsed.scheme() != "uctp+quic"
+        || parsed.host_str().is_none()
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != ""
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "broadcast.public_endpoint must be uctp+quic://host:port without credentials or a path"
+        ));
+    }
+    Ok(())
+}
+
+impl MoqRelayCfg {
+    fn validate(&self) -> Result<()> {
+        validate_moq_listener("publisher", &self.publisher.listener)?;
+        validate_moq_listener("subscriber_webtransport", &self.subscriber_webtransport)?;
+        validate_moq_listener("subscriber_raw_quic", &self.subscriber_raw_quic)?;
+
+        let binds = [
+            self.publisher.listener.bind.as_str(),
+            self.subscriber_webtransport.bind.as_str(),
+            self.subscriber_raw_quic.bind.as_str(),
+        ];
+        if binds.iter().collect::<BTreeSet<_>>().len() != binds.len() {
+            return Err(anyhow!(
+                "moq_relay publisher, WebTransport, and raw QUIC listeners require distinct binds"
+            ));
+        }
+        if self.tls.server_certificates.is_empty()
+            || self.tls.server_certificates.len() != self.tls.server_private_keys.len()
+            || self.tls.publisher_client_ca_certificates.is_empty()
+        {
+            return Err(anyhow!(
+                "moq_relay TLS requires paired server certificates/keys and at least one publisher client CA"
+            ));
+        }
+        for path in self
+            .tls
+            .server_certificates
+            .iter()
+            .chain(&self.tls.server_private_keys)
+            .chain(&self.tls.publisher_client_ca_certificates)
+        {
+            if path.is_empty() || path.len() > 4_096 || path.chars().any(char::is_control) {
+                return Err(anyhow!("moq_relay TLS path is invalid"));
+            }
+        }
+        if self.publisher.certificate_bindings.is_empty()
+            || self.publisher.max_active_sessions_per_certificate == 0
+        {
+            return Err(anyhow!(
+                "moq_relay publisher requires certificate bindings and a positive per-certificate session limit"
+            ));
+        }
+        for binding in &self.publisher.certificate_bindings {
+            if binding.certificate_sha256.len() != 64
+                || !binding
+                    .certificate_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(anyhow!(
+                    "moq_relay publisher certificate fingerprint must be 64 hexadecimal characters"
+                ));
+            }
+            let namespace = binding.scope.strip_prefix('/').ok_or_else(|| {
+                anyhow!("moq_relay publisher certificate scope must begin with /")
+            })?;
+            rvoip_moq::MoqNamespace::parse(namespace)
+                .map_err(|_| anyhow!("moq_relay publisher certificate scope is invalid"))?;
+        }
+        let limits = &self.limits;
+        let bounded = [
+            limits.max_pending_admissions,
+            limits.max_active_sessions,
+            limits.max_active_sessions_per_tenant,
+            limits.max_replay_claims,
+            limits.max_coordinated_namespaces,
+            limits.max_cached_tracks_per_namespace,
+            limits.max_pending_track_requests_per_namespace,
+            limits.max_upstream_connections,
+            limits.max_upstream_tracks,
+        ];
+        if bounded.contains(&0)
+            || limits.max_active_sessions > 100_000
+            || limits.max_active_sessions_per_tenant > limits.max_active_sessions
+            || limits.max_replay_claims < limits.max_active_sessions
+        {
+            return Err(anyhow!(
+                "moq_relay limits must be positive, bounded, and replay/session capacities must be consistent"
+            ));
+        }
+        let timeouts = &self.timeouts;
+        let seconds = [
+            timeouts.setup_secs,
+            timeouts.admission_secs,
+            timeouts.admission_operation_secs,
+            timeouts.pre_admission_cleanup_secs,
+            timeouts.admission_session_close_secs,
+            timeouts.token_revalidation_interval_secs,
+            timeouts.upstream_track_idle_secs,
+            timeouts.upstream_connection_idle_secs,
+            timeouts.drop_cleanup_secs,
+            timeouts.dependency_check_interval_secs,
+        ];
+        if seconds.iter().any(|seconds| !(1..=3_600).contains(seconds)) {
+            return Err(anyhow!(
+                "moq_relay timeout and interval values must be between 1 and 3600 seconds"
+            ));
+        }
+
+        let mut diagnostics = self
+            .diagnostics_bearer_token
+            .resolve()
+            .map_err(|error| anyhow!("resolving moq_relay.diagnostics_bearer_token: {error}"))?;
+        let valid_diagnostics = (32..=4_096).contains(&diagnostics.len());
+        diagnostics.zeroize();
+        if !valid_diagnostics {
+            return Err(anyhow!(
+                "moq_relay.diagnostics_bearer_token must resolve to 32 to 4096 bytes"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_moq_listener(kind: &str, listener: &MoqRelayListenerCfg) -> Result<()> {
+    listener
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|_| anyhow!("moq_relay.{kind}.bind must be a socket address"))?;
+    let endpoint = url::Url::parse(&listener.advertised_endpoint)
+        .map_err(|_| anyhow!("moq_relay.{kind}.advertised_endpoint is invalid"))?;
+    if endpoint.scheme() != "moqt"
+        || endpoint.host_str().is_none_or(str::is_empty)
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !matches!(endpoint.path(), "" | "/")
+    {
+        return Err(anyhow!(
+            "moq_relay.{kind}.advertised_endpoint must be a credential-free authority-only moqt:// URL"
+        ));
+    }
+    if let Some(address) = listener.advertised_socket_addr.as_deref() {
+        address.parse::<SocketAddr>().map_err(|_| {
+            anyhow!("moq_relay.{kind}.advertised_socket_addr must be a socket address")
+        })?;
+    }
+    Ok(())
+}
+
+fn deserialize_strict(value: &serde_yaml::Value, path: &std::path::Path) -> Result<Config> {
+    let rendered =
+        serde_yaml::to_string(value).with_context(|| format!("normalizing {}", path.display()))?;
+    let deserializer = serde_yaml::Deserializer::from_str(&rendered);
+    let mut unknown = BTreeSet::new();
+    let config = serde_ignored::deserialize(deserializer, |field| {
+        unknown.insert(field.to_string());
+    })
+    .with_context(|| format!("parsing {}", path.display()))?;
+    if unknown.is_empty() {
+        return Ok(config);
+    }
+    Err(anyhow!(
+        "unknown configuration field{} in {}: {}",
+        if unknown.len() == 1 { "" } else { "s" },
+        path.display(),
+        unknown.into_iter().collect::<Vec<_>>().join(", ")
+    ))
 }
 
 fn effective_value(path: &std::path::Path) -> Result<serde_yaml::Value> {
@@ -810,10 +4882,16 @@ fn redact_secrets(value: &mut serde_yaml::Value) {
                             | "signature_secret"
                             | "token_secret"
                             | "bearer_token"
+                            | "diagnostics_bearer_token"
                             | "control_hmac_key"
+                            | "token_signing_secret"
                             | "database_url"
                             | "redis_url"
                             | "password"
+                            | "media_sip_password"
+                            | "credential"
+                            | "trusted_subject"
+                            | "trusted_issuer"
                     )
                 });
                 if sensitive {
@@ -924,11 +5002,26 @@ fn default_log_format() -> String {
 fn default_http_bind() -> String {
     "0.0.0.0:9090".into()
 }
+fn default_otlp_service_name() -> String {
+    "bridgefu".into()
+}
+fn default_otlp_sampling_ratio() -> f64 {
+    1.0
+}
+fn default_otlp_max_queue_size() -> usize {
+    2_048
+}
+fn default_otlp_max_export_batch_size() -> usize {
+    512
+}
+fn default_otlp_scheduled_delay_millis() -> u64 {
+    5_000
+}
+fn default_otlp_export_timeout_millis() -> u64 {
+    10_000
+}
 fn default_config_version() -> u32 {
     1
-}
-fn default_runtime_mode() -> String {
-    "all-in-one".into()
 }
 fn default_max_calls() -> usize {
     100
@@ -941,6 +5034,42 @@ fn default_media_idle_timeout() -> u64 {
 }
 fn default_drain_timeout() -> u64 {
     30
+}
+fn default_private_gateway_bind() -> String {
+    "0.0.0.0:0".into()
+}
+fn default_private_worker_bind() -> String {
+    "0.0.0.0:9443".into()
+}
+fn default_private_active_routes() -> usize {
+    2_000
+}
+fn default_private_peer_connections() -> usize {
+    256
+}
+fn default_private_routes_per_peer() -> usize {
+    1_200
+}
+fn default_private_media_queue() -> usize {
+    10
+}
+fn default_private_reliable_queue() -> usize {
+    64
+}
+fn default_private_inbound_queue() -> usize {
+    64
+}
+fn default_private_connect_timeout() -> u64 {
+    5
+}
+fn default_private_signaling_timeout() -> u64 {
+    5
+}
+fn default_private_token_ttl() -> u64 {
+    300
+}
+fn default_private_health_interval() -> u64 {
+    5
 }
 fn default_deployment_id() -> String {
     "bridgefu".to_owned()
@@ -955,10 +5084,10 @@ fn default_worker_capabilities() -> BTreeSet<String> {
     BTreeSet::from([
         "amazon_connect".to_owned(),
         "sip".to_owned(),
+        "sip_egress".to_owned(),
         "telnyx".to_owned(),
-        "twilio".to_owned(),
-        "vonage".to_owned(),
         "webrtc".to_owned(),
+        "webrtc_egress".to_owned(),
     ])
 }
 fn default_sqlite_database_url() -> String {
@@ -966,6 +5095,30 @@ fn default_sqlite_database_url() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_api_control_rate() -> u32 {
+    50
+}
+fn default_api_control_burst() -> u32 {
+    100
+}
+fn default_api_diagnostics_rate() -> u32 {
+    2
+}
+fn default_api_diagnostics_burst() -> u32 {
+    4
+}
+fn default_api_webhook_rate() -> u32 {
+    100
+}
+fn default_api_webhook_burst() -> u32 {
+    200
+}
+fn default_api_tracked_identities() -> usize {
+    10_000
+}
+fn default_api_identity_idle_ttl() -> u64 {
+    300
 }
 fn default_broadcast_transport() -> String {
     "moqt".into()
@@ -976,6 +5129,78 @@ fn default_broadcast_ttl() -> u64 {
 fn default_max_broadcasts() -> usize {
     100
 }
+fn default_public_uctp_connections() -> usize {
+    1_024
+}
+fn default_sanitized_event_queue() -> usize {
+    64
+}
+fn default_sanitized_event_history() -> usize {
+    64
+}
+fn default_sanitized_event_rate() -> u32 {
+    8
+}
+fn default_moq_sessions_per_certificate() -> usize {
+    64
+}
+fn default_moq_pending_admissions() -> usize {
+    256
+}
+fn default_moq_active_sessions() -> usize {
+    2_048
+}
+fn default_moq_tenant_sessions() -> usize {
+    1_000
+}
+fn default_moq_replay_claims() -> usize {
+    8_192
+}
+fn default_moq_coordinated_namespaces() -> usize {
+    100_000
+}
+fn default_moq_cached_tracks() -> usize {
+    4_096
+}
+fn default_moq_pending_tracks() -> usize {
+    1_024
+}
+fn default_moq_upstream_connections() -> usize {
+    128
+}
+fn default_moq_upstream_tracks() -> usize {
+    4_096
+}
+fn default_moq_setup_timeout() -> u64 {
+    5
+}
+fn default_moq_admission_timeout() -> u64 {
+    5
+}
+fn default_moq_admission_operation_timeout() -> u64 {
+    3
+}
+fn default_moq_cleanup_timeout() -> u64 {
+    2
+}
+fn default_moq_session_close_timeout() -> u64 {
+    5
+}
+fn default_moq_revalidation_interval() -> u64 {
+    15
+}
+fn default_moq_upstream_track_idle() -> u64 {
+    30
+}
+fn default_moq_upstream_connection_idle() -> u64 {
+    60
+}
+fn default_moq_drop_cleanup() -> u64 {
+    10
+}
+fn default_moq_dependency_check_interval() -> u64 {
+    5
+}
 fn default_generic_sip_bind() -> String {
     "0.0.0.0:5070".into()
 }
@@ -984,6 +5209,48 @@ fn default_webrtc_ws_bind() -> String {
 }
 fn default_webrtc_whip_bind() -> String {
     "0.0.0.0:8081".into()
+}
+fn default_generic_webrtc_udp_bind() -> String {
+    "0.0.0.0:0".into()
+}
+fn default_generic_webrtc_audio_codecs() -> BTreeSet<GenericWebRtcAudioCodec> {
+    BTreeSet::from([GenericWebRtcAudioCodec::Opus])
+}
+fn default_canary_trusted_subject() -> String {
+    "bridgefu-static-api-key".into()
+}
+fn default_canary_trusted_issuer() -> String {
+    "bridgefu:configured-api-key".into()
+}
+fn default_canary_correlation_header() -> String {
+    "X-Correlation-Id".into()
+}
+fn default_canary_amazon_profile() -> String {
+    "default".into()
+}
+const fn default_generic_rtp_port_start() -> u16 {
+    16_384
+}
+const fn default_generic_rtp_port_end() -> u16 {
+    32_767
+}
+const fn default_symmetric_rtp_probation() -> u8 {
+    3
+}
+const fn default_symmetric_rtp_rebindings() -> u8 {
+    2
+}
+const fn default_symmetric_rtp_window() -> u64 {
+    2
+}
+const fn default_symmetric_rtp_sequence_jump() -> u16 {
+    512
+}
+const fn default_webrtc_gather_timeout() -> u64 {
+    5
+}
+const fn default_webrtc_connection_timeout() -> u64 {
+    15
 }
 
 impl Default for ContactCfg {
@@ -1012,17 +5279,54 @@ impl Default for ObsCfg {
             log_level: default_log_level(),
             log_format: default_log_format(),
             http_bind: default_http_bind(),
+            otlp: OtlpTracingCfg::default(),
+        }
+    }
+}
+impl Default for OtlpTracingCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            service_name: default_otlp_service_name(),
+            sampling_ratio: default_otlp_sampling_ratio(),
+            max_queue_size: default_otlp_max_queue_size(),
+            max_export_batch_size: default_otlp_max_export_batch_size(),
+            scheduled_delay_millis: default_otlp_scheduled_delay_millis(),
+            export_timeout_millis: default_otlp_export_timeout_millis(),
         }
     }
 }
 impl Default for RuntimeCfg {
     fn default() -> Self {
         Self {
-            mode: default_runtime_mode(),
+            mode: RuntimeMode::default(),
             max_concurrent_calls: default_max_calls(),
             setup_timeout_secs: default_setup_timeout(),
             media_idle_timeout_secs: default_media_idle_timeout(),
             drain_timeout_secs: default_drain_timeout(),
+        }
+    }
+}
+impl Default for PrivateForwardingLimitsCfg {
+    fn default() -> Self {
+        Self {
+            max_active_routes: default_private_active_routes(),
+            max_peer_connections: default_private_peer_connections(),
+            max_routes_per_peer: default_private_routes_per_peer(),
+            media_queue_capacity: default_private_media_queue(),
+            reliable_queue_capacity: default_private_reliable_queue(),
+            inbound_queue_capacity: default_private_inbound_queue(),
+        }
+    }
+}
+impl Default for PrivateForwardingTimeoutsCfg {
+    fn default() -> Self {
+        Self {
+            connect_secs: default_private_connect_timeout(),
+            signaling_secs: default_private_signaling_timeout(),
+            token_ttl_secs: default_private_token_ttl(),
+            health_interval_secs: default_private_health_interval(),
         }
     }
 }
@@ -1047,10 +5351,89 @@ impl Default for ApiCfg {
     fn default() -> Self {
         Self {
             enabled: true,
+            http_bind: None,
+            tls: None,
             bearer_token: None,
             control_hmac_key: None,
             static_tenant: None,
+            rate_limit: ApiRateLimitCfg::default(),
+            routes: BTreeMap::new(),
+            route_attachments: RouteAttachmentCfg::default(),
         }
+    }
+}
+
+impl Default for ApiRateLimitCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            control_requests_per_second: default_api_control_rate(),
+            control_burst: default_api_control_burst(),
+            diagnostics_requests_per_second: default_api_diagnostics_rate(),
+            diagnostics_burst: default_api_diagnostics_burst(),
+            webhook_requests_per_second: default_api_webhook_rate(),
+            webhook_burst: default_api_webhook_burst(),
+            max_tracked_identities: default_api_tracked_identities(),
+            identity_idle_ttl_secs: default_api_identity_idle_ttl(),
+        }
+    }
+}
+
+impl ApiRateLimitCfg {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            (
+                "control_requests_per_second",
+                self.control_requests_per_second,
+            ),
+            (
+                "diagnostics_requests_per_second",
+                self.diagnostics_requests_per_second,
+            ),
+            (
+                "webhook_requests_per_second",
+                self.webhook_requests_per_second,
+            ),
+        ] {
+            if !(1..=MAX_API_REQUESTS_PER_SECOND).contains(&value) {
+                return Err(anyhow!(
+                    "api.rate_limit.{name} must be between 1 and {MAX_API_REQUESTS_PER_SECOND}"
+                ));
+            }
+        }
+        for (name, value) in [
+            ("control_burst", self.control_burst),
+            ("diagnostics_burst", self.diagnostics_burst),
+            ("webhook_burst", self.webhook_burst),
+        ] {
+            if !(1..=MAX_API_BURST).contains(&value) {
+                return Err(anyhow!(
+                    "api.rate_limit.{name} must be between 1 and {MAX_API_BURST}"
+                ));
+            }
+        }
+        if !(1..=MAX_API_TRACKED_IDENTITIES).contains(&self.max_tracked_identities) {
+            return Err(anyhow!(
+                "api.rate_limit.max_tracked_identities must be between 1 and {MAX_API_TRACKED_IDENTITIES}"
+            ));
+        }
+        if !(1..=MAX_API_IDENTITY_IDLE_TTL_SECS).contains(&self.identity_idle_ttl_secs) {
+            return Err(anyhow!(
+                "api.rate_limit.identity_idle_ttl_secs must be between 1 and {MAX_API_IDENTITY_IDLE_TTL_SECS}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ApiTlsCfg {
+    pub fn validate(&self) -> Result<()> {
+        for path in [&self.certificate_chain, &self.private_key] {
+            if path.is_empty() || path.len() > 4_096 || path.chars().any(char::is_control) {
+                return Err(anyhow!("api.tls paths must be bounded and control-free"));
+            }
+        }
+        Ok(())
     }
 }
 impl Default for BroadcastCfg {
@@ -1061,6 +5444,40 @@ impl Default for BroadcastCfg {
             max_active: default_max_broadcasts(),
             public_endpoint: None,
             token_secret: None,
+            uctp_listener: None,
+            moq_origin_relay: None,
+            sanitized_events: BroadcastSanitizedEventsCfg::default(),
+        }
+    }
+}
+impl Default for MoqRelayLimitsCfg {
+    fn default() -> Self {
+        Self {
+            max_pending_admissions: default_moq_pending_admissions(),
+            max_active_sessions: default_moq_active_sessions(),
+            max_active_sessions_per_tenant: default_moq_tenant_sessions(),
+            max_replay_claims: default_moq_replay_claims(),
+            max_coordinated_namespaces: default_moq_coordinated_namespaces(),
+            max_cached_tracks_per_namespace: default_moq_cached_tracks(),
+            max_pending_track_requests_per_namespace: default_moq_pending_tracks(),
+            max_upstream_connections: default_moq_upstream_connections(),
+            max_upstream_tracks: default_moq_upstream_tracks(),
+        }
+    }
+}
+impl Default for MoqRelayTimeoutsCfg {
+    fn default() -> Self {
+        Self {
+            setup_secs: default_moq_setup_timeout(),
+            admission_secs: default_moq_admission_timeout(),
+            admission_operation_secs: default_moq_admission_operation_timeout(),
+            pre_admission_cleanup_secs: default_moq_cleanup_timeout(),
+            admission_session_close_secs: default_moq_session_close_timeout(),
+            token_revalidation_interval_secs: default_moq_revalidation_interval(),
+            upstream_track_idle_secs: default_moq_upstream_track_idle(),
+            upstream_connection_idle_secs: default_moq_upstream_connection_idle(),
+            drop_cleanup_secs: default_moq_drop_cleanup(),
+            dependency_check_interval_secs: default_moq_dependency_check_interval(),
         }
     }
 }
@@ -1071,7 +5488,56 @@ impl Default for GenericBridgeCfg {
             sip_bind: default_generic_sip_bind(),
             webrtc_ws_bind: default_webrtc_ws_bind(),
             webrtc_whip_bind: default_webrtc_whip_bind(),
+            sip: GenericSipNetworkCfg::default(),
+            webrtc: GenericWebRtcNetworkCfg::default(),
+            standardcharter_canary: StandardCharterCanaryCfg::default(),
             bearer_token: None,
+        }
+    }
+}
+
+impl Default for GenericSipNetworkCfg {
+    fn default() -> Self {
+        Self {
+            allow_cleartext_bearer: false,
+            digest: None,
+            advertised_addr: None,
+            media_public_addr: None,
+            stun_server: None,
+            secure_listener: None,
+            srtp: default_generic_sip_srtp(),
+            rtp_port_start: default_generic_rtp_port_start(),
+            rtp_port_end: default_generic_rtp_port_end(),
+            symmetric_rtp: GenericSymmetricRtpCfg::default(),
+        }
+    }
+}
+
+impl Default for GenericSymmetricRtpCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_ip_change: false,
+            probation_packets: default_symmetric_rtp_probation(),
+            max_rebindings: default_symmetric_rtp_rebindings(),
+            rebind_window_secs: default_symmetric_rtp_window(),
+            max_sequence_jump: default_symmetric_rtp_sequence_jump(),
+        }
+    }
+}
+
+impl Default for GenericWebRtcNetworkCfg {
+    fn default() -> Self {
+        Self {
+            udp_bind: default_generic_webrtc_udp_bind(),
+            audio_codecs: default_generic_webrtc_audio_codecs(),
+            ice_servers: None,
+            ice_transport_policy: GenericIceTransportPolicy::All,
+            nat_1to1_ips: Vec::new(),
+            nat_1to1_candidate_type: GenericNatCandidateType::Host,
+            gather_timeout_secs: default_webrtc_gather_timeout(),
+            connection_timeout_secs: default_webrtc_connection_timeout(),
+            trickle_ice: true,
         }
     }
 }
@@ -1079,6 +5545,25 @@ impl Default for GenericBridgeCfg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridgefu::call_engine::{LegId, PrincipalFingerprint};
+    use bridgefu::call_service::{
+        AttachmentPrincipalRequest, AttachmentPrincipalResolver, LegExecutionSpec,
+        SipEndpointConfig, SipInitialContextMode,
+    };
+
+    struct UnusedConnectStarter;
+
+    #[async_trait::async_trait]
+    impl ConnectContactStarter for UnusedConnectStarter {
+        async fn start_webrtc_contact(
+            &self,
+            _request: rvoip_amazon_connect::StartContactRequest,
+        ) -> rvoip_amazon_connect::Result<rvoip_amazon_connect::ConnectionData> {
+            Err(rvoip_amazon_connect::ConnectError::Control(
+                "unused config-test starter".into(),
+            ))
+        }
+    }
 
     /// The B.4 render the reconciler produces for two tenants.
     const B4_TWO_TENANTS: &str = r#"
@@ -1103,8 +5588,205 @@ mapping:
   rename: {X-Correlation-Id: correlation_id}
 "#;
 
+    #[test]
+    fn split_worker_amazon_adapter_does_not_parse_or_resolve_public_sip() {
+        let mut config = parse(LEGACY);
+        config.sip.bind_ip = "not-an-ip".into();
+        config.sip.advertised_ip = "not-a-resolvable-public-address".into();
+        config.sip.media_public_ip = "not-a-resolvable-media-address".into();
+
+        let starter: Arc<dyn ConnectContactStarter> = Arc::new(UnusedConnectStarter);
+        let adapter = config
+            .build_worker_amazon_connect_adapter_with_starter(starter)
+            .expect("worker construction is independent of public SIP");
+        assert_eq!(adapter.configured_profile_count(), 1);
+    }
+
+    #[test]
+    fn public_uctp_listener_config_is_explicit_and_runtime_ready() {
+        let listener: PublicUctpListenerCfg = serde_yaml::from_str(
+            r#"
+bind: 127.0.0.1:4446
+max_concurrent_connections: 321
+tls:
+  certificate_chain: [/run/tls/uctp.pem]
+  private_key: /run/tls/uctp.key
+"#,
+        )
+        .unwrap();
+        listener.validate().unwrap();
+        let runtime = listener.runtime().unwrap();
+        assert_eq!(
+            runtime.bind,
+            "127.0.0.1:4446".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(runtime.max_concurrent_connections, 321);
+        assert_eq!(runtime.certificate_chain.len(), 1);
+        assert!(format!("{runtime:?}").contains("private_key_configured: true"));
+        assert!(!format!("{runtime:?}").contains("uctp.key"));
+    }
+
+    #[test]
+    fn private_forwarding_defaults_support_one_thousand_direct_listener_routes() {
+        let limits = PrivateForwardingLimitsCfg::default();
+        assert_eq!(limits.max_active_routes, 2_000);
+        assert_eq!(limits.max_routes_per_peer, 1_200);
+        assert!(limits.max_active_routes >= 1_000);
+        assert!(limits.max_routes_per_peer >= 1_000);
+        limits.validate(default_max_calls()).unwrap();
+    }
+
+    #[test]
+    fn public_uctp_endpoint_and_listener_reject_ambiguous_configuration() {
+        assert!(validate_public_uctp_endpoint("uctp+quic://bridge.example:4446").is_ok());
+        for invalid in [
+            "https://bridge.example:4446",
+            "uctp+quic://bridge.example",
+            "uctp+quic://user@bridge.example:4446",
+            "uctp+quic://bridge.example:4446/path",
+        ] {
+            assert!(validate_public_uctp_endpoint(invalid).is_err(), "{invalid}");
+        }
+        let zero_bind: PublicUctpListenerCfg = serde_yaml::from_str(
+            r#"
+bind: 127.0.0.1:0
+tls:
+  certificate_chain: [/run/tls/uctp.pem]
+  private_key: /run/tls/uctp.key
+"#,
+        )
+        .unwrap();
+        assert!(zero_bind.validate().is_err());
+    }
+
+    #[test]
+    fn moq_origin_relay_separates_private_publisher_and_public_subscriber_endpoints() {
+        let valid: MoqOriginRelayCfg = serde_yaml::from_str(
+            r#"
+bind: 127.0.0.1:0
+publisher_endpoint: moqt://relay.internal.invalid:4443
+subscriber_endpoint: https://relay.public.invalid:4444
+root_certificates: [/run/tls/relay-ca.pem]
+client_certificate: /run/tls/origin.pem
+client_private_key: /run/tls/origin.key
+"#,
+        )
+        .unwrap();
+        valid.validate().unwrap();
+
+        let same: MoqOriginRelayCfg = serde_yaml::from_str(
+            r#"
+bind: 127.0.0.1:0
+publisher_endpoint: moqt://relay.invalid:4443
+subscriber_endpoint: moqt://relay.invalid:4443
+root_certificates: [/run/tls/relay-ca.pem]
+client_certificate: /run/tls/origin.pem
+client_private_key: /run/tls/origin.key
+"#,
+        )
+        .unwrap();
+        assert!(same.validate().is_err());
+    }
+
+    const MOQ_RELAY: &str = r#"
+runtime: {mode: moq-relay}
+api: {enabled: false}
+persistence:
+  deployment_id: relay-test
+  redis_url: rediss://redis.invalid
+  redis_clustered: true
+broadcast:
+  token_secret: 0123456789abcdef0123456789abcdef
+moq_relay:
+  publisher:
+    bind: 127.0.0.1:4443
+    advertised_endpoint: moqt://relay.invalid:4443
+    certificate_bindings:
+      - certificate_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        scope: /tenant-a/broadcast-a
+  subscriber_webtransport:
+    bind: 127.0.0.1:4444
+    advertised_endpoint: moqt://relay.invalid:4444
+  subscriber_raw_quic:
+    bind: 127.0.0.1:4445
+    advertised_endpoint: moqt://relay.invalid:4445
+  tls:
+    server_certificates: [/run/tls/server.pem]
+    server_private_keys: [/run/tls/server.key]
+    publisher_client_ca_certificates: [/run/tls/publisher-ca.pem]
+  diagnostics_bearer_token: 0123456789abcdef0123456789abcdef
+"#;
+
     fn parse(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("yaml parses")
+    }
+
+    fn vapi_projection_yaml() -> String {
+        format!(
+            r#"{LEGACY}
+api:
+  enabled: true
+  bearer_token: shared-private
+  control_hmac_key: 0123456789abcdef0123456789abcdef
+  static_tenant: default
+  route_attachments:
+    sip_uri_template: "sips:{{token}}@bridge.example.test:5061;transport=tls"
+  routes:
+    support:
+      tenant_id: default
+      ingress: [sip]
+      vapi_ingress_profile: vapi-public
+      destination_profile:
+        type: sip
+        profile_id: support-sbc
+      destination:
+        direction: outbound
+        signaling_initiator: bridgefu
+        media_flow: send_receive
+        endpoint:
+          type: sip
+          config:
+            uri: "sips:agent@support.example.test:5061;transport=tls"
+vapi_ingress_profiles:
+  vapi-public:
+    tenant_id: default
+    principal_subject: vapi-edge
+    issuer: vapi-managed
+    scopes: [calls:create]
+    trusted_signaling_cidrs: [192.0.2.0/24]
+    tls:
+      certificate_chain: /run/tls/sip.pem
+      private_key: /run/tls/sip-key.pem
+    srtp_required: true
+    codecs: [pcmu, opus]
+sip_profiles:
+  support-sbc:
+    allowed_targets: ["sips:agent@support.example.test:5061;transport=tls"]
+    from_uri: "sips:bridgefu@bridge.example.test"
+    srtp: required
+    codecs: [pcmu, opus]
+    metadata_keys: [correlation_id]
+context:
+  allow_headers:
+    X-Correlation-Id: correlation_id
+generic_bridge:
+  enabled: true
+  sip_bind: 127.0.0.1:5070
+  sip:
+    secure_listener:
+      bind: 127.0.0.1:5061
+      certificate_chain: /run/tls/sip.pem
+      private_key: /run/tls/sip-key.pem
+    srtp: required
+    symmetric_rtp:
+      enabled: true
+      allow_ip_change: true
+      probation_packets: 5
+      max_rebindings: 4
+      rebind_window_secs: 6
+      max_sequence_jump: 900
+"#
+        )
     }
 
     #[test]
@@ -1121,6 +5803,411 @@ mapping:
             .unwrap_err()
             .to_string()
             .contains("media_idle_timeout_secs must be greater than zero"));
+    }
+
+    #[test]
+    fn role_separated_moq_relay_configuration_is_complete_and_bounded() {
+        let config = parse(&format!("{LEGACY}\n{MOQ_RELAY}"));
+        config.validate().unwrap();
+        let relay = config.moq_relay.unwrap();
+        assert_eq!(relay.limits.max_active_sessions, 2_048);
+        assert_eq!(relay.limits.max_active_sessions_per_tenant, 1_000);
+        assert_eq!(relay.timeouts.token_revalidation_interval_secs, 15);
+
+        let duplicate = parse(&format!(
+            "{LEGACY}\n{}",
+            MOQ_RELAY.replace("127.0.0.1:4445", "127.0.0.1:4444")
+        ));
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("require distinct binds"));
+
+        let weak_diagnostics = parse(&format!(
+            "{LEGACY}\n{}",
+            MOQ_RELAY.replace(
+                "diagnostics_bearer_token: 0123456789abcdef0123456789abcdef",
+                "diagnostics_bearer_token: too-short"
+            )
+        ));
+        assert!(weak_diagnostics
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("diagnostics_bearer_token must resolve to 32 to 4096 bytes"));
+    }
+
+    #[test]
+    fn config_v1_scalar_bounds_are_enforced_by_runtime_validation() {
+        let mut config = parse(LEGACY);
+        config.aws.region.clear();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("aws.region must not be empty"));
+
+        let mut config = parse(LEGACY);
+        config.sip.port = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sip.port must be greater than zero"));
+
+        for field in ["signaling", "media", "keepalive", "idle"] {
+            let mut config = parse(LEGACY);
+            match field {
+                "signaling" => config.contact.signaling_timeout_secs = 0,
+                "media" => config.contact.media_connect_timeout_secs = 0,
+                "keepalive" => config.contact.keepalive_interval_secs = 0,
+                "idle" => config.contact.session_idle_ttl_secs = 0,
+                _ => unreachable!(),
+            }
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("contact timeout and interval values must be greater than zero"));
+        }
+
+        for field in ["setup", "drain"] {
+            let mut config = parse(LEGACY);
+            match field {
+                "setup" => config.runtime.setup_timeout_secs = 0,
+                "drain" => config.runtime.drain_timeout_secs = 0,
+                _ => unreachable!(),
+            }
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(&format!(
+                "runtime.{field}_timeout_secs must be greater than zero"
+            )));
+        }
+
+        let mut config = parse(LEGACY);
+        config.observability.log_level.clear();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("observability.log_level must not be empty"));
+
+        let mut config = parse(LEGACY);
+        config.observability.log_format = "human-ish".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("observability.log_format must be json or pretty"));
+
+        let mut config = parse(LEGACY);
+        config.observability.http_bind = "not-a-socket".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("observability.http_bind must be a socket address"));
+
+        let mut config = parse(LEGACY);
+        config.broadcast.token_ttl_secs = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("broadcast.token_ttl_secs must be between 1 and 900"));
+
+        let mut config = parse(LEGACY);
+        config.broadcast.token_ttl_secs = 901;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("broadcast.token_ttl_secs must be between 1 and 900"));
+
+        let mut config = parse(LEGACY);
+        config.broadcast.token_secret =
+            Some(serde_yaml::from_str("'too-short'").expect("secret ref parses"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("broadcast.token_secret must resolve to at least 32 bytes"));
+
+        let mut config = parse(LEGACY);
+        config
+            .context
+            .allow_headers
+            .insert("Authorization".into(), "unsafe".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("validating context allowlist"));
+    }
+
+    #[test]
+    fn sanitized_moq_events_are_default_off_and_require_exact_tenant_and_header_policy() {
+        let default = parse(LEGACY);
+        assert!(default.broadcast.sanitized_events.tenants.is_empty());
+        assert!(default
+            .broadcast
+            .sanitized_events
+            .policies(&default.context)
+            .unwrap()
+            .is_empty());
+        default.validate().unwrap();
+
+        let valid = parse(&format!(
+            r#"{LEGACY}
+context:
+  allow_headers:
+    X-Bridgefu-Event: broadcast_event
+broadcast:
+  sanitized_events:
+    tenants:
+      default:
+        context_metadata_key: broadcast_event
+        queue_events: 16
+        history_events: 8
+        max_events_per_second: 4
+"#
+        ));
+        valid.validate().unwrap();
+        let policies = valid
+            .broadcast
+            .sanitized_events
+            .policies(&valid.context)
+            .unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies["default"].max_events_per_second(), 4);
+
+        let unmapped = parse(&format!(
+            r#"{LEGACY}
+broadcast:
+  sanitized_events:
+    tenants:
+      default:
+        context_metadata_key: broadcast_event
+"#
+        ));
+        assert!(unmapped
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not mapped by context.allow_headers"));
+
+        let foreign_tenant = parse(&format!(
+            r#"{LEGACY}
+context:
+  allow_headers:
+    X-Bridgefu-Event: broadcast_event
+broadcast:
+  sanitized_events:
+    tenants:
+      another-tenant:
+        context_metadata_key: broadcast_event
+"#
+        ));
+        assert!(foreign_tenant
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("is not a configured routing tenant"));
+
+        let identifier_override = parse(&format!(
+            r#"{LEGACY}
+context:
+  allow_headers:
+    X-Correlation-Id: correlation_id
+broadcast:
+  sanitized_events:
+    tenants:
+      default:
+        context_metadata_key: correlation_id
+"#
+        ));
+        assert!(identifier_override.validate().is_err());
+    }
+
+    #[test]
+    fn otlp_is_disabled_without_a_collector_by_default() {
+        let config = parse(LEGACY);
+        assert!(!config.observability.otlp.enabled);
+        assert!(config.observability.otlp.endpoint.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_otlp_requires_safe_endpoint_service_and_sampling() {
+        let mut config = parse(LEGACY);
+        config.observability.otlp.enabled = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoint is required"));
+
+        config.observability.otlp.endpoint = Some("https://collector.example:4317".into());
+        config.validate().unwrap();
+
+        config.observability.otlp.endpoint = Some("https://token@collector.example:4317".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("without credentials, path, query, or fragment"));
+
+        config.observability.otlp.endpoint = Some("https://collector.example:4317".into());
+        config.observability.otlp.service_name = "   ".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("service_name"));
+
+        config.observability.otlp.service_name = "bridgefu-test".into();
+        config.observability.otlp.sampling_ratio = 1.01;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sampling_ratio"));
+
+        config.observability.otlp.sampling_ratio = f64::NAN;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sampling_ratio"));
+    }
+
+    #[test]
+    fn otlp_batching_is_explicitly_bounded() {
+        let mut config = parse(LEGACY);
+        config.observability.otlp.max_queue_size = MAX_OTLP_QUEUE_SIZE + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_queue_size"));
+
+        config.observability.otlp.max_queue_size = 10;
+        config.observability.otlp.max_export_batch_size = 11;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("no greater than max_queue_size"));
+
+        config.observability.otlp.max_export_batch_size = 10;
+        config.observability.otlp.scheduled_delay_millis = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("scheduled_delay_millis"));
+
+        config.observability.otlp.scheduled_delay_millis = MIN_OTLP_SCHEDULE_DELAY_MILLIS;
+        config.observability.otlp.export_timeout_millis = MAX_OTLP_EXPORT_TIMEOUT_MILLIS + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("export_timeout_millis"));
+    }
+
+    #[test]
+    fn config_v1_compatibility_fixture_preserves_model_defaults() {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../config/fixtures/config-v1.yaml")).unwrap();
+        let config = deserialize_strict(
+            &value,
+            std::path::Path::new("config/fixtures/config-v1.yaml"),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        config.resolved_tenants().unwrap();
+
+        assert_eq!(config.config_version, 1);
+        assert_eq!(config.runtime.mode, RuntimeMode::AllInOne);
+        assert_eq!(config.runtime.max_concurrent_calls, 100);
+        assert_eq!(config.broadcast.default_transport, "moqt");
+        assert_eq!(config.broadcast.token_ttl_secs, 300);
+        assert_eq!(config.persistence.backend, PersistenceBackend::Sqlite);
+        assert!(config.api.enabled);
+        assert!(config.api.rate_limit.enabled);
+        assert_eq!(config.api.rate_limit.control_requests_per_second, 50);
+        assert_eq!(config.api.rate_limit.control_burst, 100);
+        assert_eq!(config.api.rate_limit.diagnostics_requests_per_second, 2);
+        assert_eq!(config.api.rate_limit.diagnostics_burst, 4);
+        assert_eq!(config.api.rate_limit.webhook_requests_per_second, 100);
+        assert_eq!(config.api.rate_limit.webhook_burst, 200);
+        assert_eq!(config.api.rate_limit.max_tracked_identities, 10_000);
+        assert_eq!(config.api.rate_limit.identity_idle_ttl_secs, 300);
+        assert!(!config.generic_bridge.enabled);
+        assert!(!config.generic_bridge.sip.allow_cleartext_bearer);
+        assert!(!config.observability.otlp.enabled);
+        assert!(config.observability.otlp.endpoint.is_none());
+    }
+
+    #[test]
+    fn api_rate_limit_policy_is_strictly_bounded() {
+        let mut config = parse(LEGACY);
+        config.api.rate_limit.control_requests_per_second = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control_requests_per_second"));
+
+        config.api.rate_limit.control_requests_per_second = 1;
+        config.api.rate_limit.diagnostics_burst = MAX_API_BURST + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("diagnostics_burst"));
+
+        config.api.rate_limit.diagnostics_burst = 1;
+        config.api.rate_limit.max_tracked_identities = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_tracked_identities"));
+
+        config.api.rate_limit.max_tracked_identities = 1;
+        config.api.rate_limit.identity_idle_ttl_secs = MAX_API_IDENTITY_IDLE_TTL_SECS + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("identity_idle_ttl_secs"));
+    }
+
+    #[test]
+    fn runtime_mode_is_typed_defaults_and_rejects_unknown_values() {
+        let defaults = parse(LEGACY);
+        assert_eq!(defaults.runtime.mode, RuntimeMode::AllInOne);
+        assert_eq!(defaults.runtime.mode.as_str(), "all-in-one");
+
+        for (value, expected) in [
+            ("all-in-one", RuntimeMode::AllInOne),
+            ("gateway", RuntimeMode::Gateway),
+            ("worker", RuntimeMode::Worker),
+            ("moq-relay", RuntimeMode::MoqRelay),
+        ] {
+            let parsed: Config =
+                serde_yaml::from_str(&format!("{LEGACY}\nruntime:\n  mode: {value}\n")).unwrap();
+            assert_eq!(parsed.runtime.mode, expected);
+            assert_eq!(parsed.runtime.mode.to_string(), value);
+        }
+
+        let error = serde_yaml::from_str::<Config>(&format!(
+            "{LEGACY}\nruntime:\n  mode: accidental-fallback\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown variant"));
+        assert!(error.contains("accidental-fallback"));
     }
 
     #[test]
@@ -1262,7 +6349,7 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
     #[test]
     fn effective_config_redacts_control_hmac_key() {
         let mut value: serde_yaml::Value = serde_yaml::from_str(
-            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\npersistence:\n  database_url: postgres://private-database\n  redis_url: rediss://private-redis\n  allow_db_only_coordination: true\n",
+            "api:\n  bearer_token: bearer-private\n  control_hmac_key: hmac-private\npersistence:\n  database_url: postgres://private-database\n  redis_url: rediss://private-redis\n  allow_db_only_coordination: true\nproviders:\n  telnyx:\n    media_sip_password: provider-media-private\ngeneric_bridge:\n  webrtc:\n    ice_servers:\n      - urls: [turn:turn.example.test]\n        credential: turn-private\n",
         )
         .unwrap();
         redact_secrets(&mut value);
@@ -1271,8 +6358,47 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
         assert!(!rendered.contains("hmac-private"));
         assert!(!rendered.contains("private-database"));
         assert!(!rendered.contains("private-redis"));
+        assert!(!rendered.contains("provider-media-private"));
+        assert!(!rendered.contains("turn-private"));
         assert!(rendered.contains("allow_db_only_coordination: true"));
-        assert_eq!(rendered.matches("[redacted]").count(), 4);
+        assert_eq!(rendered.matches("[redacted]").count(), 6);
+    }
+
+    #[test]
+    fn strict_deserialization_rejects_unknown_fields_at_every_depth() {
+        let value: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "{LEGACY}\nruntime:\n  setup_timeout_secondz: 30\nproviders:\n  telnyx:\n    api_key: test-key\n    connection_id: test-connection\n    webhook_public_key: test-public-key\n    from: '+14155550100'\n    media_sip_authority: bridgefu.example:5060\n    media_sip_username: telnyx\n    media_sip_password: test-password\n    unexpected_credential: private\nobservability:\n  otlp:\n    headers:\n      authorization: private-otel-header\nunknown_top_level: true\n"
+        ))
+        .unwrap();
+        let error = deserialize_strict(&value, std::path::Path::new("strict-test.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown configuration fields"), "{error}");
+        assert!(error.contains("setup_timeout_secondz"), "{error}");
+        assert!(error.contains("unexpected_credential"), "{error}");
+        assert!(error.contains("observability.otlp.headers"), "{error}");
+        assert!(error.contains("unknown_top_level"), "{error}");
+        assert!(!error.contains("private"), "{error}");
+    }
+
+    #[test]
+    fn redacted_effective_config_does_not_resolve_secret_references() {
+        let path = std::env::temp_dir().join(format!(
+            "bridgefu-effective-config-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "{LEGACY}\napi:\n  enabled: true\n  bearer_token: env:BRIDGEFU_TEST_UNPROVISIONED_BEARER\n  control_hmac_key: env:BRIDGEFU_TEST_UNPROVISIONED_CONTROL_KEY\n"
+            ),
+        )
+        .unwrap();
+
+        let rendered = Config::redacted_effective_yaml(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!rendered.contains("BRIDGEFU_TEST_UNPROVISIONED"));
+        assert_eq!(rendered.matches("[redacted]").count(), 2);
     }
 
     #[test]
@@ -1290,6 +6416,20 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
             CallRepositoryBackendConfig::Sqlite { .. }
         ));
         assert!(!format!("{backend:?}").contains("bridgefu.db"));
+        assert_eq!(
+            cfg.call_worker_capabilities(),
+            BTreeSet::from([
+                "amazon_connect".to_owned(),
+                "sip".to_owned(),
+                "sip_egress".to_owned(),
+                "telnyx".to_owned(),
+                "webrtc".to_owned(),
+                "webrtc_egress".to_owned(),
+            ])
+        );
+        for unsupported in ["twilio", "vonage"] {
+            assert!(!cfg.call_worker_capabilities().contains(unsupported));
+        }
     }
 
     #[test]
@@ -1312,6 +6452,702 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
             "{LEGACY}\ngeneric_bridge:\n  enabled: true\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n"
         ));
         complete.validate().unwrap();
+    }
+
+    #[test]
+    fn generic_sip_cleartext_bearer_requires_explicit_opt_in() {
+        let defaulted = parse(&format!(
+            "{LEGACY}\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\ngeneric_bridge:\n  enabled: true\n"
+        ));
+        defaulted.validate().unwrap();
+        assert!(!defaulted.generic_bridge.sip.allow_cleartext_bearer);
+
+        let opted_in = parse(&format!(
+            "{LEGACY}\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\ngeneric_bridge:\n  enabled: true\n  sip:\n    allow_cleartext_bearer: true\n"
+        ));
+        opted_in.validate().unwrap();
+        assert!(opted_in.generic_bridge.sip.allow_cleartext_bearer);
+    }
+
+    #[test]
+    fn generic_and_telnyx_digest_merge_only_with_one_realm_and_distinct_users() {
+        let base = format!(
+            r#"{LEGACY}
+api:
+  enabled: true
+  bearer_token: shared-private
+  control_hmac_key: 0123456789abcdef0123456789abcdef
+generic_bridge:
+  enabled: true
+  sip:
+    digest:
+      realm: bridgefu
+      username: generic-media
+      password: generic-secret
+providers:
+  telnyx:
+    api_key: secret
+    connection_id: connection-a
+    webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    from: "+12065550100"
+    media_sip_authority: bridgefu.test:5060
+    media_sip_username: telnyx-media
+    media_sip_password: telnyx-secret
+"#
+        );
+        parse(&base).validate().unwrap();
+
+        let mismatched_realm = parse(&base.replace(
+            "realm: bridgefu\n      username: generic-media",
+            "realm: generic-realm\n      username: generic-media",
+        ));
+        let error = mismatched_realm.validate().unwrap_err().to_string();
+        assert!(error.contains("one exact shared realm"));
+        assert!(!error.contains("generic-secret"));
+        assert!(!error.contains("telnyx-secret"));
+
+        let colliding_user =
+            parse(&base.replace("username: generic-media", "username: telnyx-media"));
+        let error = colliding_user.validate().unwrap_err().to_string();
+        assert!(error.contains("distinct usernames"));
+        assert!(!error.contains("generic-secret"));
+        assert!(!error.contains("telnyx-secret"));
+    }
+
+    #[test]
+    fn generic_networking_maps_nat_turn_deadlines_and_symmetric_rtp() {
+        let yaml = format!(
+            "{LEGACY}\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\ngeneric_bridge:\n  enabled: true\n  sip_bind: 127.0.0.1:5070\n  webrtc_ws_bind: 127.0.0.1:8080\n  webrtc_whip_bind: 127.0.0.1:8081\n  sip:\n    advertised_addr: 192.0.2.10:5070\n    media_public_addr: 192.0.2.11:0\n    rtp_port_start: 20000\n    rtp_port_end: 20199\n    symmetric_rtp:\n      enabled: true\n      allow_ip_change: true\n      probation_packets: 4\n      max_rebindings: 3\n      rebind_window_secs: 3\n      max_sequence_jump: 1000\n  webrtc:\n    udp_bind: 127.0.0.1:0\n    ice_servers:\n      - urls: [turn:turn.example.test:3478?transport=udp]\n        username: bridgefu\n        credential: turn-private\n    ice_transport_policy: relay\n    nat_1to1_ips: [192.0.2.12]\n    nat_1to1_candidate_type: host\n    gather_timeout_secs: 6\n    connection_timeout_secs: 20\n    trickle_ice: false\n"
+        );
+        let config = parse(&yaml);
+        config.validate().unwrap();
+        let bind = config.generic_bridge.sip_bind.parse().unwrap();
+        let (sip, nat) = config
+            .generic_bridge
+            .sip_stack_config("test", bind)
+            .unwrap();
+        assert_eq!(
+            sip.sip_advertised_addr.unwrap().to_string(),
+            "192.0.2.10:5070"
+        );
+        assert_eq!(sip.media_public_addr.unwrap().to_string(), "192.0.2.11:0");
+        assert_eq!((sip.media_port_start, sip.media_port_end), (20_000, 20_199));
+        assert!(nat.symmetric_rtp.enabled);
+        assert!(nat.symmetric_rtp.allow_ip_change);
+        assert_eq!(nat.symmetric_rtp.probation_packets, 4);
+
+        let webrtc = config.generic_bridge.webrtc_stack_config().unwrap();
+        assert_eq!(webrtc.udp_bind, "127.0.0.1:0");
+        assert_eq!(webrtc.ice_servers.len(), 1);
+        assert_eq!(
+            webrtc.ice_servers[0].credential.as_deref(),
+            Some("turn-private")
+        );
+        assert_eq!(webrtc.nat_1to1_ips, vec!["192.0.2.12"]);
+        assert_eq!(webrtc.gather_timeout_secs, 6);
+        assert_eq!(webrtc.connection_timeout_secs, 20);
+        assert!(!webrtc.trickle_ice);
+        assert_eq!(webrtc.capabilities.audio_codecs.len(), 1);
+        assert_eq!(webrtc.capabilities.audio_codecs[0].name, "opus");
+        assert_eq!(
+            webrtc.ice_transport_policy,
+            rvoip_webrtc::config::IceTransportPolicy::Relay
+        );
+
+        let debug = format!("{:?}", config.generic_bridge);
+        assert!(!debug.contains("turn-private"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn generic_secure_sip_listener_projects_tls_and_strict_srtp_into_rvoip() {
+        let yaml = format!(
+            "{LEGACY}\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\ngeneric_bridge:\n  enabled: true\n  sip_bind: 127.0.0.1:5070\n  sip:\n    secure_listener:\n      bind: 0.0.0.0:5061\n      advertised_addr: 192.0.2.10:5061\n      certificate_chain: /run/tls/sip.pem\n      private_key: /run/tls/sip-key.pem\n      client_ca_certificate: /run/tls/vapi-ca.pem\n      require_client_certificate: true\n    srtp: required\n"
+        );
+        let config = parse(&yaml);
+        config.validate().unwrap();
+        let (sip, _) = config
+            .generic_bridge
+            .sip_stack_config("secure-test", "127.0.0.1:5070".parse().unwrap())
+            .unwrap();
+        assert_eq!(sip.sip_tls_mode, rvoip_sip::SipTlsMode::ClientAndServer);
+        assert_eq!(sip.tls_bind_addr.unwrap().to_string(), "0.0.0.0:5061");
+        assert_eq!(
+            sip.tls_advertised_addr.unwrap().to_string(),
+            "192.0.2.10:5061"
+        );
+        assert_eq!(
+            sip.tls_cert_path.unwrap().to_string_lossy(),
+            "/run/tls/sip.pem"
+        );
+        assert_eq!(
+            sip.tls_key_path.unwrap().to_string_lossy(),
+            "/run/tls/sip-key.pem"
+        );
+        assert!(sip.offer_srtp);
+        assert!(sip.srtp_required);
+    }
+
+    #[test]
+    fn named_profile_revisions_exclude_secrets_and_track_non_secret_policy() {
+        let yaml = format!(
+            r#"{LEGACY}
+api:
+  enabled: true
+  bearer_token: shared-private
+  control_hmac_key: 0123456789abcdef0123456789abcdef
+  static_tenant: default
+  route_attachments:
+    sip_uri_template: "sips:{{token}}@bridge.example.test:5061;transport=tls"
+  routes:
+    support:
+      tenant_id: default
+      ingress: [sip]
+      vapi_ingress_profile: vapi-public
+      destination_profile:
+        type: sip
+        profile_id: support-sbc
+      destination:
+        direction: outbound
+        signaling_initiator: bridgefu
+        media_flow: send_receive
+        endpoint:
+          type: sip
+          config:
+            uri: "sips:agent@support.example.test:5061;transport=tls"
+vapi_ingress_profiles:
+  vapi-public:
+    tenant_id: default
+    principal_subject: vapi-edge
+    issuer: vapi-managed
+    scopes: [calls:create]
+    trusted_signaling_cidrs: [192.0.2.0/24]
+    tls:
+      certificate_chain: /run/tls/sip.pem
+      private_key: /run/tls/sip-key.pem
+    srtp_required: true
+    codecs: [pcmu, opus]
+sip_profiles:
+  support-sbc:
+    allowed_targets: ["sips:agent@support.example.test:5061;transport=tls"]
+    from_uri: "sips:bridgefu@bridge.example.test"
+    outbound_proxy: "sips:edge.support.example.test:5061;lr"
+    auth:
+      type: bearer
+      token: env:OUTBOUND_TOKEN_A
+    tls_roots: [/run/tls/support-ca.pem]
+    client_certificate:
+      certificate_chain: /run/tls/support-client.pem
+      private_key: /run/tls/support-client-key.pem
+    srtp: required
+    codecs: [pcmu, opus]
+    metadata_keys: [correlation_id]
+context:
+  allow_headers:
+    X-Correlation-Id: correlation_id
+generic_bridge:
+  enabled: true
+  sip_bind: 127.0.0.1:5070
+  sip:
+    secure_listener:
+      bind: 127.0.0.1:5061
+      certificate_chain: /run/tls/sip.pem
+      private_key: /run/tls/sip-key.pem
+    srtp: required
+    symmetric_rtp:
+      enabled: true
+      allow_ip_change: true
+      probation_packets: 5
+      max_rebindings: 4
+      rebind_window_secs: 6
+      max_sequence_jump: 900
+"#
+        );
+        let config = parse(&yaml);
+        config.validate().unwrap();
+        let resolved = config.resolved_named_routes().unwrap();
+        let profile_bindings = resolved
+            .routes
+            .get("support")
+            .unwrap()
+            .profile_bindings
+            .clone();
+        let revision = profile_bindings
+            .iter()
+            .find(|profile| profile.kind() == NamedProfileKind::Sip)
+            .unwrap()
+            .revision()
+            .to_owned();
+
+        // Building the catalog does not resolve the deliberately missing env
+        // secret. The exact selected effect fails closed only when executed.
+        let resolver = config.outbound_profile_resolver().unwrap();
+        let route =
+            NamedRouteBinding::new_with_profiles("support", None, profile_bindings).unwrap();
+        assert_eq!(
+            resolver
+                .apply_sip(Some(&route), rvoip_sip::SipOriginateContext::new())
+                .unwrap_err(),
+            bridgefu::call_service::OutboundProfileError::MaterialUnavailable
+        );
+        let (sip, _) = config
+            .generic_sip_stack_config("profile-test", "127.0.0.1:5070".parse().unwrap())
+            .unwrap();
+        assert!(sip.tls_extra_ca_path.is_none());
+        assert!(sip.tls_client_cert_path.is_none());
+        assert!(sip.tls_client_key_path.is_none());
+        let profiles = config
+            .sip_egress_profile_configs("profile-test", "127.0.0.1:5070".parse().unwrap())
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        let configured = &profiles[0];
+        assert_eq!(configured.revision.expose_opaque(), revision);
+        assert_eq!(configured.allowed_initial_headers, ["X-Correlation-Id"]);
+        assert!(configured.sip_message);
+        assert_eq!(configured.stack.offered_codecs, [0, 111, 101]);
+        assert_eq!(
+            configured.stack.contact_uri.as_deref(),
+            Some("sips:bridgefu@bridge.example.test")
+        );
+        assert!(configured.stack.offer_srtp);
+        assert!(configured.stack.srtp_required);
+        assert!(configured.nat.symmetric_rtp.allow_ip_change);
+        assert_eq!(configured.nat.symmetric_rtp.probation_packets, 5);
+        assert_eq!(configured.nat.symmetric_rtp.max_rebindings, 4);
+        assert_eq!(
+            configured.nat.symmetric_rtp.rebind_window,
+            Duration::from_secs(6)
+        );
+        assert_eq!(configured.nat.symmetric_rtp.max_sequence_jump, 900);
+        assert!(sip.media_port_end < configured.stack.media_port_start);
+        assert_eq!(
+            configured
+                .stack
+                .tls_extra_ca_path
+                .as_ref()
+                .unwrap()
+                .to_string_lossy(),
+            "/run/tls/support-ca.pem"
+        );
+        assert_eq!(
+            configured
+                .stack
+                .tls_client_cert_path
+                .as_ref()
+                .unwrap()
+                .to_string_lossy(),
+            "/run/tls/support-client.pem"
+        );
+        assert_eq!(
+            configured
+                .stack
+                .tls_client_key_path
+                .as_ref()
+                .unwrap()
+                .to_string_lossy(),
+            "/run/tls/support-client-key.pem"
+        );
+
+        let rotated = parse(&yaml.replace("OUTBOUND_TOKEN_A", "OUTBOUND_TOKEN_B"));
+        rotated.validate().unwrap();
+        let rotated_revision = rotated
+            .resolved_named_routes()
+            .unwrap()
+            .routes
+            .get("support")
+            .unwrap()
+            .profile_bindings
+            .iter()
+            .find(|profile| profile.kind() == NamedProfileKind::Sip)
+            .unwrap()
+            .revision()
+            .to_owned();
+        assert_eq!(revision, rotated_revision);
+
+        let changed_yaml = yaml
+            .replace(
+                "agent@support.example.test",
+                "agent@new-support.example.test",
+            )
+            .replace("OUTBOUND_TOKEN_A", "OUTBOUND_TOKEN_PRIVATE_CANARY");
+        let changed = parse(&changed_yaml);
+        changed.validate().unwrap();
+        let changed_revision = changed
+            .resolved_named_routes()
+            .unwrap()
+            .routes
+            .get("support")
+            .unwrap()
+            .profile_bindings
+            .iter()
+            .find(|profile| profile.kind() == NamedProfileKind::Sip)
+            .unwrap()
+            .revision()
+            .to_owned();
+        assert_ne!(revision, changed_revision);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("OUTBOUND_TOKEN_A"));
+        assert!(!debug.contains("OUTBOUND_TOKEN_PRIVATE_CANARY"));
+
+        let insecure = parse(&yaml.replace("    srtp: required\n", "    srtp: disabled\n"));
+        let error = insecure.validate().unwrap_err().to_string();
+        assert!(error.contains("TLS/SRTP") || error.contains("mandatory SRTP"));
+    }
+
+    #[test]
+    fn conflicting_named_sip_security_policies_build_isolated_children() {
+        let mut config = parse(&vapi_projection_yaml());
+        let mut support = config.sip_profiles.get("support-sbc").unwrap().clone();
+        support.tls_roots = vec!["/run/tls/support-a-ca.pem".into()];
+        support.client_certificate = Some(ProfileClientCertificateCfg {
+            certificate_chain: "/run/tls/support-a-client.pem".into(),
+            private_key: serde_yaml::from_str("/run/tls/support-a-key.pem").unwrap(),
+        });
+        support.srtp = ProfileSrtpPolicy::Preferred;
+        support.codecs = BTreeSet::from([ProfileAudioCodec::Pcmu, ProfileAudioCodec::Opus]);
+        config.sip_profiles.insert("support-sbc".into(), support);
+
+        let backup_target = "sip:agent@backup.example.test:5060";
+        config.sip_profiles.insert(
+            "backup-sbc".into(),
+            SipProfileCfg {
+                allowed_targets: BTreeSet::from([backup_target.into()]),
+                from_uri: "sip:bridgefu@bridge.example.test".into(),
+                outbound_proxy: None,
+                auth: None,
+                tls_roots: vec!["/run/tls/support-b-ca.pem".into()],
+                client_certificate: None,
+                srtp: ProfileSrtpPolicy::Disabled,
+                codecs: BTreeSet::from([ProfileAudioCodec::Pcma]),
+                metadata_keys: BTreeSet::new(),
+            },
+        );
+        let mut backup_route = config.api.routes.get("support").unwrap().clone();
+        backup_route.destination_profile = Some(RouteDestinationProfileRef::Sip {
+            profile_id: "backup-sbc".into(),
+        });
+        match &mut backup_route.destination.endpoint {
+            LegEndpointConfig::Sip(endpoint) => endpoint.uri = Some(backup_target.into()),
+            _ => panic!("fixture destination must be SIP"),
+        }
+        config.api.routes.insert("backup".into(), backup_route);
+
+        config.validate().unwrap();
+        let bind = "127.0.0.1:5070".parse().unwrap();
+        let (listener, _) = config
+            .generic_sip_stack_config("isolated-profile-test", bind)
+            .unwrap();
+        let profiles = config
+            .sip_egress_profile_configs("isolated-profile-test", bind)
+            .unwrap();
+        assert_eq!(profiles.len(), 2);
+        let pcma = profiles
+            .iter()
+            .find(|profile| profile.stack.offered_codecs == [8, 101])
+            .unwrap();
+        let pcmu_opus = profiles
+            .iter()
+            .find(|profile| profile.stack.offered_codecs == [0, 111, 101])
+            .unwrap();
+        assert!(!pcma.stack.offer_srtp);
+        assert!(!pcma.stack.srtp_required);
+        assert_eq!(
+            pcma.stack.tls_extra_ca_path.as_deref(),
+            Some(std::path::Path::new("/run/tls/support-b-ca.pem"))
+        );
+        assert!(pcmu_opus.stack.offer_srtp);
+        assert!(!pcmu_opus.stack.srtp_required);
+        assert!(pcmu_opus.stack.tls_client_cert_path.is_some());
+        let mut media_ranges = profiles
+            .iter()
+            .map(|profile| (profile.stack.media_port_start, profile.stack.media_port_end))
+            .collect::<Vec<_>>();
+        media_ranges.sort_unstable();
+        assert!(listener.media_port_end < media_ranges[0].0);
+        assert!(media_ranges[0].1 < media_ranges[1].0);
+    }
+
+    #[tokio::test]
+    async fn referenced_vapi_profile_projects_one_identity_into_listener_and_attachment_resolver() {
+        let config = parse(&vapi_projection_yaml());
+        config.validate().unwrap();
+
+        let projections = config
+            .vapi_listener_principal_projections("default")
+            .unwrap();
+        assert_eq!(projections.len(), 1);
+        let projection = &projections[0];
+        assert_eq!(projection.profile_id, "vapi-public");
+        assert_eq!(projection.principal.subject, "vapi-edge");
+        assert_eq!(projection.principal.tenant.as_deref(), Some("default"));
+        assert_eq!(projection.principal.issuer.as_deref(), Some("vapi-managed"));
+        assert_eq!(projection.principal.scopes, vec!["calls:create"]);
+        assert_eq!(
+            projection.trusted_cidrs,
+            vec!["192.0.2.0/24".parse().unwrap()]
+        );
+
+        let policy = config
+            .sip_listener_auth_policy("default", rvoip_auth_core::bearer_stub(), "sip:connect")
+            .unwrap();
+        assert_eq!(
+            format!("{policy:?}"),
+            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 0 }"
+        );
+
+        let catalog = config.resolved_named_routes().unwrap();
+        let configured_route = catalog.routes.get("support").unwrap();
+        let route = NamedRouteBinding::new_with_profiles(
+            "support",
+            None,
+            configured_route.profile_bindings.clone(),
+        )
+        .unwrap();
+        let resolver = config
+            .attachment_principal_resolver(&["default".into()])
+            .unwrap();
+        let tenant = TenantId::parse("default").unwrap();
+        let leg = LegExecutionSpec {
+            leg_id: LegId::new(),
+            endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                uri: None,
+                initial_context: SipInitialContextMode::None,
+            }),
+        };
+        let api_principal = PrincipalFingerprint::new([0x91; 32]);
+        assert_eq!(
+            resolver
+                .resolve_principal(AttachmentPrincipalRequest {
+                    tenant: &tenant,
+                    leg: &leg,
+                    named_route: Some(&route),
+                    api_principal,
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        let attachment_principal = resolver
+            .resolve_authenticated_principal(AttachmentPrincipalRequest {
+                tenant: &tenant,
+                leg: &leg,
+                named_route: Some(&route),
+                api_principal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attachment_principal.subject, projection.principal.subject);
+        assert_eq!(attachment_principal.tenant, projection.principal.tenant);
+        assert_eq!(attachment_principal.issuer, projection.principal.issuer);
+        assert_eq!(attachment_principal.scopes, projection.principal.scopes);
+        assert_eq!(attachment_principal.method, projection.principal.method);
+    }
+
+    #[test]
+    fn unreferenced_vapi_profile_never_expands_listener_trust() {
+        let yaml = vapi_projection_yaml().replace(
+            "sip_profiles:\n",
+            r#"  unused-inventory:
+    tenant_id: default
+    principal_subject: unused-edge
+    issuer: unused-provider
+    scopes: [calls:create]
+    trusted_signaling_cidrs: [198.51.100.0/24]
+    tls:
+      certificate_chain: /run/tls/unused.pem
+      private_key: /run/tls/unused-key.pem
+    srtp_required: true
+    codecs: [pcmu]
+sip_profiles:
+"#,
+        );
+        let config = parse(&yaml);
+        config.validate().unwrap();
+        let projections = config
+            .vapi_listener_principal_projections("default")
+            .unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].profile_id, "vapi-public");
+        assert!(!projections[0]
+            .trusted_cidrs
+            .iter()
+            .any(|cidr| cidr.contains(&"198.51.100.42".parse::<IpAddr>().unwrap())));
+    }
+
+    #[test]
+    fn vapi_projection_rejects_cross_tenant_listener_and_conflicting_cidrs() {
+        let config = parse(&vapi_projection_yaml());
+        let error = config
+            .sip_listener_auth_policy("retail", rvoip_auth_core::bearer_stub(), "sip:connect")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exactly match the SIP listener tenant"));
+
+        let yaml = vapi_projection_yaml()
+            .replace(
+                "vapi_ingress_profiles:\n",
+                r#"    support-secondary:
+      tenant_id: default
+      ingress: [sip]
+      vapi_ingress_profile: vapi-secondary
+      destination_profile:
+        type: sip
+        profile_id: support-sbc
+      destination:
+        direction: outbound
+        signaling_initiator: bridgefu
+        media_flow: send_receive
+        endpoint:
+          type: sip
+          config:
+            uri: "sips:agent@support.example.test:5061;transport=tls"
+vapi_ingress_profiles:
+"#,
+            )
+            .replace(
+                "sip_profiles:\n",
+                r#"  vapi-secondary:
+    tenant_id: default
+    principal_subject: another-vapi-edge
+    issuer: another-vapi-provider
+    scopes: [calls:create]
+    trusted_signaling_cidrs: [192.0.2.128/25]
+    tls:
+      certificate_chain: /run/tls/sip.pem
+      private_key: /run/tls/sip-key.pem
+    srtp_required: true
+    codecs: [pcmu]
+sip_profiles:
+"#,
+            );
+        let error = parse(&yaml).validate().unwrap_err().to_string();
+        assert!(error.contains("overlapping trusted signaling CIDRs"));
+        assert!(error.contains("conflicting identities"));
+    }
+
+    #[test]
+    fn vapi_mtls_requires_explicit_leaf_mapping_and_projects_verified_identity() {
+        let missing_leaf = vapi_projection_yaml().replace(
+            "    srtp_required: true\n    codecs: [pcmu, opus]\n",
+            "    mtls_peer_ca_certificates: [/run/tls/vapi-ca.pem]\n    srtp_required: true\n    codecs: [pcmu, opus]\n",
+        );
+        let error = parse(&missing_leaf).validate().unwrap_err().to_string();
+        assert!(error.contains("mtls_leaf_certificate_sha256_fingerprints"));
+        assert!(error.contains("CA verification alone does not assign a principal"));
+
+        let fingerprint = "AB".repeat(32);
+        let configured = vapi_projection_yaml()
+            .replace(
+                "    srtp_required: true\n    codecs: [pcmu, opus]\n",
+                &format!(
+                    "    mtls_peer_ca_certificates: [/run/tls/vapi-ca.pem]\n    mtls_leaf_certificate_sha256_fingerprints: [{fingerprint}]\n    srtp_required: true\n    codecs: [pcmu, opus]\n"
+                ),
+            )
+            .replace(
+                "      private_key: /run/tls/sip-key.pem\n    srtp: required\n",
+                "      private_key: /run/tls/sip-key.pem\n      client_ca_certificate: /run/tls/vapi-ca.pem\n      require_client_certificate: true\n    srtp: required\n",
+            );
+        let config = parse(&configured);
+        config.validate().unwrap();
+        let policy = config
+            .sip_listener_auth_policy("default", rvoip_auth_core::bearer_stub(), "sip:connect")
+            .unwrap();
+        assert_eq!(
+            format!("{policy:?}"),
+            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 1 }"
+        );
+        assert!(!format!("{policy:?}").contains(&fingerprint));
+    }
+
+    #[test]
+    fn generic_networking_rejects_unsafe_or_incoherent_nat_configuration() {
+        let base = format!(
+            "{LEGACY}\napi:\n  enabled: true\n  bearer_token: shared-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n"
+        );
+        let relay_without_turn = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    ice_servers: []\n    ice_transport_policy: relay\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(relay_without_turn.contains("requires at least one TURN"));
+
+        let conflicting_sip = parse(&format!(
+            "{base}generic_bridge:\n  sip:\n    media_public_addr: 192.0.2.5:0\n    stun_server: stun.example.test:3478\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(conflicting_sip.contains("mutually exclusive"));
+
+        let conflicting_srflx = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    nat_1to1_ips: [192.0.2.6]\n    nat_1to1_candidate_type: srflx\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(conflicting_srflx.contains("cannot be combined with STUN"));
+
+        let empty_codecs = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    audio_codecs: []\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(empty_codecs.contains("audio_codecs must contain 1..=3"));
+
+        let explicit_codecs = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    audio_codecs: [opus, pcmu, pcma]\n"
+        ));
+        explicit_codecs.validate().unwrap();
+        let names = explicit_codecs
+            .generic_bridge
+            .webrtc_stack_config()
+            .unwrap()
+            .capabilities
+            .audio_codecs
+            .into_iter()
+            .map(|codec| codec.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["g.711-a".into(), "g.711-mu".into(), "opus".into()])
+        );
+    }
+
+    #[test]
+    fn standardcharter_canary_is_explicit_tenant_bound_and_false_by_default() {
+        assert!(parse(B4_TWO_TENANTS)
+            .standardcharter_canary_policy()
+            .unwrap()
+            .is_none());
+
+        let config = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  enabled: true\n  bearer_token: canary-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n  static_tenant: banking\ncontext:\n  allow_headers:\n    X-Correlation-Id: correlation_id\ngeneric_bridge:\n  enabled: true\n  standardcharter_canary:\n    enabled: true\n    tenant: banking\n"
+        ));
+        config.validate().unwrap();
+        let policy = config
+            .standardcharter_canary_policy()
+            .unwrap()
+            .expect("explicit canary policy");
+        assert_eq!(policy.tenant().as_str(), "banking");
+        let debug = format!("{policy:?}");
+        assert!(!debug.contains("inst-banking"));
+        assert!(!debug.contains("flow-banking"));
+    }
+
+    #[test]
+    fn standardcharter_canary_rejects_implicit_or_cross_tenant_routes() {
+        let missing_context = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  bearer_token: canary-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n  static_tenant: banking\ngeneric_bridge:\n  enabled: true\n  standardcharter_canary:\n    enabled: true\n    tenant: banking\n"
+        ));
+        assert!(missing_context.validate().is_err());
+
+        let wrong_tenant = parse(&format!(
+            "{B4_TWO_TENANTS}\napi:\n  bearer_token: canary-private\n  control_hmac_key: 0123456789abcdef0123456789abcdef\n  static_tenant: retail\ncontext:\n  allow_headers:\n    X-Correlation-Id: correlation_id\ngeneric_bridge:\n  enabled: true\n  standardcharter_canary:\n    enabled: true\n    tenant: banking\n"
+        ));
+        assert!(wrong_tenant.validate().is_err());
     }
 
     #[test]
@@ -1425,71 +7261,37 @@ sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
     }
 
     #[test]
-    fn provider_account_profiles_match_schema_defaults_and_are_globally_unique() {
+    fn telnyx_profile_and_media_defaults_match_schema_while_deferred_providers_fail() {
         let configured = parse(&format!(
             r#"{LEGACY}
 providers:
-  twilio:
-    account_sid: AC-account
-    auth_token: secret
   telnyx:
     api_key: secret
     connection_id: connection-a
     webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-  vonage:
-    application_id: application-a
-    private_key: private
-    signature_secret: secret
+    from: "+12065550100"
+    media_sip_authority: bridgefu.test:5060
+    media_sip_username: telnyx-media
+    media_sip_password: media-secret
 "#
         ));
         configured.validate().unwrap();
-        assert_eq!(
-            configured
-                .providers
-                .twilio
-                .as_ref()
-                .unwrap()
-                .account_profile,
-            "twilio"
-        );
-        assert_eq!(
-            configured
-                .providers
-                .telnyx
-                .as_ref()
-                .unwrap()
-                .account_profile,
-            "telnyx"
-        );
-        assert_eq!(
-            configured
-                .providers
-                .vonage
-                .as_ref()
-                .unwrap()
-                .account_profile,
-            "vonage"
-        );
+        let telnyx = configured.providers.telnyx.as_ref().unwrap();
+        assert_eq!(telnyx.account_profile, "telnyx");
+        assert_eq!(telnyx.media_sip_realm, "bridgefu");
+        assert_eq!(telnyx.media_sip_transport, "UDP");
 
-        let duplicate = parse(&format!(
-            r#"{LEGACY}
-providers:
-  twilio:
-    account_profile: shared-profile
-    account_sid: AC-account
-    auth_token: secret
-  telnyx:
-    account_profile: shared-profile
-    api_key: secret
-    connection_id: connection-a
-    webhook_public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-"#
-        ));
-        assert!(duplicate
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("globally unique"));
+        for provider in [
+            "twilio:\n    account_sid: AC-account\n    auth_token: secret",
+            "vonage:\n    application_id: application-a\n    private_key: private\n    signature_secret: secret",
+        ] {
+            let deferred = parse(&format!("{LEGACY}\nproviders:\n  {provider}\n"));
+            assert!(deferred
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("deferred"));
+        }
 
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../config/schema.json")).unwrap();
@@ -1547,7 +7349,149 @@ providers:
             "{LEGACY}\napi:\n  control_hmac_key: 'env:{MISSING_ENV}'\n"
         ));
         let error = missing.validate().unwrap_err().to_string();
-        assert!(error.contains(MISSING_ENV));
+        assert!(error.contains("referenced environment secret is unavailable"));
+        assert!(!error.contains(MISSING_ENV));
         assert!(!error.contains(&valid_secret));
+    }
+
+    #[test]
+    fn private_forwarding_is_role_bound_bounded_and_secret_redacted() {
+        const TOKEN_SECRET: &str = "private-forwarding-token-secret-32-bytes";
+        const BROADCAST_SECRET: &str = "split-broadcast-token-secret-32-bytes";
+        let gateway = parse(&format!(
+            r#"{LEGACY}
+runtime: {{mode: gateway, max_concurrent_calls: 1}}
+api:
+  http_bind: 127.0.0.1:9080
+  bearer_token: gateway-public-token
+  control_hmac_key: 0123456789abcdef0123456789abcdef
+generic_bridge:
+  enabled: true
+  sip_bind: 127.0.0.1:5070
+  webrtc_ws_bind: 127.0.0.1:8080
+  webrtc_whip_bind: 127.0.0.1:8081
+broadcast:
+  public_endpoint: uctp+quic://gateway.invalid:4444
+  token_secret: {BROADCAST_SECRET}
+private_forwarding:
+  enabled: true
+  token_signing_secret: {TOKEN_SECRET}
+  gateway:
+    gateway_id: gateway-a
+    bind: 127.0.0.1:0
+    tls:
+      certificate_chain: [/run/tls/gateway.pem]
+      private_key: /run/tls/gateway.key
+      peer_ca_certificates: [/run/tls/worker-ca.pem]
+    workers:
+      - worker_id: 00000000-0000-4000-8000-000000000002
+        endpoint: worker.internal:9443
+        server_name: worker.internal
+  limits:
+    max_active_routes: 2
+    max_peer_connections: 1
+    max_routes_per_peer: 2
+    media_queue_capacity: 10
+    reliable_queue_capacity: 16
+    inbound_queue_capacity: 16
+"#
+        ));
+        gateway.validate().unwrap();
+        let runtime = gateway.gateway_forwarding_config().unwrap();
+        assert_eq!(runtime.gateway_id, "gateway-a");
+        assert_eq!(runtime.workers.len(), 1);
+        assert_eq!(runtime.workers[0].endpoint, "worker.internal:9443");
+        assert_eq!(
+            format!("{:?}", runtime.token_key),
+            "PrivateTokenKey([redacted])"
+        );
+
+        let worker = parse(&format!(
+            r#"{LEGACY}
+runtime: {{mode: worker, max_concurrent_calls: 1}}
+persistence:
+  backend: postgres
+  database_url: postgres://database.invalid/bridgefu
+  worker_id: 00000000-0000-4000-8000-000000000002
+  redis_url: rediss://redis.invalid
+  redis_clustered: true
+api: {{enabled: false}}
+broadcast:
+  public_endpoint: uctp+quic://gateway.invalid:4444
+  token_secret: {BROADCAST_SECRET}
+private_forwarding:
+  enabled: true
+  token_signing_secret: {TOKEN_SECRET}
+  worker:
+    bind: 127.0.0.1:9443
+    tls:
+      certificate_chain: [/run/tls/worker.pem]
+      private_key: /run/tls/worker.key
+      peer_ca_certificates: [/run/tls/gateway-ca.pem]
+  limits:
+    max_active_routes: 2
+    max_peer_connections: 1
+    max_routes_per_peer: 2
+    media_queue_capacity: 10
+    reliable_queue_capacity: 16
+    inbound_queue_capacity: 16
+"#
+        ));
+        worker.validate().unwrap();
+        let runtime = worker.worker_forwarding_config().unwrap();
+        assert_eq!(
+            runtime.worker_id.to_string(),
+            "00000000-0000-4000-8000-000000000002"
+        );
+        assert_eq!(
+            runtime.bind,
+            "127.0.0.1:9443".parse::<SocketAddr>().unwrap()
+        );
+
+        let too_small = parse(&format!(
+            r#"{LEGACY}
+runtime: {{mode: gateway, max_concurrent_calls: 2}}
+api:
+  http_bind: 127.0.0.1:9080
+  bearer_token: gateway-public-token
+  control_hmac_key: 0123456789abcdef0123456789abcdef
+generic_bridge:
+  enabled: true
+  sip_bind: 127.0.0.1:5070
+  webrtc_ws_bind: 127.0.0.1:8080
+  webrtc_whip_bind: 127.0.0.1:8081
+broadcast:
+  public_endpoint: uctp+quic://gateway.invalid:4444
+  token_secret: {BROADCAST_SECRET}
+private_forwarding:
+  enabled: true
+  token_signing_secret: {TOKEN_SECRET}
+  gateway:
+    gateway_id: gateway-a
+    tls:
+      certificate_chain: [/run/tls/gateway.pem]
+      private_key: /run/tls/gateway.key
+      peer_ca_certificates: [/run/tls/worker-ca.pem]
+    workers:
+      - worker_id: 00000000-0000-4000-8000-000000000002
+        endpoint: worker.internal:9443
+        server_name: worker.internal
+  limits: {{max_active_routes: 2}}
+"#
+        ));
+        let error = too_small.validate().unwrap_err().to_string();
+        assert!(error.contains("limits are inconsistent"));
+        assert!(!error.contains(TOKEN_SECRET));
+        assert!(!error.contains(BROADCAST_SECRET));
+
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "private_forwarding:\n  token_signing_secret: {TOKEN_SECRET}\n  worker:\n    tls:\n      private_key: /private/worker.key\n"
+        ))
+        .unwrap();
+        redact_secrets(&mut value);
+        let rendered = serde_yaml::to_string(&value).unwrap();
+        assert!(!rendered.contains(TOKEN_SECRET));
+        assert!(!rendered.contains("/private/worker.key"));
+        assert_eq!(rendered.matches("[redacted]").count(), 2);
     }
 }

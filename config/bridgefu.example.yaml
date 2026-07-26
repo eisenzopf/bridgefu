@@ -61,26 +61,119 @@ tenants:
 observability:
   log_level: "info,rvoip_amazon_connect=debug"
   log_format: json           # json | pretty
-  http_bind: 0.0.0.0:9090    # serves /v1, /livez, /readyz, /metrics
+  http_bind: 0.0.0.0:9090    # gateway: operations only; all-in-one: API + operations
+  # OTLP/gRPC trace export is opt-in. Disabled mode opens no collector
+  # connection; stdout logging and Prometheus remain active.
+  otlp:
+    enabled: false
+    # endpoint: https://otel-collector.example.com:4317
+    service_name: bridgefu
+    sampling_ratio: 1.0      # parent-based trace-ID ratio, 0.0 through 1.0
+    max_queue_size: 2048     # bounded; spans are dropped if this queue fills
+    max_export_batch_size: 512
+    scheduled_delay_millis: 5000
+    export_timeout_millis: 10000
 
 runtime:
   mode: all-in-one            # all-in-one | gateway | worker | moq-relay
+  # worker binds only the observability endpoint and requires api.enabled:
+  # false plus PostgreSQL and clustered rediss:// coordination. gateway owns
+  # the authenticated /v1 call-control and provider-webhook HTTP API and also
+  # fails closed until its private UCTP forwarding and native SIP/WebRTC
+  # edges are configured;
+  # moq-relay additionally requires the role-separated block below.
   max_concurrent_calls: 100
   setup_timeout_secs: 30
   media_idle_timeout_secs: 30 # refreshed only by authoritative rvoip media activity
   drain_timeout_secs: 30
+
+# Required for role-separated `gateway` and `worker` modes. The QUIC TLS
+# handshake requires a certificate from the explicitly configured peer CA;
+# short-lived UCTP JWTs additionally bind gateway, worker audience, tenant,
+# scopes, expiry, and jti. Gateway routes use full RTP packets in UCTP 0.2
+# datagrams. Private forwarding supports complete RTCP packets through the
+# reserved bridgefu.rtcp.v1 reliable DataMessage; the current first-party SIP
+# and WebRTC adapters terminate RTCP hop-by-hop. Omit this entire block in
+# all-in-one and moq-relay modes.
+#
+# Gateway role:
+# private_forwarding:
+#   enabled: true
+#   token_signing_secret: env:BRIDGEFU_PRIVATE_FORWARDING_SECRET
+#   gateway:
+#     gateway_id: gateway-us-west-2a-01
+#     bind: 0.0.0.0:0
+#     tls:
+#       certificate_chain: [/run/tls/gateway.pem]
+#       private_key: /run/tls/gateway.key
+#       peer_ca_certificates: [/run/tls/worker-ca.pem]
+#     # The split gateway exposes this authenticated UCTP 0.2 attachment
+#     # listener plus the HTTPS API on api.http_bind and native SIP/WebRTC
+#     # listeners under generic_bridge. Keep health/metrics on the separate
+#     # observability.http_bind. Gateway mode requires api.enabled=true and
+#     # generic_bridge.enabled=true. The api.tls certificate is also reused
+#     # for WSS and WHIP/WHEP over HTTPS on non-loopback binds.
+#     public_uctp:
+#       bind: 0.0.0.0:4433
+#       tls:
+#         certificate_chain: [/run/tls/gateway.pem]
+#         private_key: /run/tls/gateway.key
+#       max_concurrent_connections: 2000
+#     workers:
+#       - worker_id: 00000000-0000-4000-8000-000000000001
+#         endpoint: 10.20.0.11:9443
+#         server_name: worker-01.bridgefu.internal
+#   limits:
+#     max_active_routes: 2000
+#     max_peer_connections: 256
+#     max_routes_per_peer: 1200
+#     media_queue_capacity: 10
+#     reliable_queue_capacity: 64
+#     inbound_queue_capacity: 64
+#   timeouts:
+#     connect_secs: 5
+#     signaling_secs: 5
+#     token_ttl_secs: 300
+#     health_interval_secs: 5
+#
+# Worker role (persistence.worker_id is the JWT audience and must match the
+# gateway target):
+# private_forwarding:
+#   enabled: true
+#   token_signing_secret: env:BRIDGEFU_PRIVATE_FORWARDING_SECRET
+#   worker:
+#     bind: 0.0.0.0:9443
+#     tls:
+#       certificate_chain: [/run/tls/worker.pem]
+#       private_key: /run/tls/worker.key
+#       peer_ca_certificates: [/run/tls/gateway-ca.pem]
+#   limits:
+#     max_active_routes: 2000
+#     max_peer_connections: 256
+#     max_routes_per_peer: 1200
+#     media_queue_capacity: 10
+#     reliable_queue_capacity: 64
+#     inbound_queue_capacity: 64
+#   timeouts:
+#     connect_secs: 5
+#     signaling_secs: 5
+#     token_ttl_secs: 300
+#     health_interval_secs: 5
 
 # Transactional call state is durable by default. The local path is suitable
 # for an all-in-one process; mount its parent directory in a container.
 persistence:
   backend: sqlite             # sqlite | postgres | memory (dev/test only)
   database_url: sqlite:///var/lib/bridgefu/bridgefu.db
-  # PostgreSQL clusters require a distinct, stable non-nil UUID per worker.
+  # PostgreSQL execution workers require a distinct, stable non-nil UUID.
+  # A gateway control plane deliberately omits worker_id.
   # worker_id: 00000000-0000-4000-8000-000000000001
   deployment_id: bridgefu
   worker_lease_ttl_secs: 30
   worker_renew_interval_secs: 10
-  worker_capabilities: [sip, webrtc, amazon_connect, twilio, telnyx, vonage]
+  # This is an allowlist. Startup advertises only entries backed by adapters
+  # and provider executors actually constructed in this worker.
+  worker_capabilities: [sip, webrtc, sip_egress, webrtc_egress, amazon_connect, telnyx]
   # Optional projection/cache. PostgreSQL always remains authoritative, but
   # clustered PostgreSQL requires rediss:// and redis_clustered: true.
   # redis_url: env:BRIDGEFU_REDIS_URL
@@ -93,48 +186,314 @@ persistence:
 
 api:
   enabled: true
+  # Required only in gateway mode. This public router contains /v1 call
+  # control and provider webhooks but never /metrics or health endpoints.
+  # http_bind: 0.0.0.0:9080
+  # Non-loopback binds fail closed unless Bridgefu terminates HTTPS here.
+  # tls:
+  #   certificate_chain: /run/tls/public-api.pem
+  #   private_key: /run/tls/public-api.key
   bearer_token: env:BRIDGEFU_API_TOKEN
   # At least 32 bytes. Required for transactional /v1/calls operations.
   control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
   # Required with the compatibility shared key when multiple tenants exist.
   # static_tenant: banking
+  # In-memory token buckets are deliberately bounded. Authenticated control
+  # and diagnostics requests are isolated by issuer+tenant+subject digest;
+  # provider webhooks use a separate gateway-wide pre-verification bucket.
+  rate_limit:
+    enabled: true
+    control_requests_per_second: 50
+    control_burst: 100
+    diagnostics_requests_per_second: 2
+    diagnostics_burst: 4
+    webhook_requests_per_second: 100
+    webhook_burst: 200
+    max_tracked_identities: 10000
+    identity_idle_ttl_secs: 300
+
+# Named routes are the only public route-selection surface. Callers submit a
+# route ID, ingress kind, and sanitized context; every destination, identity,
+# TLS posture, and credential remains server-owned. The profile ID plus a
+# SHA-256 revision of its non-secret fields is persisted with each call.
+# vapi_ingress_profiles:
+#   vapi-production:
+#     tenant_id: banking
+#     principal_subject: vapi-transfer-edge
+#     issuer: vapi-managed
+#     scopes: [calls:create]
+#     trusted_signaling_cidrs: [192.0.2.0/24]
+#     tls:
+#       certificate_chain: /run/tls/sip-public.pem
+#       private_key: env:BRIDGEFU_SIP_TLS_KEY_PATH
+#     digest:
+#       realm: bridgefu.example
+#       username: vapi-transfer
+#       password: env:VAPI_SIP_DIGEST_PASSWORD
+#     # CA verification alone does not establish a Bridgefu principal. When
+#     # mTLS is enabled, explicitly bind every accepted leaf certificate to
+#     # this profile (lower/upper-case hexadecimal are both accepted).
+#     # mtls_peer_ca_certificates: [/run/tls/vapi-client-ca.pem]
+#     # mtls_leaf_certificate_sha256_fingerprints:
+#     #   - 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+#     srtp_required: true
+#     codecs: [pcmu, opus]
+# sip_profiles:
+#   vapi-direct-assistant:
+#     allowed_targets: ["sips:standard-charter-direct@sip.vapi.ai;transport=tls"]
+#     from_uri: "sips:bridgefu@bridge.example"
+#     tls_roots: [/etc/ssl/certs/ca-certificates.crt]
+#     srtp: required
+#     codecs: [pcmu, opus]
+#     # StandardCharter signs this opaque value; Vapi receives it as a SIP
+#     # template variable and injects it into a static (non-LLM) tool field.
+#     metadata_keys: [correlation_id, handoff_token]
+#   support-sbc:
+#     allowed_targets: ["sips:support@sbc.example:5061;transport=tls"]
+#     from_uri: "sips:bridgefu@bridge.example"
+#     outbound_proxy: "sips:sbc.example:5061;lr"
+#     auth:
+#       type: digest
+#       username: bridgefu
+#       password: env:SUPPORT_SBC_PASSWORD
+#     tls_roots: [/run/tls/support-sbc-ca.pem]
+#     srtp: required
+#     codecs: [pcmu, opus]
+#     metadata_keys: [correlation_id, account_tier]
+# webrtc_profiles:
+#   browser-public:
+#     allowed_signaling_origins: ["wss://bridge.example"]
+#     tls_roots: [/run/tls/public-ca.pem]
+#     codecs: [opus]
+#     data_channels: true
+# Add the following sibling keys to the `api` block above:
+# route_attachments:
+#   sip_uri_template: "sips:{token}@bridge.example:5061;transport=tls"
+#   webrtc:
+#     signaling_uri: "wss://bridge.example/webrtc"
+#     ice_servers:
+#       - urls: ["turns:turn.example:5349?transport=tcp"]
+#         username: bridgefu
+#         credential: env:BRIDGEFU_TURN_PASSWORD
+# routes:
+#   vapi-direct-assistant:
+#     tenant_id: banking
+#     ingress: [webrtc]
+#     webrtc_ingress_profile: browser-public
+#     destination_profile:
+#       type: sip
+#       profile_id: vapi-direct-assistant
+#     destination:
+#       direction: outbound
+#       signaling_initiator: bridgefu
+#       media_flow: send_receive
+#       endpoint:
+#         type: sip
+#         config:
+#           uri: "sips:standard-charter-direct@sip.vapi.ai;transport=tls"
+#           initial_context: required
+#   support:
+#     tenant_id: banking
+#     ingress: [sip, webrtc]
+#     vapi_ingress_profile: vapi-production
+#     webrtc_ingress_profile: browser-public
+#     destination_profile:
+#       type: sip
+#       profile_id: support-sbc
+#     destination:
+#       direction: outbound
+#       signaling_initiator: bridgefu
+#       media_flow: send_receive
+#       endpoint:
+#         type: sip
+#         config:
+#           uri: "sips:support@sbc.example:5061;transport=tls"
 
 context:
   allow_headers:
     X-Correlation-Id: correlation_id
     X-Vapi-Call-Id: vapi_call_id
     X-Account-Tier: account_tier
+    # Direct-browser calls carry only a signed opaque StandardCharter session
+    # mapping. It is never a Bridgefu API credential or destination selector.
+    # Vapi removes the leading X- and exposes this as the trusted template
+    # variable `bridgefu_handoff_token` for static custom-tool parameters.
+    X-Bridgefu_Handoff_Token: handoff_token
+    # Required only when this tenant explicitly opts into the sanitized MOQT
+    # event track below. The header value must be one of the fixed public
+    # event names; arbitrary context and identifiers are never published.
+    X-Bridgefu-Event: broadcast_event
 
 broadcast:
   default_transport: moqt     # moqt | uctp-quic
   token_ttl_secs: 300
   max_active: 100
+  # Event disclosure is off by default. A tenant entry only permits a caller
+  # to request `sanitized_events: true` for an MOQT broadcast.
+  sanitized_events:
+    tenants:
+      banking:
+        context_metadata_key: broadcast_event
+        queue_events: 64
+        history_events: 64
+        max_events_per_second: 8
+  # A real receive-only UCTP listener is opt-in and currently colocated with
+  # the all-in-one generic media Orchestrator. The advertised URL must route
+  # to this UDP/QUIC bind; subscriber JWTs are tenant/broadcast-bound.
+  # public_endpoint: uctp+quic://bridge.example.com:4446
+  # token_secret: env:BRIDGEFU_BROADCAST_TOKEN_SECRET
+  # uctp_listener:
+  #   bind: 0.0.0.0:4446
+  #   max_concurrent_connections: 1024
+  #   tls:
+  #     certificate_chain: [/run/tls/uctp-server.pem]
+  #     private_key: /run/tls/uctp-server.key
+  # Split worker origin topology. `publisher_endpoint` is the private mTLS
+  # listener; only `subscriber_endpoint` may be returned to listeners. Random
+  # Bridgefu namespaces remain fail-closed until the exact-namespace dynamic
+  # publisher-authority change is owner-reviewed and enabled.
+  # moq_origin_relay:
+  #   bind: 0.0.0.0:0
+  #   publisher_endpoint: moqt://relay.internal.example:4443
+  #   subscriber_endpoint: https://relay.example.com:4444
+  #   root_certificates: [/run/tls/relay-ca.pem]
+  #   client_certificate: /run/tls/origin-client.pem
+  #   client_private_key: /run/tls/origin-client.key
   public_endpoint: moqt://127.0.0.1:4443
   token_secret: env:BRIDGEFU_BROADCAST_TOKEN_SECRET
 
-# Optional normal rvoip SIP↔WebRTC bridge, independent of the Amazon listener.
-# Inbound legs attach to explicit durable calls using their one-time tokens;
-# SIP, WebRTC, and the control API share api.bearer_token.
+# Required only for `runtime.mode: moq-relay`. Production runs three distinct
+# least-privilege UDP listeners over one shared topology: publisher mTLS,
+# browser WebTransport subscribers, and native raw-QUIC subscribers. Every
+# publisher certificate binding is an exact namespace scope.
+# moq_relay:
+#   publisher:
+#     bind: 0.0.0.0:4443
+#     advertised_endpoint: moqt://relay.example.com:4443
+#     certificate_bindings:
+#       - certificate_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+#         scope: /tenant-id/broadcast-id
+#     max_active_sessions_per_certificate: 64
+#   subscriber_webtransport:
+#     bind: 0.0.0.0:4444
+#     advertised_endpoint: moqt://relay.example.com:4444
+#   subscriber_raw_quic:
+#     bind: 0.0.0.0:4445
+#     advertised_endpoint: moqt://relay.example.com:4445
+#   tls:
+#     server_certificates: [/run/tls/server.pem]
+#     server_private_keys: [/run/tls/server.key]
+#     publisher_client_ca_certificates: [/run/tls/publisher-ca.pem]
+#   diagnostics_bearer_token: env:BRIDGEFU_MOQ_DIAGNOSTICS_TOKEN
+
+# Normal rvoip SIP↔WebRTC bridge, independent of the Amazon listener. It is
+# optional in all-in-one mode and required in gateway mode. Inbound legs attach
+# to explicit durable calls using one-time tokens. WebRTC and the control API
+# share api.bearer_token. SIP uses optional Telnyx Digest by default; cleartext
+# SIP Bearer is rejected unless the explicit opt-in below is enabled on a
+# separately restricted private/carrier network. Non-loopback gateway WebRTC
+# uses api.tls for WSS and WHIP/WHEP HTTPS.
 generic_bridge:
   enabled: false
   sip_bind: 0.0.0.0:5070
   webrtc_ws_bind: 0.0.0.0:8080
   webrtc_whip_bind: 0.0.0.0:8081
+  sip:
+    # Reusable Bearer credentials are visible to on-path observers on SIP
+    # UDP/TCP. Leave false for Telnyx Digest and ordinary production edges.
+    allow_cleartext_bearer: false
+    # First-party Digest alternative for a generic SIP peer. When Telnyx is
+    # also configured, both identities must share this exact realm and use
+    # distinct usernames so one listener can challenge them unambiguously.
+    # digest:
+    #   realm: bridgefu.example
+    #   username: generic-carrier
+    #   password: env:BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD
+    # Public Via/Contact address for containers or 1:1 NAT. rvoip always
+    # requests and honors RFC 3581 rport; omit this on a directly routed host.
+    # advertised_addr: 203.0.113.10:5070
+    # Named Vapi SIP attachments use this actual rvoip TLS listener. Its
+    # certificate/key and optional client CA must match every referenced Vapi
+    # ingress profile; Bridgefu refuses to advertise SIPS without it.
+    # secure_listener:
+    #   bind: 0.0.0.0:5061
+    #   advertised_addr: 203.0.113.10:5061
+    #   certificate_chain: /run/tls/sip-public.pem
+    #   private_key: env:BRIDGEFU_SIP_TLS_KEY_PATH
+    #   client_ca_certificate: /run/tls/vapi-client-ca.pem
+    #   require_client_certificate: false
+    # Mandatory named Vapi ingress requires `required`; disabled preserves the
+    # legacy plain-RTP listener when no secure named route is configured.
+    srtp: disabled # required | preferred | disabled
+    # Port 0 replaces only the SDP IP while retaining each allocated RTP port.
+    # media_public_addr: 203.0.113.10:0
+    # stun_server: stun.example.net:3478 # mutually exclusive with media_public_addr
+    rtp_port_start: 16384
+    rtp_port_end: 32767
+    symmetric_rtp:
+      enabled: true
+      allow_ip_change: false
+      probation_packets: 3
+      max_rebindings: 2
+      rebind_window_secs: 2
+      max_sequence_jump: 512
+  webrtc:
+    udp_bind: 0.0.0.0:0
+    # Keep browser ingress deterministic: the final answer has exactly one
+    # primary audio codec/PT. SIP destinations still negotiate G.711 on their
+    # independent SIP profile and Bridgefu transcodes at the MediaGraph.
+    audio_codecs: [opus]
+    # Omit ice_servers to retain rvoip's default STUN entry. Use [] for no
+    # external ICE service, or configure STUN/TURN explicitly as below.
+    # ice_servers:
+    #   - urls: [stun:turn.example.net:3478, "turn:turn.example.net:3478?transport=udp"]
+    #     username: bridgefu
+    #     credential: env:BRIDGEFU_TURN_PASSWORD
+    ice_transport_policy: all # all | relay
+    # nat_1to1_ips: [203.0.113.10]
+    # nat_1to1_candidate_type: host # host | srflx
+    gather_timeout_secs: 5
+    connection_timeout_secs: 15 # bounds ICE selection plus DTLS handshake
+    trickle_ice: true
+  # Separate, false-by-default durable canary for the existing Vapi contract.
+  # It accepts only an authenticated `sip:<tenant>` whose exact principal,
+  # tenant, and single X-Correlation-Id match this policy. The selected tenant
+  # mapping must rename X-Correlation-Id to the Amazon `correlation_id`
+  # attribute. The legacy listener above remains unchanged and continues to be
+  # the default production route.
+  standardcharter_canary:
+    enabled: false
+    # tenant: banking # must equal api.static_tenant and a configured tenant
+    trusted_subject: bridgefu-static-api-key
+    trusted_issuer: bridgefu:configured-api-key
+    correlation_header: X-Correlation-Id
+    amazon_profile: default
 
-# Configure any subset. Provider media is delivered through SIP/RTP.
+# Telnyx is the sole Bridgefu 1.0 provider-control integration. Provider media
+# is delivered through a unique SIP/RTP attachment. Persisted Twilio/Vonage
+# discriminants remain readable, but their configuration is rejected for new
+# 1.0 work.
 # providers:
-#   twilio:
-#     account_profile: twilio-sandbox # referenced by provider call legs
-#     account_sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#     auth_token: env:TWILIO_AUTH_TOKEN
 #   telnyx:
 #     account_profile: telnyx-sandbox
 #     connection_id: "0000000000000000000"
 #     api_key: env:TELNYX_API_KEY
 #     webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
-#   vonage:
-#     account_profile: vonage-sandbox
-#     application_id: 00000000-0000-0000-0000-000000000000
-#     private_key: env:VONAGE_PRIVATE_KEY_PEM
-#     signature_secret: env:VONAGE_SIGNATURE_SECRET
+#     # Caller identity used by both Telnyx Dial commands.
+#     from: "+15551234567"
+#     # Public SIP authority Telnyx calls for the hidden media attachment.
+#     media_sip_authority: bridge.example.com:5061
+#     media_sip_username: telnyx-media
+#     media_sip_password: env:TELNYX_MEDIA_SIP_PASSWORD
+#     media_sip_realm: bridgefu
+#     media_sip_transport: TLS
+#     # Optional per-call callback override; otherwise use the Telnyx
+#     # connection profile's webhook URL.
+#     webhook_url: https://bridge.example.com/v1/providers/telnyx/webhooks
+#     # Total timeout for each SDK attempt. Bridgefu supplies a durable UUID
+#     # command_id, so retries send the byte-identical mutation body.
+#     request_timeout_ms: 15000
+#     # Retries connection/timeouts and HTTP 408/409/429/5xx with the SDK's
+#     # bounded full-jitter backoff. Set to 0 to disable; maximum is 5.
+#     max_retries: 2
 providers: {}

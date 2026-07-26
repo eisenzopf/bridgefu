@@ -1,39 +1,294 @@
+name: bridgefu
+
+x-bridgefu-build: &bridgefu-build
+  context: .
+  dockerfile: deploy/Dockerfile
+  additional_contexts:
+    rvoip: ../rvoip
+
+x-bridgefu-environment: &bridgefu-environment
+  BRIDGEFU_API_TOKEN: ${BRIDGEFU_API_TOKEN:-development-api-token}
+  BRIDGEFU_CONTROL_HMAC_KEY: ${BRIDGEFU_CONTROL_HMAC_KEY:-change-this-32-byte-control-key-now}
+  BRIDGEFU_BROADCAST_TOKEN_SECRET: ${BRIDGEFU_BROADCAST_TOKEN_SECRET:-development-broadcast-secret}
+  BRIDGEFU_MOQ_DIAGNOSTICS_TOKEN: ${BRIDGEFU_MOQ_DIAGNOSTICS_TOKEN:-development-moq-diagnostics-token}
+  BRIDGEFU_PRIVATE_FORWARDING_SECRET: ${BRIDGEFU_PRIVATE_FORWARDING_SECRET:-development-private-forwarding-key}
+  BRIDGEFU__SIP__ADVERTISED_IP: ${BRIDGEFU_ADVERTISED_IP:-127.0.0.1}
+  BRIDGEFU__SIP__MEDIA_PUBLIC_IP: ${BRIDGEFU_MEDIA_PUBLIC_IP:-127.0.0.1}
+
+x-bridgefu-service: &bridgefu-service
+  build: *bridgefu-build
+  image: bridgefu:local
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  volumes:
+    - ${BRIDGEFU_CONFIG:-./config/bridgefu.example.yaml}:/etc/bridgefu/bridgefu.yaml:ro
+    - bridgefu-data:/var/lib/bridgefu
+  environment: *bridgefu-environment
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  stop_grace_period: 35s
+  healthcheck:
+    test: [CMD, curl, --fail, --silent, http://127.0.0.1:9090/readyz]
+    interval: 15s
+    timeout: 3s
+    start_period: 20s
+    retries: 3
+
+x-public-ports: &public-ports
+  - 5060:5060/udp
+  - 5060:5060/tcp
+  - 5070:5070/udp
+  - 5070:5070/tcp
+  - 8080:8080/tcp
+  - 8081:8081/tcp
+  - 9090:9090/tcp
+  - 4433:4433/udp
+  - 4443:4443/udp
+
 services:
-  bridgefu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      additional_contexts:
-        rvoip: ../rvoip
-    image: bridgefu:local
-    init: true
+  # Existing StandardCharter flow. Supply BRIDGEFU_CONFIG and AWS credentials
+  # through the normal AWS credential chain; no credential is baked here.
+  standardcharter:
+    <<: *bridgefu-service
+    profiles: [standardcharter]
+    ports: *public-ports
+
+  # Generic SIP <-> WebRTC. Coturn is enabled by the same profile, but its
+  # credentials and advertised address must be supplied explicitly.
+  generic:
+    <<: *bridgefu-service
+    profiles: [generic]
+    ports: *public-ports
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__GENERIC_BRIDGE__ENABLED: "true"
+      BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD: ${BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD:-bridgefu-local-sip-digest}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__REALM: ${BRIDGEFU_GENERIC_SIP_DIGEST_REALM:-bridgefu-compose}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__USERNAME: ${BRIDGEFU_GENERIC_SIP_DIGEST_USERNAME:-compose-generic}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__PASSWORD: env:BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD
+      BRIDGEFU_TURN_PASSWORD: ${TURN_PASSWORD:-bridgefu-local-turn-password}
+      BRIDGEFU__GENERIC_BRIDGE__WEBRTC__ICE_SERVERS: >-
+        [{"urls":["stun:coturn:3478","turn:coturn:3478?transport=udp"],"username":"${TURN_USERNAME:-bridgefu}","credential":"env:BRIDGEFU_TURN_PASSWORD"}]
+
+  telnyx:
+    <<: *bridgefu-service
+    profiles: [telnyx]
+    ports: *public-ports
+    environment:
+      <<: *bridgefu-environment
+      TELNYX_API_KEY: ${TELNYX_API_KEY:-}
+      TELNYX_WEBHOOK_PUBLIC_KEY: ${TELNYX_WEBHOOK_PUBLIC_KEY:-}
+      TELNYX_MEDIA_SIP_PASSWORD: ${TELNYX_MEDIA_SIP_PASSWORD:-}
+      BRIDGEFU__PROVIDERS__TELNYX: >-
+        {"account_profile":"${TELNYX_ACCOUNT_PROFILE:-telnyx-sandbox}","connection_id":"${TELNYX_CONNECTION_ID:-}","api_key":"env:TELNYX_API_KEY","webhook_public_key":"env:TELNYX_WEBHOOK_PUBLIC_KEY","from":"${TELNYX_FROM:-}","media_sip_authority":"${TELNYX_MEDIA_SIP_AUTHORITY:-}","media_sip_username":"${TELNYX_MEDIA_SIP_USERNAME:-telnyx-media}","media_sip_password":"env:TELNYX_MEDIA_SIP_PASSWORD","media_sip_realm":"${TELNYX_MEDIA_SIP_REALM:-bridgefu}","media_sip_transport":"${TELNYX_MEDIA_SIP_TRANSPORT:-UDP}","request_timeout_ms":15000,"max_retries":2}
+
+  uctp:
+    <<: *bridgefu-service
+    profiles: [uctp]
+    ports: *public-ports
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__BROADCAST__DEFAULT_TRANSPORT: uctp-quic
+
+  moqt:
+    <<: *bridgefu-service
+    profiles: [moqt]
+    ports: *public-ports
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__BROADCAST__DEFAULT_TRANSPORT: moqt
+
+  # Local clustered topology. TLS material is caller-owned: mount a directory
+  # containing ca.crt, redis.{crt,key}, gateway.{crt,key},
+  # public-uctp.{crt,key}, public-api.{crt,key}, and worker.{crt,key} via
+  # BRIDGEFU_TLS_DIR. The public-api identity also terminates WSS/WHIPS. This
+  # intentionally exercises the
+  # same rediss:// and mutually authenticated private-QUIC requirements as
+  # production.
+  postgres:
+    profiles: [cluster]
+    image: docker.io/library/postgres:17-bookworm@sha256:5530681ea5d3e2ed4ce396f9b5cb443efbac6baf2a8a19c0c0635e40ae7eadce
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777
-    volumes:
-      - ./config/bridgefu.example.yaml:/etc/bridgefu/bridgefu.yaml:ro
-      - bridgefu-data:/var/lib/bridgefu
+      - /tmp:size=32m,mode=1777
+      - /var/run/postgresql:size=16m,uid=999,gid=999
     environment:
-      BRIDGEFU__SIP__ADVERTISED_IP: "127.0.0.1"
-      BRIDGEFU__SIP__MEDIA_PUBLIC_IP: "127.0.0.1"
-      BRIDGEFU_API_TOKEN: change-me
-      BRIDGEFU_CONTROL_HMAC_KEY: change-this-32-byte-control-key-now
-      BRIDGEFU_BROADCAST_TOKEN_SECRET: change-me-too
+      POSTGRES_DB: bridgefu
+      POSTGRES_USER: bridgefu
+      POSTGRES_PASSWORD: ${BRIDGEFU_POSTGRES_PASSWORD:-bridgefu-local-only}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U bridgefu -d bridgefu]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt: [no-new-privileges:true]
+
+  redis:
+    profiles: [cluster]
+    image: docker.io/library/redis:7.2-bookworm@sha256:e51cbc16f94b2426e80b9516db174a07d55e882217a1ec1d729b137b32e24e42
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ${BRIDGEFU_TLS_DIR:-./deploy/tls}:/run/tls:ro
+      - redis-data:/data
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /run/tls/redis.crt
+      - --tls-key-file
+      - /run/tls/redis.key
+      - --tls-ca-cert-file
+      - /run/tls/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --requirepass
+      - ${BRIDGEFU_REDIS_PASSWORD:-bridgefu-redis-local-only}
+      - --appendonly
+      - "yes"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /run/tls/ca.crt -a '$${BRIDGEFU_REDIS_PASSWORD:-bridgefu-redis-local-only}' ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt: [no-new-privileges:true]
+
+  gateway:
+    <<: *bridgefu-service
+    profiles: [cluster]
     ports:
-      - "5060:5060/udp"
-      - "5060:5060/tcp"
-      - "5070:5070/udp"
-      - "5070:5070/tcp"
-      - "8080:8080/tcp"
-      - "8081:8081/tcp"
-      - "9090:9090/tcp"
-      - "4433:4433/udp"
-      - "4443:4443/udp"
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      - 9090:9090/tcp
+      - 9080:9080/tcp
+      - 4433:4433/udp
+      - 5070:5070/udp
+      - 8080:8080/tcp
+      - 8081:8081/tcp
+      - 20000-20199:20000-20199/udp
+      - 40000:40000/udp
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__RUNTIME__MODE: gateway
+      BRIDGEFU__PERSISTENCE__BACKEND: postgres
+      BRIDGEFU__PERSISTENCE__DATABASE_URL: postgres://bridgefu:${BRIDGEFU_POSTGRES_PASSWORD:-bridgefu-local-only}@postgres/bridgefu
+      BRIDGEFU__PERSISTENCE__REDIS_URL: rediss://:${BRIDGEFU_REDIS_PASSWORD:-bridgefu-redis-local-only}@redis:6379
+      BRIDGEFU__PERSISTENCE__REDIS_CLUSTERED: "true"
+      BRIDGEFU__API__ENABLED: "true"
+      BRIDGEFU__API__HTTP_BIND: 0.0.0.0:9080
+      BRIDGEFU__API__TLS__CERTIFICATE_CHAIN: /run/tls/public-api.crt
+      BRIDGEFU__API__TLS__PRIVATE_KEY: /run/tls/public-api.key
+      BRIDGEFU__GENERIC_BRIDGE__ENABLED: "true"
+      BRIDGEFU__GENERIC_BRIDGE__SIP_BIND: 0.0.0.0:5070
+      BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD: ${BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD:-bridgefu-local-sip-digest}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__REALM: ${BRIDGEFU_GENERIC_SIP_DIGEST_REALM:-bridgefu-compose}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__USERNAME: ${BRIDGEFU_GENERIC_SIP_DIGEST_USERNAME:-compose-generic}
+      BRIDGEFU__GENERIC_BRIDGE__SIP__DIGEST__PASSWORD: env:BRIDGEFU_GENERIC_SIP_DIGEST_PASSWORD
+      BRIDGEFU__GENERIC_BRIDGE__SIP__RTP_PORT_START: "20000"
+      BRIDGEFU__GENERIC_BRIDGE__SIP__RTP_PORT_END: "20199"
+      BRIDGEFU__GENERIC_BRIDGE__WEBRTC_WS_BIND: 0.0.0.0:8080
+      BRIDGEFU__GENERIC_BRIDGE__WEBRTC_WHIP_BIND: 0.0.0.0:8081
+      BRIDGEFU__GENERIC_BRIDGE__WEBRTC__UDP_BIND: 0.0.0.0:40000
+      BRIDGEFU__BROADCAST__PUBLIC_ENDPOINT: uctp+quic://${BRIDGEFU_PUBLIC_UCTP_HOST:-gateway.invalid}:4433
+      BRIDGEFU__PRIVATE_FORWARDING: >-
+        {"enabled":true,"token_signing_secret":"env:BRIDGEFU_PRIVATE_FORWARDING_SECRET","gateway":{"gateway_id":"compose-gateway","bind":"0.0.0.0:0","tls":{"certificate_chain":["/run/tls/gateway.crt"],"private_key":"/run/tls/gateway.key","peer_ca_certificates":["/run/tls/ca.crt"]},"public_uctp":{"bind":"0.0.0.0:4433","tls":{"certificate_chain":["/run/tls/public-uctp.crt"],"private_key":"/run/tls/public-uctp.key"},"max_concurrent_connections":2000},"workers":[{"worker_id":"00000000-0000-4000-8000-000000000011","endpoint":"worker:9443","server_name":"worker"}]},"limits":{"max_active_routes":2000,"max_routes_per_peer":1200}}
+      SSL_CERT_FILE: /run/tls/ca.crt
+    volumes:
+      - ${BRIDGEFU_CONFIG:-./config/bridgefu.example.yaml}:/etc/bridgefu/bridgefu.yaml:ro
+      - ${BRIDGEFU_TLS_DIR:-./deploy/tls}:/run/tls:ro
+      - gateway-data:/var/lib/bridgefu
+
+  worker:
+    <<: *bridgefu-service
+    profiles: [cluster]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ${BRIDGEFU_CONFIG:-./config/bridgefu.example.yaml}:/etc/bridgefu/bridgefu.yaml:ro
+      - ${BRIDGEFU_TLS_DIR:-./deploy/tls}:/run/tls:ro
+      - worker-data:/var/lib/bridgefu
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__RUNTIME__MODE: worker
+      BRIDGEFU__PERSISTENCE__BACKEND: postgres
+      BRIDGEFU__PERSISTENCE__DATABASE_URL: postgres://bridgefu:${BRIDGEFU_POSTGRES_PASSWORD:-bridgefu-local-only}@postgres/bridgefu
+      BRIDGEFU__PERSISTENCE__WORKER_ID: 00000000-0000-4000-8000-000000000011
+      BRIDGEFU__PERSISTENCE__REDIS_URL: rediss://:${BRIDGEFU_REDIS_PASSWORD:-bridgefu-redis-local-only}@redis:6379
+      BRIDGEFU__PERSISTENCE__REDIS_CLUSTERED: "true"
+      BRIDGEFU__API__ENABLED: "false"
+      BRIDGEFU__BROADCAST__PUBLIC_ENDPOINT: uctp+quic://${BRIDGEFU_PUBLIC_UCTP_HOST:-gateway.invalid}:4433
+      BRIDGEFU__PRIVATE_FORWARDING: >-
+        {"enabled":true,"token_signing_secret":"env:BRIDGEFU_PRIVATE_FORWARDING_SECRET","worker":{"bind":"0.0.0.0:9443","tls":{"certificate_chain":["/run/tls/worker.crt"],"private_key":"/run/tls/worker.key","peer_ca_certificates":["/run/tls/ca.crt"]}},"limits":{"max_active_routes":2000,"max_routes_per_peer":1200}}
+      SSL_CERT_FILE: /run/tls/ca.crt
+
+  moq-relay:
+    <<: *bridgefu-service
+    profiles: [cluster]
+    ports:
+      - 4443:4443/udp
+      - 4444:4444/udp
+      - 4445:4445/udp
+      - 9190:9090/tcp
+    depends_on:
+      redis: {condition: service_healthy}
+    volumes:
+      - ${BRIDGEFU_CONFIG:-./config/bridgefu.example.yaml}:/etc/bridgefu/bridgefu.yaml:ro
+      - ${BRIDGEFU_TLS_DIR:-./deploy/tls}:/run/tls:ro
+      - relay-data:/var/lib/bridgefu
+    environment:
+      <<: *bridgefu-environment
+      BRIDGEFU__RUNTIME__MODE: moq-relay
+      BRIDGEFU__OBSERVABILITY__HTTP_BIND: 0.0.0.0:9090
+      BRIDGEFU__PERSISTENCE__REDIS_URL: rediss://:${BRIDGEFU_REDIS_PASSWORD:-bridgefu-redis-local-only}@redis:6379
+      BRIDGEFU__PERSISTENCE__REDIS_CLUSTERED: "true"
+      BRIDGEFU__API__ENABLED: "false"
+      BRIDGEFU__MOQ_RELAY: >-
+        {"publisher":{"bind":"0.0.0.0:4443","advertised_endpoint":"moqt://${BRIDGEFU_MOQ_ADVERTISED_HOST:-relay.invalid}:4443","certificate_bindings":[{"certificate_sha256":"${BRIDGEFU_MOQ_PUBLISHER_SHA256:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}","scope":"${BRIDGEFU_MOQ_PUBLISHER_SCOPE:-/default/compose-validation}"}]},"subscriber_webtransport":{"bind":"0.0.0.0:4444","advertised_endpoint":"moqt://${BRIDGEFU_MOQ_ADVERTISED_HOST:-relay.invalid}:4444"},"subscriber_raw_quic":{"bind":"0.0.0.0:4445","advertised_endpoint":"moqt://${BRIDGEFU_MOQ_ADVERTISED_HOST:-relay.invalid}:4445"},"tls":{"server_certificates":["/run/tls/server.pem"],"server_private_keys":["/run/tls/server.key"],"publisher_client_ca_certificates":["/run/tls/publisher-ca.pem"]},"diagnostics_bearer_token":"env:BRIDGEFU_MOQ_DIAGNOSTICS_TOKEN"}
+      SSL_CERT_FILE: /run/tls/ca.crt
+
+  coturn:
+    profiles: [generic]
+    image: docker.io/coturn/coturn:4.14.0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/tmp:size=32m,mode=1777
+    ports:
+      - 3478:3478/udp
+      - 3478:3478/tcp
+      - 49160-49200:49160-49200/udp
+    environment:
+      DETECT_EXTERNAL_IP: "no"
+    command:
+      - --fingerprint
+      - --realm=${TURN_REALM:-bridgefu.local}
+      - --user=${TURN_USERNAME:-bridgefu}:${TURN_PASSWORD:-bridgefu-local-turn-password}
+      - --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
 volumes:
   bridgefu-data:
+  postgres-data:
+  redis-data:
+  gateway-data:
+  worker-data:
+  relay-data:

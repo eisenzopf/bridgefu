@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use bridgefu::call_engine::{
-    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTokenDigest,
-    AttachmentTransport, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
-    CommandCommit, CommandId, ConnectionBinding, CreateCall, EffectIntent, IdempotencyKeyDigest,
-    LegDirection, LegId, LegKind, LegSpec, LegState, PrincipalFingerprint, ProviderAccountKey,
-    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
-    ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderPayloadDigest,
+    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentPurpose,
+    AttachmentTokenDigest, AttachmentTransport, BindingGeneration, CallAggregate, CallCommand,
+    CallId, CallRepository, ClaimGeneration, CommandCommit, CommandId, ConnectionBinding,
+    CreateCall, EffectId, EffectIntent, IdempotencyKeyDigest, LegDirection, LegId, LegKind,
+    LegSpec, LegState, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
+    ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
+    ProviderEventState, ProviderEventTarget, ProviderPayloadDigest, ProviderReferenceRole,
     RegisterWorker, RepositoryError, RequestDigest, StopLegReason, StoredCall, TenantId,
     WorkerLease,
 };
@@ -49,6 +50,50 @@ fn digest_hex(byte: u8, uppercase: bool) -> String {
         .collect()
 }
 
+async fn claim_start_leg<R>(
+    repository: &R,
+    worker: WorkerLease,
+    call_id: CallId,
+    leg_id: LegId,
+    claim_at: DateTime<Utc>,
+) -> (EffectId, ClaimGeneration)
+where
+    R: CallRepository + CallServiceRepository + Sync,
+{
+    for _ in 0..16 {
+        let claims = repository
+            .claim_outbox(worker, claim_at, Duration::from_secs(30), 64)
+            .await
+            .unwrap();
+        for claim in claims {
+            if claim.record.call_id == call_id
+                && matches!(
+                    claim.record.intent,
+                    EffectIntent::StartLeg { leg_id: claimed_leg, .. } if claimed_leg == leg_id
+                )
+            {
+                return (claim.record.effect_id, claim.claim_generation);
+            }
+            repository
+                .reconcile_effect_result(EffectResultReconciliation {
+                    tenant_id: claim.record.tenant_id.clone(),
+                    call_id: claim.record.call_id,
+                    effect_id: claim.record.effect_id,
+                    worker,
+                    claim_generation: claim.claim_generation,
+                    result: ServiceEffectResult::Succeeded,
+                    external_reference: None,
+                    additional_external_references: Vec::new(),
+                    follow_up: None,
+                    at: claim_at,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    panic!("start effect for {call_id}/{leg_id} was not claimable")
+}
+
 fn operation_idempotency(
     key: u8,
     request: u8,
@@ -81,6 +126,7 @@ where
                 "sip".to_owned(),
                 "webrtc".to_owned(),
                 "twilio".to_owned(),
+                "telnyx".to_owned(),
             ]),
             at: at(0),
             lease_ttl: std::time::Duration::from_secs(300),
@@ -116,7 +162,10 @@ fn sip_webrtc_create(
         [
             LegExecutionSpec {
                 leg_id: inbound,
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
             LegExecutionSpec {
                 leg_id: initial.legs()[1].id(),
@@ -141,6 +190,7 @@ fn sip_webrtc_create(
         attachments: vec![AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest,
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: inbound,
             binding_generation: BindingGeneration::INITIAL,
             transport: AttachmentTransport::Sip,
@@ -197,6 +247,7 @@ fn raw_attachment_create(
             attachments: vec![AttachmentIssue {
                 attachment_id: AttachmentId::new(),
                 token_digest,
+                purpose: AttachmentPurpose::PublicInbound,
                 leg_id: inbound_leg,
                 binding_generation: BindingGeneration::INITIAL,
                 transport: AttachmentTransport::Sip,
@@ -307,7 +358,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
         [
             LegSpec {
                 direction: LegDirection::Outbound,
-                kind: LegKind::Twilio,
+                kind: LegKind::Telnyx,
             },
             LegSpec {
                 direction: LegDirection::Inbound,
@@ -322,14 +373,17 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
             LegExecutionSpec {
                 leg_id: initial.legs()[0].id(),
                 endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
-                    provider: ProviderKind::Twilio,
-                    account_profile: "twilio-sandbox".to_owned(),
+                    provider: ProviderKind::Telnyx,
+                    account_profile: "telnyx-sandbox".to_owned(),
                     destination: Some("+12065550100".to_owned()),
                 }),
             },
             LegExecutionSpec {
                 leg_id: initial.legs()[1].id(),
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
         ],
         principal(key),
@@ -386,6 +440,7 @@ where
         operation_idempotency: None,
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let ServiceCommandOutcome::Committed(view) = repository
         .commit_with_effect_payloads(request.clone())
@@ -474,8 +529,18 @@ where
         })
         .await
         .unwrap();
+    let (outbound_effect_id, outbound_claim_generation) = claim_start_leg(
+        repository,
+        worker,
+        service_call.call.aggregate.id(),
+        outbound_leg,
+        at(4),
+    )
+    .await;
     let outbound_request = OutboundConnectionBind {
-        operation_id: CommandId::new(),
+        operation_id: CommandId::from_uuid(outbound_effect_id.as_uuid()).unwrap(),
+        effect_id: outbound_effect_id,
+        claim_generation: outbound_claim_generation,
         tenant_id: owner.clone(),
         call_id: service_call.call.aggregate.id(),
         leg_id: outbound_leg,
@@ -529,7 +594,7 @@ where
     };
     let mut invalid_lifecycle_state = inbound_lifecycle_request.clone();
     invalid_lifecycle_state.command_id = CommandId::new();
-    invalid_lifecycle_state.state = LegState::Signaling;
+    invalid_lifecycle_state.state = LegState::Pending;
     assert_eq!(
         repository
             .commit_bound_connection_state(invalid_lifecycle_state)
@@ -635,6 +700,7 @@ where
         claim_generation: claimed[0].claim_generation,
         result: ServiceEffectResult::Succeeded,
         external_reference: None,
+        additional_external_references: Vec::new(),
         follow_up: None,
         at: at(10),
     };
@@ -737,6 +803,7 @@ where
         )),
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let mut invalid_transfer = transfer_request.clone();
     invalid_transfer.effect_payloads[0].ordinal = 999;
@@ -750,7 +817,10 @@ where
     );
     let mut foreign_leg_transfer = transfer_request.clone();
     let ServiceEffectPayload::Transfer { target_leg_id, .. } =
-        &mut foreign_leg_transfer.effect_payloads[0].payload;
+        &mut foreign_leg_transfer.effect_payloads[0].payload
+    else {
+        panic!("fixture payload must be a transfer")
+    };
     *target_leg_id = provider_create(tenant("foreign-transfer"), worker, 99)
         .create
         .initial
@@ -768,7 +838,10 @@ where
     let ServiceEffectPayload::Transfer {
         target_binding_generation,
         ..
-    } = &mut stale_transfer.effect_payloads[0].payload;
+    } = &mut stale_transfer.effect_payloads[0].payload
+    else {
+        panic!("fixture payload must be a transfer")
+    };
     *target_binding_generation = serde_json::from_value(serde_json::json!(2)).unwrap();
     assert_eq!(
         repository.commit_with_effect_payloads(stale_transfer).await,
@@ -799,7 +872,7 @@ where
     );
     let provider_leg_id = provider.call.aggregate.legs()[0].id();
     let provider_peer_leg_id = provider.call.aggregate.legs()[1].id();
-    let provider_account = ProviderAccountKey::parse("twilio-sandbox").unwrap();
+    let provider_account = ProviderAccountKey::parse("telnyx-sandbox").unwrap();
     let provider_external_call_id = ProviderCallId::parse("CA-conformance").unwrap();
     let provider_event_digest = ProviderEventDigest::new(digest(70));
     let provider_event = ProviderEventInput {
@@ -829,9 +902,19 @@ where
             if event.state == ProviderEventState::PendingReference
     ));
     let cross_call_connection_id = ConnectionId::from_string("provider-cross-call");
+    let (provider_effect_id, provider_claim_generation) = claim_start_leg(
+        repository,
+        worker,
+        provider.call.aggregate.id(),
+        provider_leg_id,
+        at(22),
+    )
+    .await;
     let OutboundConnectionBindOutcome::Bound(_) = repository
         .bind_outbound_connection(OutboundConnectionBind {
-            operation_id: CommandId::new(),
+            operation_id: CommandId::from_uuid(provider_effect_id.as_uuid()).unwrap(),
+            effect_id: provider_effect_id,
+            claim_generation: provider_claim_generation,
             tenant_id: provider_owner.clone(),
             call_id: provider.call.aggregate.id(),
             leg_id: provider_leg_id,
@@ -873,36 +956,46 @@ where
             .await,
         Err(RepositoryError::CommandConflict)
     );
-    let claimed = repository
-        .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
-        .await
-        .unwrap();
-    let claimed = claimed
-        .into_iter()
-        .find(|claimed| {
-            claimed.record.call_id == provider.call.aggregate.id()
-                && matches!(
-                    claimed.record.intent,
-                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg_id
-                )
-        })
-        .expect("provider start-leg effect was not claimable");
+    let provider_start_follow_up = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: provider_owner.clone(),
+            call_id: provider.call.aggregate.id(),
+            expected_version: provider.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::ProviderMediaStarted {
+                at: at(23),
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(23),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: None,
+        replacement_connection: None,
+    };
     let provider_reconciliation = EffectResultReconciliation {
         tenant_id: provider_owner.clone(),
         call_id: provider.call.aggregate.id(),
-        effect_id: claimed.record.effect_id,
+        effect_id: provider_effect_id,
         worker,
-        claim_generation: claimed.claim_generation,
+        claim_generation: provider_claim_generation,
         result: ServiceEffectResult::Succeeded,
         external_reference: Some(ExternalReferenceBinding {
             leg_id: provider_leg_id,
             binding_generation: BindingGeneration::INITIAL,
+            role: ProviderReferenceRole::Media,
             value: ExternalReferenceValue::ProviderCall {
                 account: provider_account.clone(),
                 provider_call_id: provider_external_call_id.clone(),
             },
         }),
-        follow_up: None,
+        additional_external_references: Vec::new(),
+        follow_up: Some(provider_start_follow_up),
         at: at(23),
     };
     let EffectResultOutcome::Reconciled(provider_reconciliation_view) = repository
@@ -931,6 +1024,104 @@ where
             .unwrap(),
         provider_reconciliation_view.external_reference
     );
+    let media_reference = repository
+        .load_external_reference_by_role(
+            &provider_owner,
+            provider.call.aggregate.id(),
+            provider_leg_id,
+            ProviderReferenceRole::Media,
+        )
+        .await
+        .unwrap()
+        .expect("primary provider media reference");
+    assert_eq!(media_reference.role, ProviderReferenceRole::Media);
+
+    let mut destination_effect = None;
+    for _ in 0..4 {
+        let claims = repository
+            .claim_outbox(worker, at(24), Duration::from_secs(20), 64)
+            .await
+            .unwrap();
+        let provider_claim = claims
+            .into_iter()
+            .find(|claim| claim.record.call_id == provider.call.aggregate.id())
+            .expect("provider call retained an ordered effect");
+        if matches!(
+            provider_claim.record.intent,
+            EffectIntent::ConnectProviderDestination { leg_id, .. }
+                if leg_id == provider_leg_id
+        ) {
+            destination_effect = Some(provider_claim);
+            break;
+        }
+        repository
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: provider_owner.clone(),
+                call_id: provider.call.aggregate.id(),
+                effect_id: provider_claim.record.effect_id,
+                worker,
+                claim_generation: provider_claim.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                additional_external_references: Vec::new(),
+                follow_up: None,
+                at: at(24),
+            })
+            .await
+            .unwrap();
+    }
+    let destination_effect = destination_effect
+        .expect("provider destination effect follows the durable media reference");
+    assert_ne!(
+        destination_effect.record.effect_id, provider_effect_id,
+        "media and destination mutations require distinct durable command IDs"
+    );
+    let destination_provider_call_id = ProviderCallId::parse("CA-conformance-destination").unwrap();
+    let EffectResultOutcome::Reconciled(destination_reconciliation_view) = repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: provider_owner.clone(),
+            call_id: provider.call.aggregate.id(),
+            effect_id: destination_effect.record.effect_id,
+            worker,
+            claim_generation: destination_effect.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: Some(ExternalReferenceBinding {
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                role: ProviderReferenceRole::Destination,
+                value: ExternalReferenceValue::ProviderCall {
+                    account: provider_account.clone(),
+                    provider_call_id: destination_provider_call_id,
+                },
+            }),
+            additional_external_references: Vec::new(),
+            follow_up: None,
+            at: at(24),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fresh provider destination reconciliation replayed")
+    };
+    let destination_reference = repository
+        .load_external_reference_by_role(
+            &provider_owner,
+            provider.call.aggregate.id(),
+            provider_leg_id,
+            ProviderReferenceRole::Destination,
+        )
+        .await
+        .unwrap()
+        .expect("provider destination reference");
+    assert_eq!(
+        destination_reconciliation_view.external_reference,
+        Some(destination_reference.clone())
+    );
+    assert_eq!(
+        destination_reference.role,
+        ProviderReferenceRole::Destination
+    );
+    assert_ne!(media_reference.value, destination_reference.value);
 
     let claimed_provider_event = repository
         .claim_provider_events(worker, at(24), Duration::from_secs(30), 8)
@@ -943,6 +1134,7 @@ where
         tenant_id: provider_owner.clone(),
         call_id: provider.call.aggregate.id(),
         leg_id: provider_leg_id,
+        role: ProviderReferenceRole::Media,
     };
     let current_provider = repository
         .load_service_call(&provider_owner, provider.call.aggregate.id())
@@ -970,6 +1162,7 @@ where
         operation_idempotency: None,
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let provider_event_reconciliation = ProviderEventReconciliationTransaction {
         account: provider_account.clone(),
@@ -1196,6 +1389,92 @@ where
             .plan,
         evidence.plan
     );
+    let transfer_idempotency = evidence
+        .transfer_request
+        .operation_idempotency
+        .as_ref()
+        .expect("transfer conformance request must be idempotent");
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &tenant("other-replay-tenant"),
+                evidence.call_id,
+                transfer_idempotency.key_digest,
+                transfer_idempotency.request_digest,
+                transfer_idempotency.operation,
+                at(123),
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &evidence.owner,
+                evidence.call_id,
+                transfer_idempotency.key_digest,
+                transfer_idempotency.request_digest,
+                transfer_idempotency.operation,
+                at(123),
+            )
+            .await
+            .unwrap(),
+        Some(evidence.transfer_view.clone())
+    );
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &evidence.owner,
+                evidence.call_id,
+                transfer_idempotency.key_digest,
+                RequestDigest::new(digest(99)),
+                transfer_idempotency.operation,
+                at(123),
+            )
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &evidence.owner,
+                CallId::new(),
+                transfer_idempotency.key_digest,
+                transfer_idempotency.request_digest,
+                transfer_idempotency.operation,
+                at(123),
+            )
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &evidence.owner,
+                evidence.call_id,
+                transfer_idempotency.key_digest,
+                transfer_idempotency.request_digest,
+                ServiceOperationKind::HangupCall,
+                at(123),
+            )
+            .await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+    assert_eq!(
+        repository
+            .load_service_command_replay(
+                &evidence.owner,
+                evidence.call_id,
+                transfer_idempotency.key_digest,
+                transfer_idempotency.request_digest,
+                transfer_idempotency.operation,
+                at(86_412),
+            )
+            .await
+            .unwrap(),
+        None
+    );
     assert_eq!(
         repository
             .commit_with_effect_payloads(evidence.command_request.clone())
@@ -1390,6 +1669,7 @@ where
             operation_idempotency: None,
             bound_connection: None,
             media_activity: None,
+            replacement_connection: None,
         })
         .await
         .unwrap();
@@ -1479,6 +1759,7 @@ where
         claim_generation: claims[0].claim_generation,
         result: ServiceEffectResult::Succeeded,
         external_reference: None,
+        additional_external_references: Vec::new(),
         follow_up: None,
         at: at(26),
     };
@@ -1517,6 +1798,7 @@ where
             claim_generation: next[0].claim_generation,
             result: ServiceEffectResult::Succeeded,
             external_reference: None,
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(28),
         })

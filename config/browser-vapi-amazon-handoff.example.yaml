@@ -1,0 +1,381 @@
+# BridgeFu example: Vapi transfers and direct-browser handoff to Amazon Connect
+#
+# IMPORTANT: This complete all-in-one template has not been executed or passed
+# to BridgeFu's validation command. It is intended to be used as one config
+# after its external prerequisites and placeholders are supplied, rather than
+# as fragments to merge by hand. It is not deployable as-is: every .example
+# name, reserved address/CIDR, UUID, certificate path, TURN identity, and
+# environment-variable reference below must be replaced and reviewed.
+#
+# It describes three related call journeys:
+#
+#   1. Legacy compatibility transfer
+#      Vapi -> sip:support@<public-ip>:5060 -> Amazon Connect
+#
+#   2. Managed secure transfer
+#      backend creates `amazon-connect` with ingress `sip`
+#      -> BridgeFu returns a two-minute, one-use SIPS URI
+#      -> Vapi transfers to that URI -> Amazon Connect
+#
+#   3. Direct-browser assistant and handoff
+#      backend creates `vapi-direct-assistant` with ingress `webrtc`
+#      -> browser attaches to BridgeFu over WSS/WebRTC
+#      -> BridgeFu dials the Vapi SIPS assistant
+#      -> trusted backend replaces the Vapi leg with `amazon-connect`
+#      -> the browser PeerConnection remains stable
+#
+# The third journey is endpoint replacement, not a three-party conference.
+# BridgeFu holds the Vapi assistant while Amazon Connect is prepared. It
+# retires Vapi only after successful promotion, or resumes it if handoff fails.
+#
+# Application control outline (the API bearer stays on the trusted backend):
+#
+#   POST /v1/routes/vapi-direct-assistant/calls
+#   Idempotency-Key: <unique operation key>
+#   {"ingress":"webrtc","context":{"correlation_id":"...",
+#     "metadata":{"handoff_token":"<opaque server-signed mapping>"}}}
+#
+# Store the returned call ID and outbound Vapi leg ID against that opaque
+# mapping. A Vapi custom tool should send only the opaque mapping to the trusted
+# application backend. The backend then performs:
+#
+#   POST /v1/calls/{call_id}/legs/{vapi_leg_id}/replace
+#   Idempotency-Key: <unique handoff operation key>
+#   {"route_id":"amazon-connect"}
+#
+# `bridgefu.handoff.v1` status messages are emitted automatically to the
+# browser. There is no handoff switch in YAML and the browser SDK is not the
+# authority that invokes the replacement API.
+#
+# Required external setup not represented by this all-in-one YAML:
+#
+# - AWS credentials with the required Connect permissions, supplied through
+#   the default AWS credential chain (for example an instance/task role).
+# - Amazon Connect instance, inbound contact flow, queue/agent routing, CCP,
+#   and screen-pop behavior for the contact attributes below.
+# - A Vapi SIP assistant at the exact allowlisted SIPS URI below, configured to
+#   consume only the static opaque handoff mapping in its trusted custom tool.
+# - Real Vapi signaling source CIDRs for `trusted_signaling_cidrs`; the example
+#   CIDR below grants no useful production assurance.
+# - A public SIP TLS certificate and PKCS#8 private key for port 5061.
+# - A TURN service and a public/NAT/firewall policy for WebRTC and RTP.
+# - TLS termination/reverse proxying for the public HTTPS API and WSS endpoint.
+#   In all-in-one mode BridgeFu listens for API HTTP and WebSocket signaling on
+#   the loopback binds below; `api.tls` is currently a gateway-mode setting.
+#   The proxy must preserve WebSocket upgrade headers and every offered/selected
+#   `Sec-WebSocket-Protocol` value because attachment credentials are bound to
+#   those subprotocols.
+#
+# Required environment variables (values are not safe defaults):
+#
+# - BRIDGEFU_API_TOKEN: private server-to-server API bearer
+# - BRIDGEFU_CONTROL_HMAC_KEY: at least 32 bytes of independent random keying
+#   material for idempotency and attachment-token derivation
+# - BRIDGEFU_SIP_TLS_KEY_PATH: path to the matching PKCS#8 SIP TLS private key
+# - BRIDGEFU_TURN_PASSWORD: TURN credential for the configured TURN username
+
+config_version: 1
+
+# AWS credentials are deliberately absent. BridgeFu resolves them through the
+# standard AWS credential chain. Replace the region and every Connect UUID.
+aws:
+  region: us-west-2
+
+# The frozen compatibility listener remains active in all-in-one mode. It is
+# the destination for journey 1 and is independent of the secure named-route
+# SIP listener on 5061 below. Port 5060 is plain SIP/RTP: restrict it to the
+# exact trusted Vapi/carrier networks at the firewall or load balancer.
+sip:
+  bind_ip: 0.0.0.0
+  port: 5060
+  advertised_ip: 203.0.113.10
+  media_public_ip: 203.0.113.10
+
+contact:
+  default_display_name: Vapi caller
+  signaling_timeout_secs: 15
+  media_connect_timeout_secs: 30
+  keepalive_interval_secs: 10
+  session_idle_ttl_secs: 120
+
+# Journey 1 maps allowlisted headers on the fixed-port SIP INVITE directly to
+# initial Amazon Connect attributes. Unknown headers are discarded.
+mapping:
+  unmapped: drop
+  passthrough_prefix: X-
+  rename:
+    X-Correlation-Id: correlation_id
+    X-Vapi-Call-Id: vapi_call_id
+    X-Customer-Id: customer_id
+    X-Account-Tier: account_tier
+
+# The legacy target is sip:support@<public-ip>:5060. Leaving default_tenant
+# null prevents an unknown SIP user from silently selecting this tenant.
+default_tenant: null
+tenants:
+  support:
+    instance_id: 00000000-0000-4000-8000-000000000101
+    contact_flow_id: 00000000-0000-4000-8000-000000000102
+    default_display_name: Vapi caller
+    mapping:
+      unmapped: drop
+      passthrough_prefix: X-
+      rename:
+        X-Correlation-Id: correlation_id
+        X-Vapi-Call-Id: vapi_call_id
+        X-Customer-Id: customer_id
+        X-Account-Tier: account_tier
+
+observability:
+  log_level: info
+  log_format: json
+  # In all-in-one mode this is the combined API and operations listener. Keep
+  # it private and publish only deliberately selected paths through TLS.
+  http_bind: 127.0.0.1:9090
+  otlp:
+    enabled: false
+    service_name: bridgefu
+    sampling_ratio: 1.0
+    max_queue_size: 2048
+    max_export_batch_size: 512
+    scheduled_delay_millis: 5000
+    export_timeout_millis: 10000
+
+runtime:
+  # One process owns public ingress, durable execution, SIP/WebRTC media, and
+  # Amazon Connect. Split gateway/worker deployment needs separate configs and
+  # additional PostgreSQL, Redis, mTLS, and private-forwarding infrastructure.
+  mode: all-in-one
+  max_concurrent_calls: 100
+  setup_timeout_secs: 30
+  media_idle_timeout_secs: 30
+  drain_timeout_secs: 30
+
+persistence:
+  backend: sqlite
+  # Ensure the parent directory exists, is writable only by BridgeFu, is on
+  # persistent storage, and is included in backup/recovery planning.
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  deployment_id: bridgefu-support
+  worker_lease_ttl_secs: 30
+  worker_renew_interval_secs: 10
+  # This is an allowlist intersected with adapters actually constructed by the
+  # process; listing a capability does not install it.
+  worker_capabilities: [sip, webrtc, sip_egress, amazon_connect]
+
+api:
+  enabled: true
+  # Do not expose either secret to browser JavaScript, a Vapi prompt, or a Vapi
+  # custom tool. The backend exchanges the one-use attachment descriptor with
+  # the browser using its own authenticated application session.
+  bearer_token: env:BRIDGEFU_API_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  rate_limit:
+    # These numbers are examples, not capacity or abuse-control guidance.
+    enabled: true
+    control_requests_per_second: 50
+    control_burst: 100
+    diagnostics_requests_per_second: 2
+    diagnostics_burst: 4
+    webhook_requests_per_second: 100
+    webhook_burst: 200
+    max_tracked_identities: 10000
+    identity_idle_ttl_secs: 300
+
+  # Public descriptors returned for short-lived, single-use attachments.
+  # `bridgefu.example`, the public IP, and proxy/listener routing must all be
+  # replaced with one coherent deployment topology.
+  route_attachments:
+    sip_uri_template: "sips:{token}@bridgefu.example:5061;transport=tls"
+    webrtc:
+      signaling_uri: wss://bridgefu.example/webrtc
+      ice_servers:
+        - urls:
+            - "turn:turn.example:3478?transport=udp"
+            - "turns:turn.example:5349?transport=tcp"
+          username: bridgefu
+          credential: env:BRIDGEFU_TURN_PASSWORD
+
+  routes:
+    # This single route serves two roles:
+    #
+    # - journey 2 creates it with ingress `sip`, then transfers Vapi to the
+    #   returned SIPS attachment;
+    # - journey 3 selects it by route ID when replacing the Vapi assistant leg.
+    #
+    # It can also be created directly with ingress `webrtc`, although that is
+    # not required for the assistant-first handoff.
+    amazon-connect:
+      tenant_id: support
+      ingress: [sip, webrtc]
+      vapi_ingress_profile: vapi-production
+      webrtc_ingress_profile: browser-public
+      destination_profile:
+        type: amazon_connect
+        profile_id: support-connect
+      destination:
+        direction: outbound
+        signaling_initiator: bridgefu
+        media_flow: send_receive
+        endpoint:
+          type: amazon_connect
+          config:
+            instance_id: 00000000-0000-4000-8000-000000000101
+            contact_flow_id: 00000000-0000-4000-8000-000000000102
+        # This durable specification must exactly match the endpoint and the
+        # destination profile ID above. Route attributes win on key collision;
+        # allowlisted retained call context is merged for the initial screen
+        # pop. Amazon Connect does not receive subsequent DataChannel updates.
+        amazon_connect_start:
+          profile: support-connect
+          instance_id: 00000000-0000-4000-8000-000000000101
+          contact_flow_id: 00000000-0000-4000-8000-000000000102
+          attributes:
+            integration: bridgefu
+            handoff_route: vapi-assistant
+          display_name: Vapi caller
+          description: BridgeFu managed Vapi handoff
+
+    # Journey 3 starts here. The backend creates this route with WebRTC ingress.
+    # BridgeFu waits for the authenticated browser attachment and its durable
+    # server-owned context before sending the first INVITE to Vapi.
+    vapi-direct-assistant:
+      tenant_id: support
+      ingress: [webrtc]
+      webrtc_ingress_profile: browser-public
+      destination_profile:
+        type: sip
+        profile_id: vapi-direct-assistant
+      destination:
+        direction: outbound
+        signaling_initiator: bridgefu
+        media_flow: send_receive
+        endpoint:
+          type: sip
+          config:
+            # Replace the user part with the exact Vapi assistant/SIP target
+            # configured for this deployment. It must remain byte-for-byte
+            # identical to an entry in sip_profiles.allowed_targets below.
+            uri: "sips:replace-with-vapi-assistant@sip.vapi.ai;transport=tls"
+            initial_context: required
+
+# Journey 2 authenticates the stock-Vapi transfer edge using both the one-use
+# URI attachment and an exact trusted signaling network projected to this
+# principal. Replace the documentation CIDR with current, verified Vapi source
+# ranges. TLS server identity and SRTP remain mandatory. If Digest or mTLS is
+# introduced, configure it here and install the exact matching listener policy
+# under generic_bridge.sip; do not rely on CA trust alone as identity.
+vapi_ingress_profiles:
+  vapi-production:
+    tenant_id: support
+    principal_subject: vapi-transfer-edge
+    issuer: vapi-managed
+    scopes: [calls:create]
+    trusted_signaling_cidrs: [192.0.2.0/24]
+    tls:
+      certificate_chain: /run/bridgefu/tls/sip-public.pem
+      private_key: env:BRIDGEFU_SIP_TLS_KEY_PATH
+    srtp_required: true
+    codecs: [pcmu, opus]
+
+# Outbound SIPS/SRTP policy for the initial Vapi assistant in journey 3. The
+# two metadata keys are the only named-route context values projected onto its
+# first SIP INVITE. The CA bundle path is distribution-specific.
+sip_profiles:
+  vapi-direct-assistant:
+    allowed_targets:
+      - "sips:replace-with-vapi-assistant@sip.vapi.ai;transport=tls"
+    from_uri: sips:bridgefu@bridgefu.example
+    tls_roots: [/etc/ssl/certs/ca-certificates.crt]
+    srtp: required
+    codecs: [pcmu, opus]
+    metadata_keys: [correlation_id, handoff_token]
+
+# The browser profile is revision-bound into both named routes. The one-use
+# attachment and attachment-bound signaling credential supplied by the API are
+# still required; this is not a reusable browser bearer credential.
+webrtc_profiles:
+  browser-public:
+    allowed_signaling_origins: [wss://bridgefu.example]
+    ice_servers:
+      - urls:
+          - "turn:turn.example:3478?transport=udp"
+          - "turns:turn.example:5349?transport=tcp"
+        username: bridgefu
+        credential: env:BRIDGEFU_TURN_PASSWORD
+    codecs: [opus]
+    data_channels: true
+
+# Canonical context policy shared by SIP headers, browser DataChannels, and
+# initial Amazon Connect attributes. Values are validated and ownership-bound;
+# these mappings do not let a caller choose a route or tenant. The handoff token
+# must be an opaque application mapping, never an API bearer or AWS credential.
+context:
+  allow_headers:
+    X-Correlation-Id: correlation_id
+    X-Vapi-Call-Id: vapi_call_id
+    X-Customer-Id: customer_id
+    X-Account-Tier: account_tier
+    # This spelling matches the current Vapi template-variable convention in
+    # the repository example (`bridgefu_handoff_token`). Confirm it against the
+    # live Vapi SIP-header contract before deployment.
+    X-Bridgefu_Handoff_Token: handoff_token
+
+generic_bridge:
+  enabled: true
+
+  # The cleartext generic listener is required by the current combined runtime
+  # but is not an ingress advertised by these routes. Restrict it at the host
+  # firewall. Secure named Vapi attachments arrive on port 5061 instead.
+  sip_bind: 0.0.0.0:5070
+
+  # All-in-one mode does not accept api.tls. A reviewed TLS reverse proxy maps
+  # wss://bridgefu.example/webrtc to this loopback WS listener. WHIP/WHEP is not
+  # used by these journeys but the generic runtime still owns its local bind.
+  webrtc_ws_bind: 127.0.0.1:8080
+  webrtc_whip_bind: 127.0.0.1:8081
+
+  sip:
+    # Never send the reusable API bearer over UDP/TCP SIP.
+    allow_cleartext_bearer: false
+    advertised_addr: 203.0.113.10:5070
+    media_public_addr: 203.0.113.10:0
+    secure_listener:
+      bind: 0.0.0.0:5061
+      advertised_addr: 203.0.113.10:5061
+      # These values must exactly match vapi_ingress_profiles.vapi-production.
+      certificate_chain: /run/bridgefu/tls/sip-public.pem
+      private_key: env:BRIDGEFU_SIP_TLS_KEY_PATH
+      require_client_certificate: false
+    # Required because `amazon-connect` admits named SIP ingress.
+    srtp: required
+    rtp_port_start: 20000
+    rtp_port_end: 29999
+    symmetric_rtp:
+      enabled: true
+      allow_ip_change: false
+      probation_packets: 3
+      max_rebindings: 2
+      rebind_window_secs: 2
+      max_sequence_jump: 512
+
+  webrtc:
+    udp_bind: 0.0.0.0:0
+    # One deterministic primary browser codec; MediaGraph transcodes to the
+    # independently negotiated SIP or Amazon Connect codec when required.
+    audio_codecs: [opus]
+    ice_servers:
+      - urls:
+          - "turn:turn.example:3478?transport=udp"
+          - "turns:turn.example:5349?transport=tcp"
+        username: bridgefu
+        credential: env:BRIDGEFU_TURN_PASSWORD
+    # `all` permits host/server-reflexive candidates and TURN fallback. A
+    # relay-only policy is a deployment choice that needs its own qualification.
+    ice_transport_policy: all
+    nat_1to1_ips: [203.0.113.10]
+    nat_1to1_candidate_type: host
+    gather_timeout_secs: 5
+    connection_timeout_secs: 15
+    trickle_ice: true

@@ -7,18 +7,20 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
 
 use crate::call_engine::{
-    validate_worker_lease_ttl, CallRepository, RegisterWorker, RenewWorkerLease, RepositoryError,
-    WorkerId, WorkerSnapshot, DEFAULT_WORKER_LEASE_TTL,
+    validate_worker_lease_ttl, ActivateWorkerCapabilities, CallRepository, RegisterWorker,
+    RenewWorkerLease, RepositoryError, WorkerId, WorkerSnapshot, DEFAULT_WORKER_LEASE_TTL,
 };
 use crate::coordination::{
     CoordinationClock, CoordinationError, CoordinationOutbox, CoordinationProjection,
@@ -30,8 +32,7 @@ use crate::persistence::{MemoryRepository, PostgresRepository, SqliteRepository}
 
 use super::{
     AttachmentPrincipalResolver, CallService, CallServiceClock, CallServiceCrypto,
-    CallServiceRepository, CallTimeoutPolicy, ControlCryptoError, FixedWorkerPlacement,
-    RepositoryWorkerPlacement,
+    CallServiceRepository, CallTimeoutPolicy, ControlCryptoError, RepositoryWorkerPlacement,
 };
 
 /// Explicit lease and optional Redis projection configuration.
@@ -240,6 +241,50 @@ pub struct CallServiceRuntimeConfig {
     pub coordination: CallServiceCoordinationConfig,
 }
 
+/// Transport-free configuration for a public call-control process.
+///
+/// Unlike [`CallServiceRuntimeConfig`], this type deliberately has no worker
+/// identity, capacity, or media capabilities. Constructing it can select and
+/// enqueue work for an already-registered worker, but can never register this
+/// process as a placement candidate or consume worker commands.
+pub struct CallControlRuntimeConfig {
+    /// Clustered deployments require the PostgreSQL repository.
+    pub backend: CallRepositoryBackendConfig,
+    /// Shared HMAC material for idempotency and attachment tokens.
+    pub control_key: Vec<u8>,
+    /// Call setup, transfer, and ending deadlines.
+    pub timeouts: CallTimeoutPolicy,
+    /// Exact worker IDs reachable through this gateway's private forwarding
+    /// catalog. Placement may not select any other registered worker.
+    pub eligible_workers: BTreeSet<WorkerId>,
+    /// PostgreSQL/Redis deployment namespace and projection configuration.
+    pub coordination: CallServiceCoordinationConfig,
+}
+
+impl fmt::Debug for CallControlRuntimeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallControlRuntimeConfig")
+            .field("backend", &self.backend)
+            .field("control_key", &"[redacted]")
+            .field("timeouts", &self.timeouts)
+            .field("eligible_worker_count", &self.eligible_workers.len())
+            .field("coordination", &self.coordination)
+            .finish()
+    }
+}
+
+impl Drop for CallControlRuntimeConfig {
+    fn drop(&mut self) {
+        self.control_key.zeroize();
+        match &mut self.backend {
+            CallRepositoryBackendConfig::Memory => {}
+            CallRepositoryBackendConfig::Sqlite { database_url }
+            | CallRepositoryBackendConfig::Postgres { database_url } => database_url.zeroize(),
+        }
+    }
+}
+
 impl fmt::Debug for CallServiceRuntimeConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -291,10 +336,41 @@ pub struct CallServiceRuntime {
     service: Arc<CallService>,
     timeouts: CallTimeoutPolicy,
     worker: WorkerSnapshot,
+    activated_worker: OnceLock<WorkerSnapshot>,
     clock: Arc<dyn CallServiceClock>,
     work_wakeups: watch::Sender<Option<RuntimeWorkWakeup>>,
     supervisor_health: watch::Sender<RuntimeSupervisorHealth>,
     supervisor: Option<RuntimeSupervisor>,
+}
+
+/// Durable call-control runtime for a role-separated public gateway.
+///
+/// This owns only the authenticated service, PostgreSQL handles, and the
+/// ordered PostgreSQL-to-Redis projector. It owns no rvoip orchestrator, media
+/// graph, worker lease, wakeup consumer, or execution supervisor.
+pub struct CallControlRuntime {
+    backend: CallRepositoryBackendKind,
+    repository: Arc<dyn CallRepository>,
+    service_repository: Arc<dyn CallServiceRepository>,
+    service: Arc<CallService>,
+    health: watch::Sender<CallControlRuntimeHealth>,
+    supervisor: Option<ControlPlaneSupervisor>,
+}
+
+/// Observable lifecycle of the transport-free gateway control plane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallControlRuntimeHealth {
+    /// PostgreSQL and clustered Redis were connected and the projector owns
+    /// its bounded task.
+    Healthy,
+    /// The ordered Redis projection has failed repeatedly. PostgreSQL remains
+    /// authoritative, but public admission must pause until notification
+    /// delivery recovers.
+    Degraded,
+    /// New HTTP admission is closed and the projector is being joined.
+    Draining,
+    /// Every owned task has stopped.
+    Stopped,
 }
 
 /// Coalesced signal that a worker must make bounded claims against the
@@ -333,9 +409,26 @@ struct ValidatedRuntimeConfig {
     coordination: CallServiceCoordinationConfig,
 }
 
+struct ControlRuntimeParts {
+    backend: CallRepositoryBackendKind,
+    crypto: CallServiceCrypto,
+    timeouts: CallTimeoutPolicy,
+    attachment_principals: Arc<dyn AttachmentPrincipalResolver>,
+    clock: Arc<dyn CallServiceClock>,
+    coordination_outbox: Arc<dyn CoordinationOutbox>,
+    projection: Arc<dyn CoordinationProjection>,
+    eligible_workers: BTreeSet<WorkerId>,
+}
+
 struct RuntimeSupervisor {
     cancel: watch::Sender<bool>,
     health: watch::Sender<RuntimeSupervisorHealth>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+struct ControlPlaneSupervisor {
+    cancel: watch::Sender<bool>,
+    health: watch::Sender<CallControlRuntimeHealth>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -386,6 +479,68 @@ impl fmt::Debug for CallServiceRuntime {
     }
 }
 
+impl fmt::Debug for CallControlRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallControlRuntime")
+            .field("backend", &self.backend)
+            .field("repository", &"[configured]")
+            .field("worker_registered", &false)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallControlRuntime {
+    /// Selected authoritative repository implementation.
+    #[must_use]
+    pub const fn backend(&self) -> CallRepositoryBackendKind {
+        self.backend
+    }
+
+    /// Transactional API service handle.
+    #[must_use]
+    pub fn service(&self) -> Arc<CallService> {
+        Arc::clone(&self.service)
+    }
+
+    /// Shared core repository used for webhook deduplication and diagnostics.
+    #[must_use]
+    pub fn repository(&self) -> Arc<dyn CallRepository> {
+        Arc::clone(&self.repository)
+    }
+
+    /// Shared service repository. Exposed for qualification without granting
+    /// this runtime worker execution authority.
+    #[must_use]
+    pub fn service_repository(&self) -> Arc<dyn CallServiceRepository> {
+        Arc::clone(&self.service_repository)
+    }
+
+    /// Subscribes to the owned projector lifecycle.
+    #[must_use]
+    pub fn subscribe_health(&self) -> watch::Receiver<CallControlRuntimeHealth> {
+        self.health.subscribe()
+    }
+
+    /// Stops and joins the ordered projector. No worker row is mutated because
+    /// this runtime never registered one.
+    pub async fn shutdown(mut self, deadline: Duration) {
+        self.health.send_replace(CallControlRuntimeHealth::Draining);
+        if let Some(supervisor) = self.supervisor.take() {
+            supervisor.shutdown(deadline).await;
+        }
+        self.health.send_replace(CallControlRuntimeHealth::Stopped);
+    }
+}
+
+impl Drop for CallControlRuntime {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.supervisor.take() {
+            supervisor.cancel_without_join();
+        }
+    }
+}
+
 impl CallServiceRuntime {
     /// Selected repository implementation.
     #[must_use]
@@ -414,7 +569,47 @@ impl CallServiceRuntime {
     /// Current registered worker incarnation.
     #[must_use]
     pub fn worker(&self) -> &WorkerSnapshot {
-        &self.worker
+        self.activated_worker.get().unwrap_or(&self.worker)
+    }
+
+    /// Atomically publishes the exact adapters installed for this worker
+    /// without changing its fence. Public APIs must remain unexposed until
+    /// this succeeds.
+    pub async fn activate_worker_capabilities(
+        &self,
+        capabilities: BTreeSet<String>,
+    ) -> Result<WorkerSnapshot, RepositoryError> {
+        let activated = self
+            .repository
+            .activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: self.worker.lease,
+                capabilities,
+                at: self.clock.now(),
+            })
+            .await?;
+        if let Some(existing) = self.activated_worker.get() {
+            if existing.lease != activated.lease || existing.capabilities != activated.capabilities
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+            return Ok(existing.clone());
+        }
+        match self.activated_worker.set(activated.clone()) {
+            Ok(()) => Ok(activated),
+            Err(_) => {
+                let existing = self
+                    .activated_worker
+                    .get()
+                    .ok_or(RepositoryError::Unavailable)?;
+                if existing.lease == activated.lease
+                    && existing.capabilities == activated.capabilities
+                {
+                    Ok(existing.clone())
+                } else {
+                    Err(RepositoryError::Unavailable)
+                }
+            }
+        }
     }
 
     /// Current injected UTC observation time used by execution claims and
@@ -640,6 +835,73 @@ impl RuntimeSupervisor {
         for task in self.tasks {
             task.abort();
         }
+    }
+}
+
+impl ControlPlaneSupervisor {
+    fn start(
+        outbox: Arc<dyn CoordinationOutbox>,
+        projection: Arc<dyn CoordinationProjection>,
+        health: watch::Sender<CallControlRuntimeHealth>,
+    ) -> Self {
+        let (cancel, _) = watch::channel(false);
+        let projector = format!("control-{}", uuid::Uuid::new_v4().simple());
+        let projector_cancel = cancel.subscribe();
+        let observed_cancel = cancel.subscribe();
+        let task_health = health.clone();
+        let task = tokio::spawn(async move {
+            let outcome = AssertUnwindSafe(run_control_coordination_projector(
+                outbox,
+                projection,
+                projector,
+                projector_cancel,
+                task_health.clone(),
+            ))
+            .catch_unwind()
+            .await;
+            if outcome.is_err() || !*observed_cancel.borrow() {
+                set_control_health_if_running(&task_health, CallControlRuntimeHealth::Stopped);
+            }
+        });
+        Self {
+            cancel,
+            health,
+            tasks: vec![task],
+        }
+    }
+
+    async fn shutdown(self, deadline: Duration) {
+        let _ = self.cancel.send(true);
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        for mut task in self.tasks {
+            if tokio::time::timeout(runtime_shutdown_budget(deadline_at), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    fn cancel_without_join(self) {
+        self.health.send_replace(CallControlRuntimeHealth::Stopped);
+        let _ = self.cancel.send(true);
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn set_control_health_if_running(
+    health: &watch::Sender<CallControlRuntimeHealth>,
+    next: CallControlRuntimeHealth,
+) {
+    if matches!(
+        *health.borrow(),
+        CallControlRuntimeHealth::Healthy | CallControlRuntimeHealth::Degraded
+    ) {
+        health.send_replace(next);
     }
 }
 
@@ -970,6 +1232,81 @@ async fn run_coordination_projector(
     }
 }
 
+/// Gateway projector with a health contract. A single transient failure is
+/// retried without flapping readiness; three consecutive failed claim/apply
+/// cycles pause public admission. Any successful authoritative cycle restores
+/// health. The ordered outbox remains the source of truth throughout.
+async fn run_control_coordination_projector(
+    outbox: Arc<dyn CoordinationOutbox>,
+    projection: Arc<dyn CoordinationProjection>,
+    projector: String,
+    mut cancel: watch::Receiver<bool>,
+    health: watch::Sender<CallControlRuntimeHealth>,
+) {
+    const CLAIM_TTL: Duration = Duration::from_secs(5);
+    const BATCH_SIZE: usize = 128;
+    const FAILURE_THRESHOLD: u8 = 3;
+    let mut delay = Duration::from_millis(25);
+    let mut consecutive_failures = 0_u8;
+    loop {
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(delay) => {
+                let cycle = match outbox.claim(&projector, CLAIM_TTL, BATCH_SIZE).await {
+                    Ok(claims) => {
+                        let had_claims = !claims.is_empty();
+                        let mut failed = false;
+                        for claim in claims {
+                            if projection.apply(&claim.record.event).await.is_err()
+                                || outbox.acknowledge(
+                                    claim.record.event.sequence,
+                                    &projector,
+                                    claim.claim_generation,
+                                ).await.is_err()
+                            {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        if failed {
+                            Err(Duration::from_millis(500))
+                        } else if had_claims {
+                            Ok(Duration::from_millis(25))
+                        } else {
+                            Ok(Duration::from_millis(250))
+                        }
+                    }
+                    Err(_) => Err(Duration::from_secs(1)),
+                };
+                match cycle {
+                    Ok(next_delay) => {
+                        consecutive_failures = 0;
+                        set_control_health_if_running(
+                            &health,
+                            CallControlRuntimeHealth::Healthy,
+                        );
+                        delay = next_delay;
+                    }
+                    Err(next_delay) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= FAILURE_THRESHOLD {
+                            set_control_health_if_running(
+                                &health,
+                                CallControlRuntimeHealth::Degraded,
+                            );
+                        }
+                        delay = next_delay;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Opens the configured repository, registers its stable worker, and builds a
 /// call service over those exact shared handles.
 pub async fn build_call_service_runtime(
@@ -1065,6 +1402,103 @@ pub async fn build_call_service_runtime(
     }
 }
 
+/// Opens the clustered repositories and builds a transport-free call-control
+/// service. Startup is fail-closed and deliberately performs no worker
+/// registration. Created effects and controls are committed to PostgreSQL and
+/// announced through the existing ordered Redis projection for the selected
+/// worker; workers retain their mandatory database polling fallback.
+pub async fn build_call_control_runtime(
+    mut config: CallControlRuntimeConfig,
+    attachment_principals: Arc<dyn AttachmentPrincipalResolver>,
+    clock: Arc<dyn CallServiceClock>,
+) -> Result<CallControlRuntime, CallServiceRuntimeError> {
+    let crypto = CallServiceCrypto::new(std::mem::take(&mut config.control_key))?;
+    let backend = config.backend.kind();
+    if backend != CallRepositoryBackendKind::Postgres {
+        return Err(CallServiceRuntimeError::InvalidConfiguration(
+            "split call control requires PostgreSQL",
+        ));
+    }
+    if config.eligible_workers.is_empty() {
+        return Err(CallServiceRuntimeError::InvalidConfiguration(
+            "split call control requires at least one reachable worker",
+        ));
+    }
+    config.coordination.validate_for_backend(backend)?;
+    let deployment = config.coordination.deployment.clone();
+    let mut repository_config =
+        std::mem::replace(&mut config.backend, CallRepositoryBackendConfig::Memory);
+    let CallRepositoryBackendConfig::Postgres { database_url } = &mut repository_config else {
+        unreachable!("backend kind was checked above")
+    };
+    let repository = Arc::new(
+        PostgresRepository::connect_for_deployment(database_url.as_str(), deployment.clone())
+            .await
+            .map_err(CallServiceRuntimeError::Repository)?,
+    );
+    let outbox: Arc<dyn CoordinationOutbox> = Arc::new(PostgresCoordinationOutbox::from_pool(
+        repository.pool().clone(),
+        deployment,
+    ));
+    let coordination =
+        RuntimeCoordinationBackend::connect(&mut config.coordination, Arc::clone(&clock)).await?;
+    let projection =
+        coordination
+            .projection()
+            .ok_or(CallServiceRuntimeError::InvalidConfiguration(
+                "split call control requires clustered Redis projection",
+            ))?;
+    finish_control_runtime(
+        repository,
+        ControlRuntimeParts {
+            backend,
+            crypto,
+            timeouts: config.timeouts,
+            attachment_principals,
+            clock,
+            coordination_outbox: outbox,
+            projection,
+            eligible_workers: std::mem::take(&mut config.eligible_workers),
+        },
+    )
+}
+
+fn finish_control_runtime<R>(
+    repository: Arc<R>,
+    parts: ControlRuntimeParts,
+) -> Result<CallControlRuntime, CallServiceRuntimeError>
+where
+    R: CallRepository + CallServiceRepository + 'static,
+{
+    let core_repository: Arc<dyn CallRepository> = repository.clone();
+    let service_repository: Arc<dyn CallServiceRepository> = repository;
+    let placement: Arc<dyn super::WorkerPlacement> = Arc::new(
+        RepositoryWorkerPlacement::new(Arc::clone(&core_repository))
+            .with_projection(Arc::clone(&parts.projection))
+            .with_allowed_workers(parts.eligible_workers)
+            .with_replacement_worker_guard(),
+    );
+    let service = Arc::new(CallService::new(
+        Arc::clone(&service_repository),
+        placement,
+        parts.attachment_principals,
+        parts.crypto,
+        parts.clock,
+        parts.timeouts,
+    ));
+    let (health, _) = watch::channel(CallControlRuntimeHealth::Healthy);
+    let supervisor =
+        ControlPlaneSupervisor::start(parts.coordination_outbox, parts.projection, health.clone());
+    Ok(CallControlRuntime {
+        backend: parts.backend,
+        repository: core_repository,
+        service_repository,
+        service,
+        health,
+        supervisor: Some(supervisor),
+    })
+}
+
 async fn finish_runtime<R>(
     repository: Arc<R>,
     backend: CallRepositoryBackendKind,
@@ -1096,17 +1530,13 @@ where
     let projection = coordination.projection();
     let core_repository: Arc<dyn CallRepository> = repository.clone();
     let service_repository: Arc<dyn CallServiceRepository> = repository;
-    let placement: Arc<dyn super::WorkerPlacement> = if backend == CallRepositoryBackendKind::Memory
-    {
-        Arc::new(FixedWorkerPlacement::new(worker.lease))
-    } else {
-        let placement = RepositoryWorkerPlacement::new(Arc::clone(&core_repository));
-        let placement = match projection.clone() {
-            Some(projection) => placement.with_projection(projection),
-            None => placement,
-        };
-        Arc::new(placement)
+    let placement = RepositoryWorkerPlacement::new(Arc::clone(&core_repository))
+        .with_allowed_workers(BTreeSet::from([worker.lease.worker_id]));
+    let placement = match projection.clone() {
+        Some(projection) => placement.with_projection(projection),
+        None => placement,
     };
+    let placement: Arc<dyn super::WorkerPlacement> = Arc::new(placement);
     let service = Arc::new(CallService::new(
         Arc::clone(&service_repository),
         placement,
@@ -1137,6 +1567,7 @@ where
         service,
         timeouts: config.timeouts,
         worker,
+        activated_worker: OnceLock::new(),
         clock,
         work_wakeups,
         supervisor_health,
@@ -1155,8 +1586,10 @@ mod tests {
 
     use super::*;
     use crate::call_engine::{CallRepository, RegisterWorker, WorkerId};
+    use crate::call_service::SamePrincipalAttachmentResolver;
     use crate::coordination::{
-        CoordinationError, DatabasePollReason, ProjectionSequence, WakeupMessage, WakeupReason,
+        CoordinationError, DatabasePollReason, MemoryCoordinationOutbox, ProjectionSequence,
+        WakeupMessage, WakeupReason,
     };
 
     #[derive(Debug)]
@@ -1164,6 +1597,30 @@ mod tests {
 
     #[derive(Debug)]
     struct UnavailableLeaseAuthority;
+
+    #[derive(Debug)]
+    struct UnavailableCoordinationOutbox;
+
+    #[async_trait]
+    impl CoordinationOutbox for UnavailableCoordinationOutbox {
+        async fn claim(
+            &self,
+            _projector: &str,
+            _claim_ttl: Duration,
+            _limit: usize,
+        ) -> Result<Vec<crate::coordination::CoordinationOutboxClaim>, CoordinationError> {
+            Err(CoordinationError::Unavailable)
+        }
+
+        async fn acknowledge(
+            &self,
+            _sequence: ProjectionSequence,
+            _projector: &str,
+            _claim_generation: crate::coordination::CoordinationClaimGeneration,
+        ) -> Result<(), CoordinationError> {
+            Err(CoordinationError::Unavailable)
+        }
+    }
 
     #[async_trait]
     impl WorkerLeaseAuthority for UnavailableLeaseAuthority {
@@ -1249,6 +1706,126 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn control_runtime_selects_existing_workers_without_registering_or_draining_one() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(ManualCallClock::new(at(0)));
+        let worker = registered_worker(
+            &repository,
+            WorkerId::new(),
+            at(0),
+            Duration::from_secs(300),
+        )
+        .await;
+        let deployment = DeploymentId::parse("control-runtime-test").unwrap();
+        let coordination_clock: Arc<dyn CoordinationClock> =
+            Arc::new(RuntimeCoordinationClock(clock.clone()));
+        let outbox: Arc<dyn CoordinationOutbox> = Arc::new(MemoryCoordinationOutbox::new(
+            deployment.clone(),
+            Arc::clone(&coordination_clock),
+        ));
+        let projection: Arc<dyn CoordinationProjection> =
+            Arc::new(MemoryCoordinator::new(deployment, coordination_clock, 128).unwrap());
+        let runtime = finish_control_runtime(
+            Arc::clone(&repository),
+            ControlRuntimeParts {
+                backend: CallRepositoryBackendKind::Memory,
+                crypto: CallServiceCrypto::new(vec![0x62; 32]).unwrap(),
+                timeouts: CallTimeoutPolicy {
+                    setup: Duration::from_secs(30),
+                    media_idle: Duration::from_secs(30),
+                    transfer: Duration::from_secs(30),
+                    ending: Duration::from_secs(30),
+                },
+                attachment_principals: Arc::new(SamePrincipalAttachmentResolver),
+                clock,
+                coordination_outbox: outbox,
+                projection,
+                eligible_workers: BTreeSet::from([worker.lease.worker_id]),
+            },
+        )
+        .unwrap();
+
+        let candidates = repository
+            .worker_candidates(&BTreeSet::new(), at(1), 8)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].lease, worker.lease);
+        assert!(!candidates[0].draining);
+        assert!(format!("{runtime:?}").contains("worker_registered: false"));
+        assert_eq!(
+            *runtime.subscribe_health().borrow(),
+            CallControlRuntimeHealth::Healthy
+        );
+
+        runtime.shutdown(Duration::from_secs(1)).await;
+        let retained = repository
+            .worker_snapshot(worker.lease.worker_id)
+            .await
+            .unwrap();
+        assert_eq!(retained.lease, worker.lease);
+        assert!(!retained.draining);
+    }
+
+    #[tokio::test]
+    async fn control_runtime_projector_pauses_readiness_after_persistent_failure() {
+        let clock: Arc<dyn CoordinationClock> = Arc::new(RuntimeCoordinationClock(Arc::new(
+            ManualCallClock::new(at(0)),
+        )));
+        let projection: Arc<dyn CoordinationProjection> = Arc::new(
+            MemoryCoordinator::new(
+                DeploymentId::parse("control-projector-health-test").unwrap(),
+                clock,
+                128,
+            )
+            .unwrap(),
+        );
+        let (health, mut observed_health) = watch::channel(CallControlRuntimeHealth::Healthy);
+        let supervisor = ControlPlaneSupervisor::start(
+            Arc::new(UnavailableCoordinationOutbox),
+            projection,
+            health.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while *observed_health.borrow() != CallControlRuntimeHealth::Degraded {
+                observed_health.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("persistent projection failure paused readiness");
+        supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn public_control_runtime_builder_rejects_local_backends() {
+        let error = build_call_control_runtime(
+            CallControlRuntimeConfig {
+                backend: CallRepositoryBackendConfig::Memory,
+                control_key: vec![0x71; 32],
+                timeouts: CallTimeoutPolicy {
+                    setup: Duration::from_secs(30),
+                    media_idle: Duration::from_secs(30),
+                    transfer: Duration::from_secs(30),
+                    ending: Duration::from_secs(30),
+                },
+                eligible_workers: BTreeSet::new(),
+                coordination: CallServiceCoordinationConfig::new(
+                    DeploymentId::parse("control-runtime-local-reject").unwrap(),
+                ),
+            },
+            Arc::new(SamePrincipalAttachmentResolver),
+            Arc::new(ManualCallClock::new(at(0))),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CallServiceRuntimeError::InvalidConfiguration("split call control requires PostgreSQL")
+        ));
     }
 
     #[tokio::test]

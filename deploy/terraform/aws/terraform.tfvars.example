@@ -1,0 +1,53 @@
+name       = "bridgefu-smoke"
+vpc_id     = "vpc-00000000000000000"
+public_subnet_ids  = ["subnet-00000000000000000", "subnet-11111111111111111"]
+private_subnet_ids = ["subnet-22222222222222222", "subnet-33333333333333333"]
+
+gateway_autoscaling_group_arn  = "arn:aws:autoscaling:us-west-2:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000001:autoScalingGroupName/bridgefu-gateway"
+worker_autoscaling_group_arn   = "arn:aws:autoscaling:us-west-2:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000002:autoScalingGroupName/bridgefu-worker"
+moq_relay_autoscaling_group_arn = "arn:aws:autoscaling:us-west-2:000000000000:autoScalingGroup:00000000-0000-0000-0000-000000000003:autoScalingGroupName/bridgefu-moq-relay"
+
+# Each gateway EC2 host has a stable direct-media EIP. Its host-specific
+# bridgefu.yaml must advertise that EIP for SIP/RTP and WebRTC ICE while the
+# shared NLB address carries SIP signaling, WSS/WHIPS, and the HTTPS API.
+gateway_instance_ids = {
+  gateway-a = "i-00000000000000000"
+}
+gateway_media_eip_allocation_ids = {
+  gateway-a = "eipalloc-00000000000000000"
+}
+max_gateways = 2
+
+image = "000000000000.dkr.ecr.us-west-2.amazonaws.com/bridgefu@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+otel_collector_image = "public.ecr.aws/aws-observability/aws-otel-collector@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+quic_cidrs = ["0.0.0.0/0"]
+signaling_cidrs = ["203.0.113.0/24"]
+media_cidrs     = ["203.0.113.0/24"]
+webrtc_cidrs   = ["203.0.113.0/24"]
+# `api_cidrs` gates only the HTTPS /v1 call-control and provider-webhook
+# listener. Health and metrics use the private operations port. Keep this
+# restricted even though Bridgefu terminates TLS behind the TCP pass-through.
+api_cidrs      = ["203.0.113.10/32"]
+operator_cidrs = ["10.0.0.0/8"]
+
+# Create the RBAC user group out of band so its password is never accepted as
+# a Terraform input. Put the resulting rediss:// URL in Secrets Manager.
+redis_user_group_ids = ["bridgefu-rbac"]
+
+skip_final_snapshot             = true
+database_deletion_protection    = false
+
+# Each EC2 host must have the role-specific bridgefu.yaml and reviewed OTel
+# collector config installed by immutable bootstrap. Worker hosts need unique
+# persistence.worker_id values and matching gateway target entries. The
+# gateway directory must also contain the reviewed public API certificate/key
+# referenced by `api.tls` in its config; the NLB passes that TLS through.
+secret_arns = {
+  BRIDGEFU_API_TOKEN                = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-api"
+  BRIDGEFU_CONTROL_HMAC_KEY         = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-control"
+  BRIDGEFU_BROADCAST_TOKEN_SECRET   = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-broadcast"
+  BRIDGEFU_DATABASE_URL             = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-database-url"
+  BRIDGEFU_PRIVATE_FORWARDING_SECRET = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-forwarding"
+  BRIDGEFU_REDIS_URL                = "arn:aws:secretsmanager:us-west-2:000000000000:secret:bridgefu-redis-url"
+}

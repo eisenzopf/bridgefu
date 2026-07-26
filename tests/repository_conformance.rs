@@ -5,15 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridgefu::call_engine::{
-    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentTokenDigest,
-    AttachmentTransport, BindProviderReference, BindingGeneration, CallAggregate, CallCommand,
-    CallRepository, CommandCommit, CommandCommitOutcome, CommandId, CreateCall, CreateCallOutcome,
-    DeadlineKind, EffectIntent, IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState,
-    OutboxCompletion, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
-    ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
-    ProviderEventState, ProviderEventTarget, ProviderPayloadDigest, RegisterWorker,
-    RepositoryError, RequestDigest, StoredCall, TenantId, TerminalProviderEventAcknowledge,
-    TerminalProviderEventAcknowledgeOutcome, WorkerId, WorkerLease, WorkerSnapshot,
+    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentPurpose,
+    AttachmentTokenDigest, AttachmentTransport, BindProviderReference, BindingGeneration,
+    CallAggregate, CallCommand, CallRepository, CommandCommit, CommandCommitOutcome, CommandId,
+    CreateCall, CreateCallOutcome, DeadlineKind, EffectIntent, IdempotencyKeyDigest, LegDirection,
+    LegKind, LegSpec, LegState, OutboxCompletion, PrincipalFingerprint, ProviderAccountKey,
+    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
+    ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderPayloadDigest,
+    ProviderReferenceRole, RegisterWorker, RepositoryError, RequestDigest, StoredCall, TenantId,
+    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerId,
+    WorkerLease, WorkerSnapshot,
 };
 use bridgefu::call_service::{
     CallExecutionPlan, CallServiceRepository, EffectResultOutcome, EffectResultReconciliation,
@@ -85,7 +86,10 @@ fn service_create_request(
         [
             LegExecutionSpec {
                 leg_id: aggregate.legs()[0].id(),
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
             LegExecutionSpec {
                 leg_id: aggregate.legs()[1].id(),
@@ -135,7 +139,10 @@ fn provider_service_create_request(
             },
             LegExecutionSpec {
                 leg_id: aggregate.legs()[1].id(),
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
         ],
         principal(),
@@ -217,8 +224,23 @@ where
             if event.state == ProviderEventState::PendingReference
     ));
 
+    let claimed_start = repository
+        .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| {
+            claimed.record.call_id == call_id
+                && matches!(
+                    claimed.record.intent,
+                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg_id
+                )
+        })
+        .expect("provider start effect was not claimable");
     let outbound = OutboundConnectionBind {
-        operation_id: CommandId::new(),
+        operation_id: CommandId::from_uuid(claimed_start.record.effect_id.as_uuid()).unwrap(),
+        effect_id: claimed_start.record.effect_id,
+        claim_generation: claimed_start.claim_generation,
         tenant_id: owner.clone(),
         call_id,
         leg_id: provider_leg_id,
@@ -234,19 +256,6 @@ where
         OutboundConnectionBindOutcome::Bound(_)
     ));
 
-    let claimed_start = repository
-        .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|claimed| {
-            claimed.record.call_id == call_id
-                && matches!(
-                    claimed.record.intent,
-                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg_id
-                )
-        })
-        .expect("provider start effect was not claimable");
     let EffectResultOutcome::Reconciled(effect_view) = repository
         .reconcile_effect_result(EffectResultReconciliation {
             tenant_id: owner.clone(),
@@ -258,11 +267,13 @@ where
             external_reference: Some(ExternalReferenceBinding {
                 leg_id: provider_leg_id,
                 binding_generation: BindingGeneration::INITIAL,
+                role: ProviderReferenceRole::Media,
                 value: ExternalReferenceValue::ProviderCall {
                     account: account.clone(),
                     provider_call_id: provider_call_id.clone(),
                 },
             }),
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(23),
         })
@@ -303,6 +314,7 @@ where
         operation_idempotency: None,
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let reconciliation = ProviderEventReconciliationTransaction {
         account,
@@ -313,6 +325,7 @@ where
             tenant_id: owner.clone(),
             call_id,
             leg_id: provider_leg_id,
+            role: ProviderReferenceRole::Media,
         },
         follow_up: Some(follow_up),
         at: at(25),
@@ -339,6 +352,7 @@ async fn assert_legacy_v5_history_after_v6<R>(repository: &R, evidence: &LegacyV
 where
     R: CallRepository + CallServiceRepository + Sync,
 {
+    let unclaimed_effect = bridgefu::call_engine::EffectId::new();
     let stored = repository
         .load_service_call(&evidence.owner, evidence.call_id)
         .await
@@ -360,7 +374,9 @@ where
     assert_eq!(
         repository
             .bind_outbound_connection(OutboundConnectionBind {
-                operation_id: CommandId::new(),
+                operation_id: CommandId::from_uuid(unclaimed_effect.as_uuid()).unwrap(),
+                effect_id: unclaimed_effect,
+                claim_generation: evidence.reconciliation.claim_generation,
                 tenant_id: evidence.owner.clone(),
                 call_id: evidence.call_id,
                 leg_id: evidence.provider_leg_id,
@@ -372,9 +388,7 @@ where
                 at: at(26),
             })
             .await,
-        Err(RepositoryError::InvalidInput(
-            "execution plan has no durable outbound authorization"
-        ))
+        Err(RepositoryError::StaleClaim)
     );
 }
 
@@ -401,6 +415,7 @@ fn create_request_at(
         attachments: vec![AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest: AttachmentTokenDigest::new(digest(key.wrapping_add(100))),
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: leg.id(),
             binding_generation: leg.binding_generation(),
             transport: AttachmentTransport::Sip,
@@ -546,6 +561,7 @@ async fn shared_repository_conformance(repo: Repository) {
         tenant_id: owner.clone(),
         call_id: current.aggregate.id(),
         leg_id: target_leg,
+        role: ProviderReferenceRole::Media,
         account: account.clone(),
         provider_call_id,
         worker: worker.lease,
@@ -716,6 +732,7 @@ async fn shared_repository_conformance(repo: Repository) {
             tenant_id: owner.clone(),
             call_id: current.aggregate.id(),
             leg_id: target_leg,
+            role: ProviderReferenceRole::Media,
         },
         at: at(40),
     };
@@ -1109,7 +1126,7 @@ async fn sqlite_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 6);
+    assert_eq!(schema_version, 11);
     let persisted_body: String = sqlx::query_scalar("SELECT body FROM workers WHERE worker_id = ?")
         .bind(worker_id.to_string())
         .fetch_one(upgraded.pool())
@@ -1182,7 +1199,7 @@ async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
         "INSERT INTO attachments SELECT * FROM source.attachments",
         "INSERT INTO outbox SELECT * FROM source.outbox",
         "INSERT INTO deadlines SELECT * FROM source.deadlines",
-        "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, json_remove(json_set(body, '$.plan.version', 1), '$.plan.authorization_principal_fingerprint') FROM source.call_execution_plans",
+        "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, json_remove(json_set(body, '$.plan.version', 1), '$.plan.authorization_principal_fingerprint', '$.plan.amazon_connect_starts', '$.plan.leg_semantics') FROM source.call_execution_plans",
     ] {
         sqlx::query(statement).execute(&target).await.unwrap();
     }
@@ -1238,10 +1255,18 @@ async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
         .await
         .unwrap();
     for table in V5_FIXTURE_PRE_PLAN_TABLES {
-        sqlx::query(&format!("INSERT INTO {table} SELECT * FROM source.{table}"))
-            .execute(&target)
-            .await
-            .unwrap();
+        let statement = if *table == "provider_references" {
+            "INSERT INTO provider_references(\
+                 account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body\
+             ) \
+             SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, \
+                    json_remove(body, '$.target.role') \
+             FROM source.provider_references"
+                .to_owned()
+        } else {
+            format!("INSERT INTO {table} SELECT * FROM source.{table}")
+        };
+        sqlx::query(&statement).execute(&target).await.unwrap();
     }
     sqlx::query(
         "INSERT INTO call_execution_plans(\
@@ -1252,7 +1277,9 @@ async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
                 second_leg_id, second_endpoint_kind, \
                 json_remove(\
                     json_set(body, '$.plan.version', 1), \
-                    '$.plan.authorization_principal_fingerprint'\
+                    '$.plan.authorization_principal_fingerprint', \
+                    '$.plan.amazon_connect_starts', \
+                    '$.plan.leg_semantics'\
                 ) \
          FROM source.call_execution_plans",
     )
@@ -1271,10 +1298,19 @@ async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
     .await
     .unwrap();
     for table in V5_FIXTURE_POST_PLAN_TABLES {
-        sqlx::query(&format!("INSERT INTO {table} SELECT * FROM source.{table}"))
-            .execute(&target)
-            .await
-            .unwrap();
+        let statement = if *table == "external_references" {
+            "INSERT INTO external_references(\
+                 reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                 leg_id, binding_generation, effect_id, bound_at, body\
+             ) \
+             SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                    leg_id, binding_generation, effect_id, bound_at, json_remove(body, '$.role') \
+             FROM source.external_references"
+                .to_owned()
+        } else {
+            format!("INSERT INTO {table} SELECT * FROM source.{table}")
+        };
+        sqlx::query(&statement).execute(&target).await.unwrap();
     }
     sqlx::query(
         "INSERT INTO provider_completions(\
@@ -1336,7 +1372,7 @@ async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
         .fetch_one(upgraded.pool())
         .await
         .unwrap(),
-        6
+        11
     );
     let after = sqlx::query(
         "SELECT completion_kind, body \
@@ -1431,7 +1467,7 @@ async fn postgres_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
             .fetch_one(upgraded.pool())
             .await
             .unwrap();
-    assert_eq!(schema_version, 6);
+    assert_eq!(schema_version, 11);
     let has_expiry: bool =
         sqlx::query_scalar("SELECT body ? 'lease_expires_at' FROM workers WHERE worker_id = $1")
             .bind(worker_id.as_uuid())
@@ -1662,7 +1698,7 @@ async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed()
         format!("INSERT INTO {target_schema}.attachments SELECT * FROM {source_schema}.attachments"),
         format!("INSERT INTO {target_schema}.outbox SELECT * FROM {source_schema}.outbox"),
         format!("INSERT INTO {target_schema}.deadlines SELECT * FROM {source_schema}.deadlines"),
-        format!("INSERT INTO {target_schema}.call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) #- '{{plan,authorization_principal_fingerprint}}' FROM {source_schema}.call_execution_plans"),
+        format!("INSERT INTO {target_schema}.call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, (((jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) #- '{{plan,authorization_principal_fingerprint}}') #- '{{plan,amazon_connect_starts}}') #- '{{plan,leg_semantics}}') FROM {source_schema}.call_execution_plans"),
     ] {
         sqlx::query(&statement)
             .execute(&administration)
@@ -1735,13 +1771,25 @@ async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed()
         .await
         .unwrap();
     for table in V5_FIXTURE_PRE_PLAN_TABLES {
-        sqlx::query(&format!(
-            "INSERT INTO {target_schema}.{table} \
-             SELECT * FROM {source_schema}.{table}"
-        ))
-        .execute(&administration)
-        .await
-        .unwrap();
+        let statement = if *table == "provider_references" {
+            format!(
+                "INSERT INTO {target_schema}.provider_references(\
+                     account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body\
+                 ) \
+                 SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, \
+                        body #- '{{target,role}}' \
+                 FROM {source_schema}.provider_references"
+            )
+        } else {
+            format!(
+                "INSERT INTO {target_schema}.{table} \
+                 SELECT * FROM {source_schema}.{table}"
+            )
+        };
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
     }
     sqlx::query(&format!(
         "INSERT INTO {target_schema}.call_execution_plans(\
@@ -1752,6 +1800,8 @@ async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed()
                 second_leg_id, second_endpoint_kind, \
                 jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) \
                     #- '{{plan,authorization_principal_fingerprint}}' \
+                    #- '{{plan,amazon_connect_starts}}' \
+                    #- '{{plan,leg_semantics}}' \
          FROM {source_schema}.call_execution_plans"
     ))
     .execute(&administration)
@@ -1769,13 +1819,26 @@ async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed()
     .await
     .unwrap();
     for table in V5_FIXTURE_POST_PLAN_TABLES {
-        sqlx::query(&format!(
-            "INSERT INTO {target_schema}.{table} \
-             SELECT * FROM {source_schema}.{table}"
-        ))
-        .execute(&administration)
-        .await
-        .unwrap();
+        let statement = if *table == "external_references" {
+            format!(
+                "INSERT INTO {target_schema}.external_references(\
+                     reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                     leg_id, binding_generation, effect_id, bound_at, body\
+                 ) \
+                 SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                        leg_id, binding_generation, effect_id, bound_at, body - 'role' \
+                 FROM {source_schema}.external_references"
+            )
+        } else {
+            format!(
+                "INSERT INTO {target_schema}.{table} \
+                 SELECT * FROM {source_schema}.{table}"
+            )
+        };
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
     }
     sqlx::query(&format!(
         "INSERT INTO {target_schema}.provider_completions(\
@@ -1822,7 +1885,7 @@ async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed()
         .fetch_one(upgraded.pool())
         .await
         .unwrap(),
-        6
+        11
     );
     let after = sqlx::query(
         "SELECT completion_kind, body::text AS body \
@@ -2664,7 +2727,11 @@ async fn postgres_epoch(repository: &PostgresRepository) -> i64 {
 }
 
 const REQUIRED_TABLES: &[&str] = &[
+    "amazon_connect_cleanup_authority",
     "attachments",
+    "broadcast_commands",
+    "broadcast_operation_receipts",
+    "broadcasts",
     "call_execution_plans",
     "calls",
     "commands",
@@ -2677,6 +2744,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "deadlines",
     "external_references",
     "idempotency",
+    "initial_contexts",
     "legs",
     "outbox",
     "outbound_binding_results",
@@ -2723,8 +2791,8 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 6);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=6) {
+    assert_eq!(migrations.len(), 11);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=11) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2734,7 +2802,7 @@ async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        6
+        11
     );
 }
 
@@ -2761,8 +2829,8 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
         .fetch_all(repository.pool())
         .await
         .unwrap();
-    assert_eq!(migrations.len(), 6);
-    for (migration, expected_version) in migrations.iter().zip(1_i64..=6) {
+    assert_eq!(migrations.len(), 11);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=11) {
         assert_eq!(migration.get::<i64, _>("version"), expected_version);
         assert!(migration.get::<bool, _>("success"));
     }
@@ -2772,7 +2840,7 @@ async fn assert_required_postgres_tables(repository: &PostgresRepository) {
             .await
             .unwrap()
             .get::<i64, _>("schema_version"),
-        6
+        11
     );
 }
 

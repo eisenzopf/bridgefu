@@ -14,8 +14,9 @@ Documentation, Terraform, or API scaffolding alone does not complete a gate.
 - Production StandardCharter deployment and public artifact publication are not
   authorized by this roadmap.
 - Upstream pull requests, issues, or other maintainer outreach require explicit
-  user review and approval. Dependency fixes may be developed and pinned on the
-  `eisenzopf` forks before that review.
+  user review and approval. Dependency fixes may be developed locally, but no
+  fork push, remote candidate pin, or maintainer contact occurs before that
+  review.
 
 Baseline evidence recorded on 2026-07-10:
 
@@ -24,13 +25,404 @@ Baseline evidence recorded on 2026-07-10:
 - rvoip WebRTC: WHIP, WS, and rustls feature compilation passed.
 - StandardCharter core: 31 tests passed; web: 3 tests passed.
 
+## Vapi Widget to Call Center full-duplex release gap
+
+This section is the canonical product-level release overlay approved on
+2026-07-14. It takes precedence over any older statement below that calls a
+component, localhost adapter path, or legacy StandardCharter fixture locally
+complete. Those results remain useful implementation evidence, but they do not
+make a Vapi website-widget topology supported.
+
+For this matrix, **supported** means that browser-to-destination audio works in
+both directions, DTMF and hangup behave exactly as advertised, failure cleanup
+is deterministic, and the exact topology passes both automated and required
+live acceptance tests. Having the constituent adapters or a mock topology is
+not sufficient.
+
+| Vapi widget path | Current status | Release verdict |
+|---|---|---|
+| Stock Vapi Web SDK → Bridgefu → Amazon Connect | Bridgefu's downstream Vapi SIP/RTP → Amazon Chime WebRTC bridge is implemented and hermetically tested. The stock browser `webCall` → SIP transfer has not been proven. | Partial; not yet supported end-to-end |
+| Stock Vapi Web SDK → Bridgefu → generic SIP | The downstream one-use Vapi-like SIPS/SRTP attachment → named SIPS/SRTP destination composition is hermetically green, including Digest, media, DTMF, teardown, and context policy. Stock Vapi browser `webCall` → SIP transfer and live standards-PBX behavior remain unproven. | Partial; not yet supported end-to-end |
+| Stock Vapi Web SDK → Bridgefu → Telnyx | A Vapi-like trusted-CIDR SIPS/SRTP attachment is hermetically qualified through the production Telnyx executor and a distinct authenticated Telnyx media attachment, including linked dials, full-duplex audio, RFC 4733, signed callbacks, retries, both terminal directions, and exact cleanup. Stock Vapi browser `webCall` → SIP transfer and a restricted live Telnyx account remain unproven. | Partial; not yet supported end-to-end |
+| Stock Vapi Web SDK → Bridgefu → generic WebRTC/WSS | The downstream authenticated Vapi-like SIPS/SRTP attachment → interactive WSS route is hermetically qualified with real protocol adapters. Stock Vapi browser `webCall` → SIP transfer is still unproven, so this is not live Vapi evidence. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → generic SIP | The all-in-one named-route composition is hermetically green for authenticated browser WSS/TLS to a context-gated named SIPS/TLS+SRTP destination, Opus↔PCMU and Opus↔PCMA, bidirectional DataChannel↔SIP MESSAGE, RFC 4733, both hangup directions, and exact cleanup. The built TypeScript SDK now passes the current exact pinned-Chromium handoff through a real one-use attachment, Digest SIPS/TLS+SRTP assistant, rejected-generation compensation, and successful retry to a separately profiled SIPS/TLS+SRTP call center. Local split WHIP→SIP execution and SIP→WSS replacement are also hermetically green. TURN-only, built-SDK split, live standards-PBX, and immutable-dependency qualification remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → Amazon Connect | The exact all-in-one named-route composition is hermetically green for a real authenticated, one-use browser WSS/WebRTC attachment through the production Amazon adapter seams: Opus full duplex, DTMF both ways, allowlisted initial StartWebRTCContact attributes/screen pop, both terminal directions, exactly one StopContact, and exact cleanup. The current built-SDK Chromium→Connect handoff passes both terminal variants. Amazon remains initial-context-only. TURN-only, split execution, live Connect, and immutable-dependency qualification remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → Telnyx | The production one-use authenticated WSS/WebRTC ingress and real-adapter Vapi-assistant handoff are hermetically composed with the Telnyx executor and distinct authenticated media attachment, including linked dials, full-duplex audio, RFC 4733, signed callbacks, retry behavior, both terminal directions, compensation, and cleanup. The current exact built-SDK Chromium→Telnyx test passes both terminal variants. Split execution, a restricted live-account run, and immutable-dependency qualification remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → generic WebRTC/WSS | The all-in-one named-route composition and real-adapter direct-mode handoff are hermetically green for authenticated WSS/TLS, Opus full duplex, arbitrary DataChannels, RFC 4733, hold/no-mix, application-ready promotion, rejection compensation, both hangup directions, and exact cleanup. The corrected final-SDP/PT/clock/MID implementation now passes the current exact built-SDK Chromium test for both terminal variants. Local split WHIP→WSS execution and SIP→WSS replacement are also hermetically green. TURN-only, built-SDK split, live qualification, and immutable-dependency qualification remain open. | Partial; not yet supported end-to-end |
+
+The four current exact-Chromium results above were produced against a temporary
+local RTC path override containing an uncommitted six-file candidate. They are
+local-composite validation only, not immutable release evidence. Release use
+still requires owner review, a clean fetchable private revision, restored exact
+pins and lockfile provenance, and rerunning the destination matrix from that
+immutable source. The temporary overrides have since been removed: current
+Bridgefu and rvoip manifests and Bridgefu's lockfile again resolve the exact
+`1e5b7d4...` Git source, which lacks the candidate fixes.
+
+Two ingress modes are required:
+
+1. **Vapi-managed widget.** Browser WebRTC terminates at Vapi. Vapi transfers
+   the call over SIPS/SRTP to a unique, single-use Bridgefu attachment, and
+   Bridgefu bridges that SIP leg to Amazon Connect, generic SIP, Telnyx, or
+   interactive WebRTC/WSS. Bridgefu does not claim access to Vapi's browser
+   peer connection or DataChannel.
+2. **Direct Bridgefu widget.** A reusable Bridgefu TypeScript client terminates
+   browser WSS/WebRTC at Bridgefu. Bridgefu initially connects the other leg to
+   a Vapi SIP assistant, then uses make-before-break leg replacement to move
+   that stable browser leg to the selected call-center destination. Failure
+   resumes the Vapi leg; success never creates a three-party mix.
+
+Both modes require full-duplex caller-to-agent and agent-to-caller media. They
+do not include later reverse origination to a browser that is offline.
+
+### Vapi full-duplex gap gates
+
+The `VF-*` prefix preserves the historical Gate 0–11 numbering below while
+recording the newly approved ordered Gates 0–7. A `VF-*` gate can close only
+with its listed executable evidence.
+
+| Gap gate | Status | Required evidence |
+|---|---|---|
+| VF-0 — roadmap and Vapi feasibility | In progress — owner-gated harness implemented; live evidence absent | StandardCharter now has a manual-only, dry-run-by-default Chromium harness for both Vapi transfer mechanisms, a controlled SIP echo, and a generated Bridgefu SIPS attachment. Offline contract/redaction tests are executable, but they are not qualification evidence and no live browser run has occurred. Closure still requires owner-authorized, externally credentialed evidence for full-duplex audio, DTMF, allowlisted header names, both hangup directions, callbacks, final reason, and cleanup. Automation may only flag a vendor-blocked candidate after all four echo attempts explicitly report capability unsupported; only owner review may mark Vapi-managed ingress `vendor-blocked`, and direct ingress remains release-capable. |
+| VF-1 — rvoip edge foundations | In progress — local split initial, replacement, terminal, and drain paths are green | Staged inbound SIP answer, listener policy exposure, outbound SIPS/SRTP and authentication profiles, and WSS/HTTPS/ICE/TURN/DataMessage lifecycle pass their focused suites. Authenticated `offer-ready` provides two-phase WSS admission: it requires a leased `rvoip.webrtc.v1` route and a non-anonymous, unexpired principal; stages SDP and DataChannels before core publication; emits neither media nor `Connected` before exact request-bound acceptance; preserves legacy `offer`; and performs owner-bound rejection, timeout, disconnect, and expired-principal cleanup. Its focused suite passes 11/11. The private UCTP seam has versioned, bounded `prepare`, `activate`, `abort`, `end`, DTMF, DataMessage, response, and lifecycle envelopes; exact worker fence plus tenant/call/source-leg/source-generation/target-generation checks; command expiry/digest replay rejection; source cleanup; worker/gateway client dispatch; one-use generation-bound destination-stream admission; and distinct authenticated UCTP Session/Connection/MediaStream ownership. Gateway and worker roles install the SIP/WSS proxy lifecycle, Redis-backed state/replay, durable initial and replacement bindings, DTMF/DataMessage forwarding, terminal lifecycle journaling with exact durable ACKs, and awaited End/Abort cleanup during drain. Process-level Redis restart and non-loopback real-peer qualification remain open. The local WebRTC/RTC TURN candidate and separate RTC DTMF/codec candidate remain unintegrated until owner review and immutable private pins; no fork push or upstream contact is authorized. |
+| VF-2 — secure routes and attachment lifecycle | In progress — local API, repository, and split-adapter ownership evidence is green | Named route/profile APIs, complete redacted one-use SIP and WebRTC attachment descriptors, `attach_then_dial`, durable 24-hour idempotency, atomic token consumption, tenant isolation, fail-closed split capability selection, and generation-bound split destination ownership pass focused suites. Closure still requires the final all-target regression and deployed topology evidence. |
+| VF-3 — generic SIP reference destination | In progress — secure SIP, true early media, all-in-one, and local split execution are hermetically green; live qualification remains | `tests/generic_sip_reference.rs` composes the durable named-route actor with real rvoip source, Bridgefu, proxy, and destination peers. Exact local tests cover authenticated SIPS/SRTP, non-silent destination-to-source media during 183 while both legs remain signaling, final-answer promotion onto the same source graph, full-duplex media, RFC 4733, proxy and origin Digest challenges, rejection, cancellation, and exact cleanup. `tests/qualification_generic_wss.rs` separately covers authenticated browser WSS/TLS to named SIPS/TLS+SRTP with media, context translation, DTMF, hangup, and cleanup. The split topology test adds real authenticated WHIP ingress over loopback, private mTLS UCTP, staged SIP/WSS adapter fixtures, failed-generation compensation, successful replacement, and exact terminal/drain cleanup. Non-loopback/live standards-PBX and built-SDK split qualification remain open; this does not prove stock Vapi browser transfer. |
+| VF-4 — Vapi-managed ingress | In progress — local Vapi-like edges and StandardCharter control integration are green; VF-0/live evidence remains | `tests/qualification_generic_wss.rs` proves that a trusted-CIDR-authenticated, one-use named-route SIPS attachment with mandatory SRTP reaches configured WSS and generic-SIP destinations with the advertised media, context, DTMF, terminal, and cleanup behavior. StandardCharter locally creates only allowlisted managed route calls, preserves the Amazon default and rollback flag, and keeps URI/call/tenant/credential authority off the model. This is hermetic Vapi-like SIP and local control evidence, not proof that stock Vapi `webCall` can transfer. Closure still requires VF-0, owner-authorized canary evidence, and every claimed destination. |
+| VF-5 — direct browser ingress and handoff | In progress — SDK, server-owned mapping, assistant configuration, durable lifecycle, all-in-one handoffs, local split replacement, and the local-composite exact-Chromium matrix are green | The reusable TypeScript client, StandardCharter widget integration, signed server-owned session mapping, dedicated Vapi SIP assistant/tool configuration, generation-fenced make-before-break replacement, monotonic authenticated handoff status, success compensation, timeout/cancellation, replay, glare, and no-spoof/no-mix tests are implemented. Exact built-SDK Chromium handoffs to generic SIP, generic WSS, Amazon Connect, and Telnyx pass against the recorded local RTC/rvoip composite. Real-adapter suites cover application/media-ready promotion, rejection compensation, no-mix holds, stable browser binding, exact profile revisions, terminal variants, and cleanup. The local split topology proves one failed replacement generation followed by a successful generation without cross-connect or leaked prior media, but remains an adapter-fixture/WHIP test rather than a built-SDK Chromium split matrix. Closure still requires an owner-reviewed immutable RTC pin and rerun, TURN-only and public-NAT evidence, built-SDK split execution, process-restart recovery, and deployed canary qualification. |
+| VF-6 — destination qualification | In progress — all-in-one SIP, WSS, Amazon, and Telnyx paths, local split SIP/WSS, and the local-composite exact built-SDK matrix are green | The current exact Chromium matrix qualifies direct-browser → Vapi-like SIPS/SRTP assistant → generic SIP, generic WSS, Amazon Connect, and Telnyx handoffs against the temporary local RTC path override. Real-adapter suites cover full-duplex media, DTMF, signed readiness, compensation, both terminal variants, and exact cleanup; Amazon remains initial-context-only. This is not immutable release evidence. The local split test qualifies SIP/WSS adapter-fixture routing and replacement, not split Amazon/Telnyx, stock Vapi transfer, real TURN traversal, live provider/PBX behavior, cloud infrastructure, or qualification from a fetchable reviewed RTC revision. |
+| VF-7 — clustered and release qualification | In progress — local split SIP/WSS initial, replacement, terminal, and drain execution is green; deployed qualification remains | Split workers advertise Amazon Connect only with the concrete adapter and Telnyx only with the configured executor; deferred providers and operator-supplied generic SIP/WSS egress claims are removed. The gateway hides/rejects named destinations that no live configured worker advertises. Gateway and worker roles install the authenticated private egress command service, Redis-backed epoch/replay state, SIP/WSS staged adapters, separate target-generation media admission, durable initial/replacement supervision, DTMF/DataMessage carriage, progress/terminal reconciliation, exact lifecycle ACKs, source-loss fallback, and awaited drain cleanup. `StartLegReplacement`, failed activation compensation, successful later-generation promotion, old-generation StopLeg, bridge restoration, remote terminal handling, and zero-leak drain now pass the hermetic full-topology test. Closure still requires a real process-role Redis restart test, non-loopback gateway/worker peer qualification, route-catalog fingerprinting, then AWS/GCP smoke, one-hour load, latency/memory, chaos, restart/drain, observability, container, and Terraform evidence for every supported topology. |
+
+VF-2 named-Vapi attachment-identity evidence recorded on 2026-07-15: route
+creation remains authorized by the control-API principal, while a named SIP
+ingress attachment is bound to the exact configured Vapi
+`tenant/profile_id/non-secret-revision` identity projected into the SIP
+listener. Missing, stale, wrong-tenant, and multiple ingress bindings fail
+closed; the API principal cannot consume the resulting SIP token. Direct named
+WebRTC signaling and privileged unnamed SIP retain their existing API-principal
+ownership. Three focused library/config tests pass; this is local identity and
+token evidence only, not a stock Vapi `webCall` transfer, media, or live-provider
+qualification.
+
+VF-1 private-egress evidence recorded on 2026-07-14: three focused protocol,
+authority, replay, transition, lifecycle, capacity, and drain tests pass. The
+existing real mTLS UCTP forwarding test now also sends a reserved command from
+the authenticated worker, proves that public-route injection is rejected, and
+receives the gateway's explicit ownership response on the same Connection.
+This verifies interception and response carriage; it does not satisfy the
+gateway-restart requirement.
+
+VF-1 private-egress media evidence recorded on 2026-07-14: the focused
+`split_egress_uses_a_second_generation_bound_connection_full_duplex` test uses
+real mutually authenticated UCTP 0.2 to admit a second Session, Connection,
+and audio stream for one exact destination generation. It drives dormant
+Prepare, Activate, caller-to-agent and agent-to-caller media, DTMF,
+DataMessage, End, and exact zero-leak cleanup through the gateway's staged
+SIP `ConnectionAdapter` proxy seam. The admission descriptor is one-use,
+bounded, tenant/call/source-generation/target-generation/worker-fence bound,
+and retained for connection reauthorization. This is hermetic seam evidence,
+not complete production split support. Gateway/worker role installation,
+durable initial-leg ownership, remote lifecycle reconciliation, and Redis
+state/replay are source-complete; the later evidence below closes the local
+replacement and awaited-drain gaps. Process-level restart recovery and
+non-loopback real-peer qualification remain open.
+
+VF-1/VF-3/VF-5/VF-7 split replacement and terminal-lifecycle evidence
+recorded on 2026-07-15: the exact
+`durable_actor_routes_whip_to_split_sip_and_wss_egress_with_authoritative_lifecycle`
+test passes three consecutive post-fix runs. It uses a real authenticated WHIP
+source and mutually authenticated private UCTP on loopback, drives SIP 183
+progress before final source answer, verifies full-duplex Opus media,
+DataMessages and RFC 4733, then injects a failed second-generation replacement
+and proves compensation before promoting a successful third generation. The
+old generation receives exact StopLeg cleanup, the MediaGraph bridge is
+restored only to the winner, and a later remote terminal event is journaled,
+delivered, durably ACKed, and retired without closing its private route early.
+The focused lifecycle unit proves wrong-sequence ACK rejection, no cleanup
+before the exact ACK, and replayed-ACK idempotence; the focused source-loss unit
+proves terminal-but-unacked proxy cleanup when no ACK can arrive. Gateway drain
+finishes with zero lifecycle deliveries, proxy routes, private admissions,
+bridges, and native routes. This is hermetic in-process/loopback evidence with
+adapter fixtures and an in-memory call/coordination authority. It is not a
+separate-process Redis restart, non-loopback SIP/WSS interoperability, built
+TypeScript SDK/Chromium split run, TURN/NAT traversal, cloud smoke, provider
+split path, sustained load, or chaos result.
+
+VF-3 focused evidence recorded on 2026-07-14: `cargo test -p bridgefu
+--test generic_sip_reference -- --nocapture` passes all three hermetic
+packet-path cases. The scenarios use test-only 8 MiB debug-task stacks because
+the combined SIP/TLS/SRTP/MediaGraph futures overflow Rust's 2 MiB test-thread
+default; production task and thread configuration is unchanged.
+
+VF-3 completion-gap evidence recorded on 2026-07-15: `cargo test -p
+bridgefu --test generic_sip_reference -- --nocapture` passes all six hermetic
+packet-path cases. The added exact named-route proxy case proves that the
+configured proxy receives the request even when the Request-URI target is
+unreachable, challenges it with 407, cryptographically verifies the resulting
+`Proxy-Authorization`, and observes no origin `Authorization`. It also proves
+the source receives local 180 and Bridgefu observes destination 183 with SRTP
+SDP before final answer. No RTP is sent in that proxy case, so it remains
+signaling-order evidence rather than the separate early-media proof below.
+Other real-adapter cases prove
+486 rejection and setup-deadline cancellation with outbound CANCEL, terminal
+call/leg state, and zero retained connections, bridges, admission, routes, or
+tasks.
+
+VF-3 true-early-media evidence recorded on 2026-07-15 is green for three exact
+tests. rvoip-core's
+`pending_admission_routes_early_media_without_answer_or_target_source_consumption`
+passes 1/1; rvoip-sip's
+`ringing_then_183_installs_and_publishes_srtp_before_final_answer` passes 1/1;
+and Bridgefu's
+`named_sip_route_crosses_real_srtp_transcoding_dtmf_and_bye` passes 1/1. The
+Bridgefu acceptance sends non-silent SRTP after 183 SDP, receives and decrypts
+it at the source while both durable legs remain signaling, then proves final
+200 removes the provisional sink before the same single-source MediaGraph
+installs its full-duplex route. This is hermetic all-in-one evidence; split
+execution and non-loopback/live standards-PBX qualification remain open.
+
+VF-4/VF-6 focused evidence recorded on 2026-07-14: `cargo test -p bridgefu
+--test qualification_generic_wss -- --nocapture` passes the all-in-one named-
+route qualification for both direct WebRTC ingress and a trusted-CIDR-
+authenticated, one-use Vapi-like SIPS/SRTP attachment. The real rvoip peers
+prove authenticated WSS/TLS, Opus full-duplex media, PCMU↔Opus transcoding,
+arbitrary DataMessages, allowlisted initial SIP context, later SIP MESSAGE↔
+DataChannel translation, RFC 4733 in both directions, both hangup directions,
+and zero retained routes or bridges. This local result is not evidence for a
+stock Vapi browser transfer, a real TURN traversal, split execution, or live
+infrastructure.
+
+VF-3/VF-6 generic-SIP evidence recorded on 2026-07-15: `cargo test -p
+bridgefu --test qualification_generic_wss
+direct_browser_to_named_generic_sips_qualifies_pcmu_pcma_context_and_cleanup
+-- --nocapture` passes its single qualification test, which internally runs
+both PCMU and PCMA destination cases. The real adapters prove authenticated
+browser WSS/TLS, context-gated named SIPS/TLS with mandatory SRTP, Opus codec
+translation, bidirectional DataChannel↔SIP MESSAGE context, RFC 4733 in both
+directions, browser-originated and SIP-originated hangup, and exact route,
+bridge, and retained-task cleanup. Supporting `cargo test -p rvoip-sip --test
+adapter_data_message_network -- --nocapture` passes five real-network tests
+covering the baseline round trip, origin 401 and proxy 407 stale-nonce refresh,
+configured-realm rejection, cross-dialog credential non-reuse, and retained
+authenticated BYE. This is hermetic all-in-one loopback evidence, not evidence
+for the actual browser SDK process, TURN, split execution, a live standards
+PBX, cloud infrastructure, or stock Vapi browser transfer.
+
+VF-5/VF-6 generic-WSS handoff evidence recorded on 2026-07-15:
+`cargo test -p bridgefu --test qualification_generic_wss
+direct_browser_vapi_sip_to_generic_wss_handoff_is_connected_gated_and_resumable
+-- --exact --nocapture` passes 1/1 in 15.99 seconds. One authenticated browser
+WSS/WebRTC binding first exchanges full-duplex media with a real
+Digest-authenticated SIPS/TLS+SRTP Vapi-like assistant. During replacement the
+assistant and browser are muted in both directions with zero active graph
+bridges. An authenticated interactive-WSS call center cannot promote from its
+SDP answer alone: the durable call stays `Transferring` until the destination
+application accepts and emits the exact request/connection-bound ready
+outcome. Success atomically installs generation 2, emits `connected`, preserves
+the browser binding, retires the assistant, and passes full-duplex Opus,
+arbitrary binary/JSON DataMessages, RFC 4733 in both directions, browser
+hangup, and exact cleanup. A second call receives an explicit destination
+rejection, restores the original assistant generation and full-duplex media,
+emits `resumed`, and never mixes the rejected destination.
+
+That qualification exposed an rvoip SIP eager-media race in which inbound
+publication could precede `CreateMediaSession` commit. The media driver now
+waits, cancellation-aware and within one shared setup deadline, for the exact
+media owner while failing promptly for missing or terminal sessions. `cargo
+test -p rvoip-sip media_owner_wait_tests --lib` passes 3/3 for delayed owner
+commit, terminal/missing fail-closed behavior, and cancellation. This is
+hermetic all-in-one evidence; it is not an exact built-SDK Chromium→WSS,
+TURN-only, split, live destination, stock Vapi transfer, or cloud result.
+
+The separate ignored exact Chromium case
+`built_typescript_sdk_hands_off_to_generic_wss_and_cleans_both_terminal_directions`
+passes 1/1 and internally runs browser-terminal and destination-terminal
+variants through the built TypeScript SDK, real one-use browser attachment,
+assistant hold, application-ready WSS promotion, Opus/DataChannel/RFC 4733
+traffic, and exact cleanup. The full nonignored generic-WSS file passes 4/4.
+The exact-browser result is local-composite validation through the temporary
+RTC path override, not immutable dependency, TURN-only, split, live destination,
+stock Vapi transfer, or cloud evidence.
+
+Current VF-3/VF-5/VF-6 built-browser local-composite evidence recorded on
+2026-07-15: `cargo test -p bridgefu --test qualification_browser_sdk --
+--ignored --nocapture` passes its exact-handoff form 1/1. The
+ignored test builds and imports
+the actual TypeScript `dist` module in StandardCharter's pinned Playwright
+Chromium, authenticates a one-use WSS attachment, and first reaches a
+Digest-authenticated SIPS/TLS+SRTP assistant. An authenticated generation-2
+attempt is rejected and resumes the assistant; an authenticated generation-3
+retry promotes a
+separately profiled SIPS/TLS+SRTP call center. The same `RTCPeerConnection` and
+server connection ID remain connected throughout. Both hold intervals report
+zero inbound RTP-byte delta and no browser-microphone leakage, so the assistant
+and agent are never mixed. The test proves full-duplex assistant recovery and
+agent media after promotion, exact authenticated handoff status generations,
+initial plus replacement ringback lifecycle, fake-microphone and remote audio,
+initial allowlisted SIP context, later `bridgefu.context.v1` through SIP
+MESSAGE, arbitrary labeled binary data at the authenticated rvoip core without
+arbitrary SIP injection, mandatory browser DTMF reaching the RFC 4733
+destination, hangup, exact cleanup, and attachment-replay rejection. The
+production browser profile and fixture are Opus-only for primary audio; the
+server observes actual inbound RTP PT 111, the MediaGraph reports Opus/PT111
+with a real Opus-to-PCMU transcode, and `transcode_errors` remains zero. The SDK
+suite passes 20/20.
+
+The Chromium offer uses telephone-event PT 110/48 kHz and PT 126/8 kHz. rvoip
+derives the exact telephone-event PT, clock, SDES MID binding, and direction
+from the final offer/answer pair. PT 101/8 kHz, PT 110/48 kHz, and PT 126/8 kHz
+are covered; no implicit PT 101 fallback remains. For the negotiated same-clock
+PT 110/48 kHz case, audio and DTMF use the primary Opus SSRC and one serialized
+outbound RTP sequence/timestamp writer. A different-clock telephone-event uses
+the separate supplemental encoding. Pending or ambiguous negotiation fails
+closed, and renegotiation clears the previous MID binding until a new final
+pair is accepted.
+
+The six-file RTC candidate preserves an explicit negotiated payload type only
+when that codec is represented by the sender track and shares the selected RTP
+clock. It otherwise retains the legacy primary-payload rewrite. Its SDP
+advertises only the primary audio SSRC, avoiding a duplicate Unified Plan track;
+the receiver accepts an un-signaled supplemental SSRC only through an
+authoritative MID plus negotiated payload type, or a payload type unique to one
+receiver, and fails closed on ambiguity. Full local RTC library validation
+passes 180/180, including all 13 candidate tests. rvoip's outbound-writer suite
+passes 4/4, `dtmf_wire` passes 3/3, and `browser_sdp_interop` passes 13/13. A
+bounded one-second post-`tonechange` grace remains required for Chromium's
+final three end-of-event retransmissions. The default Bridgefu public browser
+edge is explicitly Opus-only.
+
+These RTC, rvoip, and exact Chromium results were produced through the temporary
+`../rtc/rtc` path override. The candidate is uncommitted, so the results are
+local-composite validation only. Current Bridgefu and rvoip manifests and
+Bridgefu's working lockfile have been restored to the exact full
+`1e5b7d4...` Git source, and locked metadata succeeds in both repositories.
+That base revision does not contain the fixes. Owner review, a clean fetchable
+private revision, coordinated exact pins and lockfile provenance, and downstream
+reruns remain mandatory.
+TURN-only/public-NAT, split built-SDK execution, and live destinations remain
+release blockers and are not claimed by this evidence.
+
+VF-5/VF-6 Amazon Connect evidence recorded on 2026-07-15: `cargo test -p
+bridgefu --test qualification_amazon_connect -- --nocapture` passes both
+qualification tests. The original test contains browser-originated and
+Amazon-originated terminal cases. It
+uses a real authenticated one-use WSS attachment, WebRTC/ICE/DTLS, Opus RTP,
+DataChannels, the durable named-route actor, MediaGraph, and the production
+Amazon adapter lifecycle; only AWS control and Chime network I/O use public
+test seams. It proves Opus full-duplex media, DTMF in both directions,
+allowlisted `bridgefu.context.v1` projection into initial
+StartWebRTCContact attributes with server-owned collision precedence, no live
+DataChannel mutation claim, exactly one StopContact, and zero retained graph
+routes, adapter routes, lifecycle tasks, sessions, or capacity. Supporting
+`cargo test -p bridgefu --test initial_context_repository_conformance --
+--nocapture` passes memory and SQLite/restart coverage and defines the same
+conditional PostgreSQL conformance path for duplicate/conflict, source and
+target generation fencing, and an empty Amazon SIP-header projection.
+
+The added exact handoff test runs three independent all-in-one environments:
+browser terminal after success, Amazon terminal after success, and permanent
+StartWebRTCContact rejection. Each begins with the same authenticated browser
+binding talking full duplex to a real Digest SIPS/TLS+SRTP Vapi-like assistant.
+A gated Chime connector proves zero graph bridges and no media leakage in
+either direction while the assistant is held, then allows atomic promotion
+only when Amazon media is ready. The selected non-default Amazon profile
+receives the exact persisted server-owned start attributes; the default
+profile remains unused. Success preserves the browser binding, retires the
+assistant, passes full-duplex Opus and DTMF, keeps context initial-only, handles
+both terminal directions, calls StopContact exactly once, and drains every
+route/task/capacity owner. Permanent start rejection acquires no Chime stream
+and resumes full-duplex assistant media. The nonignored qualification file
+passes 2/2. The separate ignored exact Chromium test
+`direct_assistant_handoff::built_typescript_sdk_hands_off_to_amazon_and_cleans_both_terminal_directions`
+passes 1/1 and internally runs both browser-terminal and Amazon-terminal
+variants. Both results remain hermetic all-in-one evidence. The Chromium result
+is local-composite validation through the temporary RTC path override, not
+immutable dependency, TURN-only, split, live Amazon Connect, stock Vapi
+transfer, or cloud evidence.
+
+VF-5/VF-6 Telnyx evidence recorded on 2026-07-15: `cargo test -p bridgefu
+--test qualification_telnyx -- --nocapture` passes both exact network
+qualification tests in 22.34 seconds. The original test contains both direct
+authenticated one-use WSS/WebRTC ingress and Vapi-like trusted-CIDR SIPS/SRTP
+ingress. It uses the crates.io `telnyx = "=0.1.0"`
+client through Bridgefu's production provider executor, creates two linked
+provider calls plus a distinct Digest-authenticated media attachment, and
+proves full-duplex audio, RFC 4733 in both directions, signed `call.bridged`
+gating, bounded 429 retry, invalid-signature rejection, webhook deduplication,
+both terminal directions, exact hangup, cleanup, and attachment replay
+rejection. Supporting Telnyx and lifecycle suites pass 13/13 plus the focused
+admission, cache-convergence, terminal-cleanup, and durable-command-ID
+regressions.
+
+The added handoff test starts with an authenticated WSS/WebRTC browser talking
+full duplex to a real Digest SIPS/TLS+SRTP Vapi-like assistant. It holds that
+assistant with zero graph bridges and no media leakage while the production
+Telnyx executor creates a distinct, generation-bound Digest SIP/SRTP media
+attachment and destination call. The destination HTTP response is explicitly
+insufficient to promote. An invalid signature, a validly signed stale provider
+reference, and a duplicate exact event cannot switch the call; only the first
+valid signed destination-role `call.bridged` event for the exact persisted
+reference promotes the pending generation. The browser connection/binding
+remains stable, the assistant retires exactly, and Opus↔PCMU full-duplex media
+plus RFC 4733 pass after promotion. A second attempt receives a permanent
+destination rejection, hangs up the exact provider media call once, resumes
+the original assistant and full-duplex media, then drains all routes, tasks,
+and capacity. The nonignored qualification file passes 2/2. The separate
+ignored exact Chromium test
+`direct_assistant_handoff::built_typescript_sdk_hands_off_to_telnyx_and_cleans_both_terminal_directions`
+passes 1/1 in 35.38 seconds and internally runs both browser-terminal and
+Telnyx-terminal variants. This remains deterministic all-in-one evidence. The
+Chromium result is local-composite validation through the temporary RTC path
+override, not a stock Vapi browser transfer, split execution, an immutable
+dependency result, or a restricted live-account qualification.
+
+Current post-change Bridgefu regression evidence recorded on 2026-07-15:
+`cargo test -p bridgefu --lib` passes 328/328; `private_forwarding` passes 7/7;
+`call_directionality` passes 3/3; and `call_execution_supervisor` passes 39/39.
+The generic-WSS file passes all four nonignored tests and its exact Chromium
+test passes 1/1; Amazon passes 2/2 plus its exact Chromium 1/1; Telnyx passes
+2/2 plus its exact Chromium 1/1; and the generic-SIP exact Chromium test passes
+1/1. StandardCharter passes 48 core, 11 web, and 16 Python tests, and its
+production web build succeeds. These are local library, loopback, and
+local-composite browser results. They do not replace owner-authorized Vapi/AWS
+canaries, a restricted live-provider run, TURN/public-NAT qualification,
+built-SDK split execution, cloud smoke, or the release load/chaos campaign.
+
+After restoring the exact `1e5b7d4...` Git source and lock provenance,
+`cargo test --locked -p bridgefu --lib` independently passes the same 328/328
+library suite. This proves the authoritative base remains buildable and keeps
+the non-browser regression surface green; it does not reproduce the four exact
+Chromium results because that base lacks the six-file RTC candidate.
+
+Current VF-1 WebRTC signaling evidence recorded on 2026-07-15:
+`cargo test -p rvoip-webrtc --features signaling-ws --test
+outbound_ws_originating -- --nocapture` passes 11/11 authenticated
+`offer-ready` cases, and `cargo test -p rvoip-webrtc --test dtmf_wire --
+--nocapture` passes 3/3. The outbound RTP-writer suite passes 4/4 and
+`browser_sdp_interop` passes 13/13. The full local RTC library passes 180/180,
+including all 13 tests added with the six-file candidate. These results resolve
+through the uncommitted local RTC path override and remain owner-review
+evidence rather than an immutable dependency result. Qualification from a
+fetchable reviewed pin and TURN-only/public-NAT qualification therefore remain
+open.
+
+Required public product interfaces for these gates are named, server-controlled
+routes (`GET /v1/routes`, `POST /v1/routes/{route_id}/calls`) and append-only,
+generation-fenced leg replacement
+(`POST /v1/calls/{call_id}/legs/{leg_id}/replace`). Route creation returns a
+complete two-minute, one-use SIPS or WSS attachment descriptor rather than a
+bare token. The existing low-level call API remains privileged. Amazon Connect
+advertises initial StartWebRTCContact context only; generic WSS may advertise
+live DataChannels; SIP advertises only its configured initial-header and SIP
+MESSAGE capabilities.
+
 ## Architecture decisions
 
 ### Library ownership
 
 MOQT is implemented in three layers:
 
-1. A reviewed, exact-revision moq-rs dependency implements the wire protocol.
+1. A qualified, exact-revision moq-rs dependency implements the wire protocol;
+   project-owner review is still required before release approval.
 2. `rvoip-moq` owns the stable rvoip-facing compatibility and lifecycle API.
 3. Bridgefu consumes only rvoip broadcast traits and never moq-rs types.
 
@@ -44,16 +436,44 @@ alpha-engine defect blocks a gate, rvoip may patch an owner-controlled fork and
 must pin its exact commit in the dependency declaration and lockfile; floating
 branches are forbidden. CI records that revision as dependency provenance.
 The current `eisenzopf/rtc` patch covers post-handshake DataChannel creation and
-DCEP partial-reliability fixes. No upstream issue, discussion, maintainer
-contact, or pull request may be opened without the owner's explicit review and
-approval. A port to a newer upstream revision may remain private on the fork
-until that review.
+DCEP partial-reliability fixes. A separate local, uncommitted
+`codex/dtmf-codec-identity` candidate at base
+`1e5b7d4be6d94850694f2519f4c235d16c871d53` makes codec identity include MIME,
+clock, and channel count; advertises only the primary audio SSRC; routes valid
+un-signaled supplemental SSRCs by authoritative MID/payload identity; preserves
+only represented same-clock payload types on write; and fails closed on
+ambiguous ownership. Its six-file diff, current stable patch ID
+`478b7da63ea6d195f446a9abce4c56e62129a86e`, and local-path evidence are
+recorded in `docs/webrtc-fork-review.md`. The validation runs used temporary
+`../rtc/rtc` manifest overrides and a path-resolved generated lock entry. Those
+overrides are now removed: current Bridgefu and rvoip manifests and Bridgefu's
+working lockfile resolve the exact `1e5b7d4...` Git source, and locked metadata
+succeeds in both repositories. `cargo check --locked -p bridgefu` also succeeds
+against that restored source. That base lacks the candidate fixes. This
+candidate remains validation-only until the owner approves a clean, committed,
+fetchable immutable revision and downstream qualification is rerun after
+coordinated exact dependency pins and lockfile provenance are installed. No
+upstream issue, discussion, maintainer contact, fork push, or pull request may
+be opened without the owner's explicit review and approval. A port to a newer
+upstream revision may remain private on the fork until that review.
 
 ### Provider scope
 
 Bridgefu 1.0 has one first-class external provider-control integration:
 Telnyx. It uses the published `telnyx` crate pinned as `telnyx = "=0.1.0"`
-with only the Call Control, webhook, tracing, and selected rustls features.
+with only the Call Control, webhook, and selected rustls features. The SDK's
+optional tracing feature is deliberately disabled for 1.0 because its current
+debug request event includes the full URL, whose action path contains the
+provider call identifier. Bridgefu emits its own metadata-only provider spans
+and metrics instead; the SDK feature can be enabled after that URL is safely
+classified or redacted.
+
+The published 0.1.0 `rustls-ring` feature selects reqwest's no-provider mode.
+Bridgefu therefore installs ring's rustls crypto provider before constructing
+the SDK client and verifies that a process-global provider exists. This is a
+local compatibility shim, not an upstream submission; any crate patch or
+maintainer contact remains owner-review-gated.
+
 Bridgefu owns call/leg policy, durable idempotency, SIP attachment routing, and
 normalized events; the SDK owns Telnyx request models, command dispatch,
 command-ID behavior, response errors, and Ed25519 webhook verification. The
@@ -108,8 +528,30 @@ Active calls remain pinned and are drained rather than migrated.
 - Broadcasts reference a real connected `source_leg_id` and inherit its tenant.
 - MOQT responses include protocol versions and relay path; UCTP responses
   include protocol version, session, and stream.
+- Bridgefu 1.0 transfer is authoritative SIP REFER or Telnyx Call Control.
+  Protocol-native WebRTC transfer is not standardized by the selected stack
+  and returns an explicit capability error. The newly required API-level leg
+  replacement is a Bridgefu call-engine operation, not a claim that WebRTC has
+  a protocol-native transfer method; its completion is tracked by VF-5.
 
 ## Gates
+
+Current component status after the 2026-07-14 stable-tree qualification follows.
+This historical table does not override the product support matrix or `VF-*`
+release gates above:
+
+| Gate | Status | Remaining release evidence or authority |
+|---|---|---|
+| 0–6 | Complete | None in the local implementation scope. |
+| 7 | Local adapter/component evidence substantial; Vapi widget product gap open | VF-0 through VF-7, including the protected Vapi browser transfer feasibility run, API-level leg replacement, exact destination compositions, owner-reviewed WebRTC/RTC TURN pin, and deployed public-NAT/TURN runs. |
+| 8 | Local Telnyx implementation complete; live qualification pending | Restricted live Telnyx test-account control/media workflow. |
+| 9 | Direct UCTP and local/static MOQT complete; clustered dynamic MOQT pending | Owner review, immutable pin, enablement, and requalification of the private dynamic publisher-policy candidate. |
+| 10 | Local modes/config/observability/Compose preflight/Terraform validation complete | Protected multi-architecture artifact plus disposable AWS/GCP apply-smoke-destroy. |
+| 11 | Finite local qualification complete; release campaign pending | Exact one-hour loads, deployed chaos, protected provider/StandardCharter runs, and coordinated release-candidate revisions. |
+
+An unchecked item below is not implied by a green local smoke. Production
+deployment, public publication, fork push/adoption, cloud apply, and live
+provider calls remain outside automatic authority.
 
 ### Gate 0 — Plan and baseline (`complete`)
 
@@ -160,6 +602,10 @@ No AWS, Vapi, SSH, deployment, or rollback operation was executed to close this
 gate. An owner-authorized run of the protected non-production workflow remains
 explicitly unchecked Gate 11 release-qualification evidence; checking in a safe
 and locally verifiable workflow does not claim that external result.
+
+This gate freezes the legacy Vapi SIP-to-Amazon contract only. It does not
+prove that a stock Vapi browser `webCall` can transfer to SIP; that externally
+credentialed feasibility result remains pending in VF-0.
 
 Exit: current StandardCharter behavior is reproducibly protected without a
 production change.
@@ -271,6 +717,16 @@ Gate 3 evidence recorded on 2026-07-11:
 - The exact closure revision is intentionally local pending owner review. It
   has not been pushed, submitted upstream, or substituted into Bridgefu CI;
   the existing remotely available exact CI pin remains unchanged.
+- The final 2026-07-14 UCTP reauthorization audit found and fixed a scope-
+  dropping refresh race. The regression
+  `scope_dropping_refresh_is_rejected_before_existing_media_authority_changes`
+  and its wire-level counterpart
+  `auth_refresh_rejects_scope_drop_before_existing_session_authority_changes`
+  pass: every bound Session is reauthorized under the mutation lock before a
+  replacement principal becomes visible, and a rejected refresh leaves the
+  previous principal and media authority intact. The broader UCTP, QUIC, and
+  WebTransport library matrix passes 53/53. This is local negative-security
+  evidence, not a deployed qualification result.
 
 Exit: auth-negative, cross-tenant, replay, expiry, cap, and leak tests pass on
 every supported substrate.
@@ -358,9 +814,10 @@ The implementation pins the published MOQT-19/MSF-01/LOC-03 tuple.
    upstream mainline, and port the resulting wire engine to draft-19. Add
    golden control/data vectors plus raw-QUIC and WebTransport coverage.
 4. [x] Pin `moq-transport`, `moq-native-ietf`, and `moq-relay-ietf` to the same
-   reviewed 40-character fork revision. Permit that exact Git source in supply
-   chain policy without allowing branches or floating revisions, and prove no
-   moq-rs type appears in the public `rvoip-moq` API.
+   qualified 40-character fork revision, pending project-owner review. Permit
+   that exact Git source in supply-chain policy without allowing branches or
+   floating revisions, and prove no moq-rs type appears in the public
+   `rvoip-moq` API.
 5. [x] Implement the rvoip-owned LOC Opus object and MSF catalog model,
    including canonical 48 kHz mono 20 ms audio, collision-free namespace tuple
    validation, catalog authorization, Joining FETCH retention, and an optional
@@ -931,7 +1388,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
    5 behind this core seam, without exposing transport types through
    Bridgefu's durable domain. Context secrets must never appear in logs,
    diagnostics, equality output, or metrics.
-2. [ ] Make SIP origination genuinely dormant. `prepare_outbound` may reserve
+2. [x] Make SIP origination genuinely dormant. `prepare_outbound` may reserve
    bounded in-process identifiers, routes, and capacity, but it must perform no
    coordinator call, DNS lookup, socket connection, RTP allocation, timer
    creation, INVITE, or other peer-visible signaling. A retained single-flight
@@ -949,7 +1406,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
    byte-preserving in-dialog SIP MESSAGE mapping for reliable ordered
    `DataMessage`, typed asynchronous REFER progress/completion/failure, and
    validated RFC 4733 duration and inter-digit spacing.
-   - [ ] 2a — Add `SipOriginateContext`, ordered bounded initial headers,
+   - [x] 2a — Add `SipOriginateContext`, ordered bounded initial headers,
      typed/redacted credentials, wrong-context rejection, and packet-silence
      tests for every validation failure. Bound and control-check Digest,
      Basic, Bearer, and non-nested composite auth before reserving a route;
@@ -1103,7 +1560,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
      bounded opaque identifier derived after the configured Call-ID keep/redact/
      drop decision; their maps and snapshots never store or return raw peer
      Call-ID values.
-   - [ ] 2b — Replace eager originate with a dormant route, deferred media,
+   - [x] 2b — Replace eager originate with a dormant route, deferred media,
      retained single-flight activation, actual Call-ID receipt, FIFO event
      flush, cancellation compensation, exact cleanup, and capture-UAS tests.
      Initial and authenticated-retry INVITEs must use one defense-in-depth
@@ -1165,11 +1622,16 @@ not hide an earlier adapter side effect behind a nominally staged API.
      a bounded, non-expiring `PendingCleanup`/quarantine class, preserves the
      identifier, generation, exact handles, cancellation authority, and retained
      continuation, returns a sticky cleanup failure, and remains charged against
-     an explicit lifecycle/resource limit. Admission counts active, quiescing,
-     quarantined, and anti-reuse records; overload rejects new work, while
-     diagnostics expose counts, oldest age, and fixed reason class. Same-ID reuse
-     is allowed only after all creator/resource leases are zero, exact cleanup is
-     complete, and the SIP anti-reuse horizon expires. Queued dialog/media/bus
+     an explicit lifecycle/resource limit. Admission uses two independent hard
+     bounds: active permits remain charged through active, quiescing, and
+     quarantined cleanup and are released only by the exact transition to
+     retired; a separately bounded retained-fence capacity owns anti-reuse
+     records after cleanup. Retired fences do not consume active permits, but
+     exhausting either bound rejects new work. Diagnostics expose active permit
+     use, retained capacity and count, phase counts, oldest age, and fixed reason
+     class. Same-ID reuse is allowed only after all creator/resource leases are
+     zero, exact cleanup is complete, and the SIP anti-reuse horizon expires.
+     Queued dialog/media/bus
      events and callbacks carry the generation or another unique route identity;
      deterministic Call-ID and media identifiers include that identity, or their
      cleanup uses an exact generation-bound handle. Remove-by-Session-ID alone is
@@ -1198,13 +1660,13 @@ not hide an earlier adapter side effect behind a nominally staged API.
      orchestrator also requires a cooperative owned supervisor: output rejection,
      output closure, detach, or the competing input loop ending must invoke the
      provider cancellation path before the playback future is released.
-   - [ ] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
+   - [x] 2c — Add byte-preserving reliable-ordered SIP MESSAGE/DataMessage in
      both directions, with validated internal label/message-ID headers and
      explicit reliability capability errors.
-   - [ ] 2d — Publish typed REFER progress/completion/failure and implement
+   - [x] 2d — Publish typed REFER progress/completion/failure and implement
      all-or-nothing bounded RFC 4733 digit validation, requested duration, and
      inter-digit pacing.
-   - [ ] 2e — Run SIP library/dialog/adapter, packet, lifecycle, strict lint,
+   - [x] 2e — Run SIP library/dialog/adapter, packet, lifecycle, strict lint,
      documentation, and real localhost interoperability qualification; obtain
      an independent P0/P1 audit before item 2 is complete. Property/fuzz
      evidence must show that no accepted header or auth value can serialize an
@@ -1221,7 +1683,65 @@ not hide an earlier adapter side effect behind a nominally staged API.
      at the real capacity=100/10-CPS configuration for longer than the 90-second
      retention window and include blocked awaits, concurrent stop/prune/setup,
      same-address distinct-flow late 2xx, and normal-stack auth/redirect chains.
-3. [ ] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
+
+   Focused 2026-07-14 SIP evidence closes 2c. A real two-dialog UDP test sends
+   binary-safe `DataMessage` content as in-dialog SIP MESSAGE in both
+   directions and proves byte, label, message-ID, route, and terminal cleanup
+   behavior. The dialog layer now acknowledges and forwards MESSAGE instead of
+   silently consuming it. The same slice adds typed REFER accepted/progress/
+   completed/failed outcomes: real REFER/NOTIFY success and failure cases,
+   exact-route ordering, redacted diagnostics, and core normalized/
+   operational mapping pass. RFC 4733 validation rejects an invalid suffix
+   before emitting a prefix, honors requested duration, and applies bounded
+   inter-digit pacing; the exact 95 ms non-tick duration case also passes.
+   At that checkpoint, items 2a, 2b, and 2e retained broader security,
+   lifetime, soak, fuzz/property, and independent-audit gates; the final local
+   evidence below closes the implementation portions of 2a and 2b.
+
+   Final local 2026-07-14 SIP evidence completes 2a and 2b. Strict all-target
+   Clippy, strict rustdoc, all-target checks, formatting, and diff checks pass
+   for `rvoip-sip` and `rvoip-sip-dialog`; their complete library suites pass
+   413/413 and 419/419. The active Section-10 suite passes 14/14, the real
+   localhost capture UAS proves one Digest 401 retry followed by stable-dialog
+   180/200/ACK/BYE, and real DataMessage and REFER network cases pass. Three
+   512-case injection property suites cover accepted ordered headers, generated
+   authentication, and arbitrary accepted precomputed authentication.
+   Dormant prepare, cancellation, late terminal, retained single-flight,
+   generation-bound route retirement, and final drain snapshots prove zero
+   retained routes, tasks, observers, session mappings, media streams, and
+   retired transaction routes.
+
+   Final 2026-07-14 Gate 7 item 2e evidence closes the independent P0/P1 audit
+   and greater-than-90-second planner/capacity qualification. The audit found
+   and fixed options-path redirect ownership and cleanup, unresolved
+   pre-callback install reservations, default-stack cleanup overflow, CANCEL
+   teardown incorrectly sharing the expired INVITE setup deadline, and retained
+   anti-reuse fences consuming active session capacity. No unresolved P0/P1
+   SIP finding remains. Active permits and retained-fence capacity are now
+   independently bounded; retiring a session immediately releases its active
+   permit while the exact same identifier remains blocked through the 64-second
+   anti-reuse horizon. Manual-clock churn proves both bounds and generation-safe
+   reuse.
+
+   At the release configuration of 100 active sessions and 10 call attempts per
+   second, the real localhost stack completed 920/920 INVITE/486/ACK exchanges
+   in 91.903 seconds (10.0105 CPS), observed 901 retained plans/attempts and 900
+   retired exact routes, and drained every asserted live count to zero. A
+   normal-stack redirect to a fresh origin proves that stale Bearer credentials
+   are not forwarded and that the new-origin Digest retry preserves Route and
+   SDP. The three 512-case properties prove every accepted initial header,
+   generated auth value, and accepted precomputed Authorization or
+   Proxy-Authorization value serializes as exactly one SIP header line. The
+   complete SIP library suites pass 413/413 and 419/419, all 21 RFC 3263
+   failover integrations pass, focused redirect/auth/property tests pass 8/8,
+   strict default-feature all-target Clippy with dependency linting excluded is
+   clean for both SIP packages, and warning-denied rustdoc, targeted formatting,
+   and diff checks pass. Dependency-wide all-feature Clippy remains separately
+   blocked by pre-existing codec-core lint debt and an unrelated media-core
+   cfg-specific compile error; neither is in the SIP-owned Gate 7 item 2e
+   surface.
+
+3. [x] Implement real target-contacting WebRTC clients for WS, WSS, WHIP, and
    WHEP, while retaining the corresponding authenticated server roles. Local
    SDP offer construction is not an outbound client. Pin WHIP to
    [RFC 9725](https://datatracker.ietf.org/doc/rfc9725/) and WHEP to
@@ -1238,20 +1758,20 @@ not hide an earlier adapter side effect behind a nominally staged API.
    install its owner before returning `201` and emitting the operational event.
    Rejection, expiry, replay, disconnect, or abandonment must close the
    provisional connection and erase its context.
-   - [ ] 3a — Add redacted `WebRtcOriginateContext`, an explicit signaling
+   - [x] 3a — Add redacted `WebRtcOriginateContext`, an explicit signaling
      protocol, per-exchange ICE policy, async bearer credential provider, and
      bounded target/redirect policy. Reject userinfo, query credentials,
      fragments, disallowed schemes/ports/resolved addresses, TLS downgrade,
      ambiguous create retries, and cross-origin credential forwarding before
      DNS or network I/O. Keep released exhaustive `WebRtcConfig` source-
      compatible through additive types/builders.
-   - [ ] 3b — Replace the separate outbound stage with one private retained
+   - [x] 3b — Replace the separate outbound stage with one private retained
      `WebRtcOutboundRoute` modeled on `SipOutboundRoute`. Preparation is local-
      only; one activation driver owns signaling, candidate pumps, FIFO plus
      reserved terminal, exact receipt, cancellation compensation, cleanup,
      setup deadline, health, and drain. `accept` never initiates outbound
      signaling, and cancelled waiters cannot cancel or re-enter the driver.
-   - [ ] 3c — Replace per-operation `WsSignaler` sockets with one persistent,
+   - [x] 3c — Replace per-operation `WsSignaler` sockets with one persistent,
      authenticated WS/WSS connection carrying request-correlated logical
      sessions, scoped candidates, and BYE. Require and echo exactly
      `rvoip.webrtc.v1`; never echo private auth/attachment subprotocol values.
@@ -1259,35 +1779,80 @@ not hide an earlier adapter side effect behind a nominally staged API.
      pong expiry, or drain closes and joins every owned route/task. Keep legacy
      `Signaler` APIs only as truthful compatibility wrappers and key any pool
      by sanitized origin, TLS profile, and opaque credential partition.
-   - [ ] 3d — Add production rustls WHIP HTTP clients with automatic redirects
+   - [x] 3d — Add production rustls WHIP HTTP clients with automatic redirects
      disabled. Own canonical endpoint, bounded relative/absolute `Location`,
      strong rotating `ETag`, conditional serialized PATCH/DELETE, response
      bounds, ordered pre-resource candidate buffering/completion, and no retry
      after an ambiguous POST. Harden the server to require content type and
      preconditions and rotate ETags on mutation/restart.
-   - [ ] 3e — Add the minimal alpha-engine
+   - [x] 3e — Add the minimal alpha-engine
      offer→rollback→counter-offer→answer conformance test before implementing
      canonical WHEP-04 and typed `406`. Use an owner-reviewed private exact-
      revision fork only if that test fails; create no upstream issue or PR.
      Make draft-04 the default and place empty-POST/server-offer behavior
      behind explicit legacy configuration and a warning/metric.
-   - [ ] 3f — Route attachable WHEP through authenticated provisional inbound
+   - [x] 3f — Route attachable WHEP through authenticated provisional inbound
      admission. Convert the tag to a bounded routing hint, consume a hashed
      single-use attachment token, bind the exact generated Connection ID and
      owner transactionally before `201`, and clean every replay loser,
      rejection, expiry, timeout, disconnect, or abandonment.
-   - [ ] 3g — Add tracked HTTP/WS/peer-session supervisors, actual abort after
+   - [x] 3g — Add tracked HTTP/WS/peer-session supervisors, actual abort after
      drain deadline, route-owned `LocalIceEvent::{Candidate, Complete,
      Overflow}`, bounded task/resource counters, redacted diagnostics, and
      churn/soak leak tests. Global `WebRtcConfig.trickle_ice` must not choose
      policy for all exchanges.
-   - [ ] 3h — Qualify real HTTP/HTTPS and WS/WSS client-to-rvoip loopbacks with
+   - [x] 3h — Qualify real HTTP/HTTPS and WS/WSS client-to-rvoip loopbacks with
      ICE/DTLS/media/teardown; redirect and credential isolation; ETag races;
      WHEP-04 success and exact 406 fixtures; concurrent attachment replay;
      stalled-peer shutdown; and zero leaked routes, contexts, tasks, socket
      leases, or candidate pumps. Server-role and local-offer tests alone do not
      satisfy item 3.
-4. [ ] Persist signaling role independently from media direction using
+     Partial evidence recorded 2026-07-14: hermetic target-contacting WHIPS and
+     WSS adapter loopbacks use a bounded per-context rustls trust bundle (with
+     normal certificate and hostname verification), complete ICE/DTLS and
+     bidirectional Opus, then reach zero routes and outbound signaling tasks;
+     WSS also reaches zero retained hub drivers and enforces exact
+     `rvoip.webrtc.v1` selection. An HTTPS 307 fixture proves the authenticated
+     origin receives exactly one POST while the cross-origin redirect target
+     receives no request or credential. The focused secure suite passes 3/3,
+     trust/redaction unit tests pass 6/6, combined-feature check and scoped
+     no-dependency strict Clippy pass, and formatting/diff checks pass. Item 3h
+     remains open for canonical secure WHEP-04/typed `406`, item 3f attachment
+     replay, ETag concurrency, and the required churn/soak leak run. The current
+     rvoip WHEP listener is still the legacy server-offer role, so it is not
+     represented as canonical client-to-rvoip evidence.
+
+     Additional 2026-07-14 evidence closes 3a–3e. The canonical WHEP-04
+     listener now passes five end-to-end cases covering `201` send-only media,
+     typed `406` counter-offer, one-winner strong-ETag mutation, malformed
+     offer rejection, explicit legacy-mode metrics, non-HTTP teardown, and
+     sixteen-cycle route churn. Authenticated provisional admission passes 9/9
+     tests, including exact principal/routing-hint binding and a concurrent
+     replay race with one `201`, one `403`, and exact loser cleanup. Combined
+     outbound WHEP, ownership, alpha rollback, connected signaling, and
+     observability tests pass; the complete WebRTC library passes 89/89 with
+     WS, WHIP/WHEP, and rustls enabled, plus strict no-unwrap/no-expect Clippy.
+     At that checkpoint item 3f remained open until Bridgefu exercised its real durable hashed
+     token through this provisional path. Items 3g and 3h remain open for the
+     required tracked peer-session soak, canonical HTTPS WHEP loopback, and
+     complete cross-task/socket/candidate-pump zero-leak qualification.
+
+     Final local 2026-07-14 WebRTC evidence completes 3f–3h and item 3. The
+     Bridgefu execution suite exercises the canonical WHEP provisional route
+     with its real hashed, two-minute, single-use durable attachment token.
+     rvoip now owns bounded per-route peer, media, HTTP, WS, and candidate
+     tasks through one shared drain deadline, including final post-listener
+     cleanup of the in-flight publication race. Real verified HTTPS/WSS tests
+     cover ICE, DTLS, bidirectional Opus, late arbitrary DataChannels,
+     canonical WHEP `201`, exact typed `406`, strong ETag behavior, redirect
+     credential isolation, and zero route/task/resource leakage. Evidence is
+     green for all-feature compilation, strict all-target Clippy, 96 library
+     tests, 10 admission tests, 5 WHEP-04 tests, 5 secure target-contacting
+     tests, 7 outbound WHIP/WHEP/WS tests, stalled-task supervision, and local
+     ICE lifecycle. Relay-only TURN remains separately gated by item 9 and the
+     owner-reviewed private WebRTC/RTC fork decision; it does not reopen the
+     target-contacting signaling implementation completed here.
+4. [x] Persist signaling role independently from media direction using
    `SignalingInitiator` and `MediaFlow` (`send_only`, `receive_only`, or
    `send_recv`). Derive offerer/answerer behavior from the protocol and
    signaling role, never from media direction, and construct directional
@@ -1311,7 +1876,56 @@ not hide an earlier adapter side effect behind a nominally staged API.
    RTP-looking Opus/G.711 payload remains payload and no leg is decoded with a
    configured guess. Existing adapter lifecycle tests do not prove generic
    SIP/WebRTC audio interoperability.
-5. [ ] Give the Amazon adapter the same prepare/bind/activate/terminal/drain
+
+   The 2026-07-14 working tree closes the two representation/codec defects
+   from that audit without completing item 4. `MediaFrame.payload` is now
+   normatively codec payload only; the WebRTC pump no longer attempts to
+   reinterpret RTP-looking codec bytes as a serialized RTP packet and an
+   adversarial Opus-shaped vector locks that boundary. SIP media streams retain
+   the exact SDP-negotiated PCMU, PCMA, or feature-gated Opus descriptor,
+   payload type, clock, and channel shape, use the matching codec in both
+   directions, and fail closed for unsupported or application-supplied
+   unanchored SDP instead of guessing PCMU or waiting without a setup deadline.
+   The focused rvoip suites pass 21 SIP media-stream tests, the WebRTC
+   adversarial pump test, and all three explicit two-MiB fast-auto-accept
+   regressions. Bridgefu's durable execution-supervisor suite passes 8/8 and
+   now proves two managed directional MediaGraph routes for PCMU↔Opus and
+   PCMA↔Opus, 8 kHz↔48 kHz RTP timestamp translation, opaque RTP-looking
+   same-codec payload, single receiver acquisition, and exact remote-teardown
+   route/source release. The new durable one-way case executes both
+   SIP→WebRTC and WebRTC→SIP plans, acquires the enabled source exactly once,
+   never acquires the disabled source, rejects reverse media, and releases the
+   active route/source on terminal teardown. Plan schema version 3 persists
+   `SignalingInitiator` independently from `MediaFlow`; the 3/3 directionality
+   suite proves signaling-role and business-direction independence and rejects
+   incomplete source/sink pairings before execution. rvoip's 28/28 focused
+   bridge-pump suite additionally proves independently optional graph halves,
+   atomic receiver reservation/rollback, and one-way codec replacement.
+   A 2026-07-14 rvoip-owned production-path acceptance test closes the wire
+   evidence for item 4. It prepares and
+   commits real `SipAdapter` and `WebRtcAdapter` legs through `Orchestrator`,
+   bridges their production `MediaGraph` routes, uses a raw peer only at the
+   external SIP/RTP boundary, and reaches a second production rvoip WebRTC
+   server over WHIP or persistent WebSocket signaling. Its sequential matrix
+   proves PCMU↔Opus over WHIP and PCMA↔Opus over WS with actual RTP on
+   both external boundaries, negotiated payload types and 20 ms G.711 frames,
+   and zero graph drops or evictions. It also proves WebRTC→SIP RFC 4733,
+   arbitrary binary DataChannel→in-dialog SIP MESSAGE, subsequent
+   `bridgefu.context.v1` SIP MESSAGE→DataChannel, authoritative remote SIP
+   BYE, no post-BYE media, terminal graph state, and zero retained bridge,
+   route, media, signaling, peer-session, and lifecycle tasks. The test is
+   `rvoip-webrtc/tests/sip_webrtc_acceptance.rs`; its focused command is
+   `cargo test -p rvoip-webrtc --test sip_webrtc_acceptance --features
+   tls-rustls,signaling-whip,signaling-ws -- --nocapture`.
+
+   Item 4 is locally complete. Bridgefu's plan-v3 directionality and durable
+   actor tests cover independent signaling/media roles, one-way receiver
+   ownership, reverse RFC 4733, initial context before INVITE, and inbound
+   attachment. The rvoip acceptance matrix covers WHIP, WSS, WHEP, negotiated
+   codecs, and exact resource cleanup. The split-role composition and deployed
+   TURN/public-NAT qualifications remain separately tracked by items 7 and 9;
+   they no longer keep this transport-neutral media-plan contract open.
+5. [x] Give the Amazon adapter the same prepare/bind/activate/terminal/drain
    lifecycle. Its typed per-call context must contain the actual Connect
    target, attributes, display name, and a stable client token reused during
    reconciliation; default targets, empty attributes, or a newly generated
@@ -1335,39 +1949,69 @@ not hide an earlier adapter side effect behind a nominally staged API.
      distinct remote terminal/error causes, joined task, absolute-deadline
      close, streams, hold/resume/DTMF, and secret-free logs. Use the existing
      hermetic Chime server to test the adapter without another media library.
-   - [ ] 5d — Implement a retained `AmazonOutboundRoute` with local-only
+   - [x] 5d — Implement a retained `AmazonOutboundRoute` with local-only
      prepare, immutable context, single-flight activation/cleanup, bounded FIFO
      plus first terminal, authoritative liveness/fallback, stable deferred
      stream, owned tasks, and `amazon-connect.contact-id` receipt. A known
      contact is stopped exactly once on every post-Start failure, cancellation,
      remote end, peer failure, PONG expiry, or repeated local end; route becomes
      non-live before terminal delivery.
-   - [ ] 5e — Add bounded adapter and `ConnectScreenPopServer` admission,
+   - [x] 5e — Add bounded adapter and `ConnectScreenPopServer` admission,
      `begin_drain`/absolute-deadline drain, owned JoinSets, terminal fallback,
      cancellation/join for the metrics updater, and explicit pending-cleanup
      records after hard local abort. Bridgefu shuts this path down by draining,
      never by merely aborting `serve`.
-   - [ ] 5f — Persist a redaction-safe Bridgefu Amazon start spec containing
+     - [x] The adapter rejects new generic and legacy setup after an atomic
+       drain boundary, waits for admitted setup to quiesce, retires prepared
+       and active routes once, and drains to one absolute deadline. Cleanup
+       past that deadline is detached with its exact StopContact authority
+       rather than aborted in an ambiguous post-Start window.
+     - [x] `ConnectScreenPopServer` now has a linearizable, fail-closed drain
+       boundary and a bounded 256-setup admission budget. Its SIP/Connect
+       watchers, admitted per-call setup tasks, and exact registry cleanup
+       tasks are owned and joined through one shutdown signal. Server drain
+       rejects new calls, cancels each setup/active owner by exact SIP session,
+       stops `serve`, delegates to the adapter, and shuts down the coordinator
+       against one absolute deadline. Work crossing that deadline is detached,
+       never aborted in an ambiguous post-Start window.
+     - [x] Bridgefu owns the `serve`, lifecycle-ingest, metrics-updater, and
+       durable-cleanup reconciliation tasks, invokes this server drain during
+       process shutdown, and persists exact pending-cleanup records after a
+       hard local deadline. The outer listener task is retained and joined;
+       abort is only a bounded fallback after cleanup authority has moved to a
+       retained owner.
+   - [x] 5f — Persist a redaction-safe Bridgefu Amazon start spec containing
      profile, exact instance/flow, attributes, display, and optional
-     description. Derive the token deterministically from immutable effect ID
-     with a versioned domain prefix; callers never supply it and durable state
-     never contains credentials. Migrate plan schema explicitly rather than
-     defaulting legacy records into runnable work.
-   - [ ] 5g — Execute Amazon StartLeg through exact durable effect authority:
-     build context, prepare, transactionally bind the exact Connection ID, then
-     activate and reconcile its contact reference. Bind failure produces zero
-     Start. Restart never migrates old media; an ambiguous Start repeats the
-     identical token/request only to recover and stop the same contact, then
-     fails the old leg. Register one profile-resolving adapter only after rvoip
-     lifecycle tests pass.
-   - [ ] 5h — Keep the legacy listener/default runtime byte- and behavior-
+     description. Callers never supply a token, and durable state contains
+     neither a derived client token nor credentials. Migrate plan schema
+     explicitly rather than defaulting legacy records into runnable work.
+   - [x] 5g — Execute Amazon StartLeg through exact durable effect authority:
+     derive the token deterministically from immutable effect ID with a
+     versioned domain prefix, build context, prepare, transactionally bind the
+     exact Connection ID, then activate and reconcile its contact reference.
+     Bind failure produces zero Start. Restart never migrates old media; an
+     ambiguous Start repeats the identical token/request only to recover and
+     stop the same contact, then fails the old leg. Register one
+     profile-resolving adapter only after rvoip lifecycle tests pass.
+   - [x] 5h — Keep the legacy listener/default runtime byte- and behavior-
      compatible while adding a separate false-by-default authenticated canary
      listener/tenant allowlist. Require trusted Vapi principal, matching
      tenant/correlation, and atomic durable create/attach/dedup. Add full fake-
      Connect/fake-Chime PCMU↔Opus golden teardown/drain tests, repository crash-
-     barrier tests, canary replay/cross-tenant negatives, and a manually
-     protected non-production workflow that verifies AWS token idempotency
-     before any production switch.
+     barrier tests, and canary replay/cross-tenant negatives. The manually
+     protected non-production workflow is separate Gate 11 release evidence,
+     not a prerequisite for completing this local adapter/canary implementation.
+     - [x] The local generic-engine slice uses the real durable supervisor,
+       `MediaGraph`, transcoder, and rvoip Amazon adapter with injected Connect
+       control/Chime-media doubles. It proves exact correlation mapping, one
+       stable Start token/contact, PCMU↔Opus, teardown/drain, exact replay,
+       mapped-metadata conflict, cross-tenant rejection, and SQLite
+       pre-attachment restart fail-closed behavior without AWS I/O.
+     - [x] Exercise the authenticated production `SipAdapter` listener rather
+       than the adapter-bound SIP fixture with a real localhost SIP/RTP peer.
+     The owner-authorized protected Vapi/AWS non-production run remains an
+     unchecked Gate 11 item. Local evidence does not represent that
+     credentialed workflow as complete.
 
    The pre-item-5 audit at rvoip revision `7c1902eb` confirms that current
    generic `originate` eagerly performs StartWebRTCContact, Chime signaling,
@@ -1408,24 +2052,254 @@ not hide an earlier adapter side effect behind a nominally staged API.
    target/all-feature Clippy, rustdoc, and diff checks pass. Route-level
    non-live/Stop/terminal authority, PONG-expiry policy, and adapter drain
    remain explicitly in 5d/5e.
-6. [ ] Add an initial-context readiness barrier. Durable
+
+   The 2026-07-13 rvoip working tree completes 5d plus the adapter and server
+   lifecycle slices of 5e.
+   Generic prepare is I/O-dormant; activation is retained and single-flight,
+   uses the stable Connect token for bounded ambiguous-Start reconciliation,
+   publishes the redacted contact reference only after route ownership, and
+   supervises terminal, DTMF, PONG/health, media, and StopContact through one
+   exact route. Local end, remote end, setup failure, repeated end, and drain
+   cannot duplicate StopContact. Fifty-two Amazon library tests pass, including
+   hard Start/media deadlines and a drain-deadline proof that exact cleanup
+   continues after the caller's deadline. The focused server qualification adds
+   21 passing tests for bounded permanent drain admission, tracked watcher and
+   call-task shutdown, exact setup/active registry cleanup, live `serve` exit,
+   adapter delegation, and deadline detachment without aborting ambiguous work;
+   server-feature all-target check and strict no-dependency Clippy pass. The
+   Bridgefu outer-task/metrics ownership and durable hard-deadline cleanup record
+   remain under 5e, so the parent item is intentionally still open.
+
+   The 2026-07-14 Bridgefu working tree completes 5f. Execution-plan schema
+   version 3 persists an exact, validated `AmazonConnectStartSpec` keyed by the
+   outbound Amazon leg. Its profile, instance/flow, attributes, display name,
+   and optional description use the same byte, cardinality, charset, and
+   control-character bounds as rvoip; duplicate attribute keys and unknown
+   credential/token-shaped fields fail during deserialization. Debug output is
+   metadata-only. New Amazon plans fail closed without an exact target-matching
+   spec, while plan versions 1 and 2 remain readable for inspection and
+   teardown but cannot be inserted as new runnable calls. SQLite and PostgreSQL
+   migration 0008 advance repository metadata without rewriting historical
+   plan bodies or inventing start authority. Model, memory, SQLite restart,
+   corrupt-body, migration non-rewrite, and shared repository suites pass. The
+   equivalent PostgreSQL round-trip and migration cases are executable when
+   `BRIDGEFU_TEST_POSTGRES_URL` is supplied and was skipped locally because the
+   variable was unset.
+
+   The 2026-07-14 Bridgefu working tree completes 5g. Amazon execution accepts
+   only a persisted outbound, Bridgefu-initiated Amazon leg and builds its
+   rvoip context from that leg's exact start spec plus the claimed immutable
+   effect UUID. The client token is SHA-256 over a versioned domain and that
+   UUID only. Execution prepares locally, transactionally binds the exact
+   effect/claim, tenant, call, leg, generation, worker, and generated
+   Connection ID, commits signaling state, and registers the route owner before
+   activation can perform StartWebRTCContact; any bind failure aborts with zero
+   Start. Restart reuses the byte-identical context/token, recovers and
+   role-binds the exact contact reference, eagerly stops it, and atomically
+   fails the non-migratable old leg. `StopLeg` reloads only that exact persisted
+   media-role reference and uses the original profile and instance. Disabled
+   generic execution creates no fork. The focused evidence passes 5/5 Amazon
+   start-spec tests, 21/21 memory service tests, 5/5 shared service-repository
+   tests, 8/8 runtime tests, 21/21 repository tests, and the exact restart/
+   reference/stop execution test in the 176/176 library suite.
+
+   Additional 2026-07-14 Bridgefu working-tree evidence completes 5e. The
+   all-in-one compatibility process retains the legacy `serve` task, closes
+   public admission, calls `begin_drain` and `drain_until` against one absolute
+   deadline, records aggregate drain diagnostics, and joins lifecycle,
+   metrics, cleanup-reconciliation, HTTP, UCTP, and generic-runtime owners in
+   dependency order. A hard Amazon cleanup deadline no longer discards a
+   known contact: rvoip transfers the exact profile/instance/contact Stop
+   authority to a redaction-safe observer, and Bridgefu journals it in memory,
+   SQLite, or PostgreSQL until StopContact succeeds or reports already ended.
+   Startup reconciles the journal before new admission and a retained periodic
+   owner retries it thereafter. `cargo test --locked --lib
+   amazon_cleanup::tests -- --nocapture` passes 3/3 restart, tamper,
+   idempotency, redaction, and joined-reconciler cases; `cargo test --locked
+   --bin bridgefu
+   observability::tests::metrics_updater_is_owned_and_joins_on_shutdown --
+   --exact --nocapture` passes. Item 5 remains open only for the protected
+   canary work in 5h; this evidence does not claim that owner-authorized
+   non-production workflow.
+
+   The 2026-07-14 working tree now implements the local protected-canary
+   admission slice without changing that external gate. A new false-by-default
+   policy lives only on the separate generic SIP listener and binds one
+   configured tenant to an exact authenticated subject/issuer, `sip:connect`
+   plus `calls:create`, one duplicate-rejecting allowlisted correlation header,
+   and the tenant's exact Amazon target/mapping. It atomically creates or
+   byte-identically replays the durable SIP-to-Amazon call, derives the normal
+   two-minute SIP attachment bearer, and immediately returns to the ordinary
+   single-use consume path. Changed metadata, cross-tenant/expired identities,
+   attachment replay, mapping drift, or unavailable durable authority fail
+   closed; diagnostics redact the principal, route, target, and bearer. The
+   focused library suite passes 3/3 durable replay, single-use, expiry,
+   cross-tenant, duplicate-header, and redaction tests; the binary config suite
+   passes 2/2 false-default, exact-tenant/mapping, and unsafe-configuration
+   tests; the schema checker remains green.
+
+   The follow-up local golden closes the durable call-engine, fake-Connect,
+   fake-Chime, media, and repository-crash portions of 5h. The
+   `standardcharter_canary_replays_into_generic_engine_bridges_media_and_drains`
+   test enters with only the configured `sip:<tenant>` routing hint and Vapi
+   headers, replays/consumes the hidden bearer inside normal admission, sends
+   the exact two allowlisted Connect attributes, starts one contact, runs a
+   bidirectional PCMU↔Opus graph, rejects exact attachment replay, changed
+   mapped metadata, and a foreign tenant, then observes one StopContact, one
+   media close, zero aborts, zero graph routes, and zero retained Amazon
+   sessions. `standardcharter_canary_sqlite_restart_fails_closed_without_connect_io`
+   crashes after durable creation but before attachment, advances the worker
+   fence on SQLite restart, fails both old legs with `worker_restarted`, and
+   rejects correlation replay with zero Start/Stop/media routes. The focused
+   commands pass 2/2 integration tests and the original 3/3 policy tests; the
+   unchanged real-SIP frozen `standardcharter_contract` suite now passes 72/72.
+
+   This run exposed a production rvoip integration defect rather than masking
+   it in the fixture: the outbound-only Amazon adapter advertised
+   `atomic_inbound_handoff=false`, so an Orchestrator with Bridgefu's
+   fail-closed inbound gate rejected Amazon registration. The adapter now
+   advertises that invariant as vacuously true for its outbound-only surface,
+   with a direct registration regression in `rvoip-amazon-connect`. At that
+   checkpoint, item 5h and item 8 still required the authenticated generic SIP
+   wire boundary and the owner-authorized non-production Vapi/AWS workflow.
+
+   The later 2026-07-14 localhost wire qualification closes the remaining
+   local half of 5h through rvoip's production `UnifiedCoordinator` and
+   `SipAdapter`, not an adapter-bound SIP fixture. The canary is enabled
+   explicitly on a separate tenant-bound listener whose trusted loopback Vapi
+   mapping supplies the exact subject, issuer, tenant, and scopes; only the
+   configured correlation and Vapi call headers enter the inbound context.
+   A real SIP INVITE creates and single-use-attaches the durable call, reaches
+   the fake Connect/Chime boundary with exactly two screen-pop attributes,
+   and carries PCMU RTP through the owned `MediaGraph` to Opus and back.
+   Byte-identical attachment replay, mapped-metadata drift, and a foreign
+   tenant route fail closed with zero additional Connect I/O. Remote BYE
+   produces exactly one StopContact and media close, zero aborts, zero active
+   graph bridges, zero Amazon sessions or pending cleanup, and zero retained
+   SIP/orchestrator lifecycle tasks after drain. The exact test
+   `authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_exactly`
+   passes 1/1. This does not run Vapi, AWS, or authorize a production switch.
+6. [x] Add an initial-context readiness barrier. Durable
    `bridgefu.context.v1` metadata must be validated and available before an
    outbound SIP activation so allowlisted values are present on the first
    INVITE. Later context uses SIP MESSAGE where negotiated. Reject CR/LF,
    reserved or hop-by-hop headers, oversized values, identifier overrides, and
    envelopes whose tenant/call/leg fields do not match the exact durable
    connection binding.
-7. [ ] Drive inbound and outbound SIP and WebRTC through the durable call
+
+   The 2026-07-14 Bridgefu working tree completes this barrier. Call requests
+   persist an explicit backward-compatible SIP policy (`none` or `required`),
+   and idempotency transcripts bind that choice. A required outbound SIP leg
+   polls only the exact tenant/call/leg generation and cannot prepare a route
+   or INVITE until one context message is atomically durable. Memory, SQLite,
+   and PostgreSQL repository implementations bind the exact current source
+   connection and both leg generations, enforce per-call message-ID replay,
+   permit only byte-identical replay, and revalidate the 16 KiB envelope plus
+   typed SIP-header boundary. Actor tests prove a foreign envelope sends zero
+   INVITEs, a valid envelope is durable before activation and preserves its
+   allowlisted headers, and timeout sends zero INVITEs. Inbound SIP metadata is
+   translated once to the peer DataChannel, while later valid context and
+   arbitrary application DataChannels cross the owned media graph to SIP's
+   MESSAGE boundary. The complete execution-supervisor suite passes 18/18.
+7. [x] Drive inbound and outbound SIP and WebRTC through the durable call
    engine using the staged interfaces above. Support G.711, Opus, RFC 4733
-   DTMF, arbitrary DataChannels, context translation, transfer, remote hangup,
-   timeout, and teardown in both directions without bypassing the actor or
-   MediaGraph ownership model. Each SIP and WebRTC route must have one owned
+   DTMF, arbitrary DataChannels, context translation, supported SIP REFER and
+   Telnyx transfers, remote hangup, timeout, and teardown in both directions
+   without bypassing the actor or MediaGraph ownership model. Protocol-native
+   WebRTC transfer has no interoperable standard in this stack and returns an
+   explicit capability error. This checked historical item covers protocol
+   transfer only; it does not cover the API-level make-before-break leg
+   replacement now required by VF-5. Each SIP and WebRTC route must have one owned
    supervisor for negotiation, candidate, media-pump, disconnect-grace, and
    terminal tasks; teardown must cancel and join them, remove exact mappings,
    close transport resources, and emit exactly one authoritative terminal
    event. Transfer completion is established by typed protocol outcome, not by
    successful command dispatch alone.
-8. [ ] Preserve the frozen StandardCharter path while adding a protected
+
+   The 2026-07-14 working tree completes the authoritative transfer slice of
+   this item without claiming the wider SIP/WebRTC item complete. rvoip now
+   carries an application-owned, redaction-safe `TransferAttemptId` through
+   `ConnectionAdapter`, Orchestrator submission, and the authoritative
+   transfer-status stream. SIP binds that ID to one exact live route, echoes it
+   on typed REFER accepted/progress/completed/failed events, discards duplicate
+   or late events after exact route cleanup, and conservatively permits only
+   one transfer attempt per route lifetime because the lower raw REFER event
+   API does not expose a transaction identifier. Bridgefu persists
+   `transferring` plus its deadline before dispatch, treats dispatch success as
+   submission only, and finishes only after an exact call, target leg, binding
+   generation, deadline generation, connection, and attempt match. Missing,
+   stale, duplicate, cross-leg, and cross-generation status cannot settle the
+   call. Submission failure and authoritative rejection compensate back to an
+   active call and cancel the transfer deadline without disturbing the live
+   MediaGraph.
+
+   Telnyx uses the same terminal rule: Bridgefu puts a versioned ownership
+   envelope in both `client_state` and `target_leg_client_state`, reuses the
+   durable effect ID as `command_id`, and only a verified Media-role
+   `call.bridged` or `call.failed` callback matching the exact tenant, call,
+   leg, binding, and deadline generation may finish the transfer. The accepted
+   1.0 capability matrix is deliberately narrow: a SIP leg can transfer to a
+   SIP URI, and a Telnyx leg can transfer to SIP or the same Telnyx account
+   profile. WebRTC, WHIP/WHEP, Amazon Connect, mismatched provider profiles,
+   and deferred Twilio/Vonage transfer requests return explicit
+   `unsupported_capability`/`409` before durable state changes rather than
+   inferring completion from command acknowledgement.
+
+   Focused evidence is green: Bridgefu's three-test SIP transfer suite covers
+   accepted/progress, success, failure, terminal-before-submit-return, missing
+   correlation, stale generation, cross-leg injection, duplicate terminal
+   events, deadline cancellation, and media cleanup; the Telnyx callback,
+   Telnyx SDK payload, service capability, and API conflict tests pass. rvoip's
+   orchestrator correlation test and SIP exact-route REFER test also pass. The
+   commands are `cargo test --test call_execution_supervisor sip_transfer --
+   --nocapture`, `cargo test --lib
+   telnyx_transfer_callbacks_require_exact_live_correlation -- --nocapture`,
+   `cargo test --bin bridgefu
+   telnyx_sdk_uses_bridgefu_owned_command_ids_for_every_mutation --
+   --nocapture`, `cargo test --bin bridgefu
+   unsupported_transfer_capability_maps_to_explicit_conflict -- --nocapture`,
+   `cargo test -p rvoip-core --test orchestrator_dispatch
+   operational_stream_orders_dtmf_data_and_transfer_outcomes -- --nocapture`,
+   and `cargo test -p rvoip-sip --lib
+   refer_updates_are_typed_ordered_and_bound_to_the_exact_live_route --
+   --nocapture`.
+
+   The same 2026-07-14 rvoip wire harness records a narrower production-adapter
+   slice for this item. It uses actual prepared/committed SIP and WebRTC routes,
+   the common Orchestrator bridge and MediaGraph, real G.711/Opus RTP,
+   WebRTC→SIP RFC 4733, bidirectional DataMessage/SIP MESSAGE translation,
+   remote SIP hangup, post-teardown silence, and exact resource cleanup. The
+   reusable fixes exposed by that run landed in rvoip first: `rvoip-core`
+   enables the Opus media feature in its production dependency graph; WebRTC
+   retains RFC 7587 `opus/48000/2` SDP while normalizing the default media
+   signal to mono; one WebRTC audio stream can attach both Opus and
+   telephone-event tracks without duplicate pumps; and exact outbound SIP
+   release treats a peer-removed dialog as authoritative terminal state. The
+   focused three-package `cargo check` and strict `rvoip-webrtc --no-deps`
+   Clippy pass. This evidence does not complete item 7 because the Bridgefu
+   durable actor, inbound attachment paths, reverse-direction DTMF, WSS/WHEP,
+   and deployed NAT traversal are not exercised.
+
+   The later split-gateway slice closes the local inbound protocol-termination
+   gap. A real authenticated WHIP offer retains the
+   exact auth-core subject/issuer/tenant and WebRTC attachment token through
+   admission; a real SIP dialog retains its exact SIP token; both use the
+   transport-only gateway Orchestrator and drain to zero. Pump tests cover
+   complete RTP, arbitrary DataMessages, and typed DTMF over the private route.
+   Final local composition evidence uses a real native WHIP peer, exact
+   principal/attachment routing, mTLS UCTP 0.2, an authoritative single-use
+   worker consume, the durable call actor and MediaGraph, bidirectional Opus,
+   bound context DataMessages, RFC 4733 DTMF, terminal teardown, and zero
+   native/private routes, worker bridges, or lifecycle tasks. It is
+   `native_whip_edge_reaches_call_pinned_worker_over_mtls_uctp_and_drains_cleanly`;
+   the complete private-forwarding target passes 7/7. WSS and WHEP semantics
+   remain covered at their first-party rvoip listener boundaries rather than
+   by duplicating this topology test. RTCP is intentionally terminated
+   hop-by-hop when transcoding changes packet identity; the native termination
+   metric and byte-exact private RTCP conformance are tested separately.
+   Deployed NAT/TURN remains the owner-gated item 9 qualification and does not
+   keep the local call-engine implementation open.
+8. [x] Preserve the frozen StandardCharter path while adding a protected
    canary compatibility route for its trusted Vapi contract: `sip:<tenant>`
    plus `X-Correlation-Id`, without a public attachment token. The canary may
    auto-create or attach only after source authentication, explicit tenant
@@ -1433,6 +2307,17 @@ not hide an earlier adapter side effect behind a nominally staged API.
    unrelated or replayed requests must fail closed. The existing runtime stays
    the default until this path passes every frozen regression and the
    non-production canary workflow.
+   - [x] Local durable-engine compatibility evidence: authenticated principal,
+     exact tenant/correlation mapping, hidden attachment derivation, stable
+     idempotency, replay/metadata-drift/cross-tenant negatives, real
+     MediaGraph PCMU↔Opus, bidirectional teardown/drain, and SQLite crash
+     fencing through the production Amazon adapter seams.
+   - [x] Real authenticated generic SIP listener packet and RTP path with
+     durable create/attach, replay and tenant negatives, fake Connect/Chime,
+     screen-pop attributes, PCMU↔Opus, teardown, and exact drain cleanup.
+   The manually protected Vapi→AWS non-production workflow remains an
+   unchecked Gate 11 item. The legacy runtime remains the default and no
+   production switch is authorized.
 9. [ ] Add configurable STUN/TURN, symmetric RTP, advertised addresses, SIP
    `rport`, ICE/DTLS timeout handling, and NAT-aware media-port allocation. ICE
    candidate policy is per exchange: HTTP answers full-gather as required by
@@ -1444,17 +2329,71 @@ not hide an earlier adapter side effect behind a nominally staged API.
    context translation, terminal cleanup, and no media after teardown across
    representative NAT topologies. Mock-adapter bridge tests alone do not
    satisfy this prerequisite or the gate.
+   - [x] 9a — Prove the hermetic localhost production-path slice: PCMU↔Opus
+     over WHIP and WSS plus PCMA↔Opus over WS, actual SIP and WebRTC RTP,
+     RFC 4733 in both directions, arbitrary binary DataChannel→SIP MESSAGE,
+     subsequent SIP MESSAGE→`bridgefu.context.v1` DataChannel, exact
+     allowlisted initial SIP INVITE headers, symmetric-RTP tuple learning,
+     remote SIP BYE, post-teardown silence, and exact graph/route/task cleanup.
+     Prove canonical secure WHEP-04 one-way playback separately because WHEP
+     is a playback role rather than a bidirectional interactive leg.
+   - [x] 9b — Qualify the remaining local failure and durable-attachment
+     boundary: candidate-less ICE and mismatched DTLS fingerprint fail within
+     the configured deadline and release both routes; advertised signaling and
+     media addresses, RFC 3581 `rport`, and bounded symmetric-RTP rebinding
+     pass focused network tests; a real tenant-authenticated SIP listener
+     consumes Bridgefu's hashed single-use two-minute request-URI token,
+     reaches the durable call actor only after ACK, binds an explicitly
+     token-selected peer without FIFO pairing, creates one active bridge, and
+     tears both legs and all lifecycle tasks down on remote BYE. The initial
+     context proof is deliberately split: the durable actor owns and persists
+     `bridgefu.context.v1` before originate, while the production SIP wire test
+     proves the resulting allowlisted headers exactly; it is not represented
+     as one monolithic edge-to-edge test.
+   - [ ] 9c — After owner review, reconcile the private TURN/WebRTC work, the
+     uncommitted NACK/statistics delta, and the separate
+     `codex/dtmf-codec-identity` RTC candidate into clean reviewed commits on
+     an owner-approved remote, then pin immutable fetchable WebRTC/RTC
+     revisions and restore those exact dependency declarations in both rvoip
+     and Bridgefu.
+     Then run Bridgefu through representative deployed public-NAT and TURN-only
+     topologies, including explicit media-port allocation/forwarding behavior,
+     and rerun the RTC, rvoip WebRTC, exact Chromium destination, and
+     StandardCharter regression matrices. No local fork is adopted, no fork is
+     pushed, and no upstream issue or pull request is opened before that
+     review.
 
-The current exact-revision `rtc` alpha fork remains pinned while these adapter
-and lifecycle defects are fixed in rvoip. A further private fork is justified
-only by a minimal failing engine conformance test (directional RTP,
-rollback/counter-offer, close/candidate lifecycle, or late DataChannel). Any
-such patch remains on an exact reviewed revision; no upstream issue or pull
-request is created before owner review.
+Focused local evidence for 9a and 9b is green on 2026-07-14. The rvoip
+production-adapter matrix runs three bidirectional cases (WHIP/PCMU,
+WS/PCMA, and trust-bundle-scoped WSS/PCMU) plus secure WHEP-04 playback. The
+WSS peer advertises an SDP RTP tuple different from its actual source and
+proves media returns to the learned tuple. Two additional target-contacting
+WHIP cases prove bounded ICE and DTLS failure cleanup. Focused SIP/RTP tests
+prove advertised public addresses, `rport` source-port recovery, and symmetric
+RTP rebinding policy. Bridgefu's real authenticated attachment case completes
+the durable actor boundary and also exposed two reusable rvoip fixes: inbound
+`SipAdapter::accept` now waits for the UAS ACK/Active boundary before emitting
+`Connected`, and inbound BYE cleanup dispatches from a fresh owned task so the
+normal Tokio test stack is not exhausted. Scoped rvoip strict Clippy passes.
+Bridgefu's focused strict Clippy reached only an unrelated concurrent
+call-control lint after compiling this path; that repository-wide lint is not
+misrepresented as Gate 7 evidence. Item 9 remains open solely for 9c's
+owner-gated immutable fork adoption and deployed public-NAT/TURN proof.
+
+The tracked and current rvoip and Bridgefu release declarations pin the exact
+`rtc` alpha revision `1e5b7d4...`, and Bridgefu's working lockfile reports its
+full Git source. Locked metadata succeeds in both repositories. The validation
+runs used temporary `../rtc/rtc` manifest overrides and a path-resolved
+generated lock entry, but that temporary state has been removed and cannot
+become release provenance.
+A further private fork is justified only by a minimal failing engine conformance
+test (directional RTP, rollback/counter-offer, close/candidate lifecycle, or late
+DataChannel). Any adopted patch must be an exact reviewed revision; no upstream
+issue or pull request is created before owner review.
 
 The private TURN hardening work is complete locally at WebRTC revision
 `4a2f64c4a10562bfbcf6e406afb197642e72c442` with `rtc` submodule revision
-`4aa775a2c7d308b15075b544eaf667eba8584a6f`. The reviewed scope includes real
+`4aa775a2c7d308b15075b544eaf667eba8584a6f`. The candidate scope includes real
 UDP relay-only gathering and routing, allocation/permission/refresh/release,
 authenticated responses, stale-nonce and ICE-restart recovery, exact inbound
 TURN tuple enforcement, bounded peer state, IPv6 related-address handling,
@@ -1463,9 +2402,54 @@ TURN end-to-end, strict library Clippy, formatting, and independent P0/P1/P2
 audit evidence is green. These revisions have not been pushed, submitted
 upstream, or pinned into rvoip: owner review and an owner-approved private
 remote are prerequisites for changing the fetchable dependency. The existing
-rvoip `rtc` revision therefore remains authoritative until that review; no
-roadmap item may claim the local TURN fork is integrated before the exact pin
-and downstream WebRTC qualification pass.
+tracked rvoip `rtc` revision therefore remains authoritative until that review;
+the earlier temporary local path override produced validation-only evidence,
+and no roadmap item may claim the local TURN fork is integrated before the exact
+pin and downstream WebRTC qualification pass.
+
+The recorded 4/4 private WebRTC TURN run used those two heads plus the RTC
+submodule's separate uncommitted four-file NACK/statistics delta. It is valid
+evidence for that composite local worktree, not yet for a clean immutable
+revision pair. `docs/webrtc-fork-review.md` records the files, commands, scope,
+and owner-review sequence required before adoption.
+
+Downstream qualification now uses a hermetic in-process TURN server rather
+than the former Docker fixture, so an unavailable container network cannot
+silently skip relay evidence. Against the current crates.io WebRTC alpha pin,
+the real two-peer Opus test fails because `IceTransportPolicy::Relay` is not
+enforced and no relay pair is selected. The same test passes against the two
+private revisions above. That run also exposed and fixed rvoip's candidate
+diagnostic lookup: alpha stats prefix candidate entry IDs while candidate-pair
+references use the unprefixed ID.
+
+The subsequent private RTC delta at base revision
+`4aa775a2c7d308b15075b544eaf667eba8584a6f` closes the lossy-audio feedback
+path: generic NACK is negotiated for Opus, declared SDP SSRCs bind to inbound
+interceptors after first-packet codec resolution, inbound RTCP feedback updates
+statistics, and same-SSRC audio retransmissions are counted. The hermetic
+lossy-TURN test deterministically drops 31 relay packets, recovers all 200
+frames, observes 20 NACKs and 23 retransmissions, and passes. The RTC library
+passes 180/180 tests, four focused regressions pass, and the top-level private
+WebRTC TURN suite passes 4/4. The scoped four-file fork diff is uncommitted and
+unpushed. The remaining release blocker under item 9 is owner review plus an
+immutable fetchable private WebRTC/RTC revision and downstream qualification
+against that exact pin; no upstream contact is authorized.
+
+A second local RTC candidate on branch `codex/dtmf-codec-identity`, based on
+the currently authoritative `1e5b7d4be6d94850694f2519f4c235d16c871d53`,
+addresses final-SDP telephone-event interoperability independently of the TURN
+and NACK work. Its six modified files cover sender codec identity/binding,
+same-clock payload preservation, primary-only supplemental SDP, grouped and
+un-signaled supplemental receive ownership, and their tests. The current diff
+is 807 insertions and 130 deletions with stable patch ID
+`478b7da63ea6d195f446a9abce4c56e62129a86e`. The full local RTC library passes
+180/180, including all 13 candidate tests; rvoip's outbound-writer suite passes
+4/4, DTMF wire 3/3, and browser SDP 13/13. Exact built-SDK Chromium handoffs to
+generic SIP, generic WSS, Amazon Connect, and Telnyx are also green against this
+local composite. The candidate is uncommitted and unpushed; those path-override
+results do not change the authoritative tracked pin or constitute release
+integration. Owner review, a clean immutable revision, restored exact pins and
+lockfile provenance, and the downstream reruns in 9c remain mandatory.
 
 The pre-item-3 client audit at committed rvoip revision `e982e36b` confirms
 that the authenticated WS/WSS and WHIP/WHEP server roles are present, but the
@@ -2431,58 +3415,973 @@ Gate 7 progress evidence recorded on 2026-07-12:
   sip-dialog library tree pass. All four clean-baseline qualification failures
   are therefore closed without weakening trace redaction or requiring a hidden
   `RUST_MIN_STACK` setting.
+- Follow-up default-stack qualification on 2026-07-14 found one separate
+  inbound entrypoint that still awaited the first signaling state-machine
+  transition inside the transport/dialog/session poll chain. The inbound
+  handler now awaits the existing cancellation-safe fresh-task seam, preserving
+  per-shard ordering and exact state-machine error propagation while allowing
+  the parent poll chain to unwind. A raw-UDP fast-auto-accept regression runs
+  the complete inbound listener path on an explicitly configured 2 MiB Tokio
+  worker stack and passes with `RUST_MIN_STACK` absent. Both hermetic
+  StandardCharter teardown directions now use the same explicit 2 MiB runtime;
+  their exact tests pass independently, the full locked
+  `standardcharter_contract` binary passes 59/59 tests, and the focused SIP
+  teardown/header/state-table matrix passes 23/23 tests. The raw peer in the
+  rvoip regression deliberately excludes the separate UAC response path so the
+  evidence measures the corrected inbound boundary directly.
 
-Exit: both bridge directions pass real media tests and StandardCharter remains
-unchanged.
+Historical local exit: the generic SIP/WebRTC adapter directions pass the
+listed real localhost media tests and the frozen StandardCharter SIP contract
+remains unchanged. This is not evidence for a stock Vapi browser transfer, a
+direct Bridgefu widget, API-level leg replacement, or the complete destination
+matrix. Product release status is governed by VF-0 through VF-7 in addition to
+the protected Vapi/AWS run and owner-reviewed deployed NAT/TURN evidence.
 
 ### Gate 8 — Complete provider control and media (`pending`)
 
-- [ ] Replace Bridgefu's hand-written Telnyx HTTP models and Ed25519 verifier
+- [x] Replace Bridgefu's hand-written Telnyx HTTP models and Ed25519 verifier
   with exact crates.io dependency `telnyx = "=0.1.0"`; keep Bridgefu-owned tenant,
   call, leg, idempotency, deadline, redaction, and reconciliation policy.
-- [ ] Complete Telnyx originate, native bridge, transfer, hangup, DTMF,
+- [x] Replace provider methods that rely on SDK-generated command IDs with
+  Bridgefu-owned command envelopes. Originate, bridge, transfer, hangup, and
+  DTMF each receive the exact durable outbox/effect ID as their Telnyx
+  `command_id`; retries reuse that ID and a different logical operation can
+  never reuse it.
+- [x] Complete Telnyx originate, native bridge, transfer, hangup, DTMF,
   capability discovery, webhook verification, and typed event normalization.
-- [ ] Connect Telnyx media to unique Bridgefu SIP attachment URIs.
-- [ ] Persist deduplication, command IDs, callback reconciliation, and
-  idempotency; add deadlines, circuit breakers, redaction, and safe retries.
-- [ ] Reject new Twilio/Vonage provider legs with an explicit deferred
+- [x] Build the SDK client with the configured base URL, explicit request
+  timeout, reviewed retry policy, and webhook public key. Verify the exact raw
+  request body with `telnyx::webhooks::Verifier`, retain unknown event payloads
+  for forward compatibility, and never log credentials or raw call metadata.
+- [x] Connect Telnyx media to unique, hidden, two-minute Bridgefu SIP attachment
+  URIs authenticated with the configured tenant-bound Digest principal. Issue
+  the linked destination Dial only after the primary media reference is
+  durably bound, with a distinct effect ID, `link_to`, and
+  `bridge_on_answer=true`.
+- [x] Persist webhook deduplication, provider references, exact command IDs,
+  callback reconciliation, and request idempotency; enforce deadlines,
+  bounded SDK retries, redacted diagnostics, and safe retry classification.
+- [x] Add the runtime circuit breaker and prove its open/half-open/recovery
+  behavior against deterministic outage injection.
+- [x] Reject new Twilio/Vonage provider legs with an explicit deferred
   capability error while preserving safe reads of existing persisted enums.
-- [ ] Pass deterministic SDK-backed mock contracts and restricted Telnyx live
-  test-account flows.
+- [x] Pass deterministic SDK-backed Telnyx mock contracts for all mutations,
+  exact retry bodies, timeouts, 429/5xx exhaustion, invalid signatures,
+  connection binding, duplicate events, and role-aware repository restart
+  behavior.
+- [ ] Pass the restricted Telnyx live test-account control/media workflow.
+
+Gate 8 implementation evidence recorded on 2026-07-13:
+
+- `ProviderLegExecutor` is additive and defaults to a fail-closed disabled
+  implementation. The Telnyx registry implementation reconstructs the hidden
+  media token only inside the owned `StartLeg` effect and sends the token to
+  Telnyx as the SIP user; no raw token is persisted or returned by the API.
+- The durable call engine emits `ConnectProviderDestination` only after the
+  media Dial reference commits. Media and destination references use explicit
+  roles and coexist under schema version 7; SQLite and PostgreSQL migrations
+  preserve legacy references as `media`.
+- Transfer, hangup, and DTMF target the primary media reference. A Telnyx
+  logical leg cannot become connected from SIP signaling or `call.answered`;
+  it requires both the exact current SIP attachment binding and the verified
+  `call.bridged` callback.
+- `cargo test --test repository_conformance` passes 21 tests and
+  `cargo test --test call_service_repository_conformance` passes 5 tests,
+  including memory/SQLite/PostgreSQL role-aware restart and migration coverage.
+- `cargo test --lib` passes 148 tests and `cargo test --bin bridgefu` passes 68
+  tests, including the two-Dial executor, webhook profile isolation, retry,
+  redaction, attachment-purpose, bridged-state, and circuit-breaker contracts.
+- The Telnyx circuit breaker opens after bounded retryable failures, rejects
+  without touching the network, admits exactly one half-open probe, ignores
+  stale completions by generation, and exports transition/rejection metrics.
+  Its deterministic 503/open/half-open/recovery test passes.
+- The production `worker` role now constructs the configured tenant-bound
+  attachment-principal resolver and `ProviderRegistry`, then installs the call
+  execution supervisor with that provider executor. The compatibility helper
+  used by isolated worker tests remains fail-closed with the disabled executor;
+  all four `process_role::tests` pass after the production wiring change.
+- The restricted live workflow remains release-blocking. No provider call was
+  placed and no credential was read as part of this implementation pass.
 
 Exit: Telnyx passes control, media, security, retry, and outage scenarios using
 the published SDK; Twilio and Vonage are represented consistently as deferred.
 
 ### Gate 9 — Make broadcasts operational (`pending`)
 
-- [ ] Attach UCTP and MOQT to any connected source without competing for its
+- [x] Attach UCTP and MOQT to any connected source without competing for its
   receiver.
-- [ ] Expose real authenticated subscriber endpoints and enforce token expiry.
-- [ ] Publish audio/catalog and optional sanitized event tracks.
-- [ ] Track publication, negotiated version, relay path, reconnect, listener,
+  - [x] Add `ManagedBroadcastService`, which accepts a real rvoip
+    `ConnectionId`, reuses `Orchestrator::media_graph_for_connection`, exposes
+    UCTP through `register_virtual_publisher_with_codec` using canonical Opus
+    48 kHz mono, and adds MOQT as a managed graph sink. The legacy virtual-
+    publisher API remains a compatibility wrapper. Focused tests prove PCMU
+    and PCMA sources produce payload type 111 Opus with wrap-safe 960-tick
+    timestamps, same-codec sinks share one transcode group, UCTP and MOQT share
+    one source graph, and both close their exact routes/registrations.
+  - [x] Resolve a durable API `source_leg_id` through `CallService` to its
+    tenant-owned, call-pinned, currently connected binding and exact fenced
+    worker. The opaque `ConnectionId` is passed only to the colocated managed
+    media runtime; the durable API has no legacy Amazon-media fallback.
+- [x] Expose real authenticated subscriber endpoints and enforce token expiry.
+  - [x] Replace ad-hoc API JWT creation with a strict shared
+    `BroadcastTokenService`: fixed HS256, issuer, audience, contract version,
+    bounded size/TTL, exact tenant/broadcast scope, active-grant revocation,
+    credential ID, and expiry metadata.
+  - [x] Add a single-use UCTP `SessionBindingResolver` and a transport-level
+    receive-only scope. The coordinator rejects `sendonly`/`sendrecv` offers
+    before connection state or media allocation and rechecks principal expiry
+    on every command.
+  - [x] Install the shared validator plus the Redis-projected active-grant and
+    durable session-lease authorities into both standalone
+    `RvoipMoqRelayAdmission` subscriber listeners. Raw QUIC and WebTransport
+    use the same fail-closed token, replay, ownership, quota, expiry, and
+    revocation policy.
+  - [x] Install the shared validator/resolver into a real public UCTP/QUIC
+    listener. `all-in-one` binds an explicit TLS/UDP endpoint on the exact
+    managed-media Orchestrator and drains it on shutdown. The later Gate 10
+    implementation adds the authenticated split gateway-to-pinned-worker edge;
+    this checkpoint describes only the earlier standalone listener evidence.
+- [x] Publish audio/catalog and optional sanitized event tracks.
+  - [x] Attach the existing rvoip-moq LOC Opus audio and MSF catalog publisher
+    through the managed source path, with optional external-relay publication.
+  - [x] Surface opt-in sanitized-event configuration and event submission from
+    the durable call engine.
+- [x] Track publication, negotiated version, relay path, reconnect, listener,
   drop, and cleanup state.
-- [ ] Enforce 1,000 direct UCTP listeners per worker; use MOQT relays above it.
+  - [x] Add a serializable managed diagnostic snapshot containing endpoint,
+    protocol tuple, relay path, lifecycle, health, active listeners, graph and
+    route state, queue depth/capacity, drops, evictions, transcodes, and expiry.
+    Exact-generation grants and managed routes are revoked on explicit close,
+    expiry, and Drop fallback.
+  - [x] Retain managed handles in the durable API, build GET responses from
+    their current descriptors, merge sanitized managed snapshots into the
+    authenticated diagnostics response, and await exact close/revocation on
+    DELETE.
+- [x] Enforce 1,000 direct UCTP listeners per worker.
+  - [x] Bound the managed UCTP profile and diagnostics to a maximum configured
+    capacity of 1,000.
+  - [x] Make subscription admission atomic at the shared Orchestrator handler
+    and reject listener 1,001. One physical Connection holds one permit across
+    all its routes and every ingress handler sharing that Orchestrator.
+  - [x] Configure the clustered public gateway and worker path for at least
+    1,000 direct listeners. The shipped profile permits 2,000 active routes,
+    1,200 routes on one gateway-to-worker peer, and 2,000 public UCTP
+    connections; rendered-profile validation prevents regression below the
+    1,000-listener floor.
+- [ ] Route fanout above the direct-listener ceiling through the production
+  MOQT relay topology. The relay runtime is present, but arbitrary dynamic
+  namespace activation remains owner-review-gated on the pinned moq-rs fork.
 
-Exit: a normal call, UCTP, and MOQT consume one source simultaneously and all
-lifecycle/security tests pass.
+Gate 9 canonical broadcast-codec evidence recorded on 2026-07-14:
+
+- The explicit-target-codec rvoip virtual-publisher suite passes 5/5. It proves
+  PCMU and PCMA to canonical Opus publication, one source receiver, codec-group
+  reuse, one group transcode per source frame, and wrap-safe 20 ms RTP timestamp
+  continuity. Bridgefu's managed-broadcast shape suite passes 9/9 and proves
+  the production UCTP descriptors and packets advertise Opus payload type 111
+  for both G.711 source codecs. The exact rvoip command is
+  `cargo test -p rvoip-core --test virtual_publisher`; Bridgefu uses
+  `cargo test --lib broadcast::managed::shape_tests -- --nocapture`.
+
+Gate 9 implementation evidence recorded on 2026-07-13:
+
+- `cargo test -p rvoip-uctp --test coordinator receive_only_credential`
+  passes both rejection-before-state and valid `recvonly` setup cases.
+- Focused rvoip-quic and rvoip-webtransport tests prove an outbound-only
+  (`recvonly` on the wire) binding drops peer-supplied datagrams before ingress
+  delivery or publisher fanout.
+- `cargo test --lib broadcast::token::tests` passes five strict algorithm,
+  TTL/ownership, revocation, exact-session, single-use replay, and
+  cross-transport tests.
+- The focused `uctp_and_moq_share_one_real_source_and_cleanup_exactly` test
+  passes, including concurrent idempotent close and exact publisher/route/grant
+  cleanup.
+- The focused `managed_expiry_revokes_grant_and_closes_route` test proves an
+  expired publication revokes admission and removes its exact media route
+  without requiring an API cleanup request.
+- `cargo check --bin bridgefu` passes after the API token/grant integration.
+
+Gate 9 durable API integration evidence recorded on 2026-07-14:
+
+- `broadcast_source_resolution_requires_exact_owned_connected_binding_and_worker`
+  proves exact tenant, call, leg, current binding, connection redaction, and
+  worker-fence enforcement at the authoritative service boundary.
+- `durable_broadcast_rejects_invalid_foreign_disconnected_and_stale_sources`
+  proves malformed identifiers, foreign legs, disconnected legs, missing
+  runtimes, and stale process-local routes fail closed without a grant or
+  retained publication.
+- `durable_broadcasts_share_real_source_and_cleanup_managed_state` proves two
+  durable API publications consume one real Orchestrator source graph, expose
+  live sanitized diagnostics, never serialize the source `ConnectionId`, and
+  remove exact publisher registrations and grants on DELETE.
+- `broadcast_crud_and_tokens_are_hidden_from_other_tenants` proves GET, token,
+  and DELETE ownership isolation plus immediate token revocation. At this dated
+  checkpoint the rvoip virtual-publisher suite passed 3/3, including a
+  compile-time regression proving its setup future is `Send`; no blocking-thread
+  shim is used. The later canonical-codec additions bring the current suite to
+  5/5 as recorded below.
+
+Gate 9 public UCTP and admission evidence recorded on 2026-07-14:
+
+- `PublicUctpBroadcastListener` now owns a real raw-QUIC endpoint, PEM TLS
+  loading, ALPN dispatch, bounded connection admission, drain, and shutdown.
+  Installation forcibly replaces caller-supplied bearer, Session resolver,
+  subscription handler, and Orchestrator authority so a permissive prebuilt
+  transport configuration cannot bypass Bridgefu policy.
+- The listener's two real-network tests prove that an invalid credential is
+  rejected despite a permissive injected stub, a valid short-lived Bridgefu
+  token binds once, replay is rejected, active-grant revocation closes the
+  bound peer, and a dedicated ephemeral PEM endpoint drains cleanly. The token
+  authority suite passes 6/6, including non-consuming authorization checks for
+  an already-bound Session after the single-use attachment is consumed.
+- rvoip reauthorizes bound Sessions on every command and with a 250 ms raw-QUIC
+  and WebTransport lifetime guard. Principal expiry, tenant/broadcast mismatch,
+  inactive grants, and revocation fail closed; the common peer supervisor then
+  releases tasks, routes, streams, and direct-listener capacity.
+- Direct-listener permits are atomic and Orchestrator-wide. An eight-test
+  handler suite proves full-batch rollback, concurrency across handler
+  instances, one permit across multiple routes, exact unsubscribe/session/
+  connection/publisher cleanup, publisher-close versus in-flight-admission
+  serialization, and an explicit 1,001st-listener `429` without route
+  insertion. The complete UCTP state suite passes its focused matrix, and the
+  current rvoip virtual-publisher suite passes 5/5 with exact route/permit
+  cleanup on close plus canonical codec grouping.
+- `broadcast.uctp_listener` is schema-validated and explicit about bind address,
+  TLS certificate chain/private key, connection cap, token authority, and
+  advertised `uctp+quic` endpoint. Its two config tests, the configuration
+  schema checker, and `cargo check --bin bridgefu` pass. This paragraph records
+  the standalone wiring checkpoint; Gate 10 subsequently completes clustered
+  authenticated forwarding and independent listener ownership.
+
+Gate 9 sanitized-event evidence recorded on 2026-07-14:
+
+- MOQT event tracks are disabled unless both the tenant policy and the
+  individual broadcast request opt in. UCTP rejects event-track requests, and
+  the default catalog remains audio-only.
+- Event admission resolves the exact live source Connection, tenant, call,
+  leg, and worker fence before accepting a `bridgefu.context.v1` message. It
+  rejects identifier overrides, replay, NUL/control/CRLF content, oversized
+  fields, unsupported reliability, and rate/queue overflow; only fixed event
+  kinds plus a trusted receive timestamp are published.
+- Publication state, queue depth, drops, authorization, and exact route cleanup
+  are included in managed diagnostics without retaining raw context. The
+  sanitizer passes 3/3 tests, managed broadcasts 6/6, context boundaries 9/9,
+  configuration policy 1/1, the API security/lifecycle path 1/1, and the
+  rvoip-moq sanitized-event suite 9/9. Schema validation and scoped strict
+  Clippy also pass.
+
+Gate 9/11 broadcast-load harness evidence recorded on 2026-07-14:
+
+- `tests/qualification_uctp_fanout.rs` is an ignored, opt-in harness for the
+  real bounded `UctpBroadcastPublisher` target fanout. Its immutable release
+  profile is 1,000 direct targets for one hour; it records aggregate delivery,
+  drops, p95 queue latency, capacity rejection, and post-warmup RSS without
+  retaining subscriber identifiers. A 16-listener, three-second local smoke
+  delivered 2,464/2,464 frames with zero source or publisher drops, a
+  400-microsecond p95 upper bound, verified rejection beyond the configured
+  1,000-listener capacity, and 0.64 percent post-warmup RSS growth. This
+  validates the harness and publisher
+  fanout only, not 1,000 QUIC handshakes or RTP datagram paths.
+- `tests/qualification_uctp_network.rs` is the complementary ignored,
+  end-to-end raw-QUIC harness. It creates one unique Bridgefu token and
+  receive-only UCTP Session/Connection per listener through the real
+  `PublicUctpBroadcastListener`, resolves the exact broadcast grant, subscribes
+  through the Orchestrator, and consumes a MediaGraph-backed virtual publisher.
+  It parses every received datagram as an eight-byte UCTP 0.2 header plus a
+  complete RTP packet, refreshes expiring credentials during release runs, and
+  verifies unsubscribe, ConnectionEnd, route, registration, permit, and peer
+  cleanup. Its immutable release profile is 1,000 real QUIC listeners for one
+  hour at a 100-attempt/s setup rate. A four-listener, three-second local smoke
+  delivered 612/612 complete RTP datagrams from 153 source frames with no
+  invalid packets, discontinuities, unmatched timestamps, protocol errors, or
+  retained resources and a 7.3 ms aggregate p95 latency upper bound. The smoke
+  used a three-second initial credential, six-second replacements, and
+  one-second refreshes; completed 20 real wire refreshes; rotated replay IDs
+  without changing ownership; and rejected second-peer attachment first with
+  the original credential and then with a current refreshed credential after
+  the initial reservation expired. The original peers remained active for the
+  measured media. This validates the local authenticated network harness only;
+  the one-hour and deployed-network evidence remain open.
+- Broadcast token refresh now rotates the JWT replay ID while retaining a
+  stable credential lineage for UCTP Session ownership. Refresh also extends
+  only the already-consumed exact Session reservation, preventing the refreshed
+  token from attaching a second peer when the original token expires. A focused
+  unit test covers owner continuity, replay-ID rotation, and post-expiry replay
+  rejection.
+- `tests/qualification_moq_relay.rs` is an ignored, opt-in real-network
+  draft-19 harness. It uses distinct publisher-mTLS and subscriber raw-QUIC
+  listeners over a role-separated embedded relay topology; every simulated
+  listener is a real authenticated `MoqAudioSubscriber` session. rvoip now
+  validates the MSF catalog before subscribing `audio/main` on that same
+  session, exposes bounded rvoip-owned LOC events/snapshots, and shares the
+  existing credential, reconnect, and drain lifecycle. Focused real-relay tests
+  pass over raw QUIC and WebTransport without a moq-rs fork change. Its
+  immutable release profile remains 10,000 listeners for one hour. A
+  four-listener, three-second local raw-QUIC smoke brought all four sessions
+  live with no reconnects, admitted and produced 151/151 origin audio objects,
+  delivered all 151 to every listener (604 receipt/latency samples), observed
+  zero receiver lag or unmatched timestamps, measured 10 ms p95 and 16 ms
+  maximum source-admission-to-receiver latency, observed zero reconnect or
+  cleanup errors and 0.66 percent post-warmup RSS growth, retained healthy relay
+  snapshots, and shut down cleanly. A separately deployed relay-tier smoke also
+  remains open. Neither local smoke completes a Gate 11 checkbox.
+
+Local exit: a normal call, UCTP, and MOQT consume one source simultaneously and
+their lifecycle/security tests pass. Production fanout above the direct UCTP
+ceiling remains open until the dynamic MOQT publisher-policy candidate is
+owner-reviewed, pinned, enabled, and requalified.
 
 ### Gate 10 — Operations, containers, and clouds (`pending`)
 
-- [ ] Make all process modes executable with dependency-aware health and drain.
-- [ ] Enforce versioned schema-backed configuration and redacted secret refs.
-- [ ] Add OTLP tracing, complete Prometheus metrics, diagnostics, admission,
+- [x] Make all process modes executable with dependency-aware health and drain.
+  - [x] Type `runtime.mode`, preserve `all-in-one` as the compatibility default,
+    and make the split durable worker own a real call-service runtime, rvoip
+    execution supervisor, dependency-aware readiness, and bounded drain without
+    binding public signaling or control routes.
+  - [x] Add an executable `gateway` lifecycle shell and explicit concrete-edge
+    dependency seam. The shell owns operational health, pauses bounded
+    admission whenever the dependency is not healthy, permanently closes
+    admission before drain, waits for admitted setup work, and drains the edge
+    plus health server against one deadline. Main dispatch cannot fall back to
+    `all-in-one`.
+  - [x] Make the split gateway own the authenticated/versioned HTTP call API,
+    provider capabilities, and signature-verified provider webhooks through a
+    transport-free `CallControlRuntime`. It opens the shared PostgreSQL/Redis
+    authority, selects already-registered workers, and projects existing
+    durable commands without registering a worker, constructing an
+    Orchestrator, or consuming worker work. Its supervised projector pauses
+    readiness after persistent failures and joins during drain. Broadcast
+    CRUD and token requests now use the durable worker-command path described
+    below; transports without a safe public subscriber topology still return
+    an explicit capability error. Public
+    `/v1` and provider-webhook routes bind only `api.http_bind`; health and
+    metrics remain isolated on `observability.http_bind`. Non-loopback public
+    binds fail closed without `api.tls`; the runtime terminates HTTPS with
+    rustls and drains admitted requests against the configured shared deadline.
+  - [x] Add the private authenticated UCTP gateway-to-worker forwarding adapter
+    and install it as the concrete gateway edge and worker listener. The edge
+    uses mutually authenticated QUIC plus short-lived tenant- and
+    worker-bound JWTs, exact call/leg routes, complete UCTP 0.2 RTP datagrams,
+    reliable byte-exact RTCP carriage, bounded queues and admissions, immutable
+    call-to-worker pinning, dependency health, and drain/cleanup semantics.
+  - [x] Add the fail-closed private egress command protocol over that existing
+    mTLS UCTP 0.2 route. It defines bounded reliable prepare/activate/abort/end,
+    DTMF, DataMessage, response, and lifecycle envelopes; checks the physical
+    route's exact worker fence, tenant, call, source leg, and attachment
+    generation plus the requested destination generation; rejects expired or
+    digest-conflicting command IDs; serializes transitions per destination;
+    ends matching egress state on source cleanup; and blocks its reserved
+    labels at every public data boundary. Focused state-machine tests and a
+    real authenticated UCTP interception round trip are required evidence.
+  - [x] Complete executable local split SIP/WSS egress. Initial and replacement
+    execution add destination-owned worker Connections/MediaStreams over
+    additional authenticated UCTP streams with exact private-egress session
+    admission, worker SIP/WebRTC proxy adapters, gateway signaling/media
+    handlers, durable progress/terminal reconciliation, and Redis-backed
+    production state/replay seams. The generation-bound
+    `StartLegReplacement`/abort/compensation path, exact terminal ACK ordering,
+    source-loss fallback, and awaited private End/Abort drain cleanup pass the
+    hermetic full-topology test. Process-level Redis restart, non-loopback
+    real-peer, TURN/NAT, cloud, load, and chaos qualification remain required
+    before advertising split `sip_egress` or `webrtc_egress` as release-ready.
+  - [x] Wire authenticated native SIP/RTP, WSS, and WHIP/WHEP production
+    listeners on the split gateway without constructing a durable worker. A transport-only
+    rvoip Orchestrator resolves the exact principal-bound Request-URI,
+    WebSocket-subprotocol, or WHIP/WHEP-path attachment, lets only the pinned
+    worker consume it over private mTLS UCTP 0.2, and forwards complete RTP,
+    DataMessages, and typed DTMF through bounded routes. Native listeners share
+    gateway admission, readiness, and ordered drain. WSS/WHIPS reuse the
+    reviewed `api.tls` identity; non-loopback plaintext WebRTC fails preflight.
+    Bridgefu exposes optional generic and Telnyx Digest credentials to the SIP
+    listener; they can merge only under one realm with distinct usernames.
+    The configured API Bearer principal is rejected on cleartext SIP UDP/TCP by
+    default and requires the explicit
+    `generic_bridge.sip.allow_cleartext_bearer` opt-in. Bridgefu now projects
+    referenced Vapi-profile CIDRs and transport-verified mTLS leaf
+    fingerprints into rvoip's tenant-bound listener policy in both all-in-one
+    and gateway modes. Cross-tenant, overlapping-CIDR, duplicate-fingerprint,
+    and CA-without-leaf-identity configurations fail closed.
+    Focused configuration and role tests prove the false default, explicit
+    opt-in, generic/Telnyx realm and username disambiguation, cleartext Bearer
+    rejection, and preflight rejection when no usable SIP mechanism exists.
+    RTCP is deliberately hop-by-hop: transcoding/repacketization may rewrite
+    packet identity, so raw forwarding is not generally correct. A future
+    rvoip translated-feedback/diagnostic seam may expose raw packets only when
+    SSRC/sequence/timestamp identity is preserved.
+    The native and public-UCTP attachment paths now resolve the public audio
+    stream before consuming the single-use worker proof and offer exactly one
+    canonical private codec. Opus dynamic PTs normalize to 111; PCMU and PCMA
+    use PT 0 and PT 8, and mismatched private RTP is rejected. Focused evidence
+    passes six native-edge tests, five public-UCTP tests, four real mTLS
+    gateway-to-worker tests with encoded/decoded Opus and PCMU, plus rvoip
+    descriptor and real-QUIC PCMA tests. The supervisors retain
+    generation-specific cleanup through panic or forced abort; unexpected
+    supervisor-stream termination now marks health degraded, while an explicit
+    drain remains a normal shutdown.
+  - [x] Represent role-separated publisher mTLS, WebTransport and raw-QUIC
+    subscriber admission, Redis active-grant/session leases, bounded limits,
+    readiness, aggregate diagnostics, and drain; dispatch `moq-relay` through
+    three shared-topology `rvoip_moq::MoqRelayRuntime` listeners without an
+    all-in-one fallback.
+- [ ] Replace the current exact publisher certificate-to-namespace bindings
+  with an rvoip-owned active-grant admission policy for dynamically generated
+  `{tenant}/{broadcast}` namespaces. Exact preconfigured namespaces are secure
+  and executable, but are not sufficient for the production dynamic broadcast
+  API.
+  - [x] Add an rvoip-owned publisher authority contract with no moq-rs types,
+    exact or component-safe tenant-prefix certificate ceilings, exact
+    generation-fenced publication grants, bounded per-certificate capacity,
+    pre-authority certificate checks, and fail-closed bounded lookups.
+  - [x] Implement the Bridgefu authority against the existing Redis active
+    grant projection. It requires exact tenant and broadcast identity, MOQT
+    transport, a live expiry, and the current Redis generation as its fence;
+    missing, malformed, revoked, expired, or unavailable state denies.
+  - [x] Expose the policy through `MoqRelayRuntime` while retaining the static
+    exact-binding variant. The dynamic variant deliberately refuses startup
+    against the current dependency pin because that relay revision does not
+    continuously revalidate expiring mTLS publisher leases.
+  - [x] Prepare an uncommitted private moq-rs candidate which generalizes
+    production expiry-lease supervision to token and mTLS decisions and proves
+    both pre-activation and active-session publisher revocation over a real
+    raw-QUIC connection. The candidate is recorded in
+    `docs/moq-fork-review.md`; it has not been pushed or consumed.
+  - [ ] After owner review, commit and push the private candidate, pin its
+    immutable revision in rvoip, flip the guarded compatibility marker, wire
+    Bridgefu's relay role to the dynamic policy, and rerun the complete relay
+    integration suite. No upstream contact is authorized by this item.
+- [x] Enforce versioned schema-backed configuration and redacted secret refs.
+  - [x] Apply `BRIDGEFU__SECTION__KEY` overrides before strict typed parsing,
+    reject unknown keys at every depth, and keep the version-1 JSON Schema
+    closed over every documented section. CI validates the example plus
+    negative top-level, runtime, tenant, context, and Telnyx typo fixtures.
+  - [x] Provide `validate` and `print-effective-config`; the latter validates
+    shape and redacts credentials without resolving not-yet-provisioned secret
+    references, while `validate` performs secret resolution and role preflight.
+  - [x] Close the remaining semantic-parity checks between JSON Schema bounds
+    and runtime validation. Startup now enforces the schema's nonzero SIP,
+    contact, runtime, and broadcast limits, nonempty region/log filter, exact
+    log format, valid operational bind, and the bounded safe context allowlist;
+    27 configuration and 9 context tests pass.
+  - [x] Add an immutable `config-v1.yaml` schema/model compatibility fixture;
+    CI validates every versioned fixture and Rust asserts v1's typed defaults.
+    Future versions add sibling fixtures rather than rewriting v1.
+  - [x] Model the role-specific private-forwarding TLS, worker targets, token
+    secret, queue/admission bounds, and timeouts in YAML and JSON Schema. The
+    token secret is resolved only for startup, zeroized in intermediate
+    storage, redacted from effective configuration, and rejected outside the
+    gateway/worker roles.
+  - [x] Add schema-backed `api.rate_limit` settings with bounded positive
+    rates, bursts, identity capacity, and idle reclamation. Version-1 configs
+    retain explicit safe defaults and environment overrides remain available
+    through the existing typed configuration path.
+- [x] Add OTLP tracing, complete Prometheus metrics, diagnostics, admission,
   bounded work, rate limits, and circuit breakers.
+  - [x] Add opt-in OTLP/gRPC trace export using OpenTelemetry Rust 0.32 and
+    `tracing-opentelemetry` 0.33 while preserving JSON/pretty stdout logs and
+    the existing Prometheus recorder. Startup validates the collector origin,
+    service name, parent-based sampling ratio, and bounded batch queue; W3C
+    Trace Context propagation is installed, secret header configuration is
+    rejected, and every post-tracing process result uses the SDK's combined
+    flush-and-shutdown operation within the configured timeout. Disabled
+    remains the collector-free default.
+  - [x] Enforce independent token buckets for authenticated control and
+    diagnostics principals plus a pre-verification, gateway-wide provider
+    webhook budget. Principal keys are process-salted one-way
+    issuer/tenant/subject digests;
+    untrusted paths cannot create buckets, the cache is hard-bounded and
+    idle-reclaimed, capacity fails closed, and every denial returns `429` with
+    integer `Retry-After`.
+  - [x] Publish `docs/observability.md` as the Bridgefu-owned release metric and
+    diagnostic inventory. Its executable inventory test requires every listed
+    metric to have an emitter and rejects call, leg, connection, broadcast,
+    message, subject, issuer, correlation, token, or remote-address labels.
 - [ ] Produce one digest-pinned multi-architecture non-root/read-only image and
   scenario-specific Compose profiles.
+  - [x] Keep provider credentials as `env:` references, include every required
+    Telnyx control/media field, and give the clustered worker a private-role
+    configuration that passes its real preflight.
+  - [x] Render every Compose profile in CI, then run the Bridgefu binary's
+    strict `validate`/role preflight against the StandardCharter, generic,
+    Telnyx, UCTP, MOQT, clustered-gateway, clustered-worker, and
+    clustered-MOQT-relay service environments. This is executable configuration
+    validation, not a claim that the checker starts the Compose services. The
+    clustered gateway projection enables its native SIP/RTP, WSS, WHIPS,
+    HTTPS API, and public UCTP listeners with distinct media/signaling ports.
+    The relay profile passes its strict private-role preflight with
+    three distinct UDP listeners, TLS material, Redis coordination, bounded
+    limits, and no public control/signaling surface.
+  - [ ] Assemble and retain one multi-architecture image digest rather than
+    only independent per-architecture local images.
+    - [x] Add a manually dispatched, protected-environment release-candidate
+      workflow with read-only repository permission, exact full Bridgefu and
+      rvoip revisions, pinned executable Actions, `push: false`, one retained
+      OCI layout, and no registry/OIDC publication authority. Its verifier
+      rejects platform-child digests, requires exactly linux/amd64 and
+      linux/arm64, and requires statement-bound SPDX and SLSA predicates for
+      each exact platform manifest. Trivy scans single-platform layouts derived
+      from that same archive and a retained policy rejects HIGH/CRITICAL
+      findings.
+    - [ ] Configure required reviewers, run the workflow after coordinated
+      immutable revisions exist, and retain its successful root digest and
+      reports. Adding the workflow is not evidence that it has run.
 - [ ] Complete runnable AWS ECS/EC2 and GKE gateway, worker, relay, database,
   cache, identity, secret, networking, autoscaling, and telemetry stacks.
+  - [x] Define credential-free, digest-pinned AWS ECS/EC2 and GCP GKE roots
+    for the gateway, worker, and relay roles, including role-separated compute,
+    networking and load balancing, PostgreSQL, Redis, workload identity/IAM,
+    secret injection, telemetry, and bounded autoscaling. Both roots pass
+    formatting, provider initialization without a backend, and static
+    validation.
+  - [ ] Apply each root in an owner-authorized disposable account/project,
+    retain the complete call/context/broadcast/drain smoke evidence, and prove
+    that destroy leaves no billable resources. Static validation alone does
+    not satisfy this item.
 - [ ] Validate code, schemas, Compose, Terraform, runtime smoke, SBOM,
   provenance, and vulnerability policy in CI.
+  - [x] Validate configuration schema fixtures, Compose rendering and runtime
+    preflight, Terraform formatting/static validity, hardened image policy,
+    per-architecture SBOMs, and high/critical vulnerability policy.
+  - [x] Add and execute a credential-free local/CI process/configuration/health
+    smoke covering all eight Compose service preflights, all four exact process
+    runners, dependency-aware `/livez` and `/readyz`, split-role admission and
+    drain, relay diagnostics authentication, and real loopback mTLS UCTP
+    private forwarding. Its evidence explicitly sets
+    `release_criterion_satisfied: false`.
+  - [x] Add call/media/context/broadcast coverage to the credential-free
+    runtime smoke. It executes durable bidirectional codec media, initial and
+    later context/DataMessage flow, shared-source broadcast media, token,
+    diagnostic, and cleanup checks, and retains bounded output hashes in the
+    existing evidence report without claiming a deployment release criterion.
+  - [ ] Retain registry-compatible provenance evidence from the protected
+    multi-architecture candidate workflow.
+
+Gate 10 API admission and observability evidence recorded on 2026-07-14:
+
+- `api.rate_limit` defaults to 50 control requests/s with a 100-request burst,
+  2 diagnostics requests/s with a four-request burst, and 100 provider
+  webhooks/s with a 200-request burst. At most 10,000 one-way identity keys are
+  retained for five minutes by default; all values have matching schema and
+  runtime upper bounds.
+- `api_rate_limit::tests` proves independent surfaces, deterministic token
+  refill/denial, strict identity-capacity behavior, idle reclamation, and zero
+  state when disabled. `api::tests::api_rate_policy_returns_429_with_retry_after_per_surface`
+  proves the Axum boundary returns `429` plus `Retry-After`, does not let a
+  diagnostics budget consume control capacity, and rejects a second webhook
+  before signature verification/persistence. A separate Axum regression proves
+  the 256 KiB webhook body ceiling rejects before either operation.
+- `observability::tests::release_metric_inventory_is_documented_and_bounded`
+  ties the release inventory to concrete emitters and enforces the forbidden
+  high-cardinality label list. The authenticated diagnostics inventory test
+  fixes the exact top-level contract and asserts private material is absent.
+  `deploy/scripts/runtime-smoke.py --list` exposes
+  nine credential-free checks, including the new durable call/media, context,
+  and broadcast runtime checks. The three-check developer form passes 3/3 for
+  codec-exact bidirectional media/cleanup, initial and later context flow, and
+  shared-source broadcast media/token/diagnostic/cleanup. These local checks
+  do not replace live carrier, cloud apply/destroy, release-load, or protected
+  image-candidate evidence.
+  The retained smoke source record includes both tracked and untracked
+  Bridgefu/rvoip state plus exact lockfile-resolved WebRTC, RTC, and
+  moq-transport inputs; a dirty coordinated tree can no longer be reported as
+  clean merely because its implementation files are untracked. Child tests
+  strip inherited `BRIDGEFU_*`, `RVOIP_*`, `OTEL_*`, cloud, provider, and
+  external-store variables so operator credentials/configuration cannot alter
+  the hermetic result or enter a failure tail.
+
+Gate 10 gateway-lifecycle evidence recorded on 2026-07-14:
+
+- `gateway_mode_dispatches_to_the_gateway_runner_without_fallback` proves the
+  binary selects the gateway runner and never the all-in-one compatibility
+  path. Static gateway preflight now succeeds so dispatch is reachable. A
+  fully configured static MOQT relay also passes preflight and starts; only an
+  incomplete relay configuration or the deliberately disabled dynamic
+  publisher policy fails closed.
+- `production_gateway_fails_on_missing_dependency_before_binding_any_socket`
+  holds the configured operational address open and proves the missing
+  authenticated edge error wins before any bind attempt or readiness state.
+- `gateway_readiness_tracks_dependency_and_drain_closes_admission_before_shutdown`
+  proves `/readyz` follows healthy/degraded dependency state, `/livez` remains
+  available while draining, admission closes before dependency shutdown, and
+  an admitted operation is joined before bounded cleanup completes.
+- The original lifecycle shell evidence covered bounded-capacity,
+  pause/resume, permanent drain closure, terminal dependency failure, and the
+  existing worker isolation/drain regressions. The later public-UCTP evidence
+  below supersedes its original statement that no public edge existed.
+- `control_runtime_*` passes 3/3 and proves the split API authority selects an
+  existing worker without registering or draining one, rejects local stores,
+  and degrades after persistent projection failure. The gateway suite passes
+  7/7, and `tls_public_api_drain_waits_for_an_admitted_request` proves an HTTPS
+  request admitted before shutdown completes before the shared drain deadline.
+
+Gate 10 role-separated MOQT relay evidence recorded on 2026-07-14:
+
+- `runtime.mode: moq-relay` now starts three production-role listeners sharing
+  one `MoqRelayTopology`: publisher mTLS, token-authenticated WebTransport, and
+  token-authenticated raw QUIC. Startup verifies Redis grant and session-lease
+  dependencies before any relay bind; dependency loss removes readiness, an
+  unexpected listener stop is terminal, and shutdown drains all listeners
+  concurrently against one bounded deadline.
+- The API-side managed publisher projects an independently generation-fenced
+  active grant into Redis. Standalone subscriber admission validates the same
+  signed token against that projection, then uses the Redis MOQT session lease
+  as the cluster-wide replay tombstone and tenant quota. Backend errors fail
+  closed; explicit broadcast close awaits exact-generation Redis revocation.
+- `cargo test -p rvoip-moq --features relay-runtime --test
+  managed_relay_e2e` passes 3/3 real network paths: external mTLS topology,
+  publisher-to-relay-to-subscriber over raw QUIC, and the same path over
+  WebTransport. `relay_admission` passes 7/7 expiry, replay, quota,
+  wrong-transport, ownership, timeout, revocation, revalidation, and close
+  cases.
+- The focused Bridgefu process-role, relay-configuration, and exact/bounded
+  diagnostics-bearer tests pass. The public
+  `broadcast_shared_authority` integration test proves a standalone validator
+  accepts the projected active grant and rejects both missing and unavailable
+  authorities. The schema/compatibility checker, binary build, all eight
+  executable Compose service preflights, formatting, diff checks, and targeted
+  Clippy run pass. Exact historical per-module counts are superseded by the
+  final stable-tree all-target result recorded below.
+
+- The rvoip dynamic publisher policy rejects wrong certificates, cross-tenant
+  prefixes, path-confusion targets, missing/revoked/expired/unavailable grants,
+  generation replacement, and certificate-cap exhaustion; its focused policy
+  tests pass 5/5. Bridgefu's
+  focused Redis authority tests pass 2/2 for exact live MOQT grants and
+  fail-closed variants. A local, uncommitted moq-rs candidate passes 2/2 real
+  network tests for pre-activation and active-session mTLS grant revocation.
+  Against the qualified dependency pin, which is still pending project-owner
+  release review, the complete rvoip-moq suite
+  passes 138 library, 3 managed-relay, 2 external public-contract, and 7
+  subscriber-admission tests, plus strict Clippy for every rvoip-moq target.
+  rvoip still pins the qualified `ef52ac8` revision. The separate uncommitted
+  dynamic-lease candidate remains unconsumed, and the dynamic runtime refuses
+  startup until that candidate passes project-owner review and is adopted at an
+  immutable fork revision.
+  This evidence therefore does not claim a complete production relay path for
+  arbitrary new broadcasts.
+
+Gate 9/10 clustered durable broadcast-command evidence recorded on 2026-07-14:
+
+- Schema version 11 adds authoritative `broadcasts`, `broadcast_commands`, and
+  `broadcast_operation_receipts` tables to SQLite and PostgreSQL. Gateway
+  create/delete operations persist the broadcast aggregate, exact worker
+  generation, tenant-bound idempotency receipt, command, transactional
+  outbox event, and `Broadcasts` wakeup in one transaction. GET and subscriber
+  token issuance read that same tenant-scoped aggregate; no process-local
+  registry is treated as clustered truth.
+- Admission locks the authoritative, live, non-draining worker row across the
+  active-count check and insert. PostgreSQL also takes a transaction-scoped
+  advisory lock for each tenant/idempotency digest, so concurrent gateway
+  instances cannot exceed the per-worker cap or race start/stop receipts. The
+  create request digest includes the call ID as well as the canonical request,
+  preventing one reused key and identical body from aliasing broadcasts on two
+  calls.
+- The worker owns a bounded command executor. It claims only its exact worker
+  ID and fence, revalidates the connected source leg and current assignment,
+  then starts the existing MediaGraph-backed managed publisher. One-second
+  reconciliation ends publications on expiry, terminal call/leg state, source
+  rebinding, assignment change, or managed-runtime failure. Startup first
+  closes stale-fence resources and revokes their exact Redis grant generation;
+  shutdown retains unresolved generation metadata for the replacement worker
+  rather than losing cleanup authority. Active broadcasts never migrate.
+- Start/stop completion uses exact worker-, fence-, runtime-, and grant-
+  generation compare-and-set checks. A failed DELETE cannot leave an obsolete
+  worker command behind; a failed broadcast with completed cleanup transitions
+  directly to deleted. All-in-one mode prunes terminal process-local handles
+  before CRUD/diagnostics and explicitly closes the remainder during process
+  shutdown.
+- Clustered UCTP broadcast creation now terminates on the authenticated public
+  gateway and forwards receive-only media from the exact call-pinned worker
+  over private mTLS UCTP 0.2. MOQT configuration separately identifies the
+  private publisher-mTLS and public subscriber endpoints, but arbitrary
+  generated namespaces remain fail-closed until the dynamic publisher-policy
+  dependency is pinned after owner review. No transport silently advertises
+  its publisher listener to subscribers or downgrades authorization.
+- Disposable backend evidence passes: the complete SQLite/PostgreSQL
+  repository suite is 21/21; broadcast-command conformance is 2/2 for memory
+  and SQLite plus 1/1 against live PostgreSQL; Redis 7.2 coordination is 1/1;
+  and the live shared-grant test proves registration, duplicate rejection,
+  cross-process issue/validation, exact-generation revocation, and fail-closed
+  post-revocation validation. The focused broadcast library suite passes
+  22/22, and the six API regressions cover cross-call idempotency isolation,
+  topology capability errors, local pruning, ownership, and cleanup. Strict
+  no-dependency Clippy passes for the library, binary, broadcast conformance,
+  shared-authority, and full repository-conformance targets.
+
+Final local broadcast authority/reconciliation audit evidence recorded on
+2026-07-14:
+
+- The ignored live-Redis regression
+  `redis_uctp_listener_ownership_uses_complete_principal_tuple` passes against
+  the disposable Redis authority. Listener keys use the principal's complete
+  issuer, tenant, and subject ownership tuple through a length-prefixed,
+  domain-separated digest. Two otherwise identical principals from different
+  issuers acquire, revalidate, close, and rebind independently.
+- `committed_but_ambiguous_start_completion_is_reconciled_as_active` and
+  `stale_start_never_adopts_a_different_authoritative_generation` pass. A
+  post-commit unavailable response is reconciled from durable truth, while an
+  older Start claim cannot adopt or overwrite a successor runtime/grant
+  generation. The executor cleans only the uncommitted runtime it created and
+  preserves the authoritative generation.
+
+This closes the durable control-plane, worker-execution, and local clustered
+UCTP subscriber-edge gaps. It does not complete owner-reviewed dynamic MOQT
+namespace activation, a deployed relay campaign, or Gate 11 load evidence.
+
+Gate 10 private gateway-to-worker forwarding evidence recorded on 2026-07-14:
+
+- `cargo test --test private_forwarding` passes 6/6 hermetic real-network
+  tests. A trusted gateway establishes mTLS and authenticated UCTP 0.2,
+  preserves complete RTP in both directions, carries byte-exact RTCP and
+  transport-neutral DataMessages, rejects an untrusted gateway certificate,
+  enforces exact worker pinning and race-free per-peer capacity, surfaces
+  queue backpressure, rejects reserved-label and non-RTCP confusion, drains
+  without admitting new routes, and releases exact routes and permits when a
+  worker disconnects. Its fifth test composes a real native WHIP edge, exact
+  attachment authority, mTLS UCTP, the pinned durable worker and MediaGraph,
+  bidirectional Opus/context, RFC 4733 DTMF, and exact terminal cleanup.
+  The sixth test reserves an exact destination generation, admits a distinct
+  authenticated target UCTP Session/Connection/MediaStream, and drives a
+  staged SIP adapter proxy through Prepare, Activate, full-duplex media,
+  DTMF, DataMessage, and End with exact cleanup.
+- The concrete gateway factory now creates `GatewayForwarder`; the worker role
+  registers `WorkerForwardingRuntime` with the worker's existing rvoip
+  Orchestrator. Gateway readiness follows authenticated worker reachability,
+  worker drain stops new UCTP sessions before closing the endpoint, and both
+  roles complete against the process drain deadline.
+- The current `process_role::tests` lifecycle/isolation suite passes. The
+  focused private-forwarding configuration test proves
+  valid gateway and worker projections, role isolation, route-limit parity,
+  and token/key redaction. Worker readiness now requires both durable worker
+  authority and the private forwarding listener to be healthy; a healthy
+  update from either dependency cannot mask degradation in the other. The
+  complete configuration suite passes. The configuration schema checker and
+  every Compose profile render and pass the binary's strict preflight with
+  explicit private TLS and secret inputs. The disposable local TLS helper
+  generates verified Redis, gateway-client, and worker-server certificates
+  with the required Compose DNS identities and extended-key usages.
+
+- Attachment routing is now fail-closed and exact rather than a worker scan.
+  The durable call transaction projects only the attachment-token digest plus
+  tenant/call/leg, transport, keyed owner identity, expiry, and current worker
+  generation fence. Redis lookup verifies that same live, non-draining worker
+  lease before the gateway dials exactly one worker; stale projection
+  replacement and removal are sequence-fenced.
+- rvoip UCTP exposes a deliberately opt-in, authenticated pre-admission
+  routing-hint resolver. Its default ignores all capabilities. Bridgefu enables
+  it only for the private gateway intent, required scopes, bounded capability,
+  matching request/session UUID, and peer-principal tenant. The worker then
+  consumes the real two-minute, single-use attachment token against the
+  projected worker fence before activating the rvoip route, and emits the
+  admission receipt only after activation succeeds. The gateway validates the
+  returned exact worker lease before promoting that same QUIC connection; the
+  private capability itself remains unreachable to public peers.
+- Focused evidence passes for the opt-in UCTP resolver, gateway attachment
+  validation, exact Redis projection, SQLite restart/race conformance, and the
+  private QUIC lifecycle. The lifecycle test proves activation precedes the
+  receipt and replay produces neither a second binding nor a response. The
+  complete 4/4 real-network private-forwarding mTLS/UCTP suite remains green.
+
+Gate 10 authenticated split-gateway public UCTP evidence recorded on 2026-07-14:
+
+- `GatewayUctpIngress` binds a dedicated TLS/raw-QUIC UCTP 0.2 listener, uses
+  the same complete principal as the configured Bridgefu bearer validator,
+  installs rvoip's bounded fail-closed inbound-admission gate and authoritative
+  operational stream before adapter registration, and admits only the
+  `bridgefu-public-attachment` intent.
+- The typed Session contract
+  `bf-public-attach-v1:<sip|webrtc>:<attachment-token>` validates canonical
+  token shape without logging the bearer, binds the untrusted wire Session to
+  its digest, resolves its keyed tenant-owner Redis projection, and lets only
+  the pinned worker consume the original single-use token. The shared
+  `GatewayAdmission` closes on dependency degradation, capacity, and drain.
+- The media pumps reconstruct complete RTP packets from public rvoip
+  `MediaFrame`s, parse complete worker RTP packets on the reverse path, carry
+  byte-exact RTCP through the reserved reliable DataMessage, and forward other
+  reliable DataMessages bidirectionally. Both directions use bounded queues,
+  count overload drops without call IDs in labels, and evict a persistently
+  slow route. Session, conversation, public connection, private route, process
+  permit, and task ownership converge during terminal teardown.
+- `RolePlan` now describes the actual split surface: authenticated HTTP call
+  control/provider webhooks, UCTP, native SIP/RTP, WSS, and WHIP/WHEP are
+  enabled. Preflight requires `api.enabled`, `generic_bridge.enabled`,
+  PostgreSQL, clustered Redis, public TLS for every non-loopback HTTP/WebRTC
+  bind, and bearer/fingerprint authority. The executable limits, native
+  attachment contract, SIP auth limitations, and hop-by-hop RTCP boundary are
+  documented in `docs/gateway-uctp-ingress.md`.
+- The focused public-ingress suite covers typed/secret-safe Session parsing,
+  scope/intent/digest authorization, RTP framing, typed DTMF, and concurrent
+  RTP/RTCP/reliable-DataMessage pumps. Native-edge tests add a real
+  authenticated SIP dialog plus an authorized WHIP offer whose exact token,
+  WebRTC transport, subject, issuer, and tenant reach the opener before 201;
+  owner DELETE and SIP BYE return active routes to zero. These are local
+  executable checks, not a credentialed cloud/NAT/TURN smoke.
+
+Final split-gateway broadcast network evidence recorded on 2026-07-14:
+
+- The public gateway now opens one listener-unique private Session, waits for
+  its exact worker `SessionAccept` before `ConnectionReady`, and authorizes the
+  exact wire Connection on every subscribe/unsubscribe mutation. A sibling
+  Connection cannot consume or revoke another listener, and an authority
+  generation change fails synchronously before registry mutation.
+- QUIC DATAGRAM media that overtakes the reliable dynamic `StreamOpened`
+  announcement is retained in a per-peer buffer bounded to 1,000 stream IDs,
+  one complete RTP packet and 4 KiB per ID, with a non-extendable one-second
+  expiry. Known streams remain lock-free. Dynamic registration is one-shot and
+  serialized with retirement, preventing stale local-ID routes or capacity
+  bypass.
+- `real_network_two_listener_broadcast_is_receive_only_and_independently_owned`
+  uses two public raw-QUIC clients on one broadcast and one gateway-to-worker
+  peer. Both receive canonical Opus payload type 111; malicious public RTP and
+  control produce zero worker input. Ending listener one converges every
+  public/private route, direct-listener permit, authority binding, gateway
+  admission, and listener lease from two to one while listener two continues;
+  ending listener two converges every count to zero.
+- Peer-visible acceptance followed by setup timeout sends `SessionEnd` for the
+  exact unique Session. Private-route failure awaits exact listener-lease
+  cleanup. Proof panic/cancellation, lifecycle failure, graceful drain, and
+  worker lease loss release authority, capacity, Sessions, Connections, and
+  routes. The gateway ingress suite passes 13/13, gateway forwarding 7/7,
+  worker broadcast cleanup/guard tests 3/3, and rvoip's exact-Connection
+  subscribe/unsubscribe mutation regression passes.
+- Worker startup after execution/listener creation now has one bounded cleanup
+  funnel for forwarding, secret, PostgreSQL, Redis, endpoint, MOQT, policy, and
+  executor errors. Its real-mTLS-listener regression proves the original error
+  is preserved while tasks, health owners, lease admission, and the UDP port
+  are released. The four focused worker role tests pass.
+
+Gate 10 native SIP/WebRTC gateway evidence recorded on 2026-07-14:
+
+- `GatewayNativeIngress` installs bounded admission and the operational stream
+  before registering SIP/WebRTC adapters. SIP Request-URI, WebSocket private
+  subprotocol, and WHIP/WHEP path hints resolve through the same exact Redis
+  attachment authority as public UCTP; no local `CallService`, durable worker,
+  or FIFO exists on the gateway.
+- A focused media-pump test proves complete RTP reconstruction/parsing,
+  bidirectional arbitrary DataMessages, typed DTMF, bounded cleanup, and the
+  explicit worker-to-native RTCP termination metric. The real-loopback test
+  proves missing WHIP auth opens no route, valid Bearer plus SDP opens exactly
+  a WebRTC attachment with the retained principal, and authenticated SIP opens
+  only the requested SIP attachment. The exposed SIP policies are optional
+  generic/Telnyx Digest and an API Bearer that is cleartext-denied unless
+  explicitly opted in. Referenced Vapi ingress profiles add explicit
+  CIDR-to-principal and verified-mTLS-leaf-to-principal mappings through the
+  same policy constructor used by all-in-one mode; unreferenced profiles add no
+  trust. Gateway preflight rejects a dead SIP listener with none of those
+  mechanisms. Both transports converge to zero active routes.
+- Gateway health now combines private worker forwarding, public UCTP, and the
+  native correctness stream. Drain freezes all shared admission, closes
+  WSS/WHIPS and SIP signaling, drains native/public routes, and only then
+  closes private peers against one deadline.
+
+Gate 10 cloud-stack evidence recorded on 2026-07-14:
+
+- `deploy/terraform/check.sh` passes formatting, backend-free provider
+  initialization, and `terraform validate` for both the AWS and GCP roots.
+  The schema compatibility check and all eight executable Compose profiles
+  also pass against the Bridgefu binary.
+- Both cloud roots expose the implemented network shape. AWS uses a
+  CIDR-restricted NLB for SIP/UDP, WSS, WHIP/WHEP HTTPS, and the HTTPS API; a
+  separate QUIC NLB; and exact per-instance EIP associations for RTP plus the
+  fixed WebRTC media mux. GCP uses one source-preserving all-ports UDP
+  passthrough rule with protocol-specific SIP/RTP/WebRTC/QUIC firewalls and a
+  TCP rule containing only API/WSS/WHIPS ports. Health and metrics remain on
+  the distinct non-public operations port. Static validation does not prove
+  the advertised media addresses, NAT/TURN behavior, certificate chain, or
+  carrier/client CIDRs in a deployed environment.
+- The local cluster profile publishes native SIP/RTP, WSS, WHIPS, public UCTP,
+  the rustls HTTPS API, and a separate operations port. Its disposable TLS
+  helper creates distinct serverAuth identities for `public-uctp` and
+  `public-api`; the latter is shared with WSS/WHIPS instead of reusing the
+  private-forwarding clientAuth-only gateway certificate.
+- The roots intentionally contain no production credentials, public DNS,
+  public certificates, carrier allowlists, or remote state backend. No cloud
+  apply, runtime smoke, or destroy was attempted; those owner-authorized
+  credentialed runs remain the release-blocking evidence for this gate.
+
+Gate 10 local container/CI evidence recorded on 2026-07-14:
+
+- Both canonical base references resolve to manifest lists containing
+  linux/amd64 and linux/arm64. The former runtime reference was invalid and is
+  replaced by the resolvable Debian bookworm-slim manifest digest
+  `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`.
+  Builder and runtime APT inputs now use immutable 2026-05-18 and 2026-07-13
+  Debian snapshots plus explicit top-level package versions; this is a
+  reproducible-input claim, not a byte-identical-rustc claim.
+- `deploy/scripts/check-release-image.sh` passes. The multi-architecture OCI
+  verifier passes 5/5 root/digest/platform/attestation regressions, the
+  exact-platform selector passes 2/2 nested-index regressions, and the retained
+  Trivy policy passes 3/3 platform and severity regressions. No image was pushed
+  or published, and the manually authorized combined candidate workflow was
+  not run.
+- `deploy/scripts/runtime-smoke.py` passes 9/9 checks against the dirty
+  coordinated working tree at baseline `0ea0e177`: eight service preflights,
+  exact runner dispatch, role lifecycle, operational health, relay diagnostics
+  authorization, seven concrete private-forwarding loopback tests, durable
+  call/media, context, and broadcast lifecycles. The
+  report is schema-version 1, records only output hashes/byte counts, strips
+  external credentials, and truthfully leaves the complete deployment release
+  criterion false.
 
 Exit: disposable AWS and GCP deployments pass complete smoke tests and destroy
 cleanly.
 
 ### Gate 11 — Qualification and release candidate (`pending`)
+
+The manual worker-media qualification harness is executable at
+`tests/qualification_media_graph.rs` and documented in
+`docs/qualification.md`. Its `release` mode fixes the acceptance parameters at
+100 bidirectional PCMU↔Opus calls, a 10-call/s ramp, one hour of active load,
+100 ms p95 latency, and less than 10 percent post-warmup RSS growth, and writes
+versioned JSON evidence before asserting. A final 2026-07-14 one-call,
+three-second local smoke passed with 302/302 frames delivered, 302 transcodes,
+no source or graph drops, no eviction or transcode error, a 1.1 ms p95 upper
+bound, and 0.71 percent post-warmup RSS growth. That
+smoke validates the harness only; the release checkboxes remain open until the
+exact Linux release run is retained.
+
+The corresponding ignored UCTP and MOQT load harnesses are executable at
+`tests/qualification_uctp_fanout.rs`,
+`tests/qualification_uctp_network.rs`, and
+`tests/qualification_moq_relay.rs`, with exact smoke/release commands and
+scope limits in `docs/qualification.md`. The UCTP queue harness measures the
+bounded nonblocking fanout primitive, while the network harness creates an
+authenticated raw-QUIC peer and complete RTP datagram path for every listener.
+Their local smoke reports validate that the harnesses execute, but the
+1,000/10,000-listener one-hour checkboxes remain open. MOQT now has a managed
+rvoip-owned LOC audio-receive surface and the local harness measures every
+listener, but the immutable 10,000-listener one-hour run and deployed relay-tier
+evidence are still required before representing the MOQT media-fanout criterion
+as complete.
+
+The ignored finite chaos orchestrator is executable at
+`tests/qualification_chaos.rs`. It composes exact existing Bridgefu and rvoip
+tests for deterministic media loss/backpressure, malformed signaling, Telnyx
+outage handling, storage-authority loss, worker drain, relay-session loss,
+token expiry/replay, and quota exhaustion. Optional disposable Redis and
+PostgreSQL cases are reported as `skipped_external` when their named test URLs
+are absent; they never become implicit passes. Its versioned redacted report
+hard-codes `release_criterion_satisfied: false`: this finite local matrix does
+not replace live Telnyx, actual PostgreSQL-process interruption, a deployed
+relay-tier failure, network impairment at release load, or any one-hour run.
+The recorded pre-`VF-*` finite run passed all 16 scenarios: 14 local cases and
+both isolated Redis/PostgreSQL cases, with no failures or skipped cases. Its
+report still correctly leaves `release_criterion_satisfied` false. The chaos
+checkbox below remains open until the hour-long and owner-authorized deployed
+results are retained.
+
+Historical stable-tree verification recorded earlier on 2026-07-14 after the
+split-role composition test was green. Bridgefu's then-current locked
+all-target matrix passed 546 tests with zero
+failures and 12 intentional ignores. The seven ignored PostgreSQL/Redis cases
+were then executed against the isolated disposable services and pass alongside
+the 21-test repository conformance suite (28 live-store tests total); the five
+remaining ignores are the explicit manual Gate 11 harnesses. Strict all-target
+no-dependency Clippy, formatting, and whitespace checks pass. The selected
+rvoip foundation/auth/UCTP/QUIC/WebTransport/MOQT all-target matrix and strict
+Clippy passed; rvoip WebRTC passed 114 tests with only the two owner-gated TURN
+candidate tests ignored. Those counts predate the later Vapi full-duplex
+working-tree changes and must not be cited as a final current-tree run. They do
+not substitute for any unchecked credentialed, cloud, or one-hour item below.
 
 - [ ] Run the owner-authorized protected non-production Vapi-to-Connect smoke
   and retain only the redacted workflow, revision, approval, account, and

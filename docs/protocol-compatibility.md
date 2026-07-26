@@ -4,12 +4,14 @@
 |---|---|
 | SIP/RTP | Audio, G.711 µ-law/A-law, RFC 4733 DTMF |
 | WebRTC | Opus, WHIP/WHEP, WS/WSS signaling, arbitrary labeled DataChannels |
-| Context | `bridgefu.control.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
-| UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet |
+| WebRTC engine | crates.io `webrtc` `0.20.0-alpha.1` plus exact `rtc` revision `1e5b7d4be6d94850694f2519f4c235d16c871d53`; the local TURN fork is review-only and not integrated |
+| Context | `bridgefu.context.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
+| UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet; exact mono Opus/PCMU/PCMA route negotiation with canonical PT 111/0/8 |
 | MOQT wire library | Private `eisenzopf/moq-rs` draft-19 port pinned at `ef52ac8656513bb3b07b4b9b80152ac24bb2467e`; Gate 5 wire, retention, discovery, and least-privilege relay qualification is complete |
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
-MOQT draft churn is isolated in `rvoip-moq`. The reviewed private fork
+MOQT draft churn is isolated in `rvoip-moq`. The qualified private fork,
+which is still pending project-owner review,
 implements draft-19 request-stream placement, control/data/PUBLISH/FETCH
 codecs, canonical raw-QUIC/WebTransport session targets, explicit session and
 namespace acceptance, bounded retention, warm Joining FETCH, cold live
@@ -22,7 +24,7 @@ retry, redacts secrets, and defaults to a production-safe posture. Publisher
 certificates are publish-only. External relay certificates are subscribe-only
 and cannot announce or publish a namespace.
 
-The reviewed fork passes 429 transport tests. Its relay package passes 111
+The qualified fork passes 429 transport tests. Its relay package passes 111
 library, 25 binary, one admission-contract, and five feature-policy tests with
 all features, plus strict Clippy and warning-free rustdoc. Golden vectors cover
 draft-19 setup, request/response, subgroup, datagram, FETCH, object, status,
@@ -55,7 +57,7 @@ No upstream issue, pull request, or maintainer contact has been made. The
 private fork review packet is in `moq-fork-review.md`; any submission remains
 subject to project-owner review.
 
-The reviewed inputs are recorded in `moq-compatibility.json`. A scheduled,
+The tested inputs are recorded in `moq-compatibility.json`. A scheduled,
 report-only CI workflow compares those pins with IETF Datatracker and moq-rs
 upstream. It never updates a dependency or contacts an upstream maintainer.
 
@@ -65,3 +67,16 @@ experimental non-MSF profile and are not enabled by Bridgefu 1.0.
 
 RoQ remains an adapter seam. It is point-to-point RTP/RTCP carriage and is not
 used as a broadcast fanout protocol.
+
+## WebRTC alpha and TURN
+
+The authoritative alpha dependency supports the qualified WHIP/WHEP and WS/WSS
+signaling, ICE/DTLS, Opus, late DataChannel, and teardown paths. Its wrapper
+does not enforce relay-only gathering, so Bridgefu does not claim TURN relay
+qualification on that dependency.
+
+An owner-controlled local WebRTC/RTC candidate implements and passes a real
+4/4 UDP TURN suite, but the run used a dirty RTC submodule containing a separate
+uncommitted NACK/statistics delta. It has not been pinned, pushed, or submitted
+upstream. Exact provenance, evidence boundaries, and the required clean-rerun
+and owner-review sequence are in [the WebRTC fork review packet](webrtc-fork-review.md).

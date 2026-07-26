@@ -198,7 +198,8 @@ impl BindingGeneration {
         self.0 as i64
     }
 
-    fn next(self) -> Result<Self, DomainError> {
+    /// Returns the next persistence-safe binding generation.
+    pub fn next(self) -> Result<Self, DomainError> {
         if self.0 >= MAX_PERSISTED_GENERATION {
             Err(DomainError::GenerationExhausted {
                 kind: "binding_generation",
@@ -276,6 +277,65 @@ pub enum LegDirection {
     Inbound,
     /// Bridgefu originates toward a remote endpoint.
     Outbound,
+}
+
+/// Which side initiates the leg's transport signaling.
+///
+/// This is deliberately independent of [`LegDirection`]. For example, an
+/// outbound provider-controlled call can cause the provider to attach an
+/// inbound SIP media leg to Bridgefu.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalingInitiator {
+    /// Bridgefu opens the transport-signaling connection.
+    Bridgefu,
+    /// The remote endpoint attaches transport signaling to Bridgefu.
+    Remote,
+}
+
+impl SignalingInitiator {
+    /// Historical behavior used when a persisted execution plan predates the
+    /// explicit signaling field.
+    #[must_use]
+    pub const fn legacy_default(direction: LegDirection) -> Self {
+        match direction {
+            LegDirection::Inbound => Self::Remote,
+            LegDirection::Outbound => Self::Bridgefu,
+        }
+    }
+}
+
+/// Media permitted on a leg, relative to Bridgefu.
+///
+/// `ReceiveOnly` makes the leg a graph source, while `SendOnly` makes it a
+/// graph sink. A valid two-leg plan pairs each enabled source with the peer's
+/// enabled sink before any single-consumer media receiver is acquired.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaFlow {
+    /// Bridgefu receives media from and sends media to the remote endpoint.
+    #[default]
+    SendReceive,
+    /// Bridgefu sends media to the endpoint; this leg is a graph sink only.
+    SendOnly,
+    /// Bridgefu receives media from the endpoint; this leg is a graph source only.
+    ReceiveOnly,
+    /// This leg carries no media.
+    Inactive,
+}
+
+impl MediaFlow {
+    /// Whether this leg supplies a source receiver to the media graph.
+    #[must_use]
+    pub const fn source_enabled(self) -> bool {
+        matches!(self, Self::SendReceive | Self::ReceiveOnly)
+    }
+
+    /// Whether this leg accepts frames from its peer as a graph sink.
+    #[must_use]
+    pub const fn sink_enabled(self) -> bool {
+        matches!(self, Self::SendReceive | Self::SendOnly)
+    }
 }
 
 /// Signaling/provider kind for a logical call leg.
@@ -500,14 +560,49 @@ pub struct LegSpec {
     pub kind: LegKind,
 }
 
+/// Signaling and media semantics for a logical leg.
+///
+/// These values are separate from [`LegDirection`], which remains the
+/// business direction of the call relative to Bridgefu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegSemantics {
+    /// Which endpoint initiates transport signaling for this leg.
+    pub signaling_initiator: SignalingInitiator,
+    /// Media permitted on the leg, relative to Bridgefu.
+    pub media_flow: MediaFlow,
+}
+
+impl LegSemantics {
+    /// Historical semantics inferred for snapshots created before this type
+    /// was persisted explicitly.
+    #[must_use]
+    pub const fn legacy_default(direction: LegDirection) -> Self {
+        Self {
+            signaling_initiator: SignalingInitiator::legacy_default(direction),
+            media_flow: MediaFlow::SendReceive,
+        }
+    }
+}
+
 /// A logical endpoint bridged by a call aggregate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Leg {
     id: LegId,
     direction: LegDirection,
     kind: LegKind,
+    /// `None` identifies a historical snapshot and falls back to the legacy
+    /// direction-derived signaling behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signaling_initiator: Option<SignalingInitiator>,
+    #[serde(default)]
+    media_flow: MediaFlow,
     state: LegState,
     binding_generation: BindingGeneration,
+    /// Highest binding generation ever reserved for this logical leg. `None`
+    /// is the backward-compatible representation for historical snapshots and
+    /// means the current binding generation is also the high-water mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replacement_generation_cursor: Option<BindingGeneration>,
     created_at: DateTime<Utc>,
     state_changed_at: DateTime<Utc>,
     connected_at: Option<DateTime<Utc>>,
@@ -516,13 +611,16 @@ pub struct Leg {
 }
 
 impl Leg {
-    fn new(id: LegId, spec: LegSpec, now: DateTime<Utc>) -> Self {
+    fn new(id: LegId, spec: LegSpec, semantics: LegSemantics, now: DateTime<Utc>) -> Self {
         Self {
             id,
             direction: spec.direction,
             kind: spec.kind,
+            signaling_initiator: Some(semantics.signaling_initiator),
+            media_flow: semantics.media_flow,
             state: LegState::Pending,
             binding_generation: BindingGeneration::INITIAL,
+            replacement_generation_cursor: None,
             created_at: now,
             state_changed_at: now,
             connected_at: None,
@@ -549,6 +647,32 @@ impl Leg {
         self.kind
     }
 
+    /// Which endpoint initiates transport signaling for this leg.
+    ///
+    /// Historical snapshots infer the original direction-derived behavior.
+    #[must_use]
+    pub const fn signaling_initiator(&self) -> SignalingInitiator {
+        match self.signaling_initiator {
+            Some(initiator) => initiator,
+            None => SignalingInitiator::legacy_default(self.direction),
+        }
+    }
+
+    /// Media permitted on this leg, relative to Bridgefu.
+    #[must_use]
+    pub const fn media_flow(&self) -> MediaFlow {
+        self.media_flow
+    }
+
+    /// Complete resolved leg semantics.
+    #[must_use]
+    pub const fn semantics(&self) -> LegSemantics {
+        LegSemantics {
+            signaling_initiator: self.signaling_initiator(),
+            media_flow: self.media_flow,
+        }
+    }
+
     /// Current leg state.
     #[must_use]
     pub const fn state(&self) -> LegState {
@@ -559,6 +683,21 @@ impl Leg {
     #[must_use]
     pub const fn binding_generation(&self) -> BindingGeneration {
         self.binding_generation
+    }
+
+    /// Highest binding generation reserved by either the current route or a
+    /// completed replacement attempt.
+    #[must_use]
+    pub const fn replacement_generation_cursor(&self) -> BindingGeneration {
+        match self.replacement_generation_cursor {
+            Some(generation) => generation,
+            None => self.binding_generation,
+        }
+    }
+
+    /// Reserves the next append-only generation for a replacement attempt.
+    pub fn next_replacement_binding_generation(&self) -> Result<BindingGeneration, DomainError> {
+        self.replacement_generation_cursor().next()
     }
 
     /// Creation time in UTC.
@@ -668,6 +807,46 @@ pub enum TerminalOutcome {
     Failed(FailureDetails),
 }
 
+/// Durable make-before-break state for one stable logical leg.
+///
+/// The aggregate intentionally retains the previous generation as current
+/// until the new route has connected. This lets a failed attempt restore the
+/// exact old media route and prevents the pending route from becoming a
+/// third participant in the call.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegReplacement {
+    leg_id: LegId,
+    previous_binding_generation: BindingGeneration,
+    pending_binding_generation: BindingGeneration,
+    pending_kind: LegKind,
+}
+
+impl LegReplacement {
+    /// Stable logical leg being replaced.
+    #[must_use]
+    pub const fn leg_id(&self) -> LegId {
+        self.leg_id
+    }
+
+    /// Binding that remains resumable until the switch commits.
+    #[must_use]
+    pub const fn previous_binding_generation(&self) -> BindingGeneration {
+        self.previous_binding_generation
+    }
+
+    /// Monotonic generation reserved for the pending attempt.
+    #[must_use]
+    pub const fn pending_binding_generation(&self) -> BindingGeneration {
+        self.pending_binding_generation
+    }
+
+    /// Transport/provider kind of the pending endpoint.
+    #[must_use]
+    pub const fn pending_kind(&self) -> LegKind {
+        self.pending_kind
+    }
+}
+
 /// Durable aggregate for exactly two explicitly bridged logical legs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CallAggregate {
@@ -678,6 +857,11 @@ pub struct CallAggregate {
     legs: [Leg; 2],
     deadlines: CallDeadlines,
     terminal_outcome: Option<TerminalOutcome>,
+    /// Make-before-break attempt, when a stable logical leg is being rebound
+    /// to a newly prepared transport endpoint. The old binding remains the
+    /// aggregate's current binding until the replacement is committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replacement: Option<LegReplacement>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     state_changed_at: DateTime<Utc>,
@@ -692,6 +876,8 @@ struct CallAggregateWire {
     legs: [Leg; 2],
     deadlines: CallDeadlines,
     terminal_outcome: Option<TerminalOutcome>,
+    #[serde(default)]
+    replacement: Option<LegReplacement>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     state_changed_at: DateTime<Utc>,
@@ -711,6 +897,7 @@ impl<'de> Deserialize<'de> for CallAggregate {
             legs: wire.legs,
             deadlines: wire.deadlines,
             terminal_outcome: wire.terminal_outcome,
+            replacement: wire.replacement,
             created_at: wire.created_at,
             updated_at: wire.updated_at,
             state_changed_at: wire.state_changed_at,
@@ -723,19 +910,38 @@ impl<'de> Deserialize<'de> for CallAggregate {
 impl CallAggregate {
     /// Creates a new call with generated call and leg identifiers.
     pub fn new(tenant_id: TenantId, legs: [LegSpec; 2], now: DateTime<Utc>) -> Self {
+        Self::new_with_semantics(
+            tenant_id,
+            legs,
+            [
+                LegSemantics::legacy_default(legs[0].direction),
+                LegSemantics::legacy_default(legs[1].direction),
+            ],
+            now,
+        )
+        .expect("legacy bidirectional media semantics are valid")
+    }
+
+    /// Creates a new call with explicit signaling and media semantics.
+    pub fn new_with_semantics(
+        tenant_id: TenantId,
+        legs: [LegSpec; 2],
+        semantics: [LegSemantics; 2],
+        now: DateTime<Utc>,
+    ) -> Result<Self, DomainError> {
         let left_id = LegId::new();
         let mut right_id = LegId::new();
         while right_id == left_id {
             right_id = LegId::new();
         }
         // UUID v4 values cannot be nil because their version bits are set.
-        Self::with_ids(
+        Self::with_ids_and_semantics(
             CallId::new(),
             tenant_id,
             [(left_id, legs[0]), (right_id, legs[1])],
+            semantics,
             now,
         )
-        .expect("generated UUIDs are non-nil")
     }
 
     /// Creates a call with caller-supplied identifiers for durable recovery and tests.
@@ -743,6 +949,21 @@ impl CallAggregate {
         id: CallId,
         tenant_id: TenantId,
         legs: [(LegId, LegSpec); 2],
+        now: DateTime<Utc>,
+    ) -> Result<Self, DomainError> {
+        let semantics = [
+            LegSemantics::legacy_default(legs[0].1.direction),
+            LegSemantics::legacy_default(legs[1].1.direction),
+        ];
+        Self::with_ids_and_semantics(id, tenant_id, legs, semantics, now)
+    }
+
+    /// Creates a call with caller-supplied identifiers and explicit semantics.
+    pub fn with_ids_and_semantics(
+        id: CallId,
+        tenant_id: TenantId,
+        legs: [(LegId, LegSpec); 2],
+        semantics: [LegSemantics; 2],
         now: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
         if legs[0].0 == legs[1].0 {
@@ -754,11 +975,12 @@ impl CallAggregate {
             version: AggregateVersion::default(),
             state: CallState::Pending,
             legs: [
-                Leg::new(legs[0].0, legs[0].1, now),
-                Leg::new(legs[1].0, legs[1].1, now),
+                Leg::new(legs[0].0, legs[0].1, semantics[0], now),
+                Leg::new(legs[1].0, legs[1].1, semantics[1], now),
             ],
             deadlines: CallDeadlines::default(),
             terminal_outcome: None,
+            replacement: None,
             created_at: now,
             updated_at: now,
             state_changed_at: now,
@@ -834,6 +1056,12 @@ impl CallAggregate {
         self.terminal_outcome.as_ref()
     }
 
+    /// Pending make-before-break attempt, if one is active.
+    #[must_use]
+    pub const fn replacement(&self) -> Option<&LegReplacement> {
+        self.replacement.as_ref()
+    }
+
     /// Creation time in UTC.
     #[must_use]
     pub const fn created_at(&self) -> DateTime<Utc> {
@@ -857,6 +1085,7 @@ impl CallAggregate {
         if self.legs[0].id == self.legs[1].id {
             return Err(DomainError::DuplicateLegId(self.legs[0].id));
         }
+        validate_media_flows(self.legs[0].media_flow(), self.legs[1].media_flow())?;
         if self.updated_at < self.created_at || self.state_changed_at > self.updated_at {
             return Err(DomainError::InvalidSnapshot("invalid call timestamps"));
         }
@@ -864,6 +1093,11 @@ impl CallAggregate {
             if leg.binding_generation.value() == 0 {
                 return Err(DomainError::InvalidSnapshot(
                     "leg binding generation must be nonzero",
+                ));
+            }
+            if leg.replacement_generation_cursor() < leg.binding_generation {
+                return Err(DomainError::InvalidSnapshot(
+                    "leg replacement generation cursor precedes current binding",
                 ));
             }
             if leg.created_at < self.created_at
@@ -970,6 +1204,30 @@ impl CallAggregate {
             }
         }
 
+        if let Some(replacement) = &self.replacement {
+            let leg = self
+                .leg(replacement.leg_id)
+                .ok_or(DomainError::InvalidSnapshot(
+                    "replacement leg does not belong to call",
+                ))?;
+            if self.state != CallState::Transferring
+                || leg.state != LegState::Held
+                || leg.binding_generation != replacement.previous_binding_generation
+                || replacement.pending_binding_generation != leg.replacement_generation_cursor()
+                || replacement.pending_binding_generation <= replacement.previous_binding_generation
+                || self.deadlines.get(DeadlineKind::Transfer).due_at.is_none()
+            {
+                return Err(DomainError::InvalidSnapshot(
+                    "replacement state does not match held leg and transfer deadline",
+                ));
+            }
+        }
+        if self.state != CallState::Transferring && self.replacement.is_some() {
+            return Err(DomainError::InvalidSnapshot(
+                "replacement exists outside transferring state",
+            ));
+        }
+
         if !matches!(
             self.state,
             CallState::Ending | CallState::Ended | CallState::Failed
@@ -1043,6 +1301,28 @@ pub enum CallCommand {
         /// Required only when `state` is `failed`.
         failure: Option<FailureDetails>,
     },
+    /// Confirms that a provider media originate returned and schedules the
+    /// independently idempotent remote-destination originate.
+    ProviderMediaStarted {
+        /// Command time in UTC.
+        at: DateTime<Utc>,
+        /// Provider-controlled logical leg.
+        leg_id: LegId,
+        /// Binding generation owned by the completed media originate.
+        binding_generation: BindingGeneration,
+    },
+    /// Confirms that an authenticated provider SIP media attachment was
+    /// consumed. During ordinary setup this advances the provider leg to
+    /// signaling; during make-before-break replacement it records the exact
+    /// pending generation without disturbing the held leg.
+    ProviderMediaAttached {
+        /// Command time in UTC.
+        at: DateTime<Utc>,
+        /// Provider-controlled logical leg.
+        leg_id: LegId,
+        /// Exact provider-media attachment generation.
+        binding_generation: BindingGeneration,
+    },
     /// Invalidates a previous inbound/signaling binding and awaits a replacement.
     RotateLegBinding {
         /// Command time in UTC.
@@ -1068,6 +1348,17 @@ pub enum CallCommand {
         /// UTC transfer deadline.
         transfer_deadline: DateTime<Utc>,
     },
+    /// Begins a make-before-break replacement of one connected logical leg.
+    BeginLegReplacement {
+        /// Command time in UTC.
+        at: DateTime<Utc>,
+        /// Stable logical leg whose current binding remains resumable.
+        leg_id: LegId,
+        /// Kind of the server-controlled replacement endpoint.
+        pending_kind: LegKind,
+        /// UTC deadline for preparing and connecting the replacement.
+        transfer_deadline: DateTime<Utc>,
+    },
     /// Completes or rejects the current transfer generation.
     FinishTransfer {
         /// Command time in UTC.
@@ -1076,6 +1367,17 @@ pub enum CallCommand {
         deadline_generation: DeadlineGeneration,
         /// Provider/signaling result.
         result: TransferResult,
+    },
+    /// Commits or compensates the current make-before-break generation.
+    FinishLegReplacement {
+        /// Command time in UTC.
+        at: DateTime<Utc>,
+        /// Exact transfer deadline generation returned by begin.
+        deadline_generation: DeadlineGeneration,
+        /// Exact pending binding generation being settled.
+        pending_binding_generation: BindingGeneration,
+        /// Preparation result.
+        result: LegReplacementResult,
     },
     /// Starts normal peer teardown.
     BeginEnding {
@@ -1110,10 +1412,14 @@ impl CallCommand {
         match self {
             Self::StartConnecting { at, .. }
             | Self::SetLegState { at, .. }
+            | Self::ProviderMediaStarted { at, .. }
+            | Self::ProviderMediaAttached { at, .. }
             | Self::RotateLegBinding { at, .. }
             | Self::ArmDeadline { at, .. }
             | Self::BeginTransfer { at, .. }
+            | Self::BeginLegReplacement { at, .. }
             | Self::FinishTransfer { at, .. }
+            | Self::FinishLegReplacement { at, .. }
             | Self::BeginEnding { at, .. }
             | Self::DeadlineElapsed { at, .. } => *at,
         }
@@ -1127,6 +1433,16 @@ pub enum TransferResult {
     /// The transfer completed and the call remains active.
     Completed,
     /// The transfer was rejected; compensating work should restore the call.
+    Rejected(FailureDetails),
+}
+
+/// Result of preparing a replacement route while the previous route is held.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", content = "failure", rename_all = "snake_case")]
+pub enum LegReplacementResult {
+    /// The pending route is connected and can atomically become current.
+    Connected,
+    /// Preparation failed; the old route must be restored.
     Rejected(FailureDetails),
 }
 
@@ -1158,6 +1474,14 @@ pub enum EffectIntent {
         kind: LegKind,
         /// Direction relative to Bridgefu.
         direction: LegDirection,
+    },
+    /// Dial the provider destination after the provider media call reference
+    /// has been durably bound by `StartLeg`.
+    ConnectProviderDestination {
+        /// Provider-controlled logical leg.
+        leg_id: LegId,
+        /// Exact logical-leg incarnation.
+        binding_generation: BindingGeneration,
     },
     /// Await a replacement attachment using a new binding generation.
     AwaitLegAttachment {
@@ -1209,6 +1533,26 @@ pub enum EffectIntent {
     ExecuteTransfer {
         /// Transfer timer generation used to correlate the result.
         deadline_generation: DeadlineGeneration,
+    },
+    /// Prepare a new endpoint without making it part of the media graph.
+    StartLegReplacement {
+        /// Stable logical leg.
+        leg_id: LegId,
+        /// Current route retained for compensation.
+        previous_binding_generation: BindingGeneration,
+        /// Reserved next route generation.
+        pending_binding_generation: BindingGeneration,
+        /// Replacement transport/provider kind.
+        kind: LegKind,
+        /// Transfer timer generation correlating the attempt.
+        deadline_generation: DeadlineGeneration,
+    },
+    /// Abort a prepared route that never became current.
+    AbortLegReplacement {
+        /// Stable logical leg.
+        leg_id: LegId,
+        /// Pending route generation to retire.
+        pending_binding_generation: BindingGeneration,
     },
     /// Compensate a rejected or timed-out transfer.
     CompensateTransfer {
@@ -1344,6 +1688,9 @@ pub enum DomainError {
     /// A persisted/deserialized aggregate violated a structural invariant.
     #[error("invalid aggregate snapshot: {0}")]
     InvalidSnapshot(&'static str),
+    /// Leg media-flow halves do not form at least one complete graph route.
+    #[error("invalid two-leg media plan: {0}")]
+    InvalidMediaPlan(&'static str),
 }
 
 struct CommandResult {
@@ -1365,6 +1712,16 @@ impl CallAggregate {
                 state,
                 failure,
             } => self.set_leg_state(at, leg_id, binding_generation, state, failure),
+            CallCommand::ProviderMediaStarted {
+                at,
+                leg_id,
+                binding_generation,
+            } => self.provider_media_started(at, leg_id, binding_generation),
+            CallCommand::ProviderMediaAttached {
+                at,
+                leg_id,
+                binding_generation,
+            } => self.provider_media_attached(at, leg_id, binding_generation),
             CallCommand::RotateLegBinding {
                 at,
                 leg_id,
@@ -1377,11 +1734,28 @@ impl CallAggregate {
                 at,
                 transfer_deadline,
             } => self.begin_transfer(at, transfer_deadline),
+            CallCommand::BeginLegReplacement {
+                at,
+                leg_id,
+                pending_kind,
+                transfer_deadline,
+            } => self.begin_leg_replacement(at, leg_id, pending_kind, transfer_deadline),
             CallCommand::FinishTransfer {
                 at,
                 deadline_generation,
                 result,
             } => self.finish_transfer(at, deadline_generation, result),
+            CallCommand::FinishLegReplacement {
+                at,
+                deadline_generation,
+                pending_binding_generation,
+                result,
+            } => self.finish_leg_replacement(
+                at,
+                deadline_generation,
+                pending_binding_generation,
+                result,
+            ),
             CallCommand::BeginEnding {
                 at,
                 ending_deadline,
@@ -1415,7 +1789,7 @@ impl CallAggregate {
         self.set_call_state(CallState::Connecting, at);
         let mut effects = Vec::with_capacity(3);
         for leg in &mut self.legs {
-            if leg.direction == LegDirection::Inbound {
+            if leg.signaling_initiator() == SignalingInitiator::Remote {
                 leg.state = LegState::AwaitingAttach;
                 leg.state_changed_at = at;
                 effects.push(EffectIntent::AwaitLegAttachment {
@@ -1501,6 +1875,81 @@ impl CallAggregate {
         Ok(applied(at, effects))
     }
 
+    fn provider_media_started(
+        &mut self,
+        at: DateTime<Utc>,
+        leg_id: LegId,
+        supplied_generation: BindingGeneration,
+    ) -> Result<CommandResult, DomainError> {
+        let index = self.leg_index(leg_id)?;
+        if let Some(result) = compare_binding_generation(
+            leg_id,
+            self.legs[index].binding_generation,
+            supplied_generation,
+            at,
+        )? {
+            return Ok(result);
+        }
+        self.ensure_timestamp(at)?;
+        let leg = &self.legs[index];
+        if self.state != CallState::Connecting
+            || leg.direction != LegDirection::Outbound
+            || leg.kind != LegKind::Telnyx
+            || !matches!(leg.state, LegState::Pending | LegState::Signaling)
+        {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "provider_media_started",
+            });
+        }
+        if self.legs[index].state == LegState::Pending {
+            self.legs[index].state = LegState::Signaling;
+            self.legs[index].state_changed_at = at;
+        }
+        Ok(applied(
+            at,
+            vec![EffectIntent::ConnectProviderDestination {
+                leg_id,
+                binding_generation: supplied_generation,
+            }],
+        ))
+    }
+
+    fn provider_media_attached(
+        &mut self,
+        at: DateTime<Utc>,
+        leg_id: LegId,
+        supplied_generation: BindingGeneration,
+    ) -> Result<CommandResult, DomainError> {
+        self.ensure_timestamp(at)?;
+        let index = self.leg_index(leg_id)?;
+        let ordinary = self.state == CallState::Connecting
+            && self.legs[index].direction == LegDirection::Outbound
+            && self.legs[index].kind == LegKind::Telnyx
+            && self.legs[index].binding_generation == supplied_generation
+            && matches!(
+                self.legs[index].state,
+                LegState::Pending | LegState::Signaling
+            );
+        let replacement = self.state == CallState::Transferring
+            && self.replacement.as_ref().is_some_and(|replacement| {
+                replacement.leg_id == leg_id
+                    && replacement.pending_kind == LegKind::Telnyx
+                    && replacement.pending_binding_generation == supplied_generation
+            });
+        if !ordinary && !replacement {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "provider_media_attached",
+            });
+        }
+        if ordinary && self.legs[index].state == LegState::Pending {
+            self.legs[index].state = LegState::Signaling;
+            self.legs[index].state_changed_at = at;
+        }
+        Ok(applied(at, Vec::new()))
+    }
+
     fn rotate_leg_binding(
         &mut self,
         at: DateTime<Utc>,
@@ -1531,6 +1980,12 @@ impl CallAggregate {
 
         let leg = &mut self.legs[index];
         leg.binding_generation = leg.binding_generation.next()?;
+        if leg
+            .replacement_generation_cursor
+            .is_some_and(|cursor| cursor < leg.binding_generation)
+        {
+            leg.replacement_generation_cursor = Some(leg.binding_generation);
+        }
         leg.state = LegState::AwaitingAttach;
         leg.state_changed_at = at;
         let effects = vec![EffectIntent::AwaitLegAttachment {
@@ -1587,6 +2042,56 @@ impl CallAggregate {
         Ok(applied(at, effects))
     }
 
+    fn begin_leg_replacement(
+        &mut self,
+        at: DateTime<Utc>,
+        leg_id: LegId,
+        pending_kind: LegKind,
+        transfer_deadline: DateTime<Utc>,
+    ) -> Result<CommandResult, DomainError> {
+        self.ensure_timestamp(at)?;
+        if self.state != CallState::Active || self.replacement.is_some() {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "begin_leg_replacement",
+            });
+        }
+        if transfer_deadline <= at {
+            return Err(DomainError::DeadlineNotFuture);
+        }
+        let index = self.leg_index(leg_id)?;
+        if self.legs[index].state != LegState::Connected {
+            return Err(DomainError::InvalidLegTransition {
+                from: self.legs[index].state,
+                to: LegState::Held,
+            });
+        }
+        let previous_binding_generation = self.legs[index].binding_generation;
+        let pending_binding_generation = self.legs[index].next_replacement_binding_generation()?;
+
+        self.legs[index].state = LegState::Held;
+        self.legs[index].state_changed_at = at;
+        self.legs[index].replacement_generation_cursor = Some(pending_binding_generation);
+        self.set_call_state(CallState::Transferring, at);
+        let mut effects = vec![self.unbridge_media_effect()];
+        let deadline_generation =
+            self.arm_deadline_internal(DeadlineKind::Transfer, transfer_deadline, &mut effects)?;
+        self.replacement = Some(LegReplacement {
+            leg_id,
+            previous_binding_generation,
+            pending_binding_generation,
+            pending_kind,
+        });
+        effects.push(EffectIntent::StartLegReplacement {
+            leg_id,
+            previous_binding_generation,
+            pending_binding_generation,
+            kind: pending_kind,
+            deadline_generation,
+        });
+        Ok(applied(at, effects))
+    }
+
     fn finish_transfer(
         &mut self,
         at: DateTime<Utc>,
@@ -1599,6 +2104,12 @@ impl CallAggregate {
             return Ok(result);
         }
         self.ensure_timestamp(at)?;
+        if self.replacement.is_some() {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "finish_transfer",
+            });
+        }
         if self.deadlines.get(DeadlineKind::Transfer).due_at.is_none()
             && self.state == CallState::Active
         {
@@ -1619,6 +2130,82 @@ impl CallAggregate {
             effects.push(EffectIntent::CompensateTransfer { failure });
         }
         self.set_call_state(CallState::Active, at);
+        Ok(applied(at, effects))
+    }
+
+    fn finish_leg_replacement(
+        &mut self,
+        at: DateTime<Utc>,
+        supplied_deadline_generation: DeadlineGeneration,
+        supplied_binding_generation: BindingGeneration,
+        result: LegReplacementResult,
+    ) -> Result<CommandResult, DomainError> {
+        if let Some(result) = self.compare_deadline_generation(
+            DeadlineKind::Transfer,
+            supplied_deadline_generation,
+            at,
+        )? {
+            return Ok(result);
+        }
+        self.ensure_timestamp(at)?;
+        let Some(replacement) = self.replacement.clone() else {
+            if self.state == CallState::Active {
+                return Ok(ignored(at, CommandDisposition::IgnoredNoop));
+            }
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "finish_leg_replacement",
+            });
+        };
+        if self.state != CallState::Transferring
+            || self.deadlines.get(DeadlineKind::Transfer).due_at.is_none()
+        {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "finish_leg_replacement",
+            });
+        }
+        if supplied_binding_generation < replacement.pending_binding_generation {
+            return Ok(ignored(at, CommandDisposition::IgnoredStaleGeneration));
+        }
+        if supplied_binding_generation > replacement.pending_binding_generation {
+            return Err(DomainError::FutureBindingGeneration {
+                leg_id: replacement.leg_id,
+                current: replacement.pending_binding_generation.value(),
+                supplied: supplied_binding_generation.value(),
+            });
+        }
+
+        let index = self.leg_index(replacement.leg_id)?;
+        let mut effects = Vec::new();
+        self.cancel_deadline_internal(DeadlineKind::Transfer, &mut effects);
+        match result {
+            LegReplacementResult::Connected => {
+                let leg = &mut self.legs[index];
+                leg.kind = replacement.pending_kind;
+                leg.binding_generation = replacement.pending_binding_generation;
+                leg.state = LegState::Connected;
+                leg.state_changed_at = at;
+                leg.failure = None;
+                effects.push(EffectIntent::StopLeg {
+                    leg_id: replacement.leg_id,
+                    binding_generation: replacement.previous_binding_generation,
+                    reason: StopLegReason::Requested,
+                });
+            }
+            LegReplacementResult::Rejected(_) => {
+                let leg = &mut self.legs[index];
+                leg.state = LegState::Connected;
+                leg.state_changed_at = at;
+                effects.push(EffectIntent::AbortLegReplacement {
+                    leg_id: replacement.leg_id,
+                    pending_binding_generation: replacement.pending_binding_generation,
+                });
+            }
+        }
+        self.replacement = None;
+        self.set_call_state(CallState::Active, at);
+        effects.push(self.bridge_media_effect());
         Ok(applied(at, effects))
     }
 
@@ -1691,6 +2278,21 @@ impl CallAggregate {
             self.terminal_outcome = Some(TerminalOutcome::Failed(failure));
             self.finalize_terminal(at, &mut effects);
             return Ok(applied(at, effects));
+        }
+
+        if kind == DeadlineKind::Transfer {
+            if let Some(replacement) = self.replacement.take() {
+                let index = self.leg_index(replacement.leg_id)?;
+                self.legs[index].state = LegState::Connected;
+                self.legs[index].state_changed_at = at;
+                self.set_call_state(CallState::Active, at);
+                effects.push(EffectIntent::AbortLegReplacement {
+                    leg_id: replacement.leg_id,
+                    pending_binding_generation: replacement.pending_binding_generation,
+                });
+                effects.push(self.bridge_media_effect());
+                return Ok(applied(at, effects));
+            }
         }
 
         let (code, message) = match kind {
@@ -1769,6 +2371,12 @@ impl CallAggregate {
     ) -> Result<(), DomainError> {
         if matches!(self.state, CallState::Active | CallState::Transferring) {
             effects.push(self.unbridge_media_effect());
+        }
+        if let Some(replacement) = self.replacement.take() {
+            effects.push(EffectIntent::AbortLegReplacement {
+                leg_id: replacement.leg_id,
+                pending_binding_generation: replacement.pending_binding_generation,
+            });
         }
         self.cancel_deadline_internal(DeadlineKind::Setup, effects);
         self.cancel_deadline_internal(DeadlineKind::Media, effects);
@@ -1942,6 +2550,25 @@ fn compare_binding_generation(
     Ok(None)
 }
 
+fn validate_media_flows(left: MediaFlow, right: MediaFlow) -> Result<(), DomainError> {
+    let left_to_right = left.source_enabled() && right.sink_enabled();
+    let right_to_left = right.source_enabled() && left.sink_enabled();
+
+    if left.source_enabled() != right.sink_enabled()
+        || right.source_enabled() != left.sink_enabled()
+    {
+        return Err(DomainError::InvalidMediaPlan(
+            "each enabled source requires exactly one peer sink",
+        ));
+    }
+    if !left_to_right && !right_to_left {
+        return Err(DomainError::InvalidMediaPlan(
+            "at least one media direction must be enabled",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_leg_transition(from: LegState, to: LegState) -> bool {
     match from {
         LegState::Pending => matches!(
@@ -2076,6 +2703,170 @@ mod tests {
         )
     }
 
+    #[test]
+    fn signaling_initiator_is_independent_of_business_direction() {
+        let call = CallAggregate::with_ids_and_semantics(
+            CallId::from_uuid(Uuid::from_u128(100)).expect("valid call ID"),
+            TenantId::parse("tenant-a").expect("valid tenant"),
+            [
+                (
+                    LegId::from_uuid(Uuid::from_u128(101)).expect("valid leg ID"),
+                    LegSpec {
+                        direction: LegDirection::Outbound,
+                        kind: LegKind::Sip,
+                    },
+                ),
+                (
+                    LegId::from_uuid(Uuid::from_u128(102)).expect("valid leg ID"),
+                    LegSpec {
+                        direction: LegDirection::Inbound,
+                        kind: LegKind::InteractiveWebRtc,
+                    },
+                ),
+            ],
+            [
+                LegSemantics {
+                    signaling_initiator: SignalingInitiator::Remote,
+                    media_flow: MediaFlow::SendReceive,
+                },
+                LegSemantics {
+                    signaling_initiator: SignalingInitiator::Bridgefu,
+                    media_flow: MediaFlow::SendReceive,
+                },
+            ],
+            at(0),
+        )
+        .expect("valid explicit semantics");
+
+        let decision = decide(
+            &call,
+            CallCommand::StartConnecting {
+                at: at(1),
+                setup_deadline: at(60),
+            },
+        );
+        let remote_outbound = call.legs()[0].id();
+        let bridgefu_inbound = call.legs()[1].id();
+
+        assert!(decision.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::AwaitLegAttachment { leg_id, .. } if *leg_id == remote_outbound
+        )));
+        assert!(decision.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StartLeg { leg_id, direction: LegDirection::Inbound, .. }
+                if *leg_id == bridgefu_inbound
+        )));
+        assert_eq!(
+            decision.aggregate().legs()[0].state(),
+            LegState::AwaitingAttach
+        );
+        assert_eq!(decision.aggregate().legs()[1].state(), LegState::Pending);
+    }
+
+    #[test]
+    fn complementary_one_way_media_semantics_round_trip() {
+        let call = CallAggregate::new_with_semantics(
+            TenantId::parse("tenant-a").expect("valid tenant"),
+            [
+                LegSpec {
+                    direction: LegDirection::Inbound,
+                    kind: LegKind::Sip,
+                },
+                LegSpec {
+                    direction: LegDirection::Outbound,
+                    kind: LegKind::InteractiveWebRtc,
+                },
+            ],
+            [
+                LegSemantics {
+                    signaling_initiator: SignalingInitiator::Remote,
+                    media_flow: MediaFlow::ReceiveOnly,
+                },
+                LegSemantics {
+                    signaling_initiator: SignalingInitiator::Bridgefu,
+                    media_flow: MediaFlow::SendOnly,
+                },
+            ],
+            at(0),
+        )
+        .expect("complete left-to-right media route");
+
+        let encoded = serde_json::to_value(&call).expect("serialize call");
+        let decoded: CallAggregate = serde_json::from_value(encoded).expect("deserialize call");
+        assert_eq!(decoded.legs()[0].media_flow(), MediaFlow::ReceiveOnly);
+        assert_eq!(decoded.legs()[1].media_flow(), MediaFlow::SendOnly);
+        assert_eq!(decoded.legs()[0].semantics(), call.legs()[0].semantics());
+        assert_eq!(decoded.legs()[1].semantics(), call.legs()[1].semantics());
+    }
+
+    #[test]
+    fn historical_snapshot_infers_directional_signaling_and_bidirectional_media() {
+        let call = test_call();
+        let mut encoded = serde_json::to_value(&call).expect("serialize call");
+        let legs = encoded["legs"].as_array_mut().expect("legs array");
+        for leg in legs {
+            leg.as_object_mut()
+                .expect("leg object")
+                .remove("signaling_initiator");
+            leg.as_object_mut()
+                .expect("leg object")
+                .remove("media_flow");
+        }
+
+        let decoded: CallAggregate = serde_json::from_value(encoded).expect("legacy snapshot");
+        assert_eq!(
+            decoded.legs()[0].signaling_initiator(),
+            SignalingInitiator::Remote
+        );
+        assert_eq!(
+            decoded.legs()[1].signaling_initiator(),
+            SignalingInitiator::Bridgefu
+        );
+        assert!(decoded
+            .legs()
+            .iter()
+            .all(|leg| leg.media_flow() == MediaFlow::SendReceive));
+    }
+
+    #[test]
+    fn incomplete_or_empty_media_semantics_are_rejected() {
+        let legs = [
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::Sip,
+            },
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::InteractiveWebRtc,
+            },
+        ];
+        let signaling = [SignalingInitiator::Remote, SignalingInitiator::Bridgefu];
+
+        for (left, right) in [
+            (MediaFlow::ReceiveOnly, MediaFlow::ReceiveOnly),
+            (MediaFlow::Inactive, MediaFlow::Inactive),
+        ] {
+            let error = CallAggregate::new_with_semantics(
+                TenantId::parse("tenant-a").expect("valid tenant"),
+                legs,
+                [
+                    LegSemantics {
+                        signaling_initiator: signaling[0],
+                        media_flow: left,
+                    },
+                    LegSemantics {
+                        signaling_initiator: signaling[1],
+                        media_flow: right,
+                    },
+                ],
+                at(0),
+            )
+            .expect_err("invalid media plan");
+            assert!(matches!(error, DomainError::InvalidMediaPlan(_)));
+        }
+    }
+
     fn active_call() -> CallAggregate {
         let mut call = start(&test_call());
         let left = call.legs()[0].id();
@@ -2092,6 +2883,289 @@ mod tests {
         set_leg(&call, right, LegState::Connected, at(5))
             .into_parts()
             .0
+    }
+
+    #[test]
+    fn leg_replacement_switches_one_stable_logical_leg_without_three_party_media() {
+        let call = active_call();
+        let leg_id = call.legs()[1].id();
+        let old_generation = call.legs()[1].binding_generation();
+        let begun = call
+            .decide(CallCommand::BeginLegReplacement {
+                at: at(6),
+                leg_id,
+                pending_kind: LegKind::AmazonConnect,
+                transfer_deadline: at(30),
+            })
+            .expect("begin replacement");
+        assert_eq!(begun.aggregate().state(), CallState::Transferring);
+        assert_eq!(
+            begun.aggregate().leg(leg_id).unwrap().state(),
+            LegState::Held
+        );
+        let replacement = begun.aggregate().replacement().expect("replacement");
+        assert_eq!(replacement.leg_id(), leg_id);
+        assert_eq!(replacement.previous_binding_generation(), old_generation);
+        assert_eq!(replacement.pending_binding_generation().value(), 2);
+        assert!(begun
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, EffectIntent::UnbridgeMedia { .. })));
+        assert!(!begun
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, EffectIntent::BridgeMedia { .. })));
+
+        let deadline_generation = begun
+            .aggregate()
+            .deadlines()
+            .get(DeadlineKind::Transfer)
+            .generation();
+        let completed = begun
+            .aggregate()
+            .decide(CallCommand::FinishLegReplacement {
+                at: at(7),
+                deadline_generation,
+                pending_binding_generation: replacement.pending_binding_generation(),
+                result: LegReplacementResult::Connected,
+            })
+            .expect("commit replacement");
+        let leg = completed.aggregate().leg(leg_id).unwrap();
+        assert_eq!(completed.aggregate().state(), CallState::Active);
+        assert!(completed.aggregate().replacement().is_none());
+        assert_eq!(leg.id(), leg_id);
+        assert_eq!(leg.kind(), LegKind::AmazonConnect);
+        assert_eq!(leg.binding_generation().value(), 2);
+        assert!(completed.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StopLeg { leg_id: stopped, binding_generation, .. }
+                if *stopped == leg_id && *binding_generation == old_generation
+        )));
+        assert_eq!(
+            completed
+                .effects()
+                .iter()
+                .filter(|effect| matches!(effect, EffectIntent::BridgeMedia { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_or_timed_out_leg_replacement_restores_exact_old_binding() {
+        for timeout in [false, true] {
+            let call = active_call();
+            let leg_id = call.legs()[1].id();
+            let old_kind = call.legs()[1].kind();
+            let old_generation = call.legs()[1].binding_generation();
+            let begun = call
+                .decide(CallCommand::BeginLegReplacement {
+                    at: at(6),
+                    leg_id,
+                    pending_kind: LegKind::AmazonConnect,
+                    transfer_deadline: at(30),
+                })
+                .unwrap();
+            let deadline = begun.aggregate().deadlines().get(DeadlineKind::Transfer);
+            let settled = if timeout {
+                begun
+                    .aggregate()
+                    .decide(CallCommand::DeadlineElapsed {
+                        at: at(30),
+                        kind: DeadlineKind::Transfer,
+                        generation: deadline.generation(),
+                        ending_deadline: Some(at(40)),
+                    })
+                    .unwrap()
+            } else {
+                begun
+                    .aggregate()
+                    .decide(CallCommand::FinishLegReplacement {
+                        at: at(7),
+                        deadline_generation: deadline.generation(),
+                        pending_binding_generation: begun
+                            .aggregate()
+                            .replacement()
+                            .unwrap()
+                            .pending_binding_generation(),
+                        result: LegReplacementResult::Rejected(FailureDetails::sanitized(
+                            "dial_failed",
+                            "replacement destination rejected the call",
+                            true,
+                        )),
+                    })
+                    .unwrap()
+            };
+            let leg = settled.aggregate().leg(leg_id).unwrap();
+            assert_eq!(settled.aggregate().state(), CallState::Active);
+            assert!(settled.aggregate().replacement().is_none());
+            assert_eq!(leg.state(), LegState::Connected);
+            assert_eq!(leg.kind(), old_kind);
+            assert_eq!(leg.binding_generation(), old_generation);
+            assert!(settled.effects().iter().any(|effect| matches!(
+                effect,
+                EffectIntent::AbortLegReplacement { leg_id: aborted, .. } if *aborted == leg_id
+            )));
+            assert!(settled
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, EffectIntent::BridgeMedia { .. })));
+            assert!(!settled.effects().iter().any(|effect| matches!(
+                effect,
+                EffectIntent::StopLeg { leg_id: stopped, .. } if *stopped == leg_id
+            )));
+        }
+    }
+
+    #[test]
+    fn rejected_replacement_reserves_append_only_generation_for_retry() {
+        let call = active_call();
+        let leg_id = call.legs()[1].id();
+        let first = call
+            .decide(CallCommand::BeginLegReplacement {
+                at: at(6),
+                leg_id,
+                pending_kind: LegKind::Sip,
+                transfer_deadline: at(30),
+            })
+            .unwrap();
+        let first_pending = first
+            .aggregate()
+            .replacement()
+            .unwrap()
+            .pending_binding_generation();
+        assert_eq!(first_pending.value(), 2);
+        let rejected = first
+            .aggregate()
+            .decide(CallCommand::FinishLegReplacement {
+                at: at(7),
+                deadline_generation: first
+                    .aggregate()
+                    .deadlines()
+                    .get(DeadlineKind::Transfer)
+                    .generation(),
+                pending_binding_generation: first_pending,
+                result: LegReplacementResult::Rejected(FailureDetails::sanitized(
+                    "dial_failed",
+                    "replacement destination rejected the call",
+                    true,
+                )),
+            })
+            .unwrap();
+        let resumed = rejected.aggregate().leg(leg_id).unwrap();
+        assert_eq!(resumed.binding_generation(), BindingGeneration::INITIAL);
+        assert_eq!(resumed.replacement_generation_cursor(), first_pending);
+
+        let retry = rejected
+            .aggregate()
+            .decide(CallCommand::BeginLegReplacement {
+                at: at(8),
+                leg_id,
+                pending_kind: LegKind::Sip,
+                transfer_deadline: at(31),
+            })
+            .unwrap();
+        assert_eq!(
+            retry
+                .aggregate()
+                .replacement()
+                .unwrap()
+                .pending_binding_generation()
+                .value(),
+            3
+        );
+    }
+
+    #[test]
+    fn historical_snapshot_without_replacement_cursor_falls_back_to_current_binding() {
+        let call = active_call();
+        let leg_id = call.legs()[1].id();
+        let begun = call
+            .decide(CallCommand::BeginLegReplacement {
+                at: at(6),
+                leg_id,
+                pending_kind: LegKind::Sip,
+                transfer_deadline: at(30),
+            })
+            .unwrap();
+        let replacement = begun.aggregate().replacement().unwrap();
+        let promoted = begun
+            .aggregate()
+            .decide(CallCommand::FinishLegReplacement {
+                at: at(7),
+                deadline_generation: begun
+                    .aggregate()
+                    .deadlines()
+                    .get(DeadlineKind::Transfer)
+                    .generation(),
+                pending_binding_generation: replacement.pending_binding_generation(),
+                result: LegReplacementResult::Connected,
+            })
+            .unwrap();
+        let mut snapshot = serde_json::to_value(promoted.aggregate()).unwrap();
+        for leg in snapshot["legs"].as_array_mut().unwrap() {
+            leg.as_object_mut()
+                .unwrap()
+                .remove("replacement_generation_cursor");
+        }
+        let historical: CallAggregate = serde_json::from_value(snapshot).unwrap();
+        let leg = historical.leg(leg_id).unwrap();
+        assert_eq!(leg.binding_generation().value(), 2);
+        assert_eq!(leg.replacement_generation_cursor().value(), 2);
+        assert_eq!(
+            leg.next_replacement_binding_generation().unwrap().value(),
+            3
+        );
+    }
+
+    #[test]
+    fn replacement_glare_is_rejected_and_hangup_aborts_pending_generation() {
+        let call = active_call();
+        let leg_id = call.legs()[1].id();
+        let begun = call
+            .decide(CallCommand::BeginLegReplacement {
+                at: at(6),
+                leg_id,
+                pending_kind: LegKind::AmazonConnect,
+                transfer_deadline: at(30),
+            })
+            .unwrap();
+        assert!(matches!(
+            begun.aggregate().decide(CallCommand::BeginLegReplacement {
+                at: at(7),
+                leg_id,
+                pending_kind: LegKind::Sip,
+                transfer_deadline: at(31),
+            }),
+            Err(DomainError::InvalidCallTransition { .. })
+        ));
+
+        let pending = begun
+            .aggregate()
+            .replacement()
+            .unwrap()
+            .pending_binding_generation();
+        let ending = begun
+            .aggregate()
+            .decide(CallCommand::BeginEnding {
+                at: at(7),
+                ending_deadline: Some(at(20)),
+                reason: StopLegReason::Requested,
+            })
+            .unwrap();
+        assert_eq!(ending.aggregate().state(), CallState::Ending);
+        assert!(ending.aggregate().replacement().is_none());
+        assert!(ending.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::AbortLegReplacement {
+                leg_id: aborted,
+                pending_binding_generation,
+            } if *aborted == leg_id && *pending_binding_generation == pending
+        )));
+        assert!(!ending.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StopLeg { binding_generation, .. } if *binding_generation == pending
+        )));
     }
 
     #[test]
@@ -2184,6 +3258,79 @@ mod tests {
         )));
         assert_eq!(call.state(), CallState::Pending, "decision must be pure");
         assert_eq!(decision.aggregate().version().value(), 1);
+    }
+
+    #[test]
+    fn telnyx_destination_connect_is_emitted_only_after_media_start_confirmation() {
+        let call = CallAggregate::with_ids(
+            CallId::from_uuid(Uuid::from_u128(10)).expect("valid call ID"),
+            TenantId::parse("tenant-a").expect("valid tenant"),
+            [
+                (
+                    LegId::from_uuid(Uuid::from_u128(11)).expect("valid leg ID"),
+                    LegSpec {
+                        direction: LegDirection::Outbound,
+                        kind: LegKind::Telnyx,
+                    },
+                ),
+                (
+                    LegId::from_uuid(Uuid::from_u128(12)).expect("valid leg ID"),
+                    LegSpec {
+                        direction: LegDirection::Inbound,
+                        kind: LegKind::Sip,
+                    },
+                ),
+            ],
+            at(0),
+        )
+        .expect("valid Telnyx call");
+        let started = decide(
+            &call,
+            CallCommand::StartConnecting {
+                at: at(1),
+                setup_deadline: at(60),
+            },
+        );
+        let provider_leg_id = call.legs()[0].id();
+        assert!(started.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StartLeg { leg_id, .. } if *leg_id == provider_leg_id
+        )));
+        assert!(!started
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, EffectIntent::ConnectProviderDestination { .. })));
+
+        let media_started = decide(
+            started.aggregate(),
+            CallCommand::ProviderMediaStarted {
+                at: at(2),
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+            },
+        );
+        assert_eq!(
+            media_started
+                .aggregate()
+                .leg(provider_leg_id)
+                .expect("provider leg")
+                .state(),
+            LegState::Signaling
+        );
+        assert_eq!(
+            media_started
+                .effects()
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    EffectIntent::ConnectProviderDestination {
+                        leg_id,
+                        binding_generation: BindingGeneration::INITIAL,
+                    } if *leg_id == provider_leg_id
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]

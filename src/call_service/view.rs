@@ -8,7 +8,7 @@ use zeroize::Zeroize;
 
 use crate::call_engine::{
     AttachmentTransport, CallAggregate, CallId, CallState, CommandId, EffectId, FailureDetails,
-    Leg, LegDirection, LegId, LegKind, LegState, TenantId,
+    Leg, LegDirection, LegId, LegKind, LegState, MediaFlow, SignalingInitiator, TenantId,
 };
 
 use super::{ControlCommandView, DerivedAttachmentToken, StoredServiceCall};
@@ -73,6 +73,13 @@ impl AttachmentView {
             expires_at: token.expires_at,
         }
     }
+
+    /// Transfer the short-lived bearer to another internal admission owner.
+    /// The now-empty source still zeroizes on drop.
+    #[must_use]
+    pub(crate) fn into_token(mut self) -> String {
+        std::mem::take(&mut self.token)
+    }
 }
 
 /// Safe public state for one logical leg.
@@ -82,6 +89,10 @@ pub struct LegView {
     pub leg_id: LegId,
     /// Direction relative to Bridgefu.
     pub direction: LegDirection,
+    /// Which endpoint initiates transport signaling for this leg.
+    pub signaling_initiator: SignalingInitiator,
+    /// Media permitted on this leg, relative to Bridgefu.
+    pub media_flow: MediaFlow,
     /// Signaling/provider family.
     pub kind: LegKind,
     /// Current typed lifecycle state.
@@ -109,6 +120,8 @@ impl LegView {
         Self {
             leg_id: leg.id(),
             direction: leg.direction(),
+            signaling_initiator: leg.signaling_initiator(),
+            media_flow: leg.media_flow(),
             kind: leg.kind(),
             state: leg.state(),
             created_at: leg.created_at(),

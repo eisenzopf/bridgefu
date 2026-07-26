@@ -3,6 +3,10 @@
 /tests/moq-browser-e2e/node_modules
 /tests/moq-browser-e2e/dist
 
+# Python validation/runtime-smoke bytecode
+__pycache__/
+*.py[cod]
+
 # Logs
 *.log
 
@@ -13,6 +17,7 @@
 # Terraform — never commit local state (may contain sensitive values), the
 # provider plugin cache (huge), crash logs, or your real tfvars.
 terraform/.terraform/
+/deploy/terraform/*/.terraform/
 *.tfstate
 *.tfstate.*
 crash.log

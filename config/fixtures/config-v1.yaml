@@ -1,0 +1,16 @@
+# Compatibility fixture for Bridgefu's first public configuration model.
+# Keep this minimal: serde defaults are part of the v1 contract and are
+# asserted by the Rust test suite. A future config version must add a sibling
+# fixture rather than rewriting this one.
+config_version: 1
+aws:
+  region: us-west-2
+  instance_id: fixture-instance
+  contact_flow_id: fixture-flow
+sip:
+  bind_ip: 127.0.0.1
+  port: 5060
+  advertised_ip: 127.0.0.1
+  media_public_ip: 127.0.0.1
+observability:
+  http_bind: 127.0.0.1:9090

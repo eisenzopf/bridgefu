@@ -22,7 +22,7 @@
     "upstream": "cloudflare/moq-rs",
     "fork": "eisenzopf/moq-rs",
     "portBaseRevision": "c7e80e49f4189efd1e55e2533eab36adf0e8f4b4",
-    "reviewedForkRevision": "ef52ac8656513bb3b07b4b9b80152ac24bb2467e",
+    "qualifiedForkRevision": "ef52ac8656513bb3b07b4b9b80152ac24bb2467e",
     "status": "draft-19-wire-retention-discovery-and-least-privilege-relay"
   },
   "rvoipIntegration": {

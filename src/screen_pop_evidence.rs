@@ -68,6 +68,7 @@ impl ScreenPopStage {
 /// this finite vocabulary before recording evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ScreenPopTerminalReason {
     NormalHangup,
     SipHangup,
@@ -211,6 +212,7 @@ impl ScreenPopEvidenceStore {
     }
 
     /// Record a lifecycle observation using the process wall clock.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_now(
         &self,
         correlation_id: &str,
@@ -336,6 +338,7 @@ impl ScreenPopEvidenceStore {
             .map(|entry| self.snapshot(correlation_id, &entry.stages))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         let now = self.clock.now();
         let mut inner = self.lock();
@@ -343,6 +346,7 @@ impl ScreenPopEvidenceStore {
         inner.entries.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

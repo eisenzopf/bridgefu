@@ -1,4 +1,4 @@
-//! bridgefu — deployable SIP → Amazon Connect screen-pop gateway.
+//! bridgefu — programmable SIP/RTP, WebRTC/RTP, provider, and QUIC bridge.
 //!
 //! Loads a YAML config, stands up the `rvoip-amazon-connect`
 //! `ConnectScreenPopServer` (SIP UAS → header→attribute mapping →
@@ -6,24 +6,53 @@
 //! until SIGTERM/SIGINT triggers a graceful shutdown.
 
 mod api;
+mod api_rate_limit;
 mod config;
-mod context;
 mod imds;
+mod moq_relay_role;
 mod observability;
-mod providers;
+mod process_role;
 mod runtime;
 mod screen_pop_evidence;
+
+pub(crate) use bridgefu::providers;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bridgefu::context;
 use clap::{Parser, Subcommand};
+use metrics_exporter_prometheus::PrometheusHandle;
 use rvoip_amazon_connect::ConnectScreenPopServer;
 
+use crate::config::RuntimeMode;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessRunner {
+    AllInOne,
+    Gateway,
+    Worker,
+    MoqRelay,
+}
+
+const fn process_runner(mode: RuntimeMode) -> ProcessRunner {
+    match mode {
+        RuntimeMode::AllInOne => ProcessRunner::AllInOne,
+        RuntimeMode::Gateway => ProcessRunner::Gateway,
+        RuntimeMode::Worker => ProcessRunner::Worker,
+        RuntimeMode::MoqRelay => ProcessRunner::MoqRelay,
+    }
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "bridgefu", version, about = "SIP → Amazon Connect gateway")]
+#[command(
+    name = "bridgefu",
+    version,
+    about = "Programmable SIP, WebRTC, provider-control, and QUIC audio bridge"
+)]
 struct Args {
     /// Path to the YAML config file.
     #[arg(short, long, default_value = "/etc/bridgefu/bridgefu.yaml")]
@@ -45,26 +74,75 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let command = args.command.clone().unwrap_or(Command::Run);
+
+    // Printing must remain available before runtime secrets are provisioned.
+    // The helper still parses the complete typed shape and rejects unknown
+    // fields before redacting every credential-bearing value.
+    if matches!(command, Command::PrintEffectiveConfig) {
+        print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
+        return Ok(());
+    }
+
     let cfg = config::Config::load(&args.config)?;
 
-    match args.command.clone().unwrap_or(Command::Run) {
+    match command {
         Command::Validate => {
+            process_role::preflight(&cfg)?;
             println!("configuration is valid: {}", args.config.display());
             return Ok(());
         }
-        Command::PrintEffectiveConfig => {
-            print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
-            return Ok(());
+        Command::PrintEffectiveConfig => unreachable!("handled before secret-resolving load"),
+        Command::Run => {
+            // Role prerequisites are checked before tracing, metrics, or any
+            // listener/task is installed. Unsupported topologies never fall
+            // back to the all-in-one compatibility process.
+            process_role::preflight(&cfg)?;
         }
-        Command::Run => {}
     }
 
-    observability::init_tracing(&cfg.observability.log_level, &cfg.observability.log_format)?;
-    let prom = observability::install_metrics()?;
+    let tracing_guard = observability::init_tracing(&cfg.observability)?;
+    let process_result = async {
+        let prom = observability::install_metrics()?;
+        tracing::info!(
+            config = %args.config.display(),
+            runtime_mode = %cfg.runtime.mode,
+            "starting bridgefu process"
+        );
+        match process_runner(cfg.runtime.mode) {
+            ProcessRunner::AllInOne => run_all_in_one(&cfg, &args.config, prom).await,
+            ProcessRunner::Gateway => {
+                process_role::run_gateway(&cfg, prom, shutdown_signal()).await
+            }
+            ProcessRunner::Worker => process_role::run_worker(&cfg, prom, shutdown_signal()).await,
+            ProcessRunner::MoqRelay => {
+                moq_relay_role::run_moq_relay(&cfg, prom, shutdown_signal()).await
+            }
+        }
+    }
+    .await;
+    let tracing_shutdown = tracing_guard.shutdown();
+    match (process_result, tracing_shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(process), Ok(())) => Err(process),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(process), Err(shutdown)) => {
+            Err(process.context(format!("OTLP trace shutdown also failed: {shutdown:#}")))
+        }
+    }
+}
 
+/// Existing StandardCharter-compatible single-process lifecycle. This remains
+/// the default and deliberately retains the original listener construction,
+/// call-runtime sharing, and shutdown ordering.
+async fn run_all_in_one(
+    cfg: &config::Config,
+    config_path: &std::path::Path,
+    prom: PrometheusHandle,
+) -> Result<()> {
     let tenants = cfg.tenant_names()?;
     tracing::info!(
-        config = %args.config.display(),
+        config = %config_path.display(),
         region = %cfg.aws.region,
         tenants = ?tenants,
         "starting bridgefu"
@@ -78,7 +156,7 @@ async fn main() -> Result<()> {
     })?;
 
     // Build the gateway from config (resolves AWS creds + any `auto` IPs).
-    let server_cfg = cfg.into_server_config().await?;
+    let server_cfg = cfg.build_server_config().await?;
     let server = ConnectScreenPopServer::build(server_cfg)
         .await
         .map_err(|e| anyhow::anyhow!("building gateway: {e}"))?;
@@ -86,15 +164,39 @@ async fn main() -> Result<()> {
     // The broadcast channel intentionally has no replay buffer for late
     // subscribers.
     let lifecycle_events = server.subscribe_lifecycle();
-
-    observability::spawn_metrics_updater(server.clone(), tenants.clone());
+    // The lifecycle and metrics loops remain live through the complete legacy
+    // server drain. They are stopped and joined only after the final teardown
+    // evidence and route counters have been emitted.
+    let (owned_task_shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // Construct the durable authority before any generic signaling listener.
     // HTTP, SIP, and WebRTC must share this exact repository, worker fence,
     // validator, and cryptographic policy.
     let mut api_state =
-        api::ApiState::from_config(&cfg, server.clone(), prom, tenants, None).await?;
+        api::ApiState::from_config(cfg, server.clone(), prom, tenants.clone(), None).await?;
     let call_runtime_owner = api_state.call_runtime();
+    let amazon_cleanup =
+        bridgefu::amazon_cleanup::AmazonCleanupJournal::connect(cfg.call_repository_backend()?)
+            .await
+            .context("opening durable Amazon cleanup journal")?;
+    let cleanup_observer: Arc<dyn rvoip_amazon_connect::AmazonConnectCleanupObserver> =
+        amazon_cleanup.clone();
+    server
+        .adapter()
+        .install_cleanup_observer(cleanup_observer)
+        .map_err(|error| anyhow::anyhow!("installing Amazon cleanup journal: {error}"))?;
+    let cleanup_reconcile = amazon_cleanup
+        .reconcile(server.adapter())
+        .await
+        .context("reconciling retained Amazon cleanup authority")?;
+    metrics::gauge!("bridgefu_amazon_durable_cleanups_pending")
+        .set(cleanup_reconcile.remaining as f64);
+    tracing::info!(
+        attempted = cleanup_reconcile.attempted,
+        resolved = cleanup_reconcile.resolved,
+        remaining = cleanup_reconcile.remaining,
+        "initial Amazon cleanup reconciliation completed"
+    );
     let generic_runtime = if cfg.generic_bridge.enabled {
         let call_runtime = call_runtime_owner.as_ref().map(Arc::clone).ok_or_else(|| {
             anyhow::anyhow!("generic_bridge requires the authenticated transactional call runtime")
@@ -102,50 +204,233 @@ async fn main() -> Result<()> {
         let bearer_validator = api_state.bearer_validator().ok_or_else(|| {
             anyhow::anyhow!("generic_bridge requires the shared API bearer validator")
         })?;
-        let runtime = runtime::GenericBridgeRuntime::start(
-            &cfg.generic_bridge,
-            &cfg.runtime,
+        let webrtc_bearer_validator =
+            api_state
+                .webrtc_signaling_bearer_validator()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "generic_bridge requires the attachment-bound WebRTC bearer validator"
+                    )
+                })?;
+        let webrtc_session_binding = api_state.webrtc_session_binding().ok_or_else(|| {
+            anyhow::anyhow!("generic_bridge requires the WebRTC attachment binding authority")
+        })?;
+        let sip_tenant = cfg
+            .api
+            .static_tenant
+            .as_deref()
+            .or_else(|| (tenants.len() == 1).then(|| tenants[0].as_str()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("generic_bridge requires one explicit signaling tenant")
+            })?;
+        let sip_listener_auth = cfg
+            .sip_listener_auth_policy(sip_tenant, Arc::clone(&bearer_validator), "sip:connect")
+            .context("configuring all-in-one SIP listener authentication")?;
+        let generic_sip_bind = cfg
+            .generic_bridge
+            .sip_bind
+            .parse::<SocketAddr>()
+            .context("parsing generic_bridge.sip_bind")?;
+        let sip_stack = cfg
+            .generic_sip_stack_config("bridgefu-generic", generic_sip_bind)
+            .context("configuring generic SIP/RTP networking")?;
+        let sip_egress_profiles = cfg
+            .sip_egress_profile_configs("bridgefu-generic", generic_sip_bind)
+            .context("configuring isolated named SIP egress profiles")?;
+        let outbound_profiles = cfg
+            .outbound_profile_resolver()
+            .context("configuring named outbound signaling profiles")?;
+        let provider_executor: Arc<dyn bridgefu::call_service::ProviderLegExecutor> =
+            Arc::new(api_state.provider_registry());
+        // The legacy StandardCharter server keeps exclusive ownership of its
+        // adapter event receiver and routes. Generic execution gets a fresh
+        // isolated adapter only when this opt-in runtime is enabled.
+        let generic_amazon_connect = server.adapter().fork_isolated();
+        let cleanup_observer: Arc<dyn rvoip_amazon_connect::AmazonConnectCleanupObserver> =
+            amazon_cleanup.clone();
+        generic_amazon_connect
+            .install_cleanup_observer(cleanup_observer)
+            .map_err(|error| {
+                anyhow::anyhow!("installing generic Amazon cleanup journal: {error}")
+            })?;
+        let standardcharter_canary = cfg.standardcharter_canary_policy()?;
+        let signaling_tls = cfg.api.tls.as_ref().map(|tls| runtime::GenericBridgeTls {
+            certificate_chain: &tls.certificate_chain,
+            private_key: &tls.private_key,
+        });
+        let runtime = runtime::GenericBridgeRuntime::start(runtime::GenericBridgeStart {
+            config: &cfg.generic_bridge,
+            runtime: &cfg.runtime,
             call_runtime,
-            bearer_validator,
-        )
+            sip_stack,
+            sip_egress_profiles,
+            sip_listener_auth,
+            webrtc_bearer_validator,
+            webrtc_session_binding,
+            context_policy: &cfg.context,
+            standardcharter_canary,
+            provider_executor,
+            outbound_profiles,
+            amazon_connect: generic_amazon_connect,
+            signaling_tls,
+        })
         .await?;
-        api_state.set_generic_runtime(Arc::clone(&runtime));
+        if let Err(error) = api_state.set_generic_runtime(Arc::clone(&runtime)).await {
+            runtime
+                .shutdown(Duration::from_secs(cfg.runtime.drain_timeout_secs.max(1)))
+                .await;
+            return Err(error).context("publishing concrete all-in-one worker capabilities");
+        }
         Some(runtime)
     } else {
         None
     };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let public_uctp_listener_result: anyhow::Result<_> = async {
+        match &cfg.broadcast.uctp_listener {
+            Some(listener_config) => {
+                let runtime = generic_runtime.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "broadcast.uctp_listener requires the generic media Orchestrator"
+                    )
+                })?;
+                let listener = bridgefu::broadcast::PublicUctpBroadcastListener::bind(
+                    runtime.orchestrator(),
+                    api_state.broadcast_token_service(),
+                    listener_config.runtime()?,
+                )
+                .await
+                .context("starting authenticated public UCTP broadcast listener")?;
+                tracing::info!(
+                    local_addr = %listener.local_addr(),
+                    advertised_endpoint = cfg.broadcast.public_endpoint.as_deref().unwrap_or(""),
+                    "authenticated public UCTP broadcast listener started"
+                );
+                Ok(Some(listener))
+            }
+            None => Ok(None),
+        }
+    }
+    .await;
+    let public_uctp_listener = match public_uctp_listener_result {
+        Ok(listener) => listener,
+        Err(error) => {
+            if let Some(runtime) = &generic_runtime {
+                runtime
+                    .shutdown(std::time::Duration::from_secs(
+                        cfg.runtime.drain_timeout_secs,
+                    ))
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    // Start owned observers only after every fallible listener/runtime
+    // construction above has succeeded. A startup error therefore cannot
+    // strand detached metrics or cleanup tasks.
+    let mut metrics_task = observability::spawn_metrics_updater(
+        server.clone(),
+        tenants.clone(),
+        owned_task_shutdown_tx.subscribe(),
+    );
+    let mut cleanup_reconciler = amazon_cleanup.spawn_reconciler(
+        server.adapter().clone(),
+        owned_task_shutdown_tx.subscribe(),
+        std::time::Duration::from_secs(30),
+    );
+    let (http_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut lifecycle_task = screen_pop_evidence::spawn_lifecycle_ingest(
         lifecycle_events,
         api_state.screen_pop_evidence_store(),
-        shutdown_tx.subscribe(),
+        owned_task_shutdown_tx.subscribe(),
     );
+    let api_shutdown_owner = api_state.clone();
     let app = api::router(api_state);
 
     // Control/health/metrics HTTP server, shut down on the same signal as the gateway.
     let mut http = tokio::spawn(api::serve(
         http_bind,
         app,
-        wait_for_shutdown(shutdown_tx.subscribe()),
+        wait_for_shutdown(http_shutdown_tx.subscribe()),
     ));
 
-    // Run the SIP→Connect gateway until a shutdown signal.
+    // Retain the outer accept-loop owner. Dropping the `serve` future on a
+    // process signal used to bypass the server's owned drain protocol.
+    let mut legacy_serve = tokio::spawn(server.clone().serve());
     tokio::select! {
-        res = server.clone().serve() => {
-            if let Err(e) = res {
-                tracing::error!(error = %e, "gateway serve loop ended with error");
-            } else {
-                tracing::info!("gateway serve loop ended");
+        res = &mut legacy_serve => {
+            match res {
+                Ok(Ok(())) => tracing::info!("gateway serve loop ended"),
+                Ok(Err(error)) => tracing::error!(%error, "gateway serve loop ended with error"),
+                Err(error) => tracing::error!(%error, "gateway serve task failed"),
             }
         }
         _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received; stopping gateway");
+            tracing::info!("shutdown signal received; draining gateway");
         }
     }
 
-    let _ = shutdown_tx.send(true);
     let shutdown_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(cfg.runtime.drain_timeout_secs);
+    // Close public admission together. HTTP stops accepting mutations now,
+    // while lifecycle/metrics consumers intentionally remain alive until the
+    // legacy server has completed its exact teardown protocol.
+    let _ = http_shutdown_tx.send(true);
+    server.begin_drain();
+    if let Some(listener) = &public_uctp_listener {
+        listener.begin_drain();
+    }
+
+    let legacy_report = server
+        .drain_until(
+            std::time::Instant::now()
+                .checked_add(shutdown_budget(shutdown_deadline))
+                .unwrap_or_else(std::time::Instant::now),
+        )
+        .await;
+    tracing::info!(
+        attempted_tasks = legacy_report.attempted_tasks,
+        joined_tasks = legacy_report.joined_tasks,
+        failed_tasks = legacy_report.failed_tasks,
+        detached_tasks = legacy_report.detached_tasks,
+        remaining_setups = legacy_report.remaining_setups,
+        remaining_active = legacy_report.remaining_active,
+        remaining_connect_routes = legacy_report.remaining_connect_routes,
+        pending_contact_cleanups = legacy_report.adapter.pending_contact_cleanups,
+        serve_stopped = legacy_report.serve_stopped,
+        coordinator_stopped = legacy_report.coordinator_stopped,
+        "legacy screen-pop server drain completed"
+    );
+    metrics::gauge!("bridgefu_legacy_drain_incomplete").set(if legacy_report.is_complete() {
+        0.0
+    } else {
+        1.0
+    });
+    metrics::gauge!("bridgefu_amazon_pending_contact_cleanups")
+        .set(legacy_report.adapter.pending_contact_cleanups as f64);
+    if !legacy_report.is_complete() {
+        tracing::error!(
+            detached_tasks = legacy_report.detached_tasks,
+            remaining_setups = legacy_report.remaining_setups,
+            remaining_active = legacy_report.remaining_active,
+            remaining_connect_routes = legacy_report.remaining_connect_routes,
+            pending_contact_cleanups = legacy_report.adapter.pending_contact_cleanups,
+            "legacy screen-pop shutdown retained unfinished cleanup authority"
+        );
+    }
+    if !legacy_serve.is_finished()
+        && tokio::time::timeout(shutdown_budget(shutdown_deadline), &mut legacy_serve)
+            .await
+            .is_err()
+    {
+        // This is a bounded fallback only after `drain_until` has transferred
+        // ambiguous contact cleanup to retained owners and stopped the SIP
+        // coordinator. It is never the primary shutdown mechanism.
+        tracing::error!("legacy serve owner remained live after completed drain; aborting task");
+        legacy_serve.abort();
+        let _ = legacy_serve.await;
+    }
+
+    let _ = owned_task_shutdown_tx.send(true);
     // The lifecycle consumer must stop before its store and API state are
     // dropped. Abort only as a bounded fallback for a runtime bug.
     if tokio::time::timeout(
@@ -159,6 +444,28 @@ async fn main() -> Result<()> {
         lifecycle_task.abort();
         let _ = lifecycle_task.await;
     }
+    if tokio::time::timeout(
+        shutdown_budget(shutdown_deadline).min(std::time::Duration::from_secs(3)),
+        &mut metrics_task,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("metrics updater did not stop; aborting task");
+        metrics_task.abort();
+        let _ = metrics_task.await;
+    }
+    if tokio::time::timeout(
+        shutdown_budget(shutdown_deadline).min(std::time::Duration::from_secs(3)),
+        &mut cleanup_reconciler,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("Amazon cleanup reconciler did not stop; aborting task");
+        cleanup_reconciler.abort();
+        let _ = cleanup_reconciler.await;
+    }
 
     // Give the HTTP server a moment to drain from the shared shutdown signal.
     if tokio::time::timeout(
@@ -171,6 +478,18 @@ async fn main() -> Result<()> {
         tracing::warn!("HTTP API did not drain; aborting task");
         http.abort();
         let _ = http.await;
+    }
+    let closed_broadcasts = api_shutdown_owner.shutdown_local_broadcasts().await;
+    tracing::info!(closed_broadcasts, "local broadcasts drained");
+    // Release the retained API clone before CallServiceRuntime::try_unwrap.
+    drop(api_shutdown_owner);
+    if let Some(listener) = public_uctp_listener {
+        if tokio::time::timeout(shutdown_budget(shutdown_deadline), listener.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("public UCTP listener exceeded the shutdown deadline");
+        }
     }
     if let Some(runtime) = generic_runtime {
         runtime.shutdown(shutdown_budget(shutdown_deadline)).await;
@@ -251,6 +570,24 @@ mod tests {
         SystemCallServiceClock,
     };
     use bridgefu::coordination::DeploymentId;
+
+    #[test]
+    fn gateway_mode_dispatches_to_the_gateway_runner_without_fallback() {
+        assert_eq!(
+            process_runner(RuntimeMode::AllInOne),
+            ProcessRunner::AllInOne
+        );
+        assert_eq!(process_runner(RuntimeMode::Gateway), ProcessRunner::Gateway);
+        assert_ne!(
+            process_runner(RuntimeMode::Gateway),
+            ProcessRunner::AllInOne
+        );
+        assert_eq!(process_runner(RuntimeMode::Worker), ProcessRunner::Worker);
+        assert_eq!(
+            process_runner(RuntimeMode::MoqRelay),
+            ProcessRunner::MoqRelay
+        );
+    }
 
     #[tokio::test]
     async fn owned_call_runtime_shutdown_marks_worker_draining_and_joins() {

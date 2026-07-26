@@ -193,6 +193,21 @@ pub struct RegisterWorker {
     pub lease_ttl: Duration,
 }
 
+/// Same-fence activation of the concrete adapters installed by a worker.
+///
+/// Workers may register with an empty capability set while their signaling
+/// and provider adapters are being installed. This operation publishes that
+/// inventory exactly once without advancing the worker fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivateWorkerCapabilities {
+    /// Exact current worker incarnation.
+    pub worker: WorkerLease,
+    /// Non-empty concrete adapter capability set.
+    pub capabilities: BTreeSet<String>,
+    /// Authoritative observation time (replaced with database time by SQL backends).
+    pub at: DateTime<Utc>,
+}
+
 /// Same-fence worker heartbeat request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenewWorkerLease {
@@ -268,12 +283,26 @@ pub struct StoredCall {
 }
 
 /// One attachment token digest to persist atomically with a call decision.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPurpose {
+    /// Public attachment explicitly returned for an inbound logical leg.
+    #[default]
+    PublicInbound,
+    /// Internal provider SIP media attachment; never returned by an API view.
+    ProviderMedia,
+}
+
+/// One attachment token digest to persist atomically with a call decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AttachmentIssue {
     /// Stable attachment row identity.
     pub attachment_id: AttachmentId,
     /// Digest of the raw 256-bit token; the raw token is never accepted here.
     pub token_digest: AttachmentTokenDigest,
+    /// Visibility and state-machine policy for this attachment.
+    #[serde(default)]
+    pub purpose: AttachmentPurpose,
     /// Target leg.
     pub leg_id: LegId,
     /// Exact binding generation.
@@ -406,6 +435,7 @@ pub enum CommandCommitOutcome {
 pub struct AttachmentCandidate {
     pub(crate) attachment_id: AttachmentId,
     pub(crate) token_digest: AttachmentTokenDigest,
+    pub(crate) purpose: AttachmentPurpose,
     pub(crate) tenant_id: TenantId,
     pub(crate) call_id: CallId,
     pub(crate) leg_id: LegId,
@@ -442,6 +472,12 @@ impl AttachmentCandidate {
         self.transport
     }
 
+    /// Attachment visibility and state-machine policy.
+    #[must_use]
+    pub const fn purpose(&self) -> AttachmentPurpose {
+        self.purpose
+    }
+
     /// Token expiry.
     #[must_use]
     pub const fn expires_at(&self) -> DateTime<Utc> {
@@ -459,6 +495,7 @@ impl fmt::Debug for AttachmentCandidate {
             .debug_struct("AttachmentCandidate")
             .field("attachment_id", &self.attachment_id)
             .field("token_digest", &"[redacted]")
+            .field("purpose", &self.purpose)
             .field("tenant_id", &self.tenant_id)
             .field("call_id", &self.call_id)
             .field("leg_id", &self.leg_id)
@@ -644,6 +681,28 @@ pub enum ProviderEventState {
 }
 
 /// Tenant-scoped target for a normalized provider event.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReferenceRole {
+    /// Provider call whose SIP/RTP media terminates at Bridgefu.
+    #[default]
+    Media,
+    /// Provider call to the requested destination, linked to the media call.
+    Destination,
+}
+
+impl ProviderReferenceRole {
+    /// Stable storage and diagnostics label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Media => "media",
+            Self::Destination => "destination",
+        }
+    }
+}
+
+/// Tenant-scoped target for a normalized provider event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderEventTarget {
     /// Owning tenant.
@@ -652,6 +711,9 @@ pub struct ProviderEventTarget {
     pub call_id: CallId,
     /// Provider-controlled leg.
     pub leg_id: LegId,
+    /// Exact provider call role which emitted the callback.
+    #[serde(default)]
+    pub role: ProviderReferenceRole,
 }
 
 /// Normalized durable provider event. Debug deliberately omits identifiers and JSON.
@@ -758,6 +820,8 @@ pub struct BindProviderReference {
     pub call_id: CallId,
     /// Provider-controlled leg.
     pub leg_id: LegId,
+    /// Provider call role within the logical leg.
+    pub role: ProviderReferenceRole,
     /// Provider namespace.
     pub account: ProviderAccountKey,
     /// External call ID.
@@ -992,6 +1056,9 @@ pub enum RepositoryError {
     /// Worker ID/fence was not current or the worker was draining.
     #[error("stale or unavailable worker lease")]
     StaleWorkerFence,
+    /// The exact live worker does not own every adapter required by the plan.
+    #[error("worker capability is unavailable")]
+    WorkerCapabilityUnavailable,
     /// Aggregate compare-and-swap failed.
     #[error("aggregate version conflict")]
     VersionConflict,
@@ -1037,6 +1104,14 @@ pub trait CallRepository: Send + Sync {
     async fn register_worker(
         &self,
         request: RegisterWorker,
+    ) -> Result<WorkerSnapshot, RepositoryError>;
+
+    /// Publishes the concrete adapter inventory for one exact live worker.
+    /// Empty registration to non-empty activation is allowed once; replaying
+    /// the exact set is idempotent and any later change is rejected.
+    async fn activate_worker_capabilities(
+        &self,
+        request: ActivateWorkerCapabilities,
     ) -> Result<WorkerSnapshot, RepositoryError>;
 
     /// Renews one unexpired exact fence without changing its identity.
@@ -1190,14 +1265,21 @@ pub(crate) fn validate_register_worker(request: &RegisterWorker) -> Result<(), R
             "worker max_calls must be greater than zero",
         ));
     }
-    if request.capabilities.iter().any(|capability| {
+    validate_worker_capabilities(&request.capabilities)?;
+    validate_worker_lease_ttl(request.lease_ttl)
+}
+
+pub(crate) fn validate_worker_capabilities(
+    capabilities: &BTreeSet<String>,
+) -> Result<(), RepositoryError> {
+    if capabilities.iter().any(|capability| {
         capability.is_empty()
             || capability.len() > MAX_CAPABILITY_BYTES
             || capability.chars().any(char::is_control)
     }) {
         return Err(RepositoryError::InvalidInput("invalid worker capability"));
     }
-    validate_worker_lease_ttl(request.lease_ttl)
+    Ok(())
 }
 
 pub(crate) fn validate_worker_candidate_limit(limit: usize) -> Result<(), RepositoryError> {
@@ -1253,11 +1335,27 @@ pub(crate) fn validate_attachment_issue(
     let leg = call.leg(issue.leg_id).ok_or(RepositoryError::InvalidInput(
         "attachment leg is outside call",
     ))?;
-    if leg.binding_generation() != issue.binding_generation
-        || leg.state() != LegState::AwaitingAttach
-    {
+    let valid_state = match issue.purpose {
+        AttachmentPurpose::PublicInbound => {
+            leg.direction() == crate::call_engine::LegDirection::Inbound
+                && leg.state() == LegState::AwaitingAttach
+        }
+        AttachmentPurpose::ProviderMedia => {
+            let ordinary = leg.direction() == crate::call_engine::LegDirection::Outbound
+                && leg.kind() == crate::call_engine::LegKind::Telnyx
+                && leg.binding_generation() == issue.binding_generation
+                && matches!(leg.state(), LegState::Pending | LegState::Signaling);
+            let replacement = call.replacement().is_some_and(|replacement| {
+                replacement.leg_id() == issue.leg_id
+                    && replacement.pending_kind() == crate::call_engine::LegKind::Telnyx
+                    && replacement.pending_binding_generation() == issue.binding_generation
+            });
+            (ordinary || replacement) && issue.transport == AttachmentTransport::Sip
+        }
+    };
+    if !valid_state {
         return Err(RepositoryError::InvalidInput(
-            "attachment does not match an awaiting leg generation",
+            "attachment does not match its leg purpose or generation",
         ));
     }
     Ok(())

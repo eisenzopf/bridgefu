@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use bridgefu::api_principal::ApiPrincipal;
+use bridgefu::api_principal::{ApiPrincipal, CallScope};
 use bridgefu::call_engine::{
     AttachmentConsume, AttachmentLookup, AttachmentTokenDigest, BindingGeneration, CallCommand,
     CommandId, LegDirection, LegState, RepositoryError, TenantId, WorkerId,
@@ -39,7 +39,12 @@ fn coordination() -> CallServiceCoordinationConfig {
 }
 
 fn capabilities() -> BTreeSet<String> {
-    BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()])
+    BTreeSet::from([
+        "sip".to_owned(),
+        "webrtc".to_owned(),
+        "sip_egress".to_owned(),
+        "webrtc_egress".to_owned(),
+    ])
 }
 
 #[derive(Debug)]
@@ -90,7 +95,7 @@ fn principal() -> ApiPrincipal {
         AuthenticatedPrincipal {
             subject: "runtime-subject".into(),
             tenant: Some("runtime-tenant".into()),
-            scopes: vec!["*".into()],
+            scopes: vec!["*".into(), CallScope::ArbitraryDestination.as_str().into()],
             issuer: Some("runtime-test".into()),
             expires_at: None,
             method: AuthenticationMethod::Jwt,
@@ -109,13 +114,22 @@ fn input() -> CreateCallInput {
         legs: [
             RequestedLeg {
                 direction: LegDirection::Inbound,
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                signaling_initiator: None,
+                media_flow: Default::default(),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
+                amazon_connect_start: None,
             },
             RequestedLeg {
                 direction: LegDirection::Outbound,
+                signaling_initiator: None,
+                media_flow: Default::default(),
                 endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
                     signaling_uri: Some("wss://runtime.example.test/session".into()),
                 }),
+                amazon_connect_start: None,
             },
         ],
     }
@@ -136,12 +150,12 @@ async fn build(
     if matches!(&backend, CallRepositoryBackendConfig::Postgres { .. }) {
         runtime_coordination.allow_db_only_coordination = true;
     }
-    build_call_service_runtime(
+    let runtime = build_call_service_runtime(
         CallServiceRuntimeConfig {
             backend,
             worker_id,
             max_calls: 1,
-            worker_capabilities: capabilities(),
+            worker_capabilities: BTreeSet::new(),
             control_key: vec![0x74; 32],
             timeouts: CallTimeoutPolicy {
                 setup: Duration::from_secs(30),
@@ -155,7 +169,12 @@ async fn build(
         clock,
     )
     .await
-    .unwrap()
+    .unwrap();
+    runtime
+        .activate_worker_capabilities(capabilities())
+        .await
+        .unwrap();
+    runtime
 }
 
 async fn assert_consumed_expired_replay_and_capacity(
@@ -276,12 +295,7 @@ async fn assert_consumed_expired_replay_and_capacity(
             input(),
         )
         .await;
-    let expected_capacity = if durable_restart {
-        CallServiceError::CapacityExceeded
-    } else {
-        CallServiceError::Repository(RepositoryError::CapacityExceeded)
-    };
-    assert_eq!(capacity, Err(expected_capacity));
+    assert_eq!(capacity, Err(CallServiceError::CapacityExceeded));
     let worker = runtime
         .repository()
         .worker_snapshot(worker_id)

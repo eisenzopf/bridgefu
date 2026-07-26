@@ -62,7 +62,7 @@ done < <(jq -r '.standards | to_entries[] | [.key, .value.name, .value.revision,
 upstream_repo="$(jq -er '.wireLibrary.upstream' "${manifest}")"
 fork_repo="$(jq -er '.wireLibrary.fork' "${manifest}")"
 port_base="$(jq -er '.wireLibrary.portBaseRevision' "${manifest}")"
-reviewed_fork="$(jq -r '.wireLibrary.reviewedForkRevision // ""' "${manifest}")"
+qualified_fork="$(jq -r '.wireLibrary.qualifiedForkRevision // ""' "${manifest}")"
 upstream_head="$(curl --fail --silent --show-error --location \
   "https://api.github.com/repos/${upstream_repo}/commits/main" | jq -er '.sha')"
 fork_head="$(curl --fail --silent --show-error --location \
@@ -77,8 +77,8 @@ jq -n \
   --arg forkRepo "${fork_repo}" \
   --arg forkHead "${fork_head}" \
   --arg portBaseRevision "${port_base}" \
-  --arg reviewedForkRevision "${reviewed_fork}" \
-  '{generatedAt: $generatedAt, driftDetected: $drift, standards: $standards, wireLibrary: {upstream: $upstreamRepo, upstreamHead: $upstreamHead, fork: $forkRepo, forkMainHead: $forkHead, portBaseRevision: $portBaseRevision, reviewedForkRevision: (if $reviewedForkRevision == "" then null else $reviewedForkRevision end)}}' \
+  --arg qualifiedForkRevision "${qualified_fork}" \
+  '{generatedAt: $generatedAt, driftDetected: $drift, standards: $standards, wireLibrary: {upstream: $upstreamRepo, upstreamHead: $upstreamHead, fork: $forkRepo, forkMainHead: $forkHead, portBaseRevision: $portBaseRevision, qualifiedForkRevision: (if $qualifiedForkRevision == "" then null else $qualifiedForkRevision end)}}' \
   >"${report}"
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -89,7 +89,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo
     jq -r '.standards[] | "- \(.name): pinned \(.expectedRevision), current \(.actualRevision), archive match=\(.matches)"' "${report}"
     echo "- ${upstream_repo} main: ${upstream_head}"
-    echo "- Reviewed fork revision: ${reviewed_fork:-not yet pinned}"
+    echo "- Qualified fork revision (pending owner review): ${qualified_fork:-not yet pinned}"
     echo "- Drift detected: ${drift}"
   } >>"${GITHUB_STEP_SUMMARY}"
 fi

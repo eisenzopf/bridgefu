@@ -456,6 +456,153 @@ async fn memory_hints_are_capacity_filtered_and_routes_require_exact_live_fence(
 }
 
 #[tokio::test]
+async fn attachment_routes_are_owner_bound_revocable_expiring_and_fence_exact() {
+    let deployment = DeploymentId::parse("attachment-routing").expect("deployment");
+    let clock = Arc::new(ManualCoordinationClock::new(instant()));
+    let coordinator =
+        MemoryCoordinator::new(deployment.clone(), clock.clone(), 8).expect("coordinator");
+    let worker_id = worker_id(40);
+    let first_worker = worker_snapshot(worker_id, 1, instant() + TimeDelta::minutes(1));
+    coordinator
+        .apply(&event(
+            &deployment,
+            1,
+            CoordinationPayload::Worker(first_worker.clone()),
+        ))
+        .await
+        .expect("worker projection");
+
+    let token_digest = crate::call_engine::AttachmentTokenDigest::new([0x41; 32]);
+    let tenant_binding = crate::call_engine::PrincipalFingerprint::new([0x42; 32]);
+    let route = AttachmentRouteHint {
+        token_digest,
+        worker: first_worker.lease,
+        transport: crate::call_engine::AttachmentTransport::Sip,
+        tenant_binding,
+        expires_at: instant() + TimeDelta::seconds(30),
+    };
+    let lookup = AttachmentRouteLookup {
+        token_digest,
+        transport: crate::call_engine::AttachmentTransport::Sip,
+        tenant_binding,
+    };
+    coordinator
+        .apply(&event(
+            &deployment,
+            2,
+            CoordinationPayload::AttachmentRoute(route.clone()),
+        ))
+        .await
+        .expect("attachment issued");
+    assert_eq!(
+        coordinator.attachment_route_hint(lookup).await,
+        Ok(Some(route.clone()))
+    );
+    assert_eq!(
+        coordinator
+            .attachment_route_hint(AttachmentRouteLookup {
+                tenant_binding: crate::call_engine::PrincipalFingerprint::new([0x99; 32]),
+                ..lookup
+            })
+            .await,
+        Ok(None),
+        "another tenant/owner cannot use the routing projection"
+    );
+    assert_eq!(
+        coordinator
+            .attachment_route_hint(AttachmentRouteLookup {
+                transport: crate::call_engine::AttachmentTransport::WebRtc,
+                ..lookup
+            })
+            .await,
+        Ok(None),
+        "a projection cannot change signaling transports"
+    );
+
+    coordinator
+        .apply(&event(
+            &deployment,
+            3,
+            CoordinationPayload::AttachmentRouteRemoved { token_digest },
+        ))
+        .await
+        .expect("attachment revoked");
+    assert_eq!(coordinator.attachment_route_hint(lookup).await, Ok(None));
+    assert_eq!(
+        coordinator
+            .apply(&event(
+                &deployment,
+                2,
+                CoordinationPayload::AttachmentRoute(route.clone()),
+            ))
+            .await,
+        Ok(ProjectionApplyOutcome::Stale),
+        "a delayed issuance cannot resurrect a consumed/revoked route"
+    );
+
+    let second_digest = crate::call_engine::AttachmentTokenDigest::new([0x43; 32]);
+    let second_lookup = AttachmentRouteLookup {
+        token_digest: second_digest,
+        ..lookup
+    };
+    let expiring_route = AttachmentRouteHint {
+        token_digest: second_digest,
+        expires_at: instant() + TimeDelta::seconds(5),
+        ..route
+    };
+    coordinator
+        .apply(&event(
+            &deployment,
+            4,
+            CoordinationPayload::AttachmentRoute(expiring_route),
+        ))
+        .await
+        .expect("second attachment issued");
+    clock.advance(Duration::from_secs(6)).expect("advance");
+    assert_eq!(
+        coordinator.attachment_route_hint(second_lookup).await,
+        Ok(None),
+        "expired projections fail closed"
+    );
+
+    let third_digest = crate::call_engine::AttachmentTokenDigest::new([0x44; 32]);
+    let third_lookup = AttachmentRouteLookup {
+        token_digest: third_digest,
+        ..lookup
+    };
+    coordinator
+        .apply(&event_at(
+            &deployment,
+            5,
+            CoordinationPayload::AttachmentRoute(AttachmentRouteHint {
+                token_digest: third_digest,
+                worker: first_worker.lease,
+                transport: lookup.transport,
+                tenant_binding,
+                expires_at: instant() + TimeDelta::seconds(45),
+            }),
+            instant() + TimeDelta::seconds(6),
+        ))
+        .await
+        .expect("third attachment issued");
+    let restarted_worker = worker_snapshot(worker_id, 2, instant() + TimeDelta::minutes(1));
+    coordinator
+        .apply(&event_at(
+            &deployment,
+            6,
+            CoordinationPayload::Worker(restarted_worker),
+            instant() + TimeDelta::seconds(6),
+        ))
+        .await
+        .expect("worker restarted");
+    assert_eq!(
+        coordinator.attachment_route_hint(third_lookup).await,
+        Ok(None),
+        "a worker restart invalidates projections issued under the stale fence"
+    );
+}
+
+#[tokio::test]
 async fn memory_wakeup_groups_deduplicate_reclaim_ack_and_fall_back_to_database() {
     let deployment = DeploymentId::parse("test-c").expect("deployment");
     let clock = Arc::new(ManualCoordinationClock::new(instant()));
@@ -557,6 +704,13 @@ impl CoordinationProjection for FailOnceProjection {
         call_id: CallId,
     ) -> Result<Option<CallRouteHint>, CoordinationError> {
         self.inner.route_hint(call_id).await
+    }
+
+    async fn attachment_route_hint(
+        &self,
+        lookup: AttachmentRouteLookup,
+    ) -> Result<Option<AttachmentRouteHint>, CoordinationError> {
+        self.inner.attachment_route_hint(lookup).await
     }
 
     async fn replay_seen(&self, digest: ReplayDigest) -> Result<bool, CoordinationError> {

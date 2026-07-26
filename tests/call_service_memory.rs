@@ -4,25 +4,28 @@ use std::time::Duration;
 
 use bridgefu::call_engine::{
     AggregateVersion, AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup,
-    AttachmentTokenDigest, AttachmentTransport, BindProviderReference, BindingGeneration,
-    CallAggregate, CallCommand, CallRepository, CallState, CommandCommit, CommandId, CreateCall,
-    EffectIntent, FailureDetails, IdempotencyKeyDigest, LegDirection, LegKind, LegSpec, LegState,
-    OutboxCompletion, PrincipalFingerprint, ProviderAccountKey, ProviderCallId,
-    ProviderEventCommit, ProviderEventDigest, ProviderEventInput, ProviderEventOutcome,
-    ProviderEventState, ProviderPayloadDigest, RegisterWorker, RepositoryError, RequestDigest,
-    StopLegReason, StoredCall, TenantId, WorkerId, WorkerLease,
+    AttachmentPurpose, AttachmentTokenDigest, AttachmentTransport, BindProviderReference,
+    BindingGeneration, CallAggregate, CallCommand, CallRepository, CallState, ClaimGeneration,
+    CommandCommit, CommandId, CreateCall, EffectId, EffectIntent, FailureDetails,
+    IdempotencyKeyDigest, LegDirection, LegKind, LegReplacementResult, LegSemantics, LegSpec,
+    LegState, MediaFlow, OutboxCompletion, PrincipalFingerprint, ProviderAccountKey,
+    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
+    ProviderEventOutcome, ProviderEventState, ProviderPayloadDigest, ProviderReferenceRole,
+    RegisterWorker, RepositoryError, RequestDigest, SignalingInitiator, StopLegReason, StoredCall,
+    TenantId, WorkerId, WorkerLease,
 };
 use bridgefu::call_service::{
     AmazonConnectEndpointConfig, CallExecutionPlan, CallServiceRepository, CompletedServiceEffect,
     ControlCommandOutcome, ControlCommandTransaction, ControlIntent, DtmfSequence,
     EffectResultOutcome, EffectResultReconciliation, ExternalReferenceBinding,
     ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec, MediaActivityCommit,
-    MediaActivityGeneration, MediaActivityGuard, OperationIdempotency, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind, ServiceCommandOutcome,
-    ServiceCommandTransaction, ServiceCreateCandidate, ServiceCreateOutcome,
-    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectPayloadInput, ServiceEffectResult,
-    ServiceOperationKind, SipEndpointConfig, StoredServiceCall, TransferTarget,
-    WebRtcEndpointConfig,
+    MediaActivityGeneration, MediaActivityGuard, NamedProfileBinding, NamedProfileKind,
+    NamedProfileRole, NamedRouteBinding, OperationIdempotency, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ProviderEndpointConfig, ProviderKind,
+    ReplacementConnectionPromotion, ServiceCommandOutcome, ServiceCommandTransaction,
+    ServiceCreateCandidate, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, SipEndpointConfig,
+    SipInitialContextMode, StoredServiceCall, TransferTarget, WebRtcEndpointConfig,
 };
 use bridgefu::persistence::MemoryRepository;
 use chrono::{DateTime, TimeZone, Utc};
@@ -113,7 +116,10 @@ fn sip_webrtc_create(
         [
             LegExecutionSpec {
                 leg_id: inbound,
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
             LegExecutionSpec {
                 leg_id: initial.legs()[1].id(),
@@ -138,6 +144,7 @@ fn sip_webrtc_create(
         attachments: vec![AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest,
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: inbound,
             binding_generation: BindingGeneration::INITIAL,
             transport: AttachmentTransport::Sip,
@@ -184,7 +191,10 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
             },
             LegExecutionSpec {
                 leg_id: initial.legs()[1].id(),
-                endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
             },
         ],
         principal(key),
@@ -240,6 +250,7 @@ async fn service_command(
             operation_idempotency: None,
             bound_connection: None,
             media_activity: None,
+            replacement_connection: None,
         })
         .await
         .unwrap();
@@ -255,6 +266,48 @@ struct ActiveFixture {
     worker: WorkerLease,
     service_call: StoredServiceCall,
     outbound_bind: OutboundConnectionBind,
+}
+
+async fn claim_start_leg(
+    repository: &MemoryRepository,
+    worker: WorkerLease,
+    owner: &TenantId,
+    call_id: bridgefu::call_engine::CallId,
+    leg_id: bridgefu::call_engine::LegId,
+    claim_at: DateTime<Utc>,
+) -> (EffectId, ClaimGeneration) {
+    for _ in 0..8 {
+        let claims = repository
+            .claim_outbox(worker, claim_at, Duration::from_secs(30), 64)
+            .await
+            .unwrap();
+        for claim in claims {
+            if claim.record.call_id == call_id
+                && matches!(
+                    claim.record.intent,
+                    EffectIntent::StartLeg { leg_id: claimed_leg, .. } if claimed_leg == leg_id
+                )
+            {
+                return (claim.record.effect_id, claim.claim_generation);
+            }
+            repository
+                .reconcile_effect_result(EffectResultReconciliation {
+                    tenant_id: claim.record.tenant_id.clone(),
+                    call_id: claim.record.call_id,
+                    effect_id: claim.record.effect_id,
+                    worker,
+                    claim_generation: claim.claim_generation,
+                    result: ServiceEffectResult::Succeeded,
+                    external_reference: None,
+                    additional_external_references: Vec::new(),
+                    follow_up: None,
+                    at: claim_at,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    panic!("start effect for {owner}/{call_id}/{leg_id} was not claimable")
 }
 
 async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
@@ -295,8 +348,19 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
         })
         .await
         .unwrap();
+    let (start_effect_id, start_claim_generation) = claim_start_leg(
+        &repository,
+        worker,
+        &owner,
+        service_call.call.aggregate.id(),
+        outbound_leg,
+        at(4),
+    )
+    .await;
     let outbound_bind = OutboundConnectionBind {
-        operation_id: CommandId::new(),
+        operation_id: CommandId::from_uuid(start_effect_id.as_uuid()).unwrap(),
+        effect_id: start_effect_id,
+        claim_generation: start_claim_generation,
         tenant_id: owner.clone(),
         call_id: service_call.call.aggregate.id(),
         leg_id: outbound_leg,
@@ -314,6 +378,21 @@ async fn active_fixture(key: u8) -> (MemoryRepository, ActiveFixture) {
             .unwrap(),
         OutboundConnectionBindOutcome::Bound(_)
     ));
+    repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id: service_call.call.aggregate.id(),
+            effect_id: start_effect_id,
+            worker,
+            claim_generation: start_claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: None,
+            additional_external_references: Vec::new(),
+            follow_up: None,
+            at: at(4),
+        })
+        .await
+        .unwrap();
 
     let mut call = consumed.commit.call;
     call = service_command(
@@ -415,6 +494,7 @@ fn transfer_operation(
         )),
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     }
 }
 
@@ -493,6 +573,7 @@ async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
     let legacy_object = legacy_value.as_object_mut().unwrap();
     legacy_object.insert("version".to_owned(), serde_json::json!(1));
     legacy_object.remove("authorization_principal_fingerprint");
+    legacy_object.remove("leg_semantics");
     let legacy_plan: CallExecutionPlan = serde_json::from_value(legacy_value).unwrap();
     legacy_plan
         .validate_against(&request.create.initial)
@@ -503,7 +584,7 @@ async fn create_plan_validation_is_atomic_and_replay_returns_original_plan() {
     assert_eq!(
         repository.create_with_plan(legacy_create).await,
         Err(RepositoryError::InvalidInput(
-            "execution plan has no durable outbound authorization"
+            "new calls require the current execution plan version"
         ))
     );
 
@@ -646,6 +727,7 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
         operation_idempotency: None,
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
 
     assert_eq!(
@@ -701,6 +783,249 @@ async fn transfer_payload_is_ordinal_bound_atomic_and_exactly_replayed() {
 }
 
 #[tokio::test]
+async fn logical_leg_replacement_is_idempotent_rejects_glare_and_promotes_binding_atomically() {
+    let (repository, fixture) = active_fixture(96).await;
+    let leg_id = fixture.service_call.call.aggregate.legs()[1].id();
+    let previous_generation = fixture
+        .service_call
+        .call
+        .aggregate
+        .leg(leg_id)
+        .unwrap()
+        .binding_generation();
+    let pending_generation = previous_generation.next().unwrap();
+    let endpoint = LegEndpointConfig::Sip(SipEndpointConfig {
+        uri: Some("sips:agent@call-center.example".into()),
+        initial_context: SipInitialContextMode::None,
+    });
+    let begin = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            expected_version: fixture.service_call.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::BeginLegReplacement {
+                at: at(8),
+                leg_id,
+                pending_kind: LegKind::Sip,
+                transfer_deadline: at(38),
+            },
+            worker: fixture.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(8),
+        },
+        effect_payloads: vec![ServiceEffectPayloadInput {
+            ordinal: 2,
+            payload: ServiceEffectPayload::LegReplacement {
+                leg_id,
+                previous_binding_generation: previous_generation,
+                pending_binding_generation: pending_generation,
+                endpoint,
+                amazon_connect_start: None,
+                route_id: "support-sip".into(),
+                replacement_route: Some(
+                    NamedRouteBinding::new_with_profiles(
+                        "support-sip",
+                        None,
+                        vec![NamedProfileBinding::new(
+                            NamedProfileRole::Destination,
+                            NamedProfileKind::Sip,
+                            "support-sip",
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        )
+                        .unwrap()],
+                    )
+                    .unwrap(),
+                ),
+                authorization_principal_fingerprint: principal(96),
+            },
+        }],
+        operation_idempotency: Some(operation_idempotency(
+            196,
+            197,
+            ServiceOperationKind::TransferCall,
+        )),
+        bound_connection: None,
+        media_activity: None,
+        replacement_connection: None,
+    };
+    let committed = repository
+        .commit_with_effect_payloads(begin.clone())
+        .await
+        .unwrap();
+    let ServiceCommandOutcome::Committed(begun) = committed else {
+        panic!("fresh replacement must commit")
+    };
+    assert_eq!(
+        begun.command.call.aggregate.state(),
+        CallState::Transferring
+    );
+    assert_eq!(
+        begun.command.call.aggregate.leg(leg_id).unwrap().state(),
+        LegState::Held
+    );
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(begin.clone())
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(_)
+    ));
+
+    let replacement_claim = loop {
+        let claim = repository
+            .claim_outbox(fixture.worker, at(9), Duration::from_secs(30), 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("replacement predecessor or start effect must be claimable");
+        if matches!(
+            claim.record.intent,
+            EffectIntent::StartLegReplacement {
+                leg_id: effect_leg_id,
+                pending_binding_generation: effect_generation,
+                ..
+            } if effect_leg_id == leg_id && effect_generation == pending_generation
+        ) {
+            break claim;
+        }
+        repository
+            .reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: fixture.owner.clone(),
+                call_id: fixture.service_call.call.aggregate.id(),
+                effect_id: claim.record.effect_id,
+                worker: fixture.worker,
+                claim_generation: claim.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                additional_external_references: Vec::new(),
+                follow_up: None,
+                at: at(9),
+            })
+            .await
+            .unwrap();
+    };
+    repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            effect_id: replacement_claim.record.effect_id,
+            worker: fixture.worker,
+            claim_generation: replacement_claim.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: Some(ExternalReferenceBinding {
+                leg_id,
+                binding_generation: pending_generation,
+                role: ProviderReferenceRole::Media,
+                value: ExternalReferenceValue::Signaling {
+                    namespace: "sip.call-id".into(),
+                    value: "replacement-call-id-96".into(),
+                },
+            }),
+            additional_external_references: Vec::new(),
+            follow_up: None,
+            at: at(9),
+        })
+        .await
+        .unwrap();
+    assert!(repository
+        .load_external_reference_for_binding(
+            &fixture.owner,
+            fixture.service_call.call.aggregate.id(),
+            leg_id,
+            pending_generation,
+            ProviderReferenceRole::Media,
+        )
+        .await
+        .unwrap()
+        .is_some());
+
+    let mut glare = begin.clone();
+    glare.command.command_id = CommandId::new();
+    glare.command.expected_version = begun.command.call.aggregate.version();
+    glare.command.at = at(9);
+    glare.command.command = CallCommand::BeginLegReplacement {
+        at: at(9),
+        leg_id,
+        pending_kind: LegKind::Sip,
+        transfer_deadline: at(39),
+    };
+    glare.operation_idempotency = None;
+    assert_eq!(
+        repository.commit_with_effect_payloads(glare).await,
+        Err(RepositoryError::StaleClaim)
+    );
+
+    let deadline_generation = begun
+        .command
+        .call
+        .aggregate
+        .deadlines()
+        .get(bridgefu::call_engine::DeadlineKind::Transfer)
+        .generation();
+    let new_connection = ConnectionId::from_string("replacement-current-96");
+    let finish = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: fixture.owner.clone(),
+            call_id: fixture.service_call.call.aggregate.id(),
+            expected_version: begun.command.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::FinishLegReplacement {
+                at: at(10),
+                deadline_generation,
+                pending_binding_generation: pending_generation,
+                result: LegReplacementResult::Connected,
+            },
+            worker: fixture.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(10),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: None,
+        replacement_connection: Some(ReplacementConnectionPromotion {
+            previous_connection_id: fixture.outbound_bind.connection_id.clone(),
+            connection_id: new_connection.clone(),
+            leg_id,
+            previous_binding_generation: previous_generation,
+            pending_binding_generation: pending_generation,
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(96),
+        }),
+    };
+    let ServiceCommandOutcome::Committed(finished) = repository
+        .commit_with_effect_payloads(finish.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("connected replacement must commit")
+    };
+    let current = finished.command.call.bindings.get(&leg_id).unwrap();
+    assert_eq!(finished.command.call.aggregate.state(), CallState::Active);
+    assert_eq!(
+        finished.command.call.aggregate.leg(leg_id).unwrap().kind(),
+        LegKind::Sip
+    );
+    assert_eq!(current.connection_id, new_connection);
+    assert_eq!(current.binding_generation, pending_generation);
+    assert!(matches!(
+        repository
+            .commit_with_effect_payloads(finish)
+            .await
+            .unwrap(),
+        ServiceCommandOutcome::Replayed(_)
+    ));
+    let reloaded = repository
+        .load_service_call(&fixture.owner, fixture.service_call.call.aggregate.id())
+        .await
+        .unwrap();
+    assert_eq!(reloaded.call.bindings.get(&leg_id), Some(current));
+}
+
+#[tokio::test]
 async fn operation_idempotency_replays_original_before_time_and_cas_evaluation() {
     let (repository, fixture) = active_fixture(21).await;
     let before = fixture.service_call.call.clone();
@@ -736,6 +1061,7 @@ async fn operation_idempotency_replays_original_before_time_and_cas_evaluation()
         )),
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let ServiceCommandOutcome::Committed(original) = repository
         .commit_with_effect_payloads(first.clone())
@@ -801,6 +1127,7 @@ async fn operation_idempotency_conflicts_across_body_kind_and_create_receipt() {
         )),
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     assert_eq!(
         repository.commit_with_effect_payloads(wrong_kind).await,
@@ -949,6 +1276,7 @@ async fn service_managed_calls_reject_raw_mutation_completion_and_reference_bypa
                 tenant_id: fixture.owner.clone(),
                 call_id: call.aggregate.id(),
                 leg_id: call.aggregate.legs()[1].id(),
+                role: ProviderReferenceRole::Media,
                 account: ProviderAccountKey::parse("unexpected-account").unwrap(),
                 provider_call_id: ProviderCallId::parse("unexpected-call").unwrap(),
                 worker: fixture.worker,
@@ -1049,6 +1377,7 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
         claim_generation: claim.claim_generation,
         result: ServiceEffectResult::Succeeded,
         external_reference: None,
+        additional_external_references: Vec::new(),
         follow_up: None,
         at: at(12),
     };
@@ -1143,6 +1472,7 @@ async fn dtmf_control_is_fenced_claimed_completed_failed_and_replayed() {
                 true,
             )),
             external_reference: None,
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(15),
         })
@@ -1277,6 +1607,7 @@ async fn operation_idempotency_keys_are_isolated_by_tenant() {
         )),
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     assert!(matches!(
         repository
@@ -1352,6 +1683,7 @@ async fn controls_are_fifo_per_binding_and_block_later_claims() {
             claim_generation: claims[0].claim_generation,
             result: ServiceEffectResult::Succeeded,
             external_reference: None,
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(13),
         })
@@ -1422,6 +1754,7 @@ async fn claimed_control_is_invalidated_when_teardown_begins() {
                 claim_generation: claim.claim_generation,
                 result: ServiceEffectResult::Succeeded,
                 external_reference: None,
+                additional_external_references: Vec::new(),
                 follow_up: None,
                 at: at(13),
             })
@@ -1501,6 +1834,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
                 claim_generation: old_claim.claim_generation,
                 result: ServiceEffectResult::Succeeded,
                 external_reference: None,
+                additional_external_references: Vec::new(),
                 follow_up: None,
                 at: at(13),
             })
@@ -1532,6 +1866,7 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
                 claim_generation: recovered.claim_generation,
                 result: ServiceEffectResult::Succeeded,
                 external_reference: None,
+                additional_external_references: Vec::new(),
                 follow_up: None,
                 at: at(15),
             })
@@ -1558,7 +1893,9 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
     wrong_authority.principal_fingerprint = principal(99);
     assert_eq!(
         repository.bind_outbound_connection(wrong_authority).await,
-        Err(RepositoryError::StaleClaim)
+        Err(RepositoryError::InvalidInput(
+            "outbound binding operation must be derived from its effect"
+        ))
     );
 
     let mut wrong_tenant = fixture.outbound_bind.clone();
@@ -1578,7 +1915,7 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
     assert_eq!(
         repository.bind_outbound_connection(wrong_leg).await,
         Err(RepositoryError::InvalidInput(
-            "outbound binding requires an outbound leg"
+            "outbound binding operation must be derived from its effect"
         ))
     );
 
@@ -1588,7 +1925,9 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
     wrong_generation.connection_id = ConnectionId::from_string("wrong-generation-connection");
     assert_eq!(
         repository.bind_outbound_connection(wrong_generation).await,
-        Err(RepositoryError::StaleClaim)
+        Err(RepositoryError::InvalidInput(
+            "outbound binding operation must be derived from its effect"
+        ))
     );
 
     let ended = service_command(
@@ -1612,11 +1951,23 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
     let second_owner = tenant("second-owner");
     let (second_request, _) = sip_webrtc_create(second_owner.clone(), fixture.worker, 41);
     let second = created(repository.create_with_plan(second_request).await.unwrap());
+    let second_leg_id = second.call.aggregate.legs()[1].id();
+    let (second_effect_id, second_claim_generation) = claim_start_leg(
+        &repository,
+        fixture.worker,
+        &second_owner,
+        second.call.aggregate.id(),
+        second_leg_id,
+        at(21),
+    )
+    .await;
     let reused = OutboundConnectionBind {
-        operation_id: CommandId::new(),
+        operation_id: CommandId::from_uuid(second_effect_id.as_uuid()).unwrap(),
+        effect_id: second_effect_id,
+        claim_generation: second_claim_generation,
         tenant_id: second_owner,
         call_id: second.call.aggregate.id(),
-        leg_id: second.call.aggregate.legs()[1].id(),
+        leg_id: second_leg_id,
         binding_generation: BindingGeneration::INITIAL,
         worker: fixture.worker,
         connection_id: fixture.outbound_bind.connection_id,
@@ -1628,6 +1979,103 @@ async fn outbound_binding_enforces_ownership_generation_replay_and_permanent_id_
         repository.bind_outbound_connection(reused).await,
         Err(RepositoryError::AttachmentConflict)
     );
+}
+
+#[tokio::test]
+async fn outbound_binding_uses_bridgefu_initiation_not_business_direction() {
+    let repository = MemoryRepository::new();
+    let worker = register(&repository, 1).await;
+    let owner = tenant("bridgefu-initiated-business-inbound");
+    let initial = CallAggregate::new_with_semantics(
+        owner.clone(),
+        [
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::Sip,
+            },
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::InteractiveWebRtc,
+            },
+        ],
+        [
+            LegSemantics {
+                signaling_initiator: SignalingInitiator::Remote,
+                media_flow: MediaFlow::SendReceive,
+            },
+            LegSemantics {
+                signaling_initiator: SignalingInitiator::Bridgefu,
+                media_flow: MediaFlow::SendReceive,
+            },
+        ],
+        at(1),
+    )
+    .unwrap();
+    let call_id = initial.id();
+    let bridgefu_leg = initial.legs()[1].id();
+    let plan = CallExecutionPlan::new(
+        &initial,
+        [
+            LegExecutionSpec {
+                leg_id: initial.legs()[0].id(),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
+            },
+            LegExecutionSpec {
+                leg_id: bridgefu_leg,
+                endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                    signaling_uri: Some("wss://webrtc.example.test/business-inbound".into()),
+                }),
+            },
+        ],
+        principal(43),
+    )
+    .unwrap();
+    repository
+        .create_with_plan(ServiceCreateTransaction {
+            create: CreateCall {
+                initial,
+                command_id: CommandId::new(),
+                command: CallCommand::StartConnecting {
+                    at: at(2),
+                    setup_deadline: at(32),
+                },
+                worker,
+                idempotency_key: IdempotencyKeyDigest::new(digest(43)),
+                request_digest: RequestDigest::new(digest(44)),
+                attachments: Vec::new(),
+                at: at(2),
+            },
+            plan,
+            alternatives: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let (effect_id, claim_generation) =
+        claim_start_leg(&repository, worker, &owner, call_id, bridgefu_leg, at(3)).await;
+
+    assert!(matches!(
+        repository
+            .bind_outbound_connection(OutboundConnectionBind {
+                operation_id: CommandId::from_uuid(effect_id.as_uuid()).unwrap(),
+                effect_id,
+                claim_generation,
+                tenant_id: owner,
+                call_id,
+                leg_id: bridgefu_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                worker,
+                connection_id: ConnectionId::from_string("business-inbound-webrtc"),
+                transport: AttachmentTransport::WebRtc,
+                principal_fingerprint: principal(43),
+                at: at(3),
+            })
+            .await
+            .unwrap(),
+        OutboundConnectionBindOutcome::Bound(_)
+    ));
 }
 
 #[tokio::test]
@@ -1675,6 +2123,7 @@ async fn media_activity_is_exact_consecutive_and_cannot_resurrect_cancelled_dead
                     binding_generation: first.binding_generation,
                     activity_generation: first.activity_generation,
                 }),
+                replacement_connection: None,
             })
             .await,
         Err(RepositoryError::InvalidInput(
@@ -1911,6 +2360,7 @@ async fn non_provider_leg_cannot_claim_provider_callbacks() {
             claim_generation: first.claim_generation,
             result: ServiceEffectResult::Succeeded,
             external_reference: None,
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(4),
         })
@@ -1942,11 +2392,13 @@ async fn non_provider_leg_cannot_claim_provider_callbacks() {
                 external_reference: Some(ExternalReferenceBinding {
                     leg_id,
                     binding_generation,
+                    role: ProviderReferenceRole::Media,
                     value: ExternalReferenceValue::ProviderCall {
                         account,
                         provider_call_id,
                     },
                 }),
+                additional_external_references: Vec::new(),
                 follow_up: None,
                 at: at(6),
             })
@@ -2024,6 +2476,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
         operation_idempotency: None,
         bound_connection: None,
         media_activity: None,
+        replacement_connection: None,
     };
     let base = EffectResultReconciliation {
         tenant_id: owner.clone(),
@@ -2035,11 +2488,13 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
         external_reference: Some(ExternalReferenceBinding {
             leg_id: provider_leg,
             binding_generation: BindingGeneration::INITIAL,
+            role: ProviderReferenceRole::Media,
             value: ExternalReferenceValue::ProviderCall {
                 account: account.clone(),
                 provider_call_id: provider_call_id.clone(),
             },
         }),
+        additional_external_references: Vec::new(),
         follow_up: Some(correct_follow_up.clone()),
         at: at(8),
     };
@@ -2050,6 +2505,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
                 tenant_id: owner.clone(),
                 call_id: service_call.call.aggregate.id(),
                 leg_id: provider_leg,
+                role: ProviderReferenceRole::Media,
                 account: account.clone(),
                 provider_call_id: provider_call_id.clone(),
                 worker,

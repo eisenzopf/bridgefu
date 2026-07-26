@@ -1,0 +1,71 @@
+project_id   = "bridgefu-smoke-project"
+region       = "us-central1"
+name         = "bridgefu-smoke"
+network_name = "default"
+
+image = "us-central1-docker.pkg.dev/bridgefu-smoke-project/bridgefu/bridgefu@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+cloud_sql_proxy_image = "gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+gcloud_image          = "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+otel_collector_image  = "otel/opentelemetry-collector-contrib@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Every value is an immutable Secret Manager version. Init containers fetch
+# these directly through Workload Identity into memory-backed emptyDir volumes;
+# Terraform never reads the secret payloads. Role configs should reference
+# BRIDGEFU_DATABASE_URL and BRIDGEFU_REDIS_URL through env: secret refs.
+gateway_secret_versions = {
+  "bridgefu.yaml"   = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-config/versions/1"
+  "gateway.pem"     = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-cert/versions/1"
+  "gateway.key"     = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-key/versions/1"
+  "public-uctp.pem" = "projects/bridgefu-smoke-project/secrets/bridgefu-public-uctp-cert/versions/1"
+  "public-uctp.key" = "projects/bridgefu-smoke-project/secrets/bridgefu-public-uctp-key/versions/1"
+  "public-api.pem"  = "projects/bridgefu-smoke-project/secrets/bridgefu-public-api-cert/versions/1"
+  "public-api.key"  = "projects/bridgefu-smoke-project/secrets/bridgefu-public-api-key/versions/1"
+  "worker-ca.pem"   = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-ca/versions/1"
+}
+
+# Each HPA ordinal gets a separate config with a stable, unique UUID and the
+# corresponding worker certificate. Gateway configs must map those UUIDs to
+# bridgefu-worker-N.bridgefu-worker.bridgefu-smoke.svc.cluster.local:9443.
+worker_min_replicas = 2
+worker_max_replicas = 2
+worker_secret_versions = {
+  "bridgefu-worker-0.yaml" = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-0-config/versions/1"
+  "bridgefu-worker-1.yaml" = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-1-config/versions/1"
+  "worker-0.pem"           = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-0-cert/versions/1"
+  "worker-0.key"           = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-0-key/versions/1"
+  "worker-1.pem"           = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-1-cert/versions/1"
+  "worker-1.key"           = "projects/bridgefu-smoke-project/secrets/bridgefu-worker-1-key/versions/1"
+  "gateway-ca.pem"         = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-ca/versions/1"
+}
+
+moq_relay_secret_versions = {
+  "bridgefu.yaml"   = "projects/bridgefu-smoke-project/secrets/bridgefu-moq-relay-config/versions/1"
+  "server.pem"      = "projects/bridgefu-smoke-project/secrets/bridgefu-moq-relay-cert/versions/1"
+  "server.key"      = "projects/bridgefu-smoke-project/secrets/bridgefu-moq-relay-key/versions/1"
+  "publisher-ca.pem" = "projects/bridgefu-smoke-project/secrets/bridgefu-publisher-ca/versions/1"
+}
+
+otel_secret_versions = {
+  "config.yaml" = "projects/bridgefu-smoke-project/secrets/bridgefu-otel-config/versions/1"
+}
+
+# The UDP passthrough rule carries authenticated SIP, RTP, ICE/DTLS, and UCTP
+# while protocol-specific firewall allowlists keep unrelated ports closed.
+# The TCP rule carries HTTPS API plus WSS and WHIP/WHEP HTTPS; Bridgefu
+# terminates TLS with the reviewed `api.tls` key pair from the gateway secret.
+api_cidrs       = ["203.0.113.10/32"]
+signaling_cidrs = ["203.0.113.0/24"]
+media_cidrs     = ["203.0.113.0/24"]
+webrtc_cidrs   = ["203.0.113.0/24"]
+quic_cidrs      = ["0.0.0.0/0"]
+
+system_pool_min_nodes    = 1
+system_pool_max_nodes    = 2
+gateway_pool_min_nodes   = 1
+gateway_pool_max_nodes   = 2
+worker_pool_min_nodes    = 1
+worker_pool_max_nodes    = 2
+moq_relay_pool_min_nodes = 1
+moq_relay_pool_max_nodes = 2
+
+deletion_protection = false

@@ -12,15 +12,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rvoip_core::ids::ConnectionId;
+use rvoip_core::ids::{ConnectionId, MessageId};
+use rvoip_core::MAX_DATA_MESSAGE_ID_BYTES;
+use rvoip_sip::SipInitialHeaders;
 use serde::{Deserialize, Serialize};
 
 use crate::call_engine::{
     chrono_ttl, idempotency_expiry, validate_attachment_issue, validate_provider_event,
-    validate_register_worker, validate_worker_candidate_limit, validate_worker_lease_ttl,
-    worker_lease_expiry, AggregateVersion, AttachmentCandidate, AttachmentConsume, AttachmentId,
-    AttachmentIssue, AttachmentLookup, AttachmentTokenDigest, AttachmentTransport,
-    BindProviderReference, BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository,
+    validate_register_worker, validate_worker_candidate_limit, validate_worker_capabilities,
+    validate_worker_lease_ttl, worker_lease_expiry, ActivateWorkerCapabilities, AggregateVersion,
+    AttachmentCandidate, AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup,
+    AttachmentPurpose, AttachmentTokenDigest, AttachmentTransport, BindProviderReference,
+    BindingGeneration, CallAggregate, CallCommand, CallId, CallRepository, CallState,
     ClaimGeneration, ClaimedDeadline, ClaimedOutbox, ClaimedProviderEvent, CommandCommit,
     CommandCommitOutcome, CommandCommitView, CommandDisposition, CommandId, ConnectionBinding,
     ConsumedAttachment, CreateCall, CreateCallOutcome, DeadlineClaimGuard, DeadlineGeneration,
@@ -29,23 +32,26 @@ use crate::call_engine::{
     PrincipalFingerprint, ProviderAccountKey, ProviderCallId, ProviderEventCommit,
     ProviderEventCommitOutcome, ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput,
     ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderReceiptSequence,
-    RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim, StoredCall, StoredCommand,
-    TenantId, TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome,
-    TransferResult, WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
+    ProviderReferenceRole, RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim,
+    SignalingInitiator, StoredCall, StoredCommand, TenantId, TerminalProviderEventAcknowledge,
+    TerminalProviderEventAcknowledgeOutcome, TransferResult, WorkerAssignment, WorkerFence,
+    WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
     BoundConnectionGuard, BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository,
     ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction,
     ControlCommandView, ControlOutboxRecord, ControlSequence, EffectResultOutcome,
     EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
-    MediaActivityCommit, MediaActivityGeneration, MediaActivityGuard, OperationIdempotency,
-    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
-    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction,
-    ProviderEventReconciliationView, ServiceCommandOutcome, ServiceCommandTransaction,
+    InitialContextRecordOutcome, InitialContextRecordRequest, MediaActivityCommit,
+    MediaActivityGeneration, MediaActivityGuard, OperationIdempotency, OperationIdempotencyReceipt,
+    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
+    ProviderEventReconciliationTransaction, ProviderEventReconciliationView,
+    ReplacementInitialContextLookup, ServiceCommandOutcome, ServiceCommandTransaction,
     ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
     ServiceEffectPayloadInput, ServiceEffectResult, ServiceOperationKind, StoredControlCommand,
-    StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    StoredExternalReference, StoredInitialContext, StoredServiceCall, StoredServiceEffectPayload,
 };
+use crate::context::{ContextEnvelope, MAX_CONTEXT_BYTES};
 
 type BindingKey = (CallId, LegId, BindingGeneration);
 type PrincipalBindingKey = (PrincipalFingerprint, BindingKey);
@@ -53,6 +59,8 @@ type DeadlineKey = (CallId, DeadlineKind, DeadlineGeneration);
 type ProviderEventKey = (ProviderAccountKey, ProviderEventDigest);
 type ProviderReferenceKey = (ProviderAccountKey, ProviderCallId);
 type ExternalBindingKey = (CallId, LegId, BindingGeneration);
+type ExternalReferenceBindingKey = (CallId, LegId, BindingGeneration, ProviderReferenceRole);
+type InitialContextKey = (CallId, LegId, BindingGeneration);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum ExternalReferenceKey {
@@ -115,6 +123,8 @@ pub(super) struct IdempotencyRow {
 pub(super) struct AttachmentRow {
     pub(super) attachment_id: AttachmentId,
     pub(super) token_digest: AttachmentTokenDigest,
+    #[serde(default)]
+    pub(super) purpose: AttachmentPurpose,
     pub(super) tenant_id: TenantId,
     pub(super) call_id: CallId,
     pub(super) leg_id: LegId,
@@ -274,6 +284,8 @@ pub(super) struct MemoryStateSnapshot {
     pub(super) control_commands: Vec<PersistedControlCommandRow>,
     pub(super) control_outbox: Vec<ControlOutboxRecord>,
     pub(super) outbound_binding_results: Vec<PersistedOutboundBindingRow>,
+    #[serde(default)]
+    pub(super) initial_contexts: Vec<StoredInitialContext>,
     pub(super) external_references: Vec<StoredExternalReference>,
     pub(super) reconciliation_results: Vec<PersistedReconciliationRow>,
     pub(super) retired_operation_claims: Vec<RetiredOperationClaim>,
@@ -328,8 +340,10 @@ struct MemoryState {
     control_outbox: HashMap<EffectId, ControlOutboxRecord>,
     control_sequences: HashMap<ExternalBindingKey, ControlSequence>,
     outbound_binding_results: HashMap<CommandId, StoredOutboundBindingResult>,
+    initial_contexts: HashMap<InitialContextKey, StoredInitialContext>,
+    initial_context_message_ids: HashMap<(CallId, MessageId), InitialContextKey>,
     external_references: HashMap<ExternalReferenceKey, StoredExternalReference>,
-    external_reference_bindings: HashMap<ExternalBindingKey, ExternalReferenceKey>,
+    external_reference_bindings: HashMap<ExternalReferenceBindingKey, ExternalReferenceKey>,
     reconciliation_results: HashMap<EffectId, StoredReconciliationResult>,
     retired_operation_claims: HashMap<CommandId, RetiredOperationClaim>,
     control_retirements: HashMap<EffectId, ControlRetirementReceipt>,
@@ -487,6 +501,7 @@ impl MemoryRepository {
                     result: result.clone(),
                 })
                 .collect(),
+            initial_contexts: state.initial_contexts.values().cloned().collect(),
             external_references: state.external_references.values().cloned().collect(),
             reconciliation_results: state
                 .reconciliation_results
@@ -593,6 +608,7 @@ impl MemoryRepository {
                 attachment.leg_id,
                 attachment.binding_generation,
             );
+            let attachment_binding = attachment.binding.clone();
             if state
                 .attachment_ids
                 .insert(attachment.attachment_id, token_digest)
@@ -604,6 +620,29 @@ impl MemoryRepository {
                 || state.attachments.insert(token_digest, attachment).is_some()
             {
                 return Err(RepositoryError::Unavailable);
+            }
+            if let Some(binding) = attachment_binding {
+                let current_matches = state
+                    .calls
+                    .get(&binding_key.0)
+                    .and_then(|call| call.bindings.get(&binding_key.1))
+                    .is_some_and(|current| current.connection_id == binding.connection_id);
+                if !current_matches {
+                    if state
+                        .connection_owners
+                        .insert(binding.connection_id.clone(), binding_key)
+                        .is_some()
+                        || state
+                            .principal_bindings
+                            .insert(
+                                (binding.principal_fingerprint, binding_key),
+                                binding.connection_id,
+                            )
+                            .is_some()
+                    {
+                        return Err(RepositoryError::Unavailable);
+                    }
+                }
             }
         }
         let mut referenced_attachment_digests = HashSet::new();
@@ -619,6 +658,7 @@ impl MemoryRepository {
                     || row.attachment_id != issue.attachment_id
                     || row.tenant_id != result.command.tenant_id
                     || row.call_id != result.command.call_id
+                    || row.purpose != issue.purpose
                     || row.leg_id != issue.leg_id
                     || row.binding_generation != issue.binding_generation
                     || row.transport != issue.transport
@@ -792,16 +832,11 @@ impl MemoryRepository {
                     effect.command_id == payload.command_id && effect.ordinal == payload.ordinal
                 })
                 .ok_or(RepositoryError::Unavailable)?;
-            if !matches!(
-                (&effect.intent, &payload.payload),
-                (
-                    EffectIntent::ExecuteTransfer { .. },
-                    ServiceEffectPayload::Transfer { .. }
-                )
-            ) || state
-                .service_effect_payloads
-                .insert(payload.effect_id, payload)
-                .is_some()
+            if !service_payload_matches_effect(&effect.intent, &payload.payload)
+                || state
+                    .service_effect_payloads
+                    .insert(payload.effect_id, payload)
+                    .is_some()
             {
                 return Err(RepositoryError::Unavailable);
             }
@@ -831,7 +866,7 @@ impl MemoryRepository {
                 .all(|(requested, stored)| {
                     requested.ordinal == stored.ordinal
                         && requested.payload == stored.payload
-                        && transfer_payload_matches_aggregate(
+                        && service_payload_matches_aggregate(
                             &requested.payload,
                             &result.view.command.call.aggregate,
                         )
@@ -1054,7 +1089,7 @@ impl MemoryRepository {
                 || result.binding.principal_fingerprint != request.principal_fingerprint
                 || result.binding.bound_at != request.at
                 || !state.used_connection_ids.contains(&request.connection_id)
-                || leg.direction() != crate::call_engine::LegDirection::Outbound
+                || leg.signaling_initiator() != crate::call_engine::SignalingInitiator::Bridgefu
                 || call.bindings.get(&request.leg_id).is_some_and(|binding| {
                     binding.binding_generation == request.binding_generation
                         && binding != &result.binding
@@ -1077,18 +1112,65 @@ impl MemoryRepository {
             };
             call.bindings.values().any(|binding| {
                 call.aggregate.leg(binding.leg_id).is_some_and(|leg| {
-                    leg.direction() == crate::call_engine::LegDirection::Outbound
-                }) && state
+                    leg.signaling_initiator() == crate::call_engine::SignalingInitiator::Bridgefu
+                }) && (state
                     .outbound_binding_results
                     .values()
                     .filter(|result| {
                         result.request.call_id == *call_id && result.binding == *binding
                     })
                     .count()
-                    != 1
+                    + state
+                        .service_command_results
+                        .values()
+                        .filter(|result| {
+                            Self::replacement_connection_matches_binding(result, *call_id, binding)
+                        })
+                        .count()
+                    != 1)
             })
         }) {
             return Err(RepositoryError::Unavailable);
+        }
+
+        for record in snapshot.initial_contexts {
+            validate_initial_context_payload(&record).map_err(|_| RepositoryError::Unavailable)?;
+            let call = state
+                .calls
+                .get(&record.call_id)
+                .filter(|call| call.aggregate.tenant_id() == &record.tenant_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            let source = call
+                .aggregate
+                .leg(record.source_leg_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            let target = call
+                .aggregate
+                .leg(record.target_leg_id)
+                .ok_or(RepositoryError::Unavailable)?;
+            if record.source_leg_id == record.target_leg_id
+                || source.binding_generation() < record.source_binding_generation
+                || target.binding_generation() < record.target_binding_generation
+                || !state.service_managed_calls.contains(&record.call_id)
+                || !Self::initial_context_source_has_historical_binding(&state, &record)
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+            validate_initial_context_target(&state, &record)
+                .map_err(|_| RepositoryError::Unavailable)?;
+            let key = (
+                record.call_id,
+                record.target_leg_id,
+                record.target_binding_generation,
+            );
+            if state
+                .initial_context_message_ids
+                .insert((record.call_id, record.message_id.clone()), key)
+                .is_some()
+                || state.initial_contexts.insert(key, record).is_some()
+            {
+                return Err(RepositoryError::Unavailable);
+            }
         }
 
         for reference in snapshot.external_references {
@@ -1096,10 +1178,12 @@ impl MemoryRepository {
                 .value
                 .validate()
                 .map_err(|_| RepositoryError::Unavailable)?;
-            validate_external_reference_plan(
+            validate_external_reference_authority(
                 &state,
                 reference.call_id,
                 reference.leg_id,
+                reference.binding_generation,
+                reference.effect_id,
                 &reference.value,
             )
             .map_err(|_| RepositoryError::Unavailable)?;
@@ -1115,6 +1199,7 @@ impl MemoryRepository {
                 reference.call_id,
                 reference.leg_id,
                 reference.binding_generation,
+                reference.role,
             );
             let reference_key = external_reference_key(&reference.value);
             if state
@@ -1136,6 +1221,7 @@ impl MemoryRepository {
                 if provider.target.tenant_id != reference.tenant_id
                     || provider.target.call_id != reference.call_id
                     || provider.target.leg_id != reference.leg_id
+                    || provider.target.role != reference.role
                     || provider.bound_at != reference.bound_at
                 {
                     return Err(RepositoryError::Unavailable);
@@ -1157,10 +1243,11 @@ impl MemoryRepository {
                     .is_some_and(|stored| &stored.request == request && &stored.view == view),
                 _ => false,
             };
-            let reference_matches = Self::reconciliation_reference_matches(
+            let reference_matches = Self::reconciliation_references_match(
                 &state,
                 &result.request,
                 result.view.external_reference.as_ref(),
+                &result.view.additional_external_references,
             );
             if persisted.effect_id != result.request.effect_id
                 || Self::completed_effect_id(&result.view.effect) != persisted.effect_id
@@ -1193,7 +1280,11 @@ impl MemoryRepository {
                 .reconciliation_results
                 .get(&reference.effect_id)
                 .is_none_or(|result| {
-                    result.view.external_reference.as_ref() != Some(reference)
+                    (result.view.external_reference.as_ref() != Some(reference)
+                        && !result
+                            .view
+                            .additional_external_references
+                            .contains(reference))
                         || result.request.at != reference.bound_at
                 })
         }) {
@@ -1252,6 +1343,7 @@ impl MemoryRepository {
                     })
                     || !Self::bound_connection_guard_crosslinks(&state, result)
                     || !Self::media_activity_guard_crosslinks(&state, result)
+                    || !Self::replacement_connection_guard_crosslinks(&state, result)
             })
             || state.control_command_results.values().any(|result| {
                 result
@@ -1438,6 +1530,74 @@ impl MemoryRepository {
             )
     }
 
+    fn replacement_connection_matches_binding(
+        result: &StoredServiceCommandResult,
+        call_id: CallId,
+        binding: &ConnectionBinding,
+    ) -> bool {
+        result.request.command.call_id == call_id
+            && result
+                .request
+                .replacement_connection
+                .as_ref()
+                .is_some_and(|promotion| {
+                    promotion.connection_id == binding.connection_id
+                        && promotion.leg_id == binding.leg_id
+                        && promotion.pending_binding_generation == binding.binding_generation
+                        && promotion.transport == binding.transport
+                        && promotion.principal_fingerprint == binding.principal_fingerprint
+                        && result.request.command.at == binding.bound_at
+                })
+            && result.view.command.call.bindings.get(&binding.leg_id) == Some(binding)
+    }
+
+    fn replacement_connection_guard_crosslinks(
+        state: &MemoryState,
+        result: &StoredServiceCommandResult,
+    ) -> bool {
+        let Some(promotion) = &result.request.replacement_connection else {
+            return true;
+        };
+        let call_id = result.request.command.call_id;
+        let Some(binding) = result.view.command.call.bindings.get(&promotion.leg_id) else {
+            return false;
+        };
+        if !Self::replacement_connection_matches_binding(result, call_id, binding)
+            || !state.used_connection_ids.contains(&promotion.connection_id)
+            || !matches!(
+                result.request.command.command,
+                CallCommand::FinishLegReplacement {
+                    pending_binding_generation,
+                    result: crate::call_engine::LegReplacementResult::Connected,
+                    ..
+                } if pending_binding_generation == promotion.pending_binding_generation
+            )
+        {
+            return false;
+        }
+        state.service_effect_payloads.values().any(|stored| {
+            state
+                .outbox
+                .get(&stored.effect_id)
+                .is_some_and(|effect| effect.call_id == call_id)
+                && matches!(
+                &stored.payload,
+                ServiceEffectPayload::LegReplacement {
+                    leg_id,
+                    previous_binding_generation,
+                    pending_binding_generation,
+                    endpoint,
+                    authorization_principal_fingerprint,
+                    ..
+                } if *leg_id == promotion.leg_id
+                    && *previous_binding_generation == promotion.previous_binding_generation
+                    && *pending_binding_generation == promotion.pending_binding_generation
+                    && *authorization_principal_fingerprint == promotion.principal_fingerprint
+                    && validate_endpoint_transport(endpoint, promotion.transport).is_ok()
+                )
+        })
+    }
+
     fn connection_guard_has_historical_binding(
         state: &MemoryState,
         call_id: CallId,
@@ -1463,6 +1623,70 @@ impl MemoryRepository {
                 && stored.request.binding_generation == binding_generation
                 && stored.request.connection_id == *connection_id
                 && stored.binding.connection_id == *connection_id
+        }) || state.service_command_results.values().any(|stored| {
+            stored.request.command.call_id == call_id
+                && stored
+                    .request
+                    .replacement_connection
+                    .as_ref()
+                    .is_some_and(|promotion| {
+                        promotion.leg_id == leg_id
+                            && promotion.pending_binding_generation == binding_generation
+                            && promotion.connection_id == *connection_id
+                    })
+        })
+    }
+
+    /// Proves that a retained initial-context row was observed on one exact
+    /// durable source binding. Current call bindings are deliberately not the
+    /// sole evidence: terminal cleanup and successful leg replacement retire
+    /// them while their immutable attachment/outbound/promotion receipts
+    /// remain authoritative across SQL reloads.
+    fn initial_context_source_has_historical_binding(
+        state: &MemoryState,
+        record: &StoredInitialContext,
+    ) -> bool {
+        if !state
+            .used_connection_ids
+            .contains(&record.source_connection_id)
+        {
+            return false;
+        }
+        let matches = |binding: &ConnectionBinding| {
+            binding.connection_id == record.source_connection_id
+                && binding.leg_id == record.source_leg_id
+                && binding.binding_generation == record.source_binding_generation
+                && binding.bound_at <= record.recorded_at
+        };
+        state.attachments.values().any(|row| {
+            row.tenant_id == record.tenant_id
+                && row.call_id == record.call_id
+                && row.leg_id == record.source_leg_id
+                && row.binding_generation == record.source_binding_generation
+                && row.binding.as_ref().is_some_and(|binding| matches(binding))
+        }) || state.outbound_binding_results.values().any(|stored| {
+            stored.request.tenant_id == record.tenant_id
+                && stored.request.call_id == record.call_id
+                && stored.request.leg_id == record.source_leg_id
+                && stored.request.binding_generation == record.source_binding_generation
+                && matches(&stored.binding)
+        }) || state.service_command_results.values().any(|stored| {
+            stored.request.command.tenant_id == record.tenant_id
+                && stored.request.command.call_id == record.call_id
+                && stored
+                    .view
+                    .command
+                    .call
+                    .bindings
+                    .get(&record.source_leg_id)
+                    .is_some_and(|binding| {
+                        matches(binding)
+                            && Self::replacement_connection_matches_binding(
+                                stored,
+                                record.call_id,
+                                binding,
+                            )
+                    })
         })
     }
 
@@ -1669,28 +1893,48 @@ impl MemoryRepository {
             }
     }
 
-    fn reconciliation_reference_matches(
+    fn reconciliation_references_match(
         state: &MemoryState,
         request: &EffectResultReconciliation,
         stored: Option<&StoredExternalReference>,
+        additional: &[StoredExternalReference],
     ) -> bool {
-        match (&request.external_reference, stored) {
+        let primary_matches = match (&request.external_reference, stored) {
             (None, None) => true,
             (Some(binding), Some(stored)) => {
-                stored.tenant_id == request.tenant_id
-                    && stored.call_id == request.call_id
-                    && stored.leg_id == binding.leg_id
-                    && stored.binding_generation == binding.binding_generation
-                    && stored.effect_id == request.effect_id
-                    && stored.value == binding.value
-                    && stored.bound_at == request.at
-                    && state
-                        .external_references
-                        .get(&external_reference_key(&binding.value))
-                        == Some(stored)
+                Self::reconciliation_reference_binding_matches(state, request, binding, stored)
             }
             _ => false,
-        }
+        };
+        primary_matches
+            && request.additional_external_references.len() == additional.len()
+            && request
+                .additional_external_references
+                .iter()
+                .zip(additional)
+                .all(|(binding, stored)| {
+                    Self::reconciliation_reference_binding_matches(state, request, binding, stored)
+                })
+    }
+
+    fn reconciliation_reference_binding_matches(
+        state: &MemoryState,
+        request: &EffectResultReconciliation,
+        binding: &ExternalReferenceBinding,
+        stored: &StoredExternalReference,
+    ) -> bool {
+        stored.tenant_id == request.tenant_id
+            && stored.call_id == request.call_id
+            && stored.leg_id == binding.leg_id
+            && stored.binding_generation == binding.binding_generation
+            && stored.role == binding.role
+            && stored.effect_id == request.effect_id
+            && stored.value == binding.value
+            && stored.bound_at == request.at
+            && state
+                .external_references
+                .get(&external_reference_key(&binding.value))
+                == Some(stored)
     }
 
     fn released_provider_events_match(state: &MemoryState, view: &EffectResultView) -> bool {
@@ -1701,17 +1945,21 @@ impl MemoryRepository {
         {
             return false;
         }
-        let Some(StoredExternalReference {
-            value:
+        let provider_references = view
+            .external_reference
+            .iter()
+            .chain(&view.additional_external_references)
+            .filter_map(|reference| match &reference.value {
                 ExternalReferenceValue::ProviderCall {
                     account,
                     provider_call_id,
-                },
-            ..
-        }) = view.external_reference.as_ref()
-        else {
+                } => Some((account, provider_call_id)),
+                ExternalReferenceValue::Signaling { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if provider_references.is_empty() {
             return view.released_provider_events.is_empty();
-        };
+        }
         let mut seen = HashSet::new();
         view.released_provider_events.iter().all(|released| {
             let key = (released.account.clone(), released.event_digest);
@@ -1719,8 +1967,12 @@ impl MemoryRepository {
                 return false;
             };
             seen.insert(key)
-                && &released.account == account
-                && &released.provider_call_id == provider_call_id
+                && provider_references
+                    .iter()
+                    .any(|(account, provider_call_id)| {
+                        &released.account == *account
+                            && &released.provider_call_id == *provider_call_id
+                    })
                 && released.event_digest == current.event_digest
                 && released.payload_digest == current.payload_digest
                 && released.provider_call_id == current.provider_call_id
@@ -1818,14 +2070,8 @@ fn validate_idempotency_snapshot(
                 if payload.command_id != command.command_id
                     || effect.command_id != command.command_id
                     || effect.ordinal != payload.ordinal
-                    || !matches!(
-                        (&effect.intent, &payload.payload),
-                        (
-                            EffectIntent::ExecuteTransfer { .. },
-                            ServiceEffectPayload::Transfer { .. }
-                        )
-                    )
-                    || !transfer_payload_matches_aggregate(
+                    || !service_payload_matches_effect(&effect.intent, &payload.payload)
+                    || !service_payload_matches_aggregate(
                         &payload.payload,
                         &view.command.call.aggregate,
                     )
@@ -1840,7 +2086,11 @@ fn validate_idempotency_snapshot(
                     .get(&effect.effect_id)
                     .ok_or(RepositoryError::Unavailable)?;
                 if !same_outbox_identity(effect, actual)
-                    || matches!(effect.intent, EffectIntent::ExecuteTransfer { .. })
+                    || matches!(
+                        effect.intent,
+                        EffectIntent::ExecuteTransfer { .. }
+                            | EffectIntent::StartLegReplacement { .. }
+                    )
                         != payload_effects.contains(&effect.effect_id)
                 {
                     return Err(RepositoryError::Unavailable);
@@ -1933,6 +2183,40 @@ impl CallRepository for MemoryRepository {
             };
             state.workers.insert(request.worker_id, snapshot.clone());
             Ok(snapshot)
+        })
+    }
+
+    async fn activate_worker_capabilities(
+        &self,
+        request: ActivateWorkerCapabilities,
+    ) -> Result<WorkerSnapshot, RepositoryError> {
+        validate_worker_capabilities(&request.capabilities)?;
+        if request.capabilities.is_empty() {
+            return Err(RepositoryError::InvalidInput(
+                "activated worker capabilities must not be empty",
+            ));
+        }
+        self.transaction(|state| {
+            let at = authoritative_time(state, request.at);
+            let snapshot = state
+                .workers
+                .get_mut(&request.worker.worker_id)
+                .filter(|snapshot| snapshot.lease == request.worker)
+                .ok_or(RepositoryError::StaleWorkerFence)?;
+            if at >= snapshot.lease_expires_at || snapshot.draining {
+                return Err(RepositoryError::StaleWorkerFence);
+            }
+            if snapshot.capabilities == request.capabilities {
+                return Ok(snapshot.clone());
+            }
+            if !snapshot.capabilities.is_empty() {
+                return Err(RepositoryError::InvalidInput(
+                    "worker capabilities are already activated",
+                ));
+            }
+            snapshot.capabilities = request.capabilities;
+            snapshot.updated_at = at;
+            Ok(snapshot.clone())
         })
     }
 
@@ -2121,16 +2405,40 @@ impl CallRepository for MemoryRepository {
                 .map_err(|_| RepositoryError::AttachmentRejected)?;
             if call.assignment.released_at.is_some()
                 || call.assignment.lease != request.worker
-                || call.aggregate.leg(row.leg_id).is_none_or(|leg| {
-                    leg.binding_generation() != row.binding_generation
-                        || leg.state() != LegState::AwaitingAttach
-                })
+                || call
+                    .aggregate
+                    .leg(row.leg_id)
+                    .is_none_or(|leg| !match row.purpose {
+                        AttachmentPurpose::PublicInbound => {
+                            leg.binding_generation() == row.binding_generation
+                                && leg.signaling_initiator()
+                                    == crate::call_engine::SignalingInitiator::Remote
+                                && leg.state() == LegState::AwaitingAttach
+                        }
+                        AttachmentPurpose::ProviderMedia => {
+                            let ordinary = leg.binding_generation() == row.binding_generation
+                                && leg.signaling_initiator()
+                                    == crate::call_engine::SignalingInitiator::Bridgefu
+                                && leg.kind() == crate::call_engine::LegKind::Telnyx
+                                && matches!(leg.state(), LegState::Pending | LegState::Signaling);
+                            let replacement =
+                                call.aggregate.replacement().is_some_and(|replacement| {
+                                    replacement.leg_id() == row.leg_id
+                                        && replacement.pending_kind()
+                                            == crate::call_engine::LegKind::Telnyx
+                                        && replacement.pending_binding_generation()
+                                            == row.binding_generation
+                                });
+                            ordinary || replacement
+                        }
+                    })
             {
                 return Err(RepositoryError::AttachmentRejected);
             }
             Ok(AttachmentCandidate {
                 attachment_id: row.attachment_id,
                 token_digest: row.token_digest,
+                purpose: row.purpose,
                 tenant_id: row.tenant_id.clone(),
                 call_id: row.call_id,
                 leg_id: row.leg_id,
@@ -2169,6 +2477,7 @@ impl CallRepository for MemoryRepository {
                 .get(&request.candidate.token_digest)
                 .ok_or(RepositoryError::AttachmentRejected)?;
             if row.attachment_id != request.candidate.attachment_id
+                || row.purpose != request.candidate.purpose
                 || row.tenant_id != request.candidate.tenant_id
                 || row.call_id != request.candidate.call_id
                 || row.leg_id != request.candidate.leg_id
@@ -2204,16 +2513,29 @@ impl CallRepository for MemoryRepository {
                 principal_fingerprint: request.principal_fingerprint,
                 bound_at: request.at,
             };
+            let pending_replacement = state
+                .calls
+                .get(&request.candidate.call_id)
+                .and_then(|call| call.aggregate.replacement())
+                .is_some_and(|replacement| {
+                    request.candidate.purpose == AttachmentPurpose::ProviderMedia
+                        && replacement.leg_id() == request.candidate.leg_id
+                        && replacement.pending_kind() == crate::call_engine::LegKind::Telnyx
+                        && replacement.pending_binding_generation()
+                            == request.candidate.binding_generation
+                });
             let call = state
                 .calls
                 .get_mut(&request.candidate.call_id)
                 .filter(|call| call.aggregate.tenant_id() == &request.candidate.tenant_id)
                 .ok_or(RepositoryError::AttachmentRejected)?;
-            if call.bindings.contains_key(&request.candidate.leg_id) {
+            if call.bindings.contains_key(&request.candidate.leg_id) && !pending_replacement {
                 return Err(RepositoryError::AttachmentConflict);
             }
-            call.bindings
-                .insert(request.candidate.leg_id, binding.clone());
+            if !pending_replacement {
+                call.bindings
+                    .insert(request.candidate.leg_id, binding.clone());
+            }
             state
                 .connection_owners
                 .insert(request.connection_id.clone(), binding_key);
@@ -2851,6 +3173,34 @@ impl CallServiceRepository for MemoryRepository {
         <Self as CallRepository>::consume_attachment(self, request).await
     }
 
+    async fn load_attachment_binding(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        leg_id: LegId,
+        binding_generation: BindingGeneration,
+        purpose: AttachmentPurpose,
+    ) -> Result<Option<ConnectionBinding>, RepositoryError> {
+        self.read(|state| {
+            let call = tenant_call(state, tenant_id, call_id)?;
+            if call.aggregate.leg(leg_id).is_none() {
+                return Err(RepositoryError::NotFound);
+            }
+            let mut matching = state.attachments.values().filter(|row| {
+                row.tenant_id == *tenant_id
+                    && row.call_id == call_id
+                    && row.leg_id == leg_id
+                    && row.binding_generation == binding_generation
+                    && row.purpose == purpose
+            });
+            let binding = matching.next().and_then(|row| row.binding.clone());
+            if matching.next().is_some() {
+                return Err(RepositoryError::Unavailable);
+            }
+            Ok(binding)
+        })
+    }
+
     async fn commit_bound_connection_state(
         &self,
         request: BoundConnectionStateCommit,
@@ -2873,34 +3223,41 @@ impl CallServiceRepository for MemoryRepository {
         at: DateTime<Utc>,
     ) -> Result<Option<StoredServiceCall>, RepositoryError> {
         self.read(|state| {
+            load_create_replay_in_state(state, tenant_id, key_digest, request_digest, at)
+        })
+    }
+
+    async fn load_service_command_replay(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        key_digest: crate::call_engine::IdempotencyKeyDigest,
+        request_digest: crate::call_engine::RequestDigest,
+        operation: ServiceOperationKind,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ServiceCommandView>, RepositoryError> {
+        self.read(|state| {
             let Some(existing) = state.idempotency.get(&(tenant_id.clone(), key_digest)) else {
                 return Ok(None);
             };
             if existing.expires_at <= at {
                 return Ok(None);
             }
-            if existing.request_digest != request_digest
-                || !matches!(&existing.receipt, OperationIdempotencyReceipt::CreateCall)
-            {
+            if existing.request_digest != request_digest || existing.call_id != call_id {
                 return Err(RepositoryError::IdempotencyConflict);
             }
-            let call = original_create_snapshot(state, existing.call_id)?;
-            if call.aggregate.tenant_id() != tenant_id {
-                return Err(RepositoryError::Unavailable);
+            match &existing.receipt {
+                OperationIdempotencyReceipt::ServiceCommand {
+                    operation: retained_operation,
+                    view,
+                } if *retained_operation == operation
+                    && view.command.command.tenant_id == *tenant_id
+                    && view.command.command.call_id == call_id =>
+                {
+                    Ok(Some(view.as_ref().clone()))
+                }
+                _ => Err(RepositoryError::IdempotencyConflict),
             }
-            let plan = state
-                .execution_plans
-                .get(&existing.call_id)
-                .cloned()
-                .ok_or(RepositoryError::Unavailable)?;
-            plan.validate_against(&call.aggregate)
-                .map_err(|_| RepositoryError::Unavailable)?;
-            let attachments = original_create_attachments(state, existing.call_id)?;
-            Ok(Some(StoredServiceCall {
-                call,
-                plan,
-                attachments,
-            }))
         })
     }
 
@@ -2908,14 +3265,25 @@ impl CallServiceRepository for MemoryRepository {
         &self,
         request: ServiceCreateTransaction,
     ) -> Result<ServiceCreateOutcome, RepositoryError> {
-        request.plan.validate_against(&request.create.initial)?;
-        request.plan.authorization_principal_fingerprint()?;
         self.transaction(|state| {
             let ServiceCreateTransaction {
                 create,
                 plan,
                 alternatives,
             } = request;
+            let tenant_id = create.initial.tenant_id().clone();
+            if let Some(stored) = load_create_replay_in_state(
+                state,
+                &tenant_id,
+                create.idempotency_key,
+                create.request_digest,
+                create.at,
+            )? {
+                return Ok(ServiceCreateOutcome::Replayed(stored));
+            }
+            plan.validate_for_create(&create.initial)?;
+            plan.authorization_principal_fingerprint()?;
+            let required_capabilities = plan.required_worker_capabilities()?;
             let mut candidates = Vec::with_capacity(alternatives.len() + 1);
             candidates.push(create.clone());
             candidates.extend(alternatives.into_iter().map(|alternative| {
@@ -2927,6 +3295,22 @@ impl CallServiceRepository for MemoryRepository {
             let mut outcome = None;
             let mut last_admission_error = RepositoryError::CapacityExceeded;
             for candidate in candidates {
+                match ensure_worker_capabilities(
+                    state,
+                    candidate.worker,
+                    &required_capabilities,
+                    candidate.at,
+                ) {
+                    Ok(()) => {}
+                    Err(
+                        error @ (RepositoryError::StaleWorkerFence
+                        | RepositoryError::WorkerCapabilityUnavailable),
+                    ) => {
+                        last_admission_error = error;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 match create_call_in_state(state, candidate) {
                     Ok(value) => {
                         outcome = Some(value);
@@ -2934,7 +3318,8 @@ impl CallServiceRepository for MemoryRepository {
                     }
                     Err(
                         error @ (RepositoryError::CapacityExceeded
-                        | RepositoryError::StaleWorkerFence),
+                        | RepositoryError::StaleWorkerFence
+                        | RepositoryError::WorkerCapabilityUnavailable),
                     ) => {
                         last_admission_error = error;
                     }
@@ -2993,7 +3378,7 @@ impl CallServiceRepository for MemoryRepository {
                 .get(&call_id)
                 .cloned()
                 .ok_or(RepositoryError::NotFound)?;
-            let attachments = original_create_attachments(state, call_id)?;
+            let attachments = service_call_attachments(state, call_id)?;
             Ok(StoredServiceCall {
                 call,
                 plan,
@@ -3008,6 +3393,14 @@ impl CallServiceRepository for MemoryRepository {
     ) -> Result<ServiceCommandOutcome, RepositoryError> {
         let request = normalize_service_command(request)?;
         self.transaction(|state| commit_service_command_in_state(state, request, false))
+    }
+
+    async fn commit_leg_replacement_with_worker_guard(
+        &self,
+        request: ServiceCommandTransaction,
+    ) -> Result<ServiceCommandOutcome, RepositoryError> {
+        let request = normalize_service_command(request)?;
+        self.transaction(|state| commit_leg_replacement_with_worker_guard_in_state(state, request))
     }
 
     async fn load_effect_payload(
@@ -3114,6 +3507,52 @@ impl CallServiceRepository for MemoryRepository {
         self.transaction(|state| bind_outbound_connection_in_state(state, request))
     }
 
+    async fn record_initial_context(
+        &self,
+        request: InitialContextRecordRequest,
+    ) -> Result<InitialContextRecordOutcome, RepositoryError> {
+        let record = StoredInitialContext::from(request);
+        validate_initial_context_payload(&record)?;
+        self.transaction(|state| record_initial_context_in_state(state, record))
+    }
+
+    async fn load_initial_context(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        target_leg_id: LegId,
+        target_binding_generation: BindingGeneration,
+    ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+        self.read(|state| {
+            let call = tenant_call(state, tenant_id, call_id)?;
+            let target = call
+                .aggregate
+                .leg(target_leg_id)
+                .ok_or(RepositoryError::NotFound)?;
+            if target.binding_generation() != target_binding_generation {
+                return Err(RepositoryError::StaleClaim);
+            }
+            let record = state
+                .initial_contexts
+                .get(&(call_id, target_leg_id, target_binding_generation))
+                .cloned();
+            if record
+                .as_ref()
+                .is_some_and(|record| &record.tenant_id != tenant_id)
+            {
+                return Err(RepositoryError::Unavailable);
+            }
+            Ok(record)
+        })
+    }
+
+    async fn load_replacement_initial_context(
+        &self,
+        lookup: ReplacementInitialContextLookup,
+    ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+        self.read(|state| load_replacement_initial_context_in_state(state, &lookup))
+    }
+
     async fn load_external_reference(
         &self,
         tenant_id: &TenantId,
@@ -3126,7 +3565,12 @@ impl CallServiceRepository for MemoryRepository {
                 .aggregate
                 .leg(leg_id)
                 .ok_or(RepositoryError::NotFound)?;
-            let binding_key = (call_id, leg_id, leg.binding_generation());
+            let binding_key = (
+                call_id,
+                leg_id,
+                leg.binding_generation(),
+                ProviderReferenceRole::Media,
+            );
             let Some(reference_key) = state.external_reference_bindings.get(&binding_key) else {
                 return Ok(None);
             };
@@ -3136,6 +3580,67 @@ impl CallServiceRepository for MemoryRepository {
                 .cloned()
                 .ok_or(RepositoryError::Unavailable)?;
             if &reference.tenant_id != tenant_id {
+                return Err(RepositoryError::Unavailable);
+            }
+            Ok(Some(reference))
+        })
+    }
+
+    async fn load_external_reference_by_role(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        leg_id: LegId,
+        role: ProviderReferenceRole,
+    ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+        self.read(|state| {
+            let call = tenant_call(state, tenant_id, call_id)?;
+            let leg = call
+                .aggregate
+                .leg(leg_id)
+                .ok_or(RepositoryError::NotFound)?;
+            let key = (call_id, leg_id, leg.binding_generation(), role);
+            let Some(reference_key) = state.external_reference_bindings.get(&key) else {
+                return Ok(None);
+            };
+            let reference = state
+                .external_references
+                .get(reference_key)
+                .cloned()
+                .ok_or(RepositoryError::Unavailable)?;
+            if &reference.tenant_id != tenant_id || reference.role != role {
+                return Err(RepositoryError::Unavailable);
+            }
+            Ok(Some(reference))
+        })
+    }
+
+    async fn load_external_reference_for_binding(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        leg_id: LegId,
+        binding_generation: BindingGeneration,
+        role: ProviderReferenceRole,
+    ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+        self.read(|state| {
+            let call = tenant_call(state, tenant_id, call_id)?;
+            if call.aggregate.leg(leg_id).is_none() {
+                return Err(RepositoryError::NotFound);
+            }
+            let key = (call_id, leg_id, binding_generation, role);
+            let Some(reference_key) = state.external_reference_bindings.get(&key) else {
+                return Ok(None);
+            };
+            let reference = state
+                .external_references
+                .get(reference_key)
+                .cloned()
+                .ok_or(RepositoryError::Unavailable)?;
+            if &reference.tenant_id != tenant_id
+                || reference.binding_generation != binding_generation
+                || reference.role != role
+            {
                 return Err(RepositoryError::Unavailable);
             }
             Ok(Some(reference))
@@ -3166,6 +3671,43 @@ fn original_create_snapshot(
     Ok(original_create_result(state, call_id)?.call.clone())
 }
 
+fn load_create_replay_in_state(
+    state: &MemoryState,
+    tenant_id: &TenantId,
+    key_digest: IdempotencyKeyDigest,
+    request_digest: crate::call_engine::RequestDigest,
+    at: DateTime<Utc>,
+) -> Result<Option<StoredServiceCall>, RepositoryError> {
+    let Some(existing) = state.idempotency.get(&(tenant_id.clone(), key_digest)) else {
+        return Ok(None);
+    };
+    if existing.expires_at <= at {
+        return Ok(None);
+    }
+    if existing.request_digest != request_digest
+        || !matches!(&existing.receipt, OperationIdempotencyReceipt::CreateCall)
+    {
+        return Err(RepositoryError::IdempotencyConflict);
+    }
+    let call = original_create_snapshot(state, existing.call_id)?;
+    if call.aggregate.tenant_id() != tenant_id {
+        return Err(RepositoryError::Unavailable);
+    }
+    let plan = state
+        .execution_plans
+        .get(&existing.call_id)
+        .cloned()
+        .ok_or(RepositoryError::Unavailable)?;
+    plan.validate_against(&call.aggregate)
+        .map_err(|_| RepositoryError::Unavailable)?;
+    let attachments = original_create_attachments(state, existing.call_id)?;
+    Ok(Some(StoredServiceCall {
+        call,
+        plan,
+        attachments,
+    }))
+}
+
 fn original_create_attachments(
     state: &MemoryState,
     call_id: CallId,
@@ -3174,6 +3716,38 @@ fn original_create_attachments(
         .command
         .attachments
         .clone())
+}
+
+fn service_call_attachments(
+    state: &MemoryState,
+    call_id: CallId,
+) -> Result<Vec<AttachmentIssue>, RepositoryError> {
+    let mut attachments = state
+        .commands
+        .values()
+        .filter(|command| command.call_id == call_id)
+        .flat_map(|command| {
+            command
+                .attachments
+                .iter()
+                .cloned()
+                .map(move |attachment| (command.observed_version.value(), attachment))
+        })
+        .collect::<Vec<_>>();
+    attachments.sort_by_key(|(version, attachment)| (*version, attachment.attachment_id.as_uuid()));
+    for (_, attachment) in &attachments {
+        let row = state
+            .attachments
+            .get(&attachment.token_digest)
+            .ok_or(RepositoryError::Unavailable)?;
+        if row.call_id != call_id || row.attachment_id != attachment.attachment_id {
+            return Err(RepositoryError::Unavailable);
+        }
+    }
+    Ok(attachments
+        .into_iter()
+        .map(|(_, attachment)| attachment)
+        .collect())
 }
 
 fn original_create_result(
@@ -3341,7 +3915,11 @@ fn retire_expired_idempotency(
 fn normalize_service_command(
     mut request: ServiceCommandTransaction,
 ) -> Result<ServiceCommandTransaction, RepositoryError> {
-    if request.bound_connection.is_some() && request.media_activity.is_some() {
+    if usize::from(request.bound_connection.is_some())
+        + usize::from(request.media_activity.is_some())
+        + usize::from(request.replacement_connection.is_some())
+        > 1
+    {
         return Err(RepositoryError::InvalidInput(
             "service command cannot carry multiple connection guards",
         ));
@@ -3381,6 +3959,24 @@ fn normalize_service_command(
             "media activity guard does not match media deadline command",
         ));
     }
+    if let Some(promotion) = &request.replacement_connection {
+        if request.operation_idempotency.is_some()
+            || !request.effect_payloads.is_empty()
+            || promotion.previous_connection_id == promotion.connection_id
+            || !matches!(
+                &request.command.command,
+                CallCommand::FinishLegReplacement {
+                    pending_binding_generation,
+                    result: crate::call_engine::LegReplacementResult::Connected,
+                    ..
+                } if *pending_binding_generation == promotion.pending_binding_generation
+            )
+        {
+            return Err(RepositoryError::InvalidInput(
+                "replacement connection does not match a connected replacement result",
+            ));
+        }
+    }
     request
         .effect_payloads
         .sort_by_key(|payload| payload.ordinal);
@@ -3397,6 +3993,79 @@ fn normalize_service_command(
         input.payload.validate()?;
     }
     Ok(request)
+}
+
+fn commit_leg_replacement_with_worker_guard_in_state(
+    state: &mut MemoryState,
+    request: ServiceCommandTransaction,
+) -> Result<ServiceCommandOutcome, RepositoryError> {
+    // The durable receipt is authoritative for a lost-response retry. A
+    // worker that drains after the original commit must not turn the exact
+    // replay into a different result.
+    if let Some(replayed) = replay_service_operation(state, &request)? {
+        return Ok(replayed);
+    }
+    validate_leg_replacement_worker_guard(state, &request)?;
+    commit_service_command_in_state(state, request, false)
+}
+
+fn validate_leg_replacement_worker_guard(
+    state: &MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<(), RepositoryError> {
+    let (command_leg_id, pending_kind) = match &request.command.command {
+        CallCommand::BeginLegReplacement {
+            leg_id,
+            pending_kind,
+            ..
+        } => (*leg_id, *pending_kind),
+        _ => {
+            return Err(RepositoryError::InvalidInput(
+                "worker guard requires begin leg replacement",
+            ));
+        }
+    };
+    let mut replacements =
+        request
+            .effect_payloads
+            .iter()
+            .filter_map(|input| match &input.payload {
+                ServiceEffectPayload::LegReplacement {
+                    leg_id, endpoint, ..
+                } => Some((*leg_id, endpoint)),
+                ServiceEffectPayload::Transfer { .. } => None,
+            });
+    let (payload_leg_id, endpoint) = replacements.next().ok_or(RepositoryError::InvalidInput(
+        "guarded replacement requires one replacement payload",
+    ))?;
+    if replacements.next().is_some()
+        || payload_leg_id != command_leg_id
+        || endpoint.kind() != pending_kind
+    {
+        return Err(RepositoryError::InvalidInput(
+            "guarded replacement payload does not match command",
+        ));
+    }
+    let required_capability = endpoint.required_worker_capability(SignalingInitiator::Bridgefu)?;
+
+    ensure_worker(state, request.command.worker, false, request.command.at)?;
+    let call = state
+        .calls
+        .get(&request.command.call_id)
+        .filter(|call| call.aggregate.tenant_id() == &request.command.tenant_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if call.assignment.released_at.is_some() || call.assignment.lease != request.command.worker {
+        return Err(RepositoryError::StaleWorkerFence);
+    }
+    let worker = state
+        .workers
+        .get(&request.command.worker.worker_id)
+        .filter(|worker| worker.lease == request.command.worker)
+        .ok_or(RepositoryError::StaleWorkerFence)?;
+    if !worker.capabilities.contains(required_capability) {
+        return Err(RepositoryError::StaleWorkerFence);
+    }
+    Ok(())
 }
 
 fn commit_service_command_in_state(
@@ -3442,12 +4111,23 @@ fn commit_service_command_in_state(
 
     validate_transfer_payload_targets(state, &request)?;
     validate_media_activity_guard(state, &request)?;
+    validate_replacement_connection(state, &request)?;
 
     let core_request = request.command.clone();
-    let core = match commit_command_in_state(state, core_request)? {
+    let mut core = match commit_command_in_state(state, core_request)? {
         CommandCommitOutcome::Committed(view) => view,
         CommandCommitOutcome::Replayed(_) => return Err(RepositoryError::CommandConflict),
     };
+    apply_replacement_connection(state, &request)?;
+    if request.replacement_connection.is_some() {
+        let promoted = tenant_call(state, &request.command.tenant_id, request.command.call_id)?;
+        core.call = promoted.clone();
+        state
+            .command_results
+            .get_mut(&request.command.command_id)
+            .ok_or(RepositoryError::Unavailable)?
+            .call = promoted;
+    }
     let mut stored_payloads = Vec::with_capacity(request.effect_payloads.len());
     for effect in &core.outbox {
         let supplied = request
@@ -3462,9 +4142,21 @@ fn commit_service_command_in_state(
                     ..
                 }),
             ) => {}
+            (
+                EffectIntent::StartLegReplacement { .. },
+                Some(ServiceEffectPayloadInput {
+                    payload: ServiceEffectPayload::LegReplacement { .. },
+                    ..
+                }),
+            ) => {}
             (EffectIntent::ExecuteTransfer { .. }, None) => {
                 return Err(RepositoryError::InvalidInput(
                     "transfer effect requires a service payload",
+                ));
+            }
+            (EffectIntent::StartLegReplacement { .. }, None) => {
+                return Err(RepositoryError::InvalidInput(
+                    "leg replacement effect requires a service payload",
                 ));
             }
             (_, Some(_)) => {
@@ -3535,6 +4227,128 @@ fn commit_service_command_in_state(
     Ok(ServiceCommandOutcome::Committed(view))
 }
 
+fn validate_replacement_connection(
+    state: &MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<(), RepositoryError> {
+    let Some(promotion) = &request.replacement_connection else {
+        return Ok(());
+    };
+    let call = state
+        .calls
+        .get(&request.command.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let replacement = call
+        .aggregate
+        .replacement()
+        .ok_or(RepositoryError::StaleClaim)?;
+    let binding = call
+        .bindings
+        .get(&promotion.leg_id)
+        .ok_or(RepositoryError::StaleClaim)?;
+    let pending_key = (
+        request.command.call_id,
+        promotion.leg_id,
+        promotion.pending_binding_generation,
+    );
+    let authenticated_pending_attachment = state.attachments.values().any(|row| {
+        row.call_id == request.command.call_id
+            && row.leg_id == promotion.leg_id
+            && row.binding_generation == promotion.pending_binding_generation
+            && row.purpose == AttachmentPurpose::ProviderMedia
+            && row.transport == promotion.transport
+            && row.expected_principal == promotion.principal_fingerprint
+            && row.revoked_at.is_none()
+            && row.binding.as_ref().is_some_and(|pending| {
+                pending.connection_id == promotion.connection_id
+                    && pending.binding_generation == promotion.pending_binding_generation
+                    && pending.principal_fingerprint == promotion.principal_fingerprint
+            })
+            && state.connection_owners.get(&promotion.connection_id) == Some(&pending_key)
+    });
+    let unused_process_owned_connection =
+        !state.used_connection_ids.contains(&promotion.connection_id)
+            && !state
+                .connection_owners
+                .contains_key(&promotion.connection_id);
+    if replacement.leg_id() != promotion.leg_id
+        || replacement.previous_binding_generation() != promotion.previous_binding_generation
+        || replacement.pending_binding_generation() != promotion.pending_binding_generation
+        || binding.connection_id != promotion.previous_connection_id
+        || binding.binding_generation != promotion.previous_binding_generation
+        || (!unused_process_owned_connection && !authenticated_pending_attachment)
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+
+    let payload = state
+        .service_effect_payloads
+        .values()
+        .find_map(|stored| match &stored.payload {
+            ServiceEffectPayload::LegReplacement {
+                leg_id,
+                previous_binding_generation,
+                pending_binding_generation,
+                endpoint,
+                authorization_principal_fingerprint,
+                ..
+            } if *leg_id == promotion.leg_id
+                && *previous_binding_generation == promotion.previous_binding_generation
+                && *pending_binding_generation == promotion.pending_binding_generation
+                && state
+                    .outbox
+                    .get(&stored.effect_id)
+                    .is_some_and(|effect| effect.call_id == request.command.call_id) =>
+            {
+                Some((endpoint, *authorization_principal_fingerprint))
+            }
+            _ => None,
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    if payload.1 != promotion.principal_fingerprint {
+        return Err(RepositoryError::StaleClaim);
+    }
+    validate_endpoint_transport(payload.0, promotion.transport)
+}
+
+fn apply_replacement_connection(
+    state: &mut MemoryState,
+    request: &ServiceCommandTransaction,
+) -> Result<(), RepositoryError> {
+    let Some(promotion) = &request.replacement_connection else {
+        return Ok(());
+    };
+    let binding = ConnectionBinding {
+        connection_id: promotion.connection_id.clone(),
+        leg_id: promotion.leg_id,
+        binding_generation: promotion.pending_binding_generation,
+        transport: promotion.transport,
+        principal_fingerprint: promotion.principal_fingerprint,
+        bound_at: request.command.at,
+    };
+    let new_key = (
+        request.command.call_id,
+        promotion.leg_id,
+        promotion.pending_binding_generation,
+    );
+    let new_principal_key = (promotion.principal_fingerprint, new_key);
+    let call = state
+        .calls
+        .get_mut(&request.command.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    call.bindings.insert(promotion.leg_id, binding);
+    state
+        .connection_owners
+        .insert(promotion.connection_id.clone(), new_key);
+    state
+        .principal_bindings
+        .insert(new_principal_key, promotion.connection_id.clone());
+    state
+        .used_connection_ids
+        .insert(promotion.connection_id.clone());
+    Ok(())
+}
+
 fn validate_transfer_payload_targets(
     state: &MemoryState,
     request: &ServiceCommandTransaction,
@@ -3544,40 +4358,101 @@ fn validate_transfer_payload_targets(
         .get(&request.command.call_id)
         .ok_or(RepositoryError::NotFound)?;
     for payload in &request.effect_payloads {
-        let ServiceEffectPayload::Transfer {
-            target_leg_id,
-            target_binding_generation,
-            ..
-        } = &payload.payload;
-        let leg = call
-            .aggregate
-            .leg(*target_leg_id)
-            .ok_or(RepositoryError::InvalidInput(
-                "transfer target leg does not belong to call",
-            ))?;
-        if leg.binding_generation() != *target_binding_generation {
-            return Err(RepositoryError::StaleClaim);
-        }
-        if !matches!(leg.state(), LegState::Connected | LegState::Held) {
-            return Err(RepositoryError::DomainRejected);
+        match &payload.payload {
+            ServiceEffectPayload::Transfer {
+                target_leg_id,
+                target_binding_generation,
+                ..
+            } => {
+                let leg =
+                    call.aggregate
+                        .leg(*target_leg_id)
+                        .ok_or(RepositoryError::InvalidInput(
+                            "transfer target leg does not belong to call",
+                        ))?;
+                if leg.binding_generation() != *target_binding_generation {
+                    return Err(RepositoryError::StaleClaim);
+                }
+                if !matches!(leg.state(), LegState::Connected | LegState::Held) {
+                    return Err(RepositoryError::DomainRejected);
+                }
+            }
+            ServiceEffectPayload::LegReplacement {
+                leg_id,
+                previous_binding_generation,
+                pending_binding_generation,
+                endpoint,
+                ..
+            } => {
+                let leg = call
+                    .aggregate
+                    .leg(*leg_id)
+                    .ok_or(RepositoryError::InvalidInput(
+                        "replacement target leg does not belong to call",
+                    ))?;
+                let expected_pending_generation = leg
+                    .next_replacement_binding_generation()
+                    .map_err(|_| RepositoryError::StaleClaim)?;
+                if leg.binding_generation() != *previous_binding_generation
+                    || *pending_binding_generation != expected_pending_generation
+                    || leg.state() != LegState::Connected
+                    || endpoint.kind()
+                        != match &request.command.command {
+                            CallCommand::BeginLegReplacement { pending_kind, .. } => *pending_kind,
+                            _ => {
+                                return Err(RepositoryError::InvalidInput(
+                                    "replacement payload requires begin replacement command",
+                                ))
+                            }
+                        }
+                {
+                    return Err(RepositoryError::StaleClaim);
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn transfer_payload_matches_aggregate(
+fn service_payload_matches_aggregate(
     payload: &ServiceEffectPayload,
     aggregate: &CallAggregate,
 ) -> bool {
-    let ServiceEffectPayload::Transfer {
-        target_leg_id,
-        target_binding_generation,
-        ..
-    } = payload;
-    aggregate.leg(*target_leg_id).is_some_and(|leg| {
-        leg.binding_generation() == *target_binding_generation
-            && matches!(leg.state(), LegState::Connected | LegState::Held)
-    })
+    match payload {
+        ServiceEffectPayload::Transfer {
+            target_leg_id,
+            target_binding_generation,
+            ..
+        } => aggregate.leg(*target_leg_id).is_some_and(|leg| {
+            leg.binding_generation() == *target_binding_generation
+                && matches!(leg.state(), LegState::Connected | LegState::Held)
+        }),
+        ServiceEffectPayload::LegReplacement {
+            leg_id,
+            previous_binding_generation,
+            pending_binding_generation,
+            endpoint,
+            ..
+        } => aggregate.replacement().is_some_and(|replacement| {
+            replacement.leg_id() == *leg_id
+                && replacement.previous_binding_generation() == *previous_binding_generation
+                && replacement.pending_binding_generation() == *pending_binding_generation
+                && replacement.pending_kind() == endpoint.kind()
+        }),
+    }
+}
+
+fn service_payload_matches_effect(effect: &EffectIntent, payload: &ServiceEffectPayload) -> bool {
+    matches!(
+        (effect, payload),
+        (
+            EffectIntent::ExecuteTransfer { .. },
+            ServiceEffectPayload::Transfer { .. }
+        ) | (
+            EffectIntent::StartLegReplacement { .. },
+            ServiceEffectPayload::LegReplacement { .. }
+        )
+    )
 }
 
 fn validate_media_activity_guard(
@@ -3632,7 +4507,8 @@ fn commit_bound_connection_state_in_state(
 ) -> Result<ServiceCommandOutcome, RepositoryError> {
     if !matches!(
         request.state,
-        LegState::Connected
+        LegState::Signaling
+            | LegState::Connected
             | LegState::Held
             | LegState::Ending
             | LegState::Ended
@@ -3668,6 +4544,7 @@ fn commit_bound_connection_state_in_state(
             binding_generation: request.binding_generation,
         }),
         media_activity: None,
+        replacement_connection: None,
     })?;
 
     // Exact lost-response replay wins even after the call or binding advances.
@@ -3737,6 +4614,7 @@ fn commit_media_activity_in_state(
             binding_generation: request.binding_generation,
             activity_generation: request.activity_generation,
         }),
+        replacement_connection: None,
     })?;
     commit_service_command_in_state(state, transaction, true)
 }
@@ -3901,6 +4779,48 @@ fn bind_outbound_connection_in_state(
         request.worker,
         request.at,
     )?;
+    if request.operation_id.as_uuid() != request.effect_id.as_uuid() {
+        return Err(RepositoryError::InvalidInput(
+            "outbound binding operation must be derived from its effect",
+        ));
+    }
+    let effect = state
+        .outbox
+        .get(&request.effect_id)
+        .ok_or(RepositoryError::StaleClaim)?;
+    if effect.tenant_id != request.tenant_id
+        || effect.call_id != request.call_id
+        || effect.worker != request.worker
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    match effect.intent {
+        EffectIntent::StartLeg {
+            leg_id,
+            binding_generation,
+            kind,
+            direction: _,
+        } if leg_id == request.leg_id && binding_generation == request.binding_generation => {
+            let call = state
+                .calls
+                .get(&request.call_id)
+                .ok_or(RepositoryError::NotFound)?;
+            let leg = call
+                .aggregate
+                .leg(request.leg_id)
+                .ok_or(RepositoryError::NotFound)?;
+            if leg.kind() != kind {
+                return Err(RepositoryError::StaleClaim);
+            }
+        }
+        _ => return Err(RepositoryError::StaleClaim),
+    }
+    validate_effect_claim(
+        &effect.state,
+        request.worker,
+        request.claim_generation,
+        request.at,
+    )?;
     let plan = state
         .execution_plans
         .get(&request.call_id)
@@ -3923,9 +4843,9 @@ fn bind_outbound_connection_in_state(
         .aggregate
         .leg(request.leg_id)
         .ok_or(RepositoryError::NotFound)?;
-    if leg.direction() != crate::call_engine::LegDirection::Outbound {
+    if leg.signaling_initiator() != crate::call_engine::SignalingInitiator::Bridgefu {
         return Err(RepositoryError::InvalidInput(
-            "outbound binding requires an outbound leg",
+            "outbound binding requires Bridgefu signaling initiation",
         ));
     }
     if leg.binding_generation() != request.binding_generation {
@@ -3982,6 +4902,243 @@ fn bind_outbound_connection_in_state(
     Ok(OutboundConnectionBindOutcome::Bound(binding))
 }
 
+fn validate_initial_context_payload(record: &StoredInitialContext) -> Result<(), RepositoryError> {
+    if record.source_leg_id == record.target_leg_id
+        || record.envelope.is_empty()
+        || record.envelope.len() > MAX_CONTEXT_BYTES
+        || record.message_id.as_str().is_empty()
+        || record.message_id.as_str().len() > MAX_DATA_MESSAGE_ID_BYTES
+        || record.message_id.as_str().chars().any(char::is_control)
+    {
+        return Err(RepositoryError::InvalidInput(
+            "invalid initial context record",
+        ));
+    }
+    let envelope: ContextEnvelope = serde_json::from_slice(&record.envelope)
+        .map_err(|_| RepositoryError::InvalidInput("invalid initial context envelope"))?;
+    envelope
+        .validate()
+        .and_then(|()| {
+            envelope.validate_binding(
+                record.tenant_id.as_str(),
+                &record.call_id.to_string(),
+                &record.source_leg_id.to_string(),
+            )
+        })
+        .map_err(|_| RepositoryError::InvalidInput("invalid initial context envelope"))?;
+    SipInitialHeaders::new(
+        record
+            .initial_sip_headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    )
+    .map_err(|_| RepositoryError::InvalidInput("invalid initial SIP headers"))?;
+    Ok(())
+}
+
+fn validate_initial_context_target(
+    state: &MemoryState,
+    record: &StoredInitialContext,
+) -> Result<(), RepositoryError> {
+    let plan = state
+        .execution_plans
+        .get(&record.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let source = plan
+        .legs
+        .iter()
+        .find(|spec| spec.leg_id == record.source_leg_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let target = plan
+        .legs
+        .iter()
+        .find(|spec| spec.leg_id == record.target_leg_id)
+        .ok_or(RepositoryError::NotFound)?;
+
+    // Initial context is authorized by the immutable execution-plan endpoint
+    // that admitted it. The aggregate leg kind is intentionally not used:
+    // that kind changes after a successful make-before-break handoff while
+    // the original context remains valid input to later server-owned routes.
+    match &target.endpoint {
+        crate::call_service::LegEndpointConfig::Sip(_)
+            if plan.sip_initial_context_mode(target.leg_id)?
+                == crate::call_service::SipInitialContextMode::Required =>
+        {
+            Ok(())
+        }
+        crate::call_service::LegEndpointConfig::AmazonConnect(_)
+            if record.initial_sip_headers.is_empty()
+                && plan.named_route().is_some()
+                && plan.amazon_connect_start_spec(target.leg_id).is_ok()
+                && matches!(
+                    &source.endpoint,
+                    crate::call_service::LegEndpointConfig::WebRtc(_)
+                )
+                && plan.leg_signaling_initiator(source.leg_id)
+                    == Ok(crate::call_engine::SignalingInitiator::Remote)
+                && plan.leg_signaling_initiator(target.leg_id)
+                    == Ok(crate::call_engine::SignalingInitiator::Bridgefu) =>
+        {
+            Ok(())
+        }
+        crate::call_service::LegEndpointConfig::Provider(
+            crate::call_service::ProviderEndpointConfig {
+                provider: crate::call_service::ProviderKind::Telnyx,
+                ..
+            },
+        ) if record.initial_sip_headers.is_empty()
+            && plan.named_route().is_some()
+            && matches!(
+                &source.endpoint,
+                crate::call_service::LegEndpointConfig::WebRtc(_)
+            )
+            && plan.leg_signaling_initiator(source.leg_id)
+                == Ok(crate::call_engine::SignalingInitiator::Remote)
+            && plan.leg_signaling_initiator(target.leg_id)
+                == Ok(crate::call_engine::SignalingInitiator::Bridgefu) =>
+        {
+            Ok(())
+        }
+        _ => Err(RepositoryError::InvalidInput(
+            "initial context target is not authorized by its execution plan",
+        )),
+    }
+}
+
+fn record_initial_context_in_state(
+    state: &mut MemoryState,
+    record: StoredInitialContext,
+) -> Result<InitialContextRecordOutcome, RepositoryError> {
+    let call = tenant_call(state, &record.tenant_id, record.call_id)?;
+    if !state.service_managed_calls.contains(&record.call_id) {
+        return Err(RepositoryError::NotFound);
+    }
+    let key = (
+        record.call_id,
+        record.target_leg_id,
+        record.target_binding_generation,
+    );
+    if let Some(existing) = state.initial_contexts.get(&key) {
+        return if existing == &record {
+            Ok(InitialContextRecordOutcome::Replayed(existing.clone()))
+        } else {
+            Err(RepositoryError::CommandConflict)
+        };
+    }
+    if state
+        .initial_context_message_ids
+        .contains_key(&(record.call_id, record.message_id.clone()))
+    {
+        return Err(RepositoryError::CommandConflict);
+    }
+    let source = call
+        .aggregate
+        .leg(record.source_leg_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let target = call
+        .aggregate
+        .leg(record.target_leg_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if source.binding_generation() != record.source_binding_generation
+        || target.binding_generation() != record.target_binding_generation
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    validate_initial_context_target(state, &record)?;
+    let source_binding = call
+        .bindings
+        .get(&record.source_leg_id)
+        .filter(|binding| {
+            binding.connection_id == record.source_connection_id
+                && binding.leg_id == record.source_leg_id
+                && binding.binding_generation == record.source_binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    if record.recorded_at < source_binding.bound_at {
+        return Err(RepositoryError::InvalidInput(
+            "initial context time predates its source binding",
+        ));
+    }
+    state
+        .initial_context_message_ids
+        .insert((record.call_id, record.message_id.clone()), key);
+    state.initial_contexts.insert(key, record.clone());
+    Ok(InitialContextRecordOutcome::Recorded(record))
+}
+
+fn load_replacement_initial_context_in_state(
+    state: &MemoryState,
+    lookup: &ReplacementInitialContextLookup,
+) -> Result<Option<StoredInitialContext>, RepositoryError> {
+    let call = tenant_call(state, &lookup.tenant_id, lookup.call_id)?;
+    if !state.service_managed_calls.contains(&lookup.call_id)
+        || call.aggregate.state() != CallState::Transferring
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    let replacement = call
+        .aggregate
+        .replacement()
+        .ok_or(RepositoryError::StaleClaim)?;
+    if replacement.leg_id() != lookup.target_leg_id
+        || replacement.previous_binding_generation() != lookup.previous_binding_generation
+        || replacement.pending_binding_generation() != lookup.pending_binding_generation
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    let target = call
+        .aggregate
+        .leg(lookup.target_leg_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if target.binding_generation() != lookup.previous_binding_generation {
+        return Err(RepositoryError::StaleClaim);
+    }
+
+    // A stable logical leg retains the first source-admitted context across
+    // successful sequential handoffs. No row is copied to a later generation:
+    // the active replacement fence above is the pending generation authority.
+    let mut candidates = state
+        .initial_contexts
+        .iter()
+        .filter(|((call_id, target_leg_id, target_generation), _)| {
+            *call_id == lookup.call_id
+                && *target_leg_id == lookup.target_leg_id
+                && *target_generation <= lookup.previous_binding_generation
+        })
+        .map(|(_, record)| record);
+    let Some(record) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some()
+        || record.tenant_id != lookup.tenant_id
+        || record.call_id != lookup.call_id
+        || record.target_leg_id != lookup.target_leg_id
+    {
+        return Err(RepositoryError::Unavailable);
+    }
+    validate_initial_context_payload(record).map_err(|_| RepositoryError::Unavailable)?;
+    let source = call
+        .aggregate
+        .leg(record.source_leg_id)
+        .ok_or(RepositoryError::Unavailable)?;
+    if source.binding_generation() != record.source_binding_generation {
+        return Err(RepositoryError::StaleClaim);
+    }
+    let source_binding = call
+        .bindings
+        .get(&record.source_leg_id)
+        .filter(|binding| {
+            binding.connection_id == record.source_connection_id
+                && binding.leg_id == record.source_leg_id
+                && binding.binding_generation == record.source_binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    if record.recorded_at < source_binding.bound_at {
+        return Err(RepositoryError::Unavailable);
+    }
+    Ok(Some(record.clone()))
+}
+
 fn validate_endpoint_transport(
     endpoint: &crate::call_service::LegEndpointConfig,
     transport: AttachmentTransport,
@@ -4012,12 +5169,24 @@ fn normalize_reconciliation(
     if let Some(reference) = &request.external_reference {
         reference.value.validate()?;
     }
-    if request.external_reference.is_some()
-        && !matches!(request.result, ServiceEffectResult::Succeeded)
+    for reference in &request.additional_external_references {
+        reference.value.validate()?;
+    }
+    let mut binding_keys = HashSet::new();
+    let mut reference_keys = HashSet::new();
+    for reference in request
+        .external_reference
+        .iter()
+        .chain(&request.additional_external_references)
     {
-        return Err(RepositoryError::InvalidInput(
-            "failed effect cannot bind an external reference",
-        ));
+        if !binding_keys.insert((
+            reference.leg_id,
+            reference.binding_generation,
+            reference.role,
+        )) || !reference_keys.insert(external_reference_key(&reference.value))
+        {
+            return Err(RepositoryError::ProviderReferenceConflict);
+        }
     }
     Ok(request)
 }
@@ -4097,23 +5266,63 @@ fn reconcile_effect_result_in_state(
         return Err(RepositoryError::NotFound);
     }
 
-    let mut released_provider_events = Vec::new();
-    let external_reference = match (&effect, &request.external_reference) {
-        (ServiceEffectSnapshot::Control(_), Some(_)) => {
+    let has_any_external_reference =
+        request.external_reference.is_some() || !request.additional_external_references.is_empty();
+    if has_any_external_reference && matches!(request.result, ServiceEffectResult::Failed(_)) {
+        let failed_references = request
+            .external_reference
+            .iter()
+            .chain(&request.additional_external_references)
+            .collect::<Vec<_>>();
+        let failed_provider_replacement_media = matches!(
+            &effect,
+            ServiceEffectSnapshot::Call(record)
+                if matches!(record.intent, EffectIntent::StartLegReplacement { .. })
+                    && failed_references.len() == 1
+                    && failed_references[0].role == ProviderReferenceRole::Media
+        );
+        if !failed_provider_replacement_media {
             return Err(RepositoryError::InvalidInput(
-                "control effect cannot bind an external reference",
+                "failed effect can bind only its replacement media reference for cleanup",
             ));
         }
-        (ServiceEffectSnapshot::Control(_), None) => None,
-        (ServiceEffectSnapshot::Call(record), Some(binding)) => {
+    }
+    if matches!(effect, ServiceEffectSnapshot::Control(_)) && has_any_external_reference {
+        return Err(RepositoryError::InvalidInput(
+            "control effect cannot bind an external reference",
+        ));
+    }
+    if let ServiceEffectSnapshot::Call(record) = &effect {
+        for binding in request
+            .external_reference
+            .iter()
+            .chain(&request.additional_external_references)
+        {
             validate_external_reference_effect(record, binding)?;
+        }
+    }
+
+    let mut released_provider_events = Vec::new();
+    let external_reference = match (&effect, &request.external_reference) {
+        (ServiceEffectSnapshot::Control(_), Some(_)) => unreachable!("validated above"),
+        (ServiceEffectSnapshot::Control(_), None) => None,
+        (ServiceEffectSnapshot::Call(_), Some(binding)) => {
             let (stored, released) =
                 store_external_reference_in_state(state, &request, binding.clone())?;
-            released_provider_events = released;
+            released_provider_events.extend(released);
             Some(stored)
         }
         (ServiceEffectSnapshot::Call(_), None) => None,
     };
+    let mut additional_external_references =
+        Vec::with_capacity(request.additional_external_references.len());
+    for binding in &request.additional_external_references {
+        let (stored, released) =
+            store_external_reference_in_state(state, &request, binding.clone())?;
+        additional_external_references.push(stored);
+        released_provider_events.extend(released);
+    }
+    released_provider_events.sort_by_key(|event| event.receipt_sequence);
 
     let follow_up = match (&effect, request.follow_up.clone()) {
         (ServiceEffectSnapshot::Control(_), Some(_)) => {
@@ -4171,6 +5380,7 @@ fn reconcile_effect_result_in_state(
     let view = EffectResultView {
         effect: completed,
         external_reference,
+        additional_external_references,
         released_provider_events,
         follow_up,
     };
@@ -4264,9 +5474,14 @@ fn reconcile_provider_event_in_state(
                 ));
             }
             let reference = provider_external_reference(state, &event, &request.target)?;
+            let call = state
+                .calls
+                .get(&request.target.call_id)
+                .ok_or(RepositoryError::NotFound)?;
             validate_provider_service_follow_up(
                 &request.target,
                 reference.binding_generation,
+                &call.aggregate,
                 &follow_up.command.command,
             )?;
             match commit_service_command_in_state(state, follow_up, false)? {
@@ -4277,7 +5492,13 @@ fn reconcile_provider_event_in_state(
             }
         }
         None => {
-            ensure_terminal_call_worker(state, &request.target, request.worker, request.at)?;
+            ensure_stale_or_terminal_provider_ack(
+                state,
+                &event,
+                &request.target,
+                request.worker,
+                request.at,
+            )?;
             None
         }
     };
@@ -4327,35 +5548,90 @@ fn ensure_provider_event_service_reference(
     if !state.service_managed_calls.contains(&target.call_id) {
         return Err(RepositoryError::NotFound);
     }
-    let plan = state
+    let reference = provider_external_reference(state, event, target)?;
+    let plan_authorized = state
         .execution_plans
         .get(&target.call_id)
-        .ok_or(RepositoryError::Unavailable)?;
-    let spec = plan
-        .legs
-        .iter()
-        .find(|spec| spec.leg_id == target.leg_id)
-        .ok_or(RepositoryError::ProviderReferenceConflict)?;
-    if !matches!(
-        &spec.endpoint,
-        crate::call_service::LegEndpointConfig::Provider(config)
-            if config.account_profile == request.account.as_str()
-    ) {
+        .and_then(|plan| plan.legs.iter().find(|spec| spec.leg_id == target.leg_id))
+        .is_some_and(|spec| {
+            matches!(
+                &spec.endpoint,
+                crate::call_service::LegEndpointConfig::Provider(config)
+                    if config.account_profile == request.account.as_str()
+            )
+        });
+    let replacement_authorized = state
+        .service_effect_payloads
+        .get(&reference.effect_id)
+        .is_some_and(|payload| {
+            matches!(
+                &payload.payload,
+                ServiceEffectPayload::LegReplacement {
+                    leg_id,
+                    endpoint: crate::call_service::LegEndpointConfig::Provider(config),
+                    ..
+                } if *leg_id == target.leg_id
+                    && config.account_profile == request.account.as_str()
+            )
+        });
+    if !plan_authorized && !replacement_authorized {
         return Err(RepositoryError::ProviderReferenceConflict);
     }
-    let reference = provider_external_reference(state, event, target)?;
     let leg = call
         .aggregate
         .leg(target.leg_id)
         .ok_or(RepositoryError::ProviderReferenceConflict)?;
     if require_current_generation && leg.binding_generation() != reference.binding_generation {
-        return Err(RepositoryError::StaleClaim);
+        let pending_replacement_follow_up = request.follow_up.as_ref().is_some_and(|follow_up| {
+            matches!(
+                (&follow_up.command.command, call.aggregate.replacement()),
+                (
+                    CallCommand::FinishLegReplacement {
+                        pending_binding_generation,
+                        ..
+                    },
+                    Some(replacement),
+                ) if replacement.leg_id() == target.leg_id
+                    && replacement.pending_binding_generation() == reference.binding_generation
+                    && *pending_binding_generation == reference.binding_generation
+            )
+        });
+        if !pending_replacement_follow_up {
+            return Err(RepositoryError::StaleClaim);
+        }
     }
     let provider_reference = state
         .provider_references
         .get(&(request.account.clone(), event.provider_call_id.clone()))
         .ok_or(RepositoryError::ProviderReferenceConflict)?;
     if provider_reference.target != *target || provider_reference.bound_at != reference.bound_at {
+        return Err(RepositoryError::ProviderReferenceConflict);
+    }
+    Ok(())
+}
+
+fn ensure_stale_or_terminal_provider_ack(
+    state: &MemoryState,
+    event: &ProviderEventEnvelope,
+    target: &ProviderEventTarget,
+    worker: WorkerLease,
+    at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    let call = state
+        .calls
+        .get(&target.call_id)
+        .filter(|call| call.aggregate.tenant_id() == &target.tenant_id)
+        .ok_or(RepositoryError::NotFound)?;
+    if call.aggregate.state().is_terminal() {
+        return ensure_terminal_call_worker(state, target, worker, at);
+    }
+    ensure_call_worker(state, &target.tenant_id, target.call_id, worker, at)?;
+    let reference = provider_external_reference(state, event, target)?;
+    let leg = call
+        .aggregate
+        .leg(target.leg_id)
+        .ok_or(RepositoryError::ProviderReferenceConflict)?;
+    if reference.binding_generation == leg.binding_generation() {
         return Err(RepositoryError::ProviderReferenceConflict);
     }
     Ok(())
@@ -4374,6 +5650,7 @@ fn provider_external_reference<'a>(
     if reference.tenant_id != target.tenant_id
         || reference.call_id != target.call_id
         || reference.leg_id != target.leg_id
+        || reference.role != target.role
         || reference.value
             != (ExternalReferenceValue::ProviderCall {
                 account: event.account.clone(),
@@ -4383,6 +5660,7 @@ fn provider_external_reference<'a>(
             target.call_id,
             target.leg_id,
             reference.binding_generation,
+            target.role,
         )) != Some(&key)
     {
         return Err(RepositoryError::ProviderReferenceConflict);
@@ -4393,6 +5671,7 @@ fn provider_external_reference<'a>(
 fn validate_provider_service_follow_up(
     target: &ProviderEventTarget,
     reference_generation: BindingGeneration,
+    aggregate: &crate::call_engine::CallAggregate,
     command: &CallCommand,
 ) -> Result<(), RepositoryError> {
     let valid = match command {
@@ -4411,10 +5690,67 @@ fn validate_provider_service_follow_up(
             binding_generation,
             ..
         } => *leg_id == target.leg_id && *binding_generation == reference_generation,
-        CallCommand::FinishTransfer { .. } | CallCommand::BeginEnding { .. } => true,
+        CallCommand::FinishTransfer {
+            deadline_generation,
+            ..
+        } => {
+            target.role == ProviderReferenceRole::Media
+                && aggregate.state() == crate::call_engine::CallState::Transferring
+                && aggregate
+                    .leg(target.leg_id)
+                    .is_some_and(|leg| leg.binding_generation() == reference_generation)
+                && aggregate
+                    .deadlines()
+                    .get(crate::call_engine::DeadlineKind::Transfer)
+                    .due_at()
+                    .is_some()
+                && aggregate
+                    .deadlines()
+                    .get(crate::call_engine::DeadlineKind::Transfer)
+                    .generation()
+                    == *deadline_generation
+        }
+        CallCommand::FinishLegReplacement {
+            deadline_generation,
+            pending_binding_generation,
+            result,
+            ..
+        } => {
+            let replacement = aggregate.replacement();
+            let role_authorized = match result {
+                crate::call_engine::LegReplacementResult::Connected => {
+                    target.role == ProviderReferenceRole::Destination
+                }
+                crate::call_engine::LegReplacementResult::Rejected(_) => matches!(
+                    target.role,
+                    ProviderReferenceRole::Media | ProviderReferenceRole::Destination
+                ),
+            };
+            role_authorized
+                && aggregate.state() == crate::call_engine::CallState::Transferring
+                && replacement.is_some_and(|replacement| {
+                    replacement.leg_id() == target.leg_id
+                        && replacement.pending_binding_generation() == reference_generation
+                        && *pending_binding_generation == reference_generation
+                })
+                && aggregate
+                    .deadlines()
+                    .get(crate::call_engine::DeadlineKind::Transfer)
+                    .due_at()
+                    .is_some()
+                && aggregate
+                    .deadlines()
+                    .get(crate::call_engine::DeadlineKind::Transfer)
+                    .generation()
+                    == *deadline_generation
+        }
+        CallCommand::BeginEnding { .. } => true,
         CallCommand::StartConnecting { .. }
+        | CallCommand::ProviderMediaStarted { .. }
+        | CallCommand::ProviderMediaAttached { .. }
         | CallCommand::ArmDeadline { .. }
         | CallCommand::BeginTransfer { .. }
+        | CallCommand::BeginLegReplacement { .. }
         | CallCommand::DeadlineElapsed { .. } => false,
     };
     if valid {
@@ -4534,6 +5870,7 @@ fn provider_completion_crosslinks(
                         && validate_provider_service_follow_up(
                             &request.target,
                             reference.binding_generation,
+                            &call.aggregate,
                             &follow_up.command.command,
                         )
                         .is_ok()
@@ -4566,6 +5903,35 @@ fn validate_effect_follow_up(
                 ..
             },
             ServiceEffectResult::Succeeded,
+            CallCommand::ProviderMediaStarted {
+                leg_id: command_leg,
+                binding_generation: command_generation,
+                ..
+            },
+        ) => leg_id == command_leg && binding_generation == command_generation,
+        (
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                kind: crate::call_engine::LegKind::AmazonConnect,
+                direction: crate::call_engine::LegDirection::Outbound,
+            },
+            ServiceEffectResult::Succeeded,
+            CallCommand::SetLegState {
+                leg_id: command_leg,
+                binding_generation: command_generation,
+                state: LegState::Failed,
+                failure: Some(_),
+                ..
+            },
+        ) => leg_id == command_leg && binding_generation == command_generation,
+        (
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                ..
+            },
+            ServiceEffectResult::Succeeded,
             CallCommand::SetLegState {
                 leg_id: command_leg,
                 binding_generation: command_generation,
@@ -4579,6 +5945,10 @@ fn validate_effect_follow_up(
                 leg_id,
                 binding_generation,
                 ..
+            }
+            | EffectIntent::ConnectProviderDestination {
+                leg_id,
+                binding_generation,
             }
             | EffectIntent::StopLeg {
                 leg_id,
@@ -4646,6 +6016,40 @@ fn validate_effect_follow_up(
                 ..
             },
         ) => deadline_generation == command_generation && expected == actual,
+        (
+            EffectIntent::StartLegReplacement {
+                deadline_generation,
+                pending_binding_generation,
+                ..
+            },
+            ServiceEffectResult::Succeeded,
+            CallCommand::FinishLegReplacement {
+                deadline_generation: command_deadline,
+                pending_binding_generation: command_binding,
+                result: crate::call_engine::LegReplacementResult::Connected,
+                ..
+            },
+        ) => {
+            deadline_generation == command_deadline && pending_binding_generation == command_binding
+        }
+        (
+            EffectIntent::StartLegReplacement {
+                deadline_generation,
+                pending_binding_generation,
+                ..
+            },
+            ServiceEffectResult::Failed(expected),
+            CallCommand::FinishLegReplacement {
+                deadline_generation: command_deadline,
+                pending_binding_generation: command_binding,
+                result: crate::call_engine::LegReplacementResult::Rejected(actual),
+                ..
+            },
+        ) => {
+            deadline_generation == command_deadline
+                && pending_binding_generation == command_binding
+                && expected == actual
+        }
         _ => false,
     };
     if valid {
@@ -4714,9 +6118,36 @@ fn validate_external_reference_effect(
             leg_id,
             binding_generation,
             ..
-        } if leg_id == binding.leg_id && binding_generation == binding.binding_generation => Ok(()),
+        } if leg_id == binding.leg_id
+            && binding_generation == binding.binding_generation
+            && binding.role == ProviderReferenceRole::Media =>
+        {
+            Ok(())
+        }
+        EffectIntent::ConnectProviderDestination {
+            leg_id,
+            binding_generation,
+        } if leg_id == binding.leg_id
+            && binding_generation == binding.binding_generation
+            && binding.role == ProviderReferenceRole::Destination =>
+        {
+            Ok(())
+        }
+        EffectIntent::StartLegReplacement {
+            leg_id,
+            pending_binding_generation,
+            ..
+        } if leg_id == binding.leg_id
+            && pending_binding_generation == binding.binding_generation
+            && matches!(
+                binding.role,
+                ProviderReferenceRole::Media | ProviderReferenceRole::Destination
+            ) =>
+        {
+            Ok(())
+        }
         _ => Err(RepositoryError::InvalidInput(
-            "external reference does not match a start-leg effect",
+            "external reference role does not match its provider effect",
         )),
     }
 }
@@ -4726,7 +6157,14 @@ fn store_external_reference_in_state(
     request: &EffectResultReconciliation,
     binding: ExternalReferenceBinding,
 ) -> Result<(StoredExternalReference, Vec<ProviderEventEnvelope>), RepositoryError> {
-    validate_external_reference_plan(state, request.call_id, binding.leg_id, &binding.value)?;
+    validate_external_reference_authority(
+        state,
+        request.call_id,
+        binding.leg_id,
+        binding.binding_generation,
+        request.effect_id,
+        &binding.value,
+    )?;
     let call = state
         .calls
         .get(&request.call_id)
@@ -4736,10 +6174,31 @@ fn store_external_reference_in_state(
         .aggregate
         .leg(binding.leg_id)
         .ok_or(RepositoryError::NotFound)?;
-    if leg.binding_generation() != binding.binding_generation {
+    let replacement_generation_is_authorized = state
+        .service_effect_payloads
+        .get(&request.effect_id)
+        .is_some_and(|payload| {
+            matches!(
+                &payload.payload,
+                ServiceEffectPayload::LegReplacement {
+                    leg_id,
+                    pending_binding_generation,
+                    ..
+                } if *leg_id == binding.leg_id
+                    && *pending_binding_generation == binding.binding_generation
+            )
+        });
+    if leg.binding_generation() != binding.binding_generation
+        && !replacement_generation_is_authorized
+    {
         return Err(RepositoryError::StaleClaim);
     }
-    let binding_key = (request.call_id, binding.leg_id, binding.binding_generation);
+    let binding_key = (
+        request.call_id,
+        binding.leg_id,
+        binding.binding_generation,
+        binding.role,
+    );
     let reference_key = external_reference_key(&binding.value);
     if state.external_references.contains_key(&reference_key)
         || state.external_reference_bindings.contains_key(&binding_key)
@@ -4751,6 +6210,7 @@ fn store_external_reference_in_state(
         call_id: request.call_id,
         leg_id: binding.leg_id,
         binding_generation: binding.binding_generation,
+        role: binding.role,
         effect_id: request.effect_id,
         value: binding.value.clone(),
         bound_at: request.at,
@@ -4772,6 +6232,7 @@ fn store_external_reference_in_state(
                 tenant_id: request.tenant_id.clone(),
                 call_id: request.call_id,
                 leg_id: binding.leg_id,
+                role: binding.role,
                 account,
                 provider_call_id,
                 worker: request.worker,
@@ -4783,12 +6244,36 @@ fn store_external_reference_in_state(
     Ok((stored, released))
 }
 
-fn validate_external_reference_plan(
+fn validate_external_reference_authority(
     state: &MemoryState,
     call_id: CallId,
     leg_id: LegId,
+    binding_generation: BindingGeneration,
+    effect_id: EffectId,
     value: &ExternalReferenceValue,
 ) -> Result<(), RepositoryError> {
+    if let Some(payload) = state.service_effect_payloads.get(&effect_id) {
+        let record = state
+            .outbox
+            .get(&effect_id)
+            .ok_or(RepositoryError::ProviderReferenceConflict)?;
+        let ServiceEffectPayload::LegReplacement {
+            leg_id: payload_leg_id,
+            pending_binding_generation,
+            endpoint,
+            ..
+        } = &payload.payload
+        else {
+            return Err(RepositoryError::ProviderReferenceConflict);
+        };
+        if record.call_id != call_id
+            || *payload_leg_id != leg_id
+            || *pending_binding_generation != binding_generation
+        {
+            return Err(RepositoryError::ProviderReferenceConflict);
+        }
+        return validate_external_reference_endpoint(endpoint, value);
+    }
     let plan = state
         .execution_plans
         .get(&call_id)
@@ -4798,7 +6283,22 @@ fn validate_external_reference_plan(
         .iter()
         .find(|spec| spec.leg_id == leg_id)
         .ok_or(RepositoryError::ProviderReferenceConflict)?;
-    match (&spec.endpoint, value) {
+    validate_external_reference_endpoint(&spec.endpoint, value)
+}
+
+fn validate_external_reference_endpoint(
+    endpoint: &crate::call_service::LegEndpointConfig,
+    value: &ExternalReferenceValue,
+) -> Result<(), RepositoryError> {
+    match (endpoint, value) {
+        (
+            crate::call_service::LegEndpointConfig::AmazonConnect(_),
+            ExternalReferenceValue::Signaling { namespace, .. },
+        ) if namespace == rvoip_amazon_connect::AMAZON_CONNECT_CONTACT_REFERENCE_KIND => Ok(()),
+        (
+            crate::call_service::LegEndpointConfig::AmazonConnect(_),
+            ExternalReferenceValue::Signaling { .. },
+        ) => Err(RepositoryError::ProviderReferenceConflict),
         (
             crate::call_service::LegEndpointConfig::Provider(config),
             ExternalReferenceValue::ProviderCall { account, .. },
@@ -4814,7 +6314,14 @@ fn validate_external_reference_plan(
         | (_, ExternalReferenceValue::ProviderCall { .. }) => {
             Err(RepositoryError::ProviderReferenceConflict)
         }
-        (_, ExternalReferenceValue::Signaling { .. }) => Ok(()),
+        (_, ExternalReferenceValue::Signaling { namespace, .. })
+            if namespace != rvoip_amazon_connect::AMAZON_CONNECT_CONTACT_REFERENCE_KIND =>
+        {
+            Ok(())
+        }
+        (_, ExternalReferenceValue::Signaling { .. }) => {
+            Err(RepositoryError::ProviderReferenceConflict)
+        }
     }
 }
 
@@ -4850,6 +6357,25 @@ fn ensure_worker(
         return Err(RepositoryError::StaleWorkerFence);
     }
     Ok(())
+}
+
+fn ensure_worker_capabilities(
+    state: &MemoryState,
+    lease: WorkerLease,
+    required_capabilities: &BTreeSet<String>,
+    at: DateTime<Utc>,
+) -> Result<(), RepositoryError> {
+    ensure_worker(state, lease, false, at)?;
+    let worker = state
+        .workers
+        .get(&lease.worker_id)
+        .filter(|worker| worker.lease == lease)
+        .ok_or(RepositoryError::StaleWorkerFence)?;
+    if required_capabilities.is_subset(&worker.capabilities) {
+        Ok(())
+    } else {
+        Err(RepositoryError::WorkerCapabilityUnavailable)
+    }
 }
 
 fn reject_service_managed_call(
@@ -4946,6 +6472,7 @@ fn bind_provider_reference_in_state(
         tenant_id: request.tenant_id.clone(),
         call_id: request.call_id,
         leg_id: request.leg_id,
+        role: request.role,
     };
     let key = (request.account.clone(), request.provider_call_id.clone());
     if let Some(existing) = state.provider_references.get(&key) {
@@ -5012,6 +6539,7 @@ fn insert_attachments(
         let row = AttachmentRow {
             attachment_id: issue.attachment_id,
             token_digest: issue.token_digest,
+            purpose: issue.purpose,
             tenant_id: tenant_id.clone(),
             call_id,
             leg_id: issue.leg_id,
@@ -5378,6 +6906,47 @@ fn retire_inactive_bindings(
         }
     }
 
+    // A consumed provider-media attachment for a pending replacement owns a
+    // parallel connection without replacing the call's current binding. Once
+    // that pending generation is aborted, retire its durable ownership
+    // exactly; a later generation must never inherit or clean up this route.
+    let retired_provider_attachments = state
+        .attachments
+        .values_mut()
+        .filter(|row| row.call_id == call_id && row.purpose == AttachmentPurpose::ProviderMedia)
+        .filter_map(|row| {
+            let current = next
+                .leg(row.leg_id)
+                .is_some_and(|leg| leg.binding_generation() == row.binding_generation);
+            let pending = next.replacement().is_some_and(|replacement| {
+                replacement.leg_id() == row.leg_id
+                    && replacement.pending_binding_generation() == row.binding_generation
+            });
+            if current || pending {
+                return None;
+            }
+            row.revoked_at.get_or_insert(next.updated_at());
+            row.binding.clone()
+        })
+        .collect::<Vec<_>>();
+    for binding in retired_provider_attachments {
+        let key = (call_id, binding.leg_id, binding.binding_generation);
+        let is_current = state
+            .calls
+            .get(&call_id)
+            .and_then(|call| call.bindings.get(&binding.leg_id))
+            .is_some_and(|current| current.connection_id == binding.connection_id);
+        if !is_current && state.connection_owners.get(&binding.connection_id) == Some(&key) {
+            state.connection_owners.remove(&binding.connection_id);
+        }
+        let principal_key = (binding.principal_fingerprint, key);
+        if !is_current
+            && state.principal_bindings.get(&principal_key) == Some(&binding.connection_id)
+        {
+            state.principal_bindings.remove(&principal_key);
+        }
+    }
+
     for effect_id in retired_control_effects {
         let failure =
             FailureDetails::sanitized("binding_retired", "control target binding retired", false);
@@ -5427,10 +6996,22 @@ fn provider_event_claimable(
     let Some(target) = event.target.as_ref() else {
         return false;
     };
-    if !state.calls.get(&target.call_id).is_some_and(|call| {
+    let Some(call) = state.calls.get(&target.call_id).filter(|call| {
         call.aggregate.tenant_id() == &target.tenant_id && call.assignment.lease == worker
-    }) {
+    }) else {
         return false;
+    };
+    if event.kind.eq_ignore_ascii_case("call.bridged") {
+        let Some(leg) = call.aggregate.leg(target.leg_id) else {
+            return false;
+        };
+        if call
+            .bindings
+            .get(&target.leg_id)
+            .is_none_or(|binding| binding.binding_generation != leg.binding_generation())
+        {
+            return false;
+        }
     }
     !state.provider_events.values().any(|predecessor| {
         predecessor.account == event.account
@@ -5445,9 +7026,9 @@ fn validate_provider_command_target(
     command: &CallCommand,
 ) -> Result<(), RepositoryError> {
     let leg_id = match command {
-        CallCommand::SetLegState { leg_id, .. } | CallCommand::RotateLegBinding { leg_id, .. } => {
-            Some(*leg_id)
-        }
+        CallCommand::SetLegState { leg_id, .. }
+        | CallCommand::ProviderMediaStarted { leg_id, .. }
+        | CallCommand::RotateLegBinding { leg_id, .. } => Some(*leg_id),
         _ => None,
     };
     if leg_id.is_some_and(|leg_id| leg_id != target.leg_id) {
@@ -5727,19 +7308,39 @@ fn validate_attachment_effect(
     effects: &[EffectIntent],
     issue: &AttachmentIssue,
 ) -> Result<(), RepositoryError> {
-    if effects.iter().any(|effect| {
-        matches!(
-            effect,
+    let matched = effects.iter().any(|effect| match (issue.purpose, effect) {
+        (
+            AttachmentPurpose::PublicInbound,
             EffectIntent::AwaitLegAttachment {
                 leg_id,
                 binding_generation,
-            } if *leg_id == issue.leg_id && *binding_generation == issue.binding_generation
-        )
-    }) {
+            },
+        ) => *leg_id == issue.leg_id && *binding_generation == issue.binding_generation,
+        (
+            AttachmentPurpose::ProviderMedia,
+            EffectIntent::StartLeg {
+                leg_id,
+                binding_generation,
+                kind: crate::call_engine::LegKind::Telnyx,
+                ..
+            },
+        ) => *leg_id == issue.leg_id && *binding_generation == issue.binding_generation,
+        (
+            AttachmentPurpose::ProviderMedia,
+            EffectIntent::StartLegReplacement {
+                leg_id,
+                pending_binding_generation,
+                kind: crate::call_engine::LegKind::Telnyx,
+                ..
+            },
+        ) => *leg_id == issue.leg_id && *pending_binding_generation == issue.binding_generation,
+        _ => false,
+    });
+    if matched {
         Ok(())
     } else {
         Err(RepositoryError::InvalidInput(
-            "attachment is not backed by an await-attachment effect",
+            "attachment purpose is not backed by its signaling effect",
         ))
     }
 }
@@ -5785,13 +7386,24 @@ fn release_assignment_in_state(
 fn validate_attachment_consume_command(request: &AttachmentConsume) -> Result<(), RepositoryError> {
     validate_command_timestamp(&request.command, request.at)?;
     match &request.command {
+        CallCommand::ProviderMediaAttached {
+            leg_id,
+            binding_generation,
+            ..
+        } if request.candidate.purpose == AttachmentPurpose::ProviderMedia
+            && *leg_id == request.candidate.leg_id
+            && *binding_generation == request.candidate.binding_generation =>
+        {
+            Ok(())
+        }
         CallCommand::SetLegState {
             leg_id,
             binding_generation,
             state: LegState::Signaling,
             failure: None,
             ..
-        } if *leg_id == request.candidate.leg_id
+        } if request.candidate.purpose == AttachmentPurpose::PublicInbound
+            && *leg_id == request.candidate.leg_id
             && *binding_generation == request.candidate.binding_generation =>
         {
             Ok(())
@@ -5821,12 +7433,14 @@ mod tests {
 
     use super::*;
     use crate::call_engine::{
-        CallAggregate, CallState, LegDirection, LegKind, LegSpec, ProviderPayloadDigest,
-        RequestDigest, StopLegReason,
+        CallAggregate, CallState, LegDirection, LegKind, LegReplacementResult, LegSpec,
+        ProviderPayloadDigest, RequestDigest, StopLegReason,
     };
     use crate::call_service::{
-        ControlIntent, DtmfSequence, LegEndpointConfig, LegExecutionSpec, ProviderEndpointConfig,
-        ProviderKind, ServiceOperationKind, SipEndpointConfig, WebRtcEndpointConfig,
+        ControlIntent, DtmfSequence, LegEndpointConfig, LegExecutionSpec, NamedProfileBinding,
+        NamedProfileKind, NamedProfileRole, NamedRouteBinding, ProviderEndpointConfig,
+        ProviderKind, ReplacementConnectionPromotion, ServiceOperationKind, SipEndpointConfig,
+        WebRtcEndpointConfig,
     };
 
     fn at(second: i64) -> DateTime<Utc> {
@@ -5849,7 +7463,13 @@ mod tests {
         repo.register_worker(RegisterWorker {
             worker_id: WorkerId::new(),
             max_calls,
-            capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+            capabilities: BTreeSet::from([
+                "sip".into(),
+                "webrtc".into(),
+                "sip_egress".into(),
+                "webrtc_egress".into(),
+                "telnyx".into(),
+            ]),
             at: at(0),
             lease_ttl: std::time::Duration::from_secs(300),
         })
@@ -5879,6 +7499,7 @@ mod tests {
         AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest: AttachmentTokenDigest::new(digest(byte)),
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: leg.id(),
             binding_generation: leg.binding_generation(),
             transport: AttachmentTransport::Sip,
@@ -5981,6 +7602,7 @@ mod tests {
                 operation_idempotency: None,
                 bound_connection: None,
                 media_activity: None,
+                replacement_connection: None,
             })
             .await
             .unwrap();
@@ -6067,6 +7689,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_create_replays_before_atomic_worker_capability_health() {
+        let repo = MemoryRepository::new();
+        let worker = repo
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 1,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let owner = tenant("tenant-capability-guard");
+        let aggregate = new_call(owner);
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[0].id(),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
+                },
+                LegExecutionSpec {
+                    leg_id: aggregate.legs()[1].id(),
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/capability".into()),
+                    }),
+                },
+            ],
+            service_principal(),
+        )
+        .unwrap();
+        let request = ServiceCreateTransaction {
+            create: create_request(aggregate, worker.lease, 211, 212),
+            plan,
+            alternatives: Vec::new(),
+        };
+
+        assert_eq!(
+            repo.create_with_plan(request.clone()).await,
+            Err(RepositoryError::WorkerCapabilityUnavailable)
+        );
+        assert_eq!(
+            repo.worker_snapshot(worker.lease.worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+
+        repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+            worker: worker.lease,
+            capabilities: BTreeSet::from(["sip".to_owned(), "webrtc_egress".to_owned()]),
+            at: at(1),
+        })
+        .await
+        .unwrap();
+        let created = repo.create_with_plan(request.clone()).await.unwrap();
+        assert!(matches!(created, ServiceCreateOutcome::Created(_)));
+        repo.set_worker_draining(worker.lease, true, at(3))
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.create_with_plan(request).await.unwrap(),
+            ServiceCreateOutcome::Replayed(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn service_snapshot_reconstructs_plan_and_exact_command_replay() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 1).await;
@@ -6077,7 +7770,10 @@ mod tests {
             [
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[0].id(),
-                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
                 },
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[1].id(),
@@ -6123,6 +7819,7 @@ mod tests {
             operation_idempotency: None,
             bound_connection: None,
             media_activity: None,
+            replacement_connection: None,
         };
         let committed = match repo
             .commit_with_effect_payloads(command.clone())
@@ -6175,6 +7872,447 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_snapshot_retains_context_and_promotion_across_destination_kind_change() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-replacement-snapshot");
+        let aggregate = CallAggregate::new(
+            owner.clone(),
+            [
+                LegSpec {
+                    direction: LegDirection::Inbound,
+                    kind: LegKind::InteractiveWebRtc,
+                },
+                LegSpec {
+                    direction: LegDirection::Outbound,
+                    kind: LegKind::Sip,
+                },
+            ],
+            at(1),
+        );
+        let call_id = aggregate.id();
+        let inbound_leg = aggregate.legs()[0].id();
+        let outbound_leg = aggregate.legs()[1].id();
+        let plan = CallExecutionPlan::new_with_named_route(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: inbound_leg,
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: None,
+                    }),
+                },
+                LegExecutionSpec {
+                    leg_id: outbound_leg,
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: Some("sips:vapi-assistant@example.invalid".into()),
+                        initial_context: crate::call_service::SipInitialContextMode::Required,
+                    }),
+                },
+            ],
+            service_principal(),
+            BTreeMap::new(),
+            NamedRouteBinding::new_with_profiles(
+                "replacement-snapshot-assistant",
+                None,
+                vec![NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::Sip,
+                    "replacement-snapshot-assistant",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut create = create_request(aggregate, worker.lease, 171, 172);
+        create.attachments[0].transport = AttachmentTransport::WebRtc;
+        let stored = match repo
+            .create_with_plan(ServiceCreateTransaction {
+                create,
+                plan,
+                alternatives: Vec::new(),
+            })
+            .await
+            .unwrap()
+        {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh service call replayed"),
+        };
+        let issue = stored.attachments[0].clone();
+        let candidate = repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: issue.token_digest,
+                tenant_id: owner.clone(),
+                transport: issue.transport,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        let inbound_connection = ConnectionId::from_string("replacement-snapshot-inbound");
+        let _consumed = repo
+            .consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: inbound_leg,
+                    binding_generation: BindingGeneration::INITIAL,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: inbound_connection.clone(),
+                principal_fingerprint: service_principal(),
+                principal_expires_at: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        let mut context = ContextEnvelope::new(
+            "replacement-snapshot-correlation",
+            owner.as_str(),
+            call_id.to_string(),
+            inbound_leg.to_string(),
+        );
+        context
+            .metadata
+            .insert("account_ref".into(), "replacement-snapshot-account".into());
+        let retained_context = InitialContextRecordRequest {
+            tenant_id: owner.clone(),
+            call_id,
+            source_connection_id: inbound_connection.clone(),
+            source_leg_id: inbound_leg,
+            source_binding_generation: BindingGeneration::INITIAL,
+            target_leg_id: outbound_leg,
+            target_binding_generation: BindingGeneration::INITIAL,
+            message_id: MessageId::from_string("replacement-snapshot-context"),
+            envelope: serde_json::to_vec(&context).unwrap(),
+            initial_sip_headers: vec![
+                (
+                    "X-Correlation-Id".into(),
+                    "replacement-snapshot-correlation".into(),
+                ),
+                (
+                    "X-Account-Ref".into(),
+                    "replacement-snapshot-account".into(),
+                ),
+            ],
+            recorded_at: at(3),
+        };
+        assert!(matches!(
+            repo.record_initial_context(retained_context.clone())
+                .await
+                .unwrap(),
+            InitialContextRecordOutcome::Recorded(_)
+        ));
+        let start = loop {
+            let claim = repo
+                .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 1)
+                .await
+                .unwrap()
+                .pop()
+                .expect("start predecessor or target must be claimable");
+            if matches!(
+                claim.record.intent,
+                EffectIntent::StartLeg { leg_id, .. } if leg_id == outbound_leg
+            ) {
+                break claim;
+            }
+            repo.reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: owner.clone(),
+                call_id,
+                effect_id: claim.record.effect_id,
+                worker: worker.lease,
+                claim_generation: claim.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                additional_external_references: Vec::new(),
+                follow_up: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        };
+        let outbound_connection = ConnectionId::from_string("replacement-snapshot-outbound");
+        repo.bind_outbound_connection(OutboundConnectionBind {
+            operation_id: CommandId::from_uuid(start.record.effect_id.as_uuid()).unwrap(),
+            effect_id: start.record.effect_id,
+            claim_generation: start.claim_generation,
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            worker: worker.lease,
+            connection_id: outbound_connection.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: service_principal(),
+            at: at(3),
+        })
+        .await
+        .unwrap();
+        repo.reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id,
+            effect_id: start.record.effect_id,
+            worker: worker.lease,
+            claim_generation: start.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: None,
+            additional_external_references: Vec::new(),
+            follow_up: None,
+            at: at(3),
+        })
+        .await
+        .unwrap();
+        let current = repo.load_service_call(&owner, call_id).await.unwrap();
+        repo.commit_bound_connection_state(BoundConnectionStateCommit {
+            tenant_id: owner.clone(),
+            call_id,
+            expected_version: current.call.aggregate.version(),
+            command_id: CommandId::new(),
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            connection_id: outbound_connection.clone(),
+            worker: worker.lease,
+            state: LegState::Signaling,
+            failure: None,
+            at: at(4),
+        })
+        .await
+        .unwrap();
+        let current = repo.load_service_call(&owner, call_id).await.unwrap();
+        repo.commit_bound_connection_state(BoundConnectionStateCommit {
+            tenant_id: owner.clone(),
+            call_id,
+            expected_version: current.call.aggregate.version(),
+            command_id: CommandId::new(),
+            leg_id: inbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            connection_id: inbound_connection,
+            worker: worker.lease,
+            state: LegState::Connected,
+            failure: None,
+            at: at(5),
+        })
+        .await
+        .unwrap();
+        let current = repo.load_service_call(&owner, call_id).await.unwrap();
+        repo.commit_bound_connection_state(BoundConnectionStateCommit {
+            tenant_id: owner.clone(),
+            call_id,
+            expected_version: current.call.aggregate.version(),
+            command_id: CommandId::new(),
+            leg_id: outbound_leg,
+            binding_generation: BindingGeneration::INITIAL,
+            connection_id: outbound_connection.clone(),
+            worker: worker.lease,
+            state: LegState::Connected,
+            failure: None,
+            at: at(6),
+        })
+        .await
+        .unwrap();
+        let active = repo.load_service_call(&owner, call_id).await.unwrap();
+        assert_eq!(active.call.aggregate.state(), CallState::Active);
+        let pending_generation = BindingGeneration::INITIAL.next().unwrap();
+        let replacement_request = ServiceCommandTransaction {
+            command: CommandCommit {
+                tenant_id: owner.clone(),
+                call_id,
+                expected_version: active.call.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::BeginLegReplacement {
+                    at: at(7),
+                    leg_id: outbound_leg,
+                    pending_kind: LegKind::Telnyx,
+                    transfer_deadline: at(37),
+                },
+                worker: worker.lease,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(7),
+            },
+            effect_payloads: vec![ServiceEffectPayloadInput {
+                ordinal: 2,
+                payload: ServiceEffectPayload::LegReplacement {
+                    leg_id: outbound_leg,
+                    previous_binding_generation: BindingGeneration::INITIAL,
+                    pending_binding_generation: pending_generation,
+                    endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                        provider: ProviderKind::Telnyx,
+                        account_profile: "replacement-telnyx".into(),
+                        destination: Some("+12065550123".into()),
+                    }),
+                    amazon_connect_start: None,
+                    route_id: "replacement-telnyx".into(),
+                    replacement_route: Some(
+                        NamedRouteBinding::new_with_profiles(
+                            "replacement-telnyx",
+                            None,
+                            vec![NamedProfileBinding::new(
+                                NamedProfileRole::Destination,
+                                NamedProfileKind::Telnyx,
+                                "replacement-telnyx",
+                                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            )
+                            .unwrap()],
+                        )
+                        .unwrap(),
+                    ),
+                    authorization_principal_fingerprint: service_principal(),
+                },
+            }],
+            operation_idempotency: Some(OperationIdempotency {
+                key_digest: IdempotencyKeyDigest::new(digest(0xc1)),
+                request_digest: RequestDigest::new(digest(0xc2)),
+                operation: ServiceOperationKind::TransferCall,
+            }),
+            bound_connection: None,
+            media_activity: None,
+            replacement_connection: None,
+        };
+
+        // Capability is checked in the same repository transaction as the
+        // state change. A stale inventory cannot leave a replacement behind.
+        repo.transaction(|state| {
+            state
+                .workers
+                .get_mut(&worker.lease.worker_id)
+                .unwrap()
+                .capabilities
+                .remove("telnyx");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            repo.commit_leg_replacement_with_worker_guard(replacement_request.clone())
+                .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+        assert_eq!(
+            repo.load_service_call(&owner, call_id)
+                .await
+                .unwrap()
+                .call
+                .aggregate
+                .state(),
+            CallState::Active
+        );
+        repo.transaction(|state| {
+            state
+                .workers
+                .get_mut(&worker.lease.worker_id)
+                .unwrap()
+                .capabilities
+                .insert("telnyx".to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let begun = match repo
+            .commit_leg_replacement_with_worker_guard(replacement_request.clone())
+            .await
+            .unwrap()
+        {
+            ServiceCommandOutcome::Committed(view) => view,
+            ServiceCommandOutcome::Replayed(_) => panic!("fresh replacement replayed"),
+        };
+        repo.set_worker_draining(worker.lease, true, at(7))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.commit_leg_replacement_with_worker_guard(replacement_request)
+                .await
+                .unwrap(),
+            ServiceCommandOutcome::Replayed(begun.clone())
+        );
+        let replacement_connection = ConnectionId::from_string("replacement-snapshot-current");
+        let deadline_generation = begun
+            .command
+            .call
+            .aggregate
+            .deadlines()
+            .get(DeadlineKind::Transfer)
+            .generation();
+        repo.commit_with_effect_payloads(ServiceCommandTransaction {
+            command: CommandCommit {
+                tenant_id: owner.clone(),
+                call_id,
+                expected_version: begun.command.call.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::FinishLegReplacement {
+                    at: at(8),
+                    deadline_generation,
+                    pending_binding_generation: pending_generation,
+                    result: LegReplacementResult::Connected,
+                },
+                worker: worker.lease,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(8),
+            },
+            effect_payloads: Vec::new(),
+            operation_idempotency: None,
+            bound_connection: None,
+            media_activity: None,
+            replacement_connection: Some(ReplacementConnectionPromotion {
+                previous_connection_id: outbound_connection,
+                connection_id: replacement_connection.clone(),
+                leg_id: outbound_leg,
+                previous_binding_generation: BindingGeneration::INITIAL,
+                pending_binding_generation: pending_generation,
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let snapshot = repo.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .initial_contexts
+                .iter()
+                .filter(|record| record.call_id == call_id)
+                .count(),
+            1
+        );
+        let mut forged_source = snapshot.clone();
+        forged_source
+            .initial_contexts
+            .iter_mut()
+            .find(|record| record.call_id == call_id)
+            .unwrap()
+            .source_connection_id = ConnectionId::from_string("forged-context-source");
+        assert!(matches!(
+            MemoryRepository::from_snapshot(forged_source),
+            Err(RepositoryError::Unavailable)
+        ));
+
+        let recovered = MemoryRepository::from_snapshot(snapshot).unwrap();
+        let recovered_call = recovered.load_service_call(&owner, call_id).await.unwrap();
+        assert_eq!(
+            recovered_call
+                .call
+                .aggregate
+                .leg(outbound_leg)
+                .unwrap()
+                .kind(),
+            LegKind::Telnyx
+        );
+        assert_eq!(
+            recovered_call.call.bindings[&outbound_leg].connection_id,
+            replacement_connection
+        );
+        assert_eq!(
+            recovered_call.call.bindings[&outbound_leg].binding_generation,
+            pending_generation
+        );
+    }
+
+    #[tokio::test]
     async fn service_provider_reconciliation_crosslinks_follow_up_and_terminal_ack() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 1).await;
@@ -6184,7 +8322,7 @@ mod tests {
             [
                 LegSpec {
                     direction: LegDirection::Outbound,
-                    kind: LegKind::Twilio,
+                    kind: LegKind::Telnyx,
                 },
                 LegSpec {
                     direction: LegDirection::Inbound,
@@ -6201,14 +8339,17 @@ mod tests {
                 LegExecutionSpec {
                     leg_id: provider_leg,
                     endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
-                        provider: ProviderKind::Twilio,
-                        account_profile: "twilio-sandbox".into(),
+                        provider: ProviderKind::Telnyx,
+                        account_profile: "telnyx-sandbox".into(),
                         destination: Some("+12065550100".into()),
                     }),
                 },
                 LegExecutionSpec {
                     leg_id: peer_leg,
-                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
                 },
             ],
             service_principal(),
@@ -6238,8 +8379,8 @@ mod tests {
             ServiceCreateOutcome::Created(stored) => stored,
             ServiceCreateOutcome::Replayed(_) => panic!("fresh provider call replayed"),
         };
-        let account = ProviderAccountKey::parse("twilio-sandbox").unwrap();
-        let provider_call_id = ProviderCallId::parse("CA-provider-reconciliation").unwrap();
+        let account = ProviderAccountKey::parse("telnyx-sandbox").unwrap();
+        let provider_call_id = ProviderCallId::parse("telnyx-provider-reconciliation").unwrap();
         let first_digest = ProviderEventDigest::new(digest(53));
         repo.ingest_provider_event(ProviderEventInput {
             account: account.clone(),
@@ -6276,11 +8417,13 @@ mod tests {
                 external_reference: Some(ExternalReferenceBinding {
                     leg_id: provider_leg,
                     binding_generation: BindingGeneration::INITIAL,
+                    role: ProviderReferenceRole::Media,
                     value: ExternalReferenceValue::ProviderCall {
                         account: account.clone(),
                         provider_call_id: provider_call_id.clone(),
                     },
                 }),
+                additional_external_references: Vec::new(),
                 follow_up: None,
                 at: at(4),
             })
@@ -6292,6 +8435,7 @@ mod tests {
             tenant_id: owner.clone(),
             call_id: stored.call.aggregate.id(),
             leg_id: provider_leg,
+            role: ProviderReferenceRole::Media,
         };
         let first_claim = repo
             .claim_provider_events(worker.lease, at(5), Duration::from_secs(30), 8)
@@ -6326,6 +8470,7 @@ mod tests {
                 operation_idempotency: None,
                 bound_connection: None,
                 media_activity: None,
+                replacement_connection: None,
             }),
             at: at(6),
         };
@@ -6492,6 +8637,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telnyx_bridged_callback_waits_for_the_current_sip_media_binding() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-telnyx-binding-gate");
+        let aggregate = CallAggregate::new(
+            owner.clone(),
+            [
+                LegSpec {
+                    direction: LegDirection::Outbound,
+                    kind: LegKind::Telnyx,
+                },
+                LegSpec {
+                    direction: LegDirection::Inbound,
+                    kind: LegKind::Sip,
+                },
+            ],
+            at(1),
+        );
+        let provider_leg = aggregate.legs()[0].id();
+        let peer_leg = aggregate.legs()[1].id();
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: provider_leg,
+                    endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                        provider: ProviderKind::Telnyx,
+                        account_profile: "telnyx-sandbox".into(),
+                        destination: Some("+12065550100".into()),
+                    }),
+                },
+                LegExecutionSpec {
+                    leg_id: peer_leg,
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
+                },
+            ],
+            service_principal(),
+        )
+        .unwrap();
+        let stored = match repo
+            .create_with_plan(ServiceCreateTransaction {
+                create: CreateCall {
+                    initial: aggregate,
+                    command_id: CommandId::new(),
+                    command: CallCommand::StartConnecting {
+                        at: at(2),
+                        setup_deadline: at(32),
+                    },
+                    worker: worker.lease,
+                    idempotency_key: IdempotencyKeyDigest::new(digest(210)),
+                    request_digest: RequestDigest::new(digest(211)),
+                    attachments: Vec::new(),
+                    at: at(2),
+                },
+                plan,
+                alternatives: Vec::new(),
+            })
+            .await
+            .unwrap()
+        {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh provider call replayed"),
+        };
+        let account = ProviderAccountKey::parse("telnyx-sandbox").unwrap();
+        let provider_call_id = ProviderCallId::parse("telnyx-media-call").unwrap();
+        let start = repo
+            .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|claim| {
+                matches!(
+                    claim.record.intent,
+                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg
+                )
+            })
+            .expect("provider start effect");
+        assert!(matches!(
+            repo.bind_outbound_connection(OutboundConnectionBind {
+                operation_id: CommandId::from_uuid(start.record.effect_id.as_uuid()).unwrap(),
+                effect_id: start.record.effect_id,
+                claim_generation: start.claim_generation,
+                tenant_id: owner.clone(),
+                call_id: stored.call.aggregate.id(),
+                leg_id: provider_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                worker: worker.lease,
+                connection_id: ConnectionId::from_string("telnyx-current-sip-media"),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: service_principal(),
+                at: at(3),
+            })
+            .await
+            .unwrap(),
+            OutboundConnectionBindOutcome::Bound(_)
+        ));
+        repo.reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id: stored.call.aggregate.id(),
+            effect_id: start.record.effect_id,
+            worker: worker.lease,
+            claim_generation: start.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: Some(ExternalReferenceBinding {
+                leg_id: provider_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                role: ProviderReferenceRole::Media,
+                value: ExternalReferenceValue::ProviderCall {
+                    account: account.clone(),
+                    provider_call_id: provider_call_id.clone(),
+                },
+            }),
+            additional_external_references: Vec::new(),
+            follow_up: Some(ServiceCommandTransaction {
+                command: CommandCommit {
+                    tenant_id: owner.clone(),
+                    call_id: stored.call.aggregate.id(),
+                    expected_version: stored.call.aggregate.version(),
+                    command_id: CommandId::new(),
+                    command: CallCommand::ProviderMediaStarted {
+                        at: at(4),
+                        leg_id: provider_leg,
+                        binding_generation: BindingGeneration::INITIAL,
+                    },
+                    worker: worker.lease,
+                    attachments: Vec::new(),
+                    deadline_claim: None,
+                    at: at(4),
+                },
+                effect_payloads: Vec::new(),
+                operation_idempotency: None,
+                bound_connection: None,
+                media_activity: None,
+                replacement_connection: None,
+            }),
+            at: at(4),
+        })
+        .await
+        .unwrap();
+
+        let event_digest = ProviderEventDigest::new(digest(212));
+        let accepted = repo
+            .ingest_provider_event(ProviderEventInput {
+                account: account.clone(),
+                event_digest,
+                payload_digest: ProviderPayloadDigest::new(digest(213)),
+                provider_call_id,
+                kind: "call.bridged".into(),
+                payload: json!({"data": {"event_type": "call.bridged"}}),
+                occurred_at: Some(at(5)),
+                received_at: at(5),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            accepted,
+            ProviderEventOutcome::Accepted(ProviderEventEnvelope {
+                state: ProviderEventState::Ready,
+                ..
+            })
+        ));
+        let claimable_without_current_binding = repo
+            .read(|state| {
+                let mut without_current_binding = state.clone();
+                without_current_binding
+                    .calls
+                    .get_mut(&stored.call.aggregate.id())
+                    .expect("stored call")
+                    .bindings
+                    .remove(&provider_leg);
+                let event = without_current_binding
+                    .provider_events
+                    .get(&(account.clone(), event_digest))
+                    .expect("stored provider event");
+                Ok(provider_event_claimable(
+                    &without_current_binding,
+                    event,
+                    worker.lease,
+                    at(6),
+                ))
+            })
+            .unwrap();
+        assert!(!claimable_without_current_binding);
+        let claims = repo
+            .claim_provider_events(worker.lease, at(6), Duration::from_secs(30), 8)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].event.event_digest, event_digest);
+    }
+
+    #[tokio::test]
     async fn bound_connection_lifecycle_is_exact_fenced_and_replayable() {
         let repo = MemoryRepository::new();
         let worker = worker(&repo, 1).await;
@@ -6502,7 +8842,10 @@ mod tests {
             [
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[0].id(),
-                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
                 },
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[1].id(),
@@ -6639,7 +8982,10 @@ mod tests {
             [
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[0].id(),
-                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
                 },
                 LegExecutionSpec {
                     leg_id: outbound_leg,
@@ -6658,8 +9004,38 @@ mod tests {
         })
         .await
         .unwrap();
+        let claimed = loop {
+            let predecessor_or_start = repo
+                .claim_outbox(worker.lease, at(3), Duration::from_secs(10), 1)
+                .await
+                .unwrap()
+                .pop()
+                .expect("ordered start predecessor or target effect");
+            if matches!(
+                predecessor_or_start.record.intent,
+                EffectIntent::StartLeg { leg_id, .. } if leg_id == outbound_leg
+            ) {
+                break predecessor_or_start;
+            }
+            repo.reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: owner.clone(),
+                call_id,
+                effect_id: predecessor_or_start.record.effect_id,
+                worker: worker.lease,
+                claim_generation: predecessor_or_start.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                additional_external_references: Vec::new(),
+                follow_up: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        };
         repo.bind_outbound_connection(OutboundConnectionBind {
-            operation_id: CommandId::new(),
+            operation_id: CommandId::from_uuid(claimed.record.effect_id.as_uuid()).unwrap(),
+            effect_id: claimed.record.effect_id,
+            claim_generation: claimed.claim_generation,
             tenant_id: owner.clone(),
             call_id,
             leg_id: outbound_leg,
@@ -6672,12 +9048,6 @@ mod tests {
         })
         .await
         .unwrap();
-        let claimed = repo
-            .claim_outbox(worker.lease, at(3), Duration::from_secs(10), 1)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
         repo.reconcile_effect_result(EffectResultReconciliation {
             tenant_id: owner,
             call_id,
@@ -6686,6 +9056,7 @@ mod tests {
             claim_generation: claimed.claim_generation,
             result: ServiceEffectResult::Succeeded,
             external_reference: None,
+            additional_external_references: Vec::new(),
             follow_up: None,
             at: at(4),
         })
@@ -6721,7 +9092,10 @@ mod tests {
             [
                 LegExecutionSpec {
                     leg_id,
-                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig { uri: None }),
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
                 },
                 LegExecutionSpec {
                     leg_id: aggregate.legs()[1].id(),
@@ -6945,6 +9319,7 @@ mod tests {
                 operation_idempotency: None,
                 bound_connection: None,
                 media_activity: None,
+                replacement_connection: None,
             })
             .await
             .unwrap(),
@@ -7353,6 +9728,7 @@ mod tests {
         let bad_issue = AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest: AttachmentTokenDigest::new(digest(60 + 100)),
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: current.aggregate.legs()[1].id(),
             binding_generation: current.aggregate.legs()[1].binding_generation(),
             transport: AttachmentTransport::WebRtc,
@@ -7382,7 +9758,7 @@ mod tests {
         assert_eq!(
             rejected,
             Err(RepositoryError::InvalidInput(
-                "attachment does not match an awaiting leg generation"
+                "attachment does not match its leg purpose or generation"
             ))
         );
         assert_eq!(repo.counts().unwrap(), counts);
@@ -7471,6 +9847,7 @@ mod tests {
         let issue = AttachmentIssue {
             attachment_id: AttachmentId::new(),
             token_digest: AttachmentTokenDigest::new(digest(221)),
+            purpose: AttachmentPurpose::PublicInbound,
             leg_id: rotated_leg.id(),
             binding_generation: rotated_leg.binding_generation(),
             transport: AttachmentTransport::Sip,
@@ -8075,6 +10452,7 @@ mod tests {
                 attachments: vec![AttachmentIssue {
                     attachment_id: AttachmentId::new(),
                     token_digest: new_token,
+                    purpose: AttachmentPurpose::PublicInbound,
                     leg_id,
                     binding_generation: generation_two,
                     transport: AttachmentTransport::Sip,
@@ -8346,6 +10724,7 @@ mod tests {
                 tenant_id: owner.clone(),
                 call_id: call.aggregate.id(),
                 leg_id: call.aggregate.legs()[1].id(),
+                role: ProviderReferenceRole::Media,
                 account: account.clone(),
                 provider_call_id,
                 worker: worker.lease,
@@ -8403,6 +10782,7 @@ mod tests {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
             leg_id: call.aggregate.legs()[1].id(),
+            role: ProviderReferenceRole::Media,
             account: account.clone(),
             provider_call_id,
             worker: worker.lease,
@@ -8579,6 +10959,7 @@ mod tests {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
             leg_id: target_leg,
+            role: ProviderReferenceRole::Media,
             account: account.clone(),
             provider_call_id,
             worker: worker.lease,
@@ -8748,6 +11129,7 @@ mod tests {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
             leg_id: call.aggregate.legs()[1].id(),
+            role: ProviderReferenceRole::Media,
             account: account.clone(),
             provider_call_id,
             worker: worker.lease,
@@ -8865,11 +11247,13 @@ mod tests {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
             leg_id: call.aggregate.legs()[1].id(),
+            role: ProviderReferenceRole::Media,
         };
         repo.bind_provider_reference(BindProviderReference {
             tenant_id: owner.clone(),
             call_id: call.aggregate.id(),
             leg_id: target.leg_id,
+            role: ProviderReferenceRole::Media,
             account: account.clone(),
             provider_call_id: provider_call_id.clone(),
             worker: worker.lease,
@@ -9297,6 +11681,102 @@ mod tests {
             old_cleanup_claim[0].record.effect_id
         );
         assert!(cleanup[0].claim_generation > old_cleanup_claim[0].claim_generation);
+    }
+
+    #[tokio::test]
+    async fn worker_capabilities_activate_once_on_the_exact_live_fence() {
+        let repo = MemoryRepository::new();
+        let worker_id = WorkerId::new();
+        let registered = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(0),
+                lease_ttl: Duration::from_secs(30),
+            })
+            .await
+            .unwrap();
+        let capabilities = BTreeSet::from(["sip".to_owned(), "sip_egress".to_owned()]);
+        let activated = repo
+            .activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: registered.lease,
+                capabilities: capabilities.clone(),
+                at: at(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(activated.capabilities, capabilities);
+        assert_eq!(
+            repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: registered.lease,
+                capabilities: capabilities.clone(),
+                at: at(2),
+            })
+            .await
+            .unwrap()
+            .capabilities,
+            capabilities
+        );
+        assert_eq!(
+            repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: registered.lease,
+                capabilities: BTreeSet::from(["webrtc".to_owned()]),
+                at: at(3),
+            })
+            .await,
+            Err(RepositoryError::InvalidInput(
+                "worker capabilities are already activated"
+            ))
+        );
+        assert_eq!(
+            repo.worker_snapshot(worker_id).await.unwrap().capabilities,
+            capabilities
+        );
+
+        repo.set_worker_draining(registered.lease, true, at(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: registered.lease,
+                capabilities: BTreeSet::from(["sip".to_owned(), "sip_egress".to_owned()]),
+                at: at(5),
+            })
+            .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+
+        let replacement = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::new(),
+                at: at(6),
+                lease_ttl: Duration::from_secs(30),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: registered.lease,
+                capabilities: BTreeSet::from(["sip".to_owned()]),
+                at: at(7),
+            })
+            .await,
+            Err(RepositoryError::StaleWorkerFence)
+        );
+        assert_eq!(
+            repo.activate_worker_capabilities(ActivateWorkerCapabilities {
+                worker: replacement.lease,
+                capabilities: BTreeSet::new(),
+                at: at(7),
+            })
+            .await,
+            Err(RepositoryError::InvalidInput(
+                "activated worker capabilities must not be empty"
+            ))
+        );
     }
 
     #[tokio::test]

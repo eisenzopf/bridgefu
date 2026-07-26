@@ -8,14 +8,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Notify;
 
-use crate::call_engine::{CallId, WorkerId};
+use crate::call_engine::{AttachmentTokenDigest, CallId, WorkerId};
 
 use super::{
-    validate_poll_interval, CallRouteHint, CoordinationClock, CoordinationError, CoordinationEvent,
-    CoordinationPayload, CoordinationProjection, DatabasePollReason, DeploymentId,
-    ProjectionApplyOutcome, ProjectionSequence, ReplayDigest, ReplayMarker, WakeupConsumer,
-    WakeupMessage, WakeupPoll, WakeupPublisher, WakeupReason, WorkerCoordinationSnapshot,
-    WorkerSelectionRequest,
+    validate_poll_interval, AttachmentRouteHint, AttachmentRouteLookup, CallRouteHint,
+    CoordinationClock, CoordinationError, CoordinationEvent, CoordinationPayload,
+    CoordinationProjection, DatabasePollReason, DeploymentId, ProjectionApplyOutcome,
+    ProjectionSequence, ReplayDigest, ReplayMarker, WakeupConsumer, WakeupMessage, WakeupPoll,
+    WakeupPublisher, WakeupReason, WorkerCoordinationSnapshot, WorkerSelectionRequest,
 };
 
 const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -58,6 +58,7 @@ struct MemoryWakeupStream {
 struct MemoryState {
     workers: HashMap<WorkerId, Versioned<WorkerCoordinationSnapshot>>,
     routes: HashMap<CallId, Versioned<Option<CallRouteHint>>>,
+    attachment_routes: HashMap<AttachmentTokenDigest, Versioned<Option<AttachmentRouteHint>>>,
     replay: HashMap<ReplayDigest, Versioned<ReplayMarker>>,
     wakeup_sequences: HashMap<WorkerId, Versioned<WakeupReason>>,
     streams: HashMap<WorkerId, MemoryWakeupStream>,
@@ -172,6 +173,9 @@ impl MemoryCoordinator {
     fn cleanup_locked(&self, state: &mut MemoryState, now: DateTime<Utc>) {
         state.workers.retain(|_, entry| entry.retained_until > now);
         state.routes.retain(|_, entry| entry.retained_until > now);
+        state
+            .attachment_routes
+            .retain(|_, entry| entry.retained_until > now);
         state.replay.retain(|_, entry| entry.retained_until > now);
         state
             .wakeup_sequences
@@ -311,6 +315,41 @@ impl MemoryCoordinator {
         apply_versioned(&mut state.routes, call_id, sequence, None, keep_until)
     }
 
+    fn apply_attachment_route(
+        &self,
+        state: &mut MemoryState,
+        sequence: ProjectionSequence,
+        incoming: AttachmentRouteHint,
+    ) -> Result<ProjectionApplyOutcome, CoordinationError> {
+        let now = self.clock.now();
+        let keep_until = retained_until(incoming.expires_at, now, self.tombstone_ttl)?;
+        apply_versioned(
+            &mut state.attachment_routes,
+            incoming.token_digest,
+            sequence,
+            Some(incoming),
+            keep_until,
+        )
+    }
+
+    fn remove_attachment_route(
+        &self,
+        state: &mut MemoryState,
+        sequence: ProjectionSequence,
+        recorded_at: DateTime<Utc>,
+        token_digest: AttachmentTokenDigest,
+    ) -> Result<ProjectionApplyOutcome, CoordinationError> {
+        let now = self.clock.now();
+        let keep_until = retained_until(recorded_at, now, self.tombstone_ttl)?;
+        apply_versioned(
+            &mut state.attachment_routes,
+            token_digest,
+            sequence,
+            None,
+            keep_until,
+        )
+    }
+
     fn apply_replay(
         &self,
         state: &mut MemoryState,
@@ -425,6 +464,16 @@ impl CoordinationProjection for MemoryCoordinator {
             CoordinationPayload::RouteRemoved { call_id } => {
                 self.remove_route(&mut state, event.sequence, event.recorded_at, *call_id)
             }
+            CoordinationPayload::AttachmentRoute(route) => {
+                self.apply_attachment_route(&mut state, event.sequence, route.clone())
+            }
+            CoordinationPayload::AttachmentRouteRemoved { token_digest } => self
+                .remove_attachment_route(
+                    &mut state,
+                    event.sequence,
+                    event.recorded_at,
+                    *token_digest,
+                ),
             CoordinationPayload::Replay(marker) => {
                 self.apply_replay(&mut state, event.sequence, marker.clone())
             }
@@ -490,6 +539,37 @@ impl CoordinationProjection for MemoryCoordinator {
             .get(&route.worker.worker_id)
             .is_some_and(|worker| {
                 worker.value.lease == route.worker && worker.value.lease_expires_at > now
+            });
+        Ok(worker_is_live.then(|| route.clone()))
+    }
+
+    async fn attachment_route_hint(
+        &self,
+        lookup: AttachmentRouteLookup,
+    ) -> Result<Option<AttachmentRouteHint>, CoordinationError> {
+        let now = self.clock.now();
+        let mut state = self.lock()?;
+        self.cleanup_locked(&mut state, now);
+        let Some(route) = state
+            .attachment_routes
+            .get(&lookup.token_digest)
+            .and_then(|entry| entry.value.as_ref())
+        else {
+            return Ok(None);
+        };
+        if route.expires_at <= now
+            || route.transport != lookup.transport
+            || route.tenant_binding != lookup.tenant_binding
+        {
+            return Ok(None);
+        }
+        let worker_is_live = state
+            .workers
+            .get(&route.worker.worker_id)
+            .is_some_and(|worker| {
+                worker.value.lease == route.worker
+                    && worker.value.lease_expires_at > now
+                    && !worker.value.draining
             });
         Ok(worker_is_live.then(|| route.clone()))
     }

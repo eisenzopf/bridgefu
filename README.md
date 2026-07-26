@@ -1,10 +1,31 @@
 # bridgefu
 
+## Start here
+
+This working tree contains both the preserved Vapi-to-Amazon gateway and a
+larger Bridgefu 1.0 call-control platform. Use these three review artifacts
+before reading the subsystem documentation:
+
+- [Product overview](docs/product-overview.md) explains the exactly-two-leg
+  model and the two intended Vapi/Amazon call journeys.
+- [Complete Vapi/browser/Amazon configuration](config/browser-vapi-amazon-handoff.example.yaml)
+  puts the fixed SIP transfer, secure named transfer, and browser-first
+  handoff into one annotated all-in-one example. It contains placeholders and
+  has deliberately not been executed.
+- [Comprehensive changelog](CHANGELOG.md) inventories the work in this release
+  candidate, calls out compatibility changes and open gates, and provides a
+  subsystem review index.
+
 Bridgefu is a programmable Rust SIP/RTP ↔ WebRTC/RTP bridge and the reference
 application for rvoip. It preserves the Vapi → Amazon Connect screen-pop path,
 adds a normal rvoip SIP/WebRTC runtime, native Telnyx call control,
 safe SIP-header/DataChannel context envelopes, and UCTP or MOQT audio fanout.
 Twilio and Vonage provider control are deferred beyond 1.0.
+
+UCTP direct fanout and local/static MOQT relay topologies are executable. The
+clustered API-created MOQT namespace policy remains fail-closed until the
+private moq-rs admission patch is owner-reviewed, immutably pinned, and
+requalified; the tree does not yet claim arbitrary production relay fanout.
 
 ```
 PSTN caller ─▶ Vapi app ─(SIP transfer/REFER with X- headers)─▶ bridgefu
@@ -12,10 +33,20 @@ PSTN caller ─▶ Vapi app ─(SIP transfer/REFER with X- headers)─▶ bridge
             ─▶ live agent (CCP rings, screen pop populated, two-way audio)
 ```
 
+The diagram is the frozen SIP-transfer contract, not a claim that a stock Vapi
+website `webCall` is qualified end to end. Browser-to-call-center support is
+tracked separately for Vapi-managed and direct Bridgefu WebRTC ingress in the
+[full-duplex support matrix and gap gates](docs/roadmap.md#vapi-widget-to-call-center-full-duplex-release-gap).
+The externally credentialed stock-widget transfer feasibility run is pending;
+no widget path is represented as supported until its exact automated and live
+evidence is green.
+
 The core data plane is an rvoip `MediaGraph`, so a call peer and both broadcast
 types can observe one source without competing for its receiver. See
-[architecture](docs/architecture.md), [security](docs/security.md), and the
-[provider matrix](docs/provider-capabilities.md).
+[architecture](docs/architecture.md), [security](docs/security.md), the
+[observability contract](docs/observability.md), and the
+[provider matrix](docs/provider-capabilities.md). A typed call, transfer, DTMF,
+and broadcast walkthrough is in the [v1 API quick start](docs/api.md).
 
 This tree is an implementation branch toward 1.0, not a GA performance claim.
 The ordered implementation gates and their evidence are tracked in the
@@ -23,8 +54,14 @@ The ordered implementation gates and their evidence are tracked in the
 also documented in
 [protocol compatibility](docs/protocol-compatibility.md) and
 [BENCHMARKS.md](BENCHMARKS.md).
+Existing installations should follow the additive
+[v1 migration guide](docs/migration-v1.md) before enabling generic bridging or
+broadcasts.
 The Gate 6 SQL transaction model and its deterministic PostgreSQL runner are
 documented in [durable repository backends](docs/repository-backends.md).
+The currently executable role-separated public edge and its deliberately
+fail-closed surface boundary are documented in
+[split gateway UCTP ingress](docs/gateway-uctp-ingress.md).
 The protected StandardCharter staging procedure is documented in the
 [non-production smoke, drain, and rollback runbook](docs/standardcharter-smoke-runbook.md).
 
@@ -35,43 +72,60 @@ MOQT draft-19 qualification is recorded in the
 [fork review packet](docs/moq-fork-review.md). No upstream submission has been
 made.
 
+The separate, unintegrated WebRTC/RTC TURN candidate and its owner-review gate
+are recorded in the private [WebRTC fork review packet](docs/webrtc-fork-review.md).
+It has not been pinned, pushed, or submitted upstream.
+
+Bridgefu is MIT licensed. Development and security-reporting expectations are
+in [CONTRIBUTING.md](CONTRIBUTING.md); unreleased compatibility changes are in
+[CHANGELOG.md](CHANGELOG.md).
+
+Release load runs are intentionally manual and retain versioned evidence; see
+[release qualification](docs/qualification.md). A short smoke run never counts
+as the one-hour release gate.
+
 ---
 
 ## How it's built and deployed
 
-- The daemon depends on the `rvoip` workspace **by path** (`../rvoip/...`). Some
-  rvoip crates are **not published to crates.io**, so we always build against a
-  local checkout — never the registry.
-- Deployment target: a single **arm64 / Graviton, Amazon Linux 2023** EC2 instance
-  (default `t4g.2xlarge`).
-- The instance **builds the Docker image itself**: Terraform's bootstrap clones
-  `github.com/eisenzopf/rvoip`, and `deploy.sh` syncs the bridgefu source up,
-  then runs `docker build` on the instance. The first build is slow; afterward the
-  rvoip layers cache and redeploys only recompile bridgefu.
-- The image runs under **systemd** (`Restart=always`) with `docker run --network host`.
-
-```
-On the instance:
-  /opt/build/rvoip      <- git clone of github.com/eisenzopf/rvoip
-  /opt/build/bridgefu   <- rsync of this repo (deploy.sh)
-  docker build --build-context rvoip=../rvoip -f Dockerfile .
-```
+- Development uses a sibling `../rvoip` workspace because several reusable
+  crates are not yet published. Release inputs name exact Bridgefu and rvoip
+  revisions; floating branches are not release inputs.
+- The multi-stage image supports `linux/amd64` and `linux/arm64`, runs as a
+  non-root user, and is compatible with a read-only root filesystem. The
+  protected release-candidate workflow assembles one OCI index and verifies
+  its platform manifests, SBOMs, provenance statements, and vulnerability
+  policy without granting registry publication authority.
+- Compose profiles cover StandardCharter, generic SIP↔WebRTC, Telnyx, UCTP,
+  MOQT, PostgreSQL/Redis, and Coturn. The executable process roles are
+  `all-in-one`, `gateway`, `worker`, and `moq-relay`; see
+  [deployment details](deploy/README.md) for the exact supported edge surfaces.
+- Terraform roots under `deploy/terraform/aws` and `deploy/terraform/gcp`
+  define role-separated ECS-on-EC2 and GKE deployments. They are statically
+  validated but deliberately require an owner-authorized disposable account
+  or project before `apply` and smoke evidence can be called complete.
+- `deploy.sh` and the systemd unit remain as an isolated legacy
+  StandardCharter deployment path. They are not the reference clustered
+  topology.
 
 ---
 
 ## Prerequisites
 
-On your **laptop / build host**:
+For local containers and validation:
+
+- Docker with Compose; Buildx is required only for the retained multi-platform
+  release-candidate artifact.
+- Rust stable when running the source test suites directly.
+
+For an owner-authorized cloud deployment:
 
 - [Terraform](https://developer.hashicorp.com/terraform/downloads) ≥ 1.5
-- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) v2, authenticated (see below)
-- An SSH keypair (`ssh-keygen -t ed25519`)
-- `rsync`, `ssh`, `scp` (standard on macOS/Linux)
+- The AWS CLI v2 or Google Cloud CLI, authenticated to the disposable target.
+- Provider credentials supplied only through the documented secret references.
 
-You do **not** need Docker or Rust locally — the build happens on the instance.
-
-An **Amazon Connect instance** with a contact flow configured for the screen pop
-(see [Amazon Connect setup](#amazon-connect-setup)).
+The StandardCharter profile additionally requires an Amazon Connect instance
+with the screen-pop contact flow described below.
 
 ---
 
@@ -79,8 +133,9 @@ An **Amazon Connect instance** with a contact flow configured for the screen pop
 
 Two distinct credential paths:
 
-1. **Terraform + deploy.sh (your laptop)** — uses your AWS credentials to create
-   infra. Provide them however the AWS CLI/SDK expects:
+1. **Terraform or the legacy deploy script** uses your local AWS identity to
+   create only the resources in the selected root. Provide it through the
+   normal AWS CLI/SDK chain:
 
    ```bash
    export AWS_PROFILE=your-profile          # or:
@@ -89,14 +144,19 @@ Two distinct credential paths:
    export AWS_REGION=us-west-2              # match var.region
    ```
 
-   Your principal needs permissions for EC2, VPC, EIP, IAM (role/profile/policy),
-   and SSM parameter read.
+   The reference AWS root needs the Terraform operations required for VPC/EC2,
+   ECS, ELB, RDS, ElastiCache, IAM, Secrets Manager, CloudWatch, and
+   autoscaling. The isolated legacy single-EC2 root needs only its documented
+   EC2/VPC/EIP/IAM and SSM-read subset. Use a disposable account and scope the
+   identity to the selected root rather than granting a permanent broad role.
 
-2. **bridgefu at runtime (on the instance)** — uses the **EC2 instance role**
-   created by Terraform. No AWS keys ever live in config or on the box. The role
-   is least-privilege: only `connect:StartWebRTCContact` and `connect:StopContact`.
-   The daemon resolves region + credentials via the standard AWS chain
-   (`AwsConnectStarter::from_env`), and discovers its public IP via IMDSv2.
+2. **Bridgefu at runtime** uses its ECS task role (or the legacy EC2 instance
+   role). No AWS keys live in YAML or in the image. The reference runtime role
+   scopes `connect:DescribeContact`, `connect:StartWebRTCContact`, and
+   `connect:StopContact` to configured Connect instance/contact resources; the
+   legacy proof-of-concept role has only Start/Stop and still requires tighter
+   resource scoping. The daemon resolves credentials through the standard AWS
+   chain.
 
 ---
 
@@ -134,7 +194,20 @@ Leave `sip.advertised_ip` and `sip.media_public_ip` as `auto` — on EC2 the dae
 resolves the public (Elastic) IP via IMDSv2. AWS credentials are **never** in this
 file. See [config/bridgefu.example.yaml](config/bridgefu.example.yaml) for every
 field. Every scalar can be overridden with a double-underscore environment key,
-for example `BRIDGEFU__RUNTIME__MAX_CONCURRENT_CALLS=200`.
+for example `BRIDGEFU__RUNTIME__MAX_CONCURRENT_CALLS=200`. Configuration keys
+are strict at every depth, so a misspelled file or environment-override key
+fails startup instead of being ignored. `print-effective-config` validates that
+typed shape and redacts secret references without requiring those secrets to be
+provisioned first; `validate` resolves secrets and performs the full runtime
+preflight.
+
+The non-secret
+[StandardCharter managed-route fixture](config/fixtures/standardcharter-managed-routes.yaml)
+defines the paired `amazon-connect`, `generic-sip`, `telnyx`, and `generic-wss`
+routes, both approved ingress modes, and only `env:` credential references. Its
+[StandardCharter environment half](config/fixtures/standardcharter-managed-routes.env)
+keeps legacy rollback explicitly scoped to the default Amazon route. The schema
+check validates both files and their shared route catalog in CI.
 
 ```bash
 bridgefu --config bridgefu.yaml validate
@@ -151,6 +224,11 @@ least 32 bytes). With the compatibility shared API key, set
 requests require exactly one visible-ASCII `Idempotency-Key` header; receipts
 are tenant-bound and retained for 24 hours. `POST /v1/calls` accepts exactly two
 typed SIP, WebRTC, WHIP/WHEP, Amazon Connect, or provider-controlled legs.
+Outbound SIP endpoints may set `initial_context: required`; that opt-in keeps
+the first INVITE completely dormant until an exact source connection delivers
+one valid, durable `bridgefu.context.v1` envelope. The default is `none`, so
+existing callers retain immediate SIP origination. Initial allowlisted values
+become ordered INVITE headers, while later valid context uses SIP MESSAGE.
 Startup validation resolves the control-key reference, verifies its byte
 length without rendering it, and rejects a static tenant that is not present
 in the configured routing table. Transactional state uses durable SQLite by
@@ -167,7 +245,11 @@ capacity after that budget or the two-minute attachment window is exhausted.
 Missing API authentication makes every protected route fail closed with `503`;
 missing call-control key material makes the call routes fail with `503`. The
 existing StandardCharter listener and public health/metrics endpoints continue
-to start normally. Legacy Amazon-call broadcasts and screen-pop diagnostics
+to start normally. A separate durable `sip:<tenant>` StandardCharter canary is
+available only through the explicitly enabled
+`generic_bridge.standardcharter_canary` policy; it requires the exact trusted
+principal, tenant, scopes, and one mapped `X-Correlation-Id`, then consumes the
+same single-use attachment proof as every other inbound leg. Legacy Amazon-call broadcasts and screen-pop diagnostics
 remain available in an unambiguous single-tenant runtime. In a multi-tenant
 runtime they fail closed until those legacy resources carry durable tenant
 ownership; broadcast reads, token creation, and deletion always require the
@@ -180,13 +262,20 @@ curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \
 
 ---
 
-## Deploy
+## Legacy StandardCharter single-EC2 deployment
+
+The commands below preserve the original StandardCharter proof-of-concept
+path. They do not deploy the Bridgefu 1.0 gateway/worker/MOQT-relay topology.
+For the reference container profiles and the statically validated AWS ECS and
+GCP GKE roots, start with [deployment details](deploy/README.md) and
+`deploy/terraform/{aws,gcp}`. Cloud apply/smoke/destroy remains an
+owner-authorized release gate.
 
 ```bash
 # 1. Stand up the infra.
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars       # public_key, admin_cidr, region (and optionally sip_cidr)
+$EDITOR terraform.tfvars       # public_key, admin_cidr, region (and optionally sip_cidrs)
 terraform init
 terraform apply
 
@@ -240,11 +329,12 @@ X-Account-Tier:     <tier>
 These map (per `mapping.rename`) to `HostedWidget-customerId` /
 `HostedWidget-vapiCallId` / `HostedWidget-accountTier` contact attributes.
 
-A successful test (PRD §9): logs show `INVITE received` → inbound headers include
-the `X-` set → `attributes=N>0` → `StartWebRTCContact` with a real `contact_id` →
-Chime connected → `bridged`; the agent CCP rings with the screen pop populated and
-audio flows both ways; hanging up either leg tears down the other (no leaked
-contacts).
+A successful protected test (PRD §9) uses synthetic non-sensitive metadata and
+retains only redacted lifecycle evidence: authenticated INVITE accepted,
+nonzero mapped-attribute count, StartWebRTCContact success, Chime connected,
+bridge active, CCP screen pop populated, bidirectional audio, and exact teardown.
+Raw SIP headers, attribute values, tokens, and contact identifiers are not log
+evidence.
 
 ---
 
@@ -273,11 +363,15 @@ To redeploy after a code or config change, just re-run `deploy.sh`.
 Do not expose signaling until the configured carrier and identity policies are
 in place:
 
-- **SIP/RTP are open by default** (`sip_cidr = 0.0.0.0/0`). **TODO:** set `sip_cidr`
-  to the Vapi/carrier CIDRs once known and `terraform apply`.
+- The legacy root restricts SIP signaling with `sip_cidrs`; its defaults are
+  the two documented Vapi signaling `/32` addresses. Replace them with the
+  exact carrier ranges for your deployment. RTP uses the separate `rtp_cidr`
+  and defaults to `0.0.0.0/0` because Vapi media source addresses are dynamic;
+  established-session checks do not replace network-level protection.
 - SSH (22) and metrics (9090) are restricted to `admin_cidr` — set this to your IP.
-- The IAM policy uses `Resource = "*"` for the two Connect actions. **TODO:** scope
-  to the specific instance + contact-flow ARNs.
+- The legacy IAM policy uses `Resource = "*"` for its two Connect actions.
+  Scope it to the specific instance and contact resources before use; the
+  reference AWS root already accepts explicit instance ARNs.
 - Use SIPS/SRTP or private carrier networks where required. See the complete
   [security model](docs/security.md).
 
@@ -291,9 +385,9 @@ in place:
 | `package X requires rustc 1.9x` | The AWS SDK crates float their MSRV above rvoip's declared 1.88. `deploy/Dockerfile` pins the builder to `rust:1.95`; bump it if a future `cargo update` raises the floor again. |
 | First build very slow | Expected — the full rvoip tree compiles once. Redeploys reuse cached layers. |
 | `IMDS request timed out (not on EC2?)` | You're running off-EC2, or IMDSv2 is blocked. Set literal IPs for `advertised_ip` / `media_public_ip` instead of `auto`. |
-| `X-` headers missing in logs | The core risk this test exists to answer (PRD FR6). Set `log_level: "info,rvoip_amazon_connect=debug"` to log the full inbound header set and the resulting attribute map. |
+| Expected `X-` context is absent | Do not enable raw-header or attribute-value logging. Use synthetic values in the protected non-production workflow, inspect redacted context/admission counters and traces, and run the hermetic StandardCharter contract test to isolate mapping from carrier delivery. |
 | `AccessDenied` on StartWebRTCContact | Region mismatch (config vs Connect instance) or the contact flow isn't WebRTC-enabled; confirm `instance_id`/`contact_flow_id`. |
-| No audio / one-way audio | RTP blocked — confirm `sip_cidr` allows UDP 16384–32767 from the carrier, and the EIP is what's advertised in SDP. |
+| No audio / one-way audio | RTP may be blocked — confirm `sip_cidrs` allows carrier signaling, `rtp_cidr` and UDP 16384–32767 match the media policy, and the EIP is advertised in SDP. |
 
 ---
 
@@ -305,7 +399,7 @@ in place:
 cargo build
 export BRIDGEFU_API_TOKEN=dev-api-token
 export BRIDGEFU_CONTROL_HMAC_KEY=change-this-32-byte-control-key-now
-export BRIDGEFU_BROADCAST_TOKEN_SECRET=dev-broadcast-secret
+export BRIDGEFU_BROADCAST_TOKEN_SECRET=dev-broadcast-secret-change-me-32-bytes
 cargo run -- --config config/bridgefu.example.yaml validate
 
 # Build/run the non-root, read-only-capable image (BuildKit required).
@@ -321,5 +415,7 @@ Dockerfile                reproducible multi-stage non-root image
 compose.yaml              local all-in-one deployment
 deploy/bridgefu.service   systemd unit (docker run --network host, Restart=always)
 deploy.sh                 sync -> build-on-instance -> restart -> healthcheck
-terraform/                VPC, EIP, security group, IAM role, AL2023 arm64 instance
+terraform/                legacy StandardCharter single-EC2 root
+deploy/terraform/aws/     reference ECS/EC2 gateway, worker, relay, RDS, Redis
+deploy/terraform/gcp/     reference GKE gateway, worker, relay, SQL, Redis
 ```

@@ -29,13 +29,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{Executor, Row};
 
 use crate::call_engine::{
-    AggregateVersion, AttachmentCandidate, AttachmentConsume, AttachmentLookup,
-    BindProviderReference, CallAggregate, CallId, CallRepository, ClaimGeneration, ClaimedDeadline,
-    ClaimedOutbox, ClaimedProviderEvent, CommandCommit, CommandCommitOutcome, ConnectionBinding,
-    ConsumedAttachment, CreateCall, CreateCallOutcome, DeadlineState, EffectId, LegId,
-    OutboxCompletion, OutboxRecord, OutboxState, ProviderEventCommit, ProviderEventCommitOutcome,
-    ProviderEventEnvelope, ProviderEventInput, ProviderEventOutcome, ProviderEventState,
-    RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim, StoredCall, TenantId,
+    ActivateWorkerCapabilities, AggregateVersion, AttachmentCandidate, AttachmentConsume,
+    AttachmentLookup, AttachmentPurpose, BindProviderReference, BindingGeneration, CallAggregate,
+    CallId, CallRepository, ClaimGeneration, ClaimedDeadline, ClaimedOutbox, ClaimedProviderEvent,
+    CommandCommit, CommandCommitOutcome, ConnectionBinding, ConsumedAttachment, CreateCall,
+    CreateCallOutcome, DeadlineState, EffectId, LegId, OutboxCompletion, OutboxRecord, OutboxState,
+    ProviderEventCommit, ProviderEventCommitOutcome, ProviderEventEnvelope, ProviderEventInput,
+    ProviderEventOutcome, ProviderEventState, ProviderReferenceRole, RegisterWorker,
+    RenewWorkerLease, RepositoryError, RestartClaim, StoredCall, TenantId,
     TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerAssignment,
     WorkerId, WorkerLease, WorkerSnapshot,
 };
@@ -43,15 +44,18 @@ use crate::call_service::{
     BoundConnectionStateCommit, CallServiceRepository, ClaimedControlEffect,
     CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
     ControlOutboxRecord, EffectResultOutcome, EffectResultReconciliation, ExternalReferenceValue,
-    LegEndpointConfig, MediaActivityCommit, OperationIdempotencyReceipt, OutboundConnectionBind,
+    InitialContextRecordOutcome, InitialContextRecordRequest, LegEndpointConfig,
+    MediaActivityCommit, OperationIdempotencyReceipt, OutboundConnectionBind,
     OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
     ProviderEventReconciliationTransaction, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult,
-    ServiceOperationKind, StoredExternalReference, StoredServiceCall, StoredServiceEffectPayload,
+    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
+    ServiceEffectResult, ServiceOperationKind, StoredExternalReference, StoredInitialContext,
+    StoredServiceCall, StoredServiceEffectPayload,
 };
 use crate::coordination::{
-    CallRouteHint, CoordinationPayload, DeploymentId, PostgresCoordinationOutbox, ReplayDigest,
-    ReplayMarker, SqliteCoordinationOutbox, WakeupReason, WorkerCoordinationSnapshot,
+    AttachmentRouteHint, CallRouteHint, CoordinationPayload, DeploymentId,
+    PostgresCoordinationOutbox, ReplayDigest, ReplayMarker, SqliteCoordinationOutbox, WakeupReason,
+    WorkerCoordinationSnapshot,
 };
 
 use super::memory::{
@@ -90,6 +94,7 @@ struct ServiceSnapshotRows {
     control_commands: Vec<PersistedControlCommandRow>,
     control_outbox: Vec<ControlOutboxRecord>,
     outbound_binding_results: Vec<PersistedOutboundBindingRow>,
+    initial_contexts: Vec<StoredInitialContext>,
     external_references: Vec<StoredExternalReference>,
     reconciliation_results: Vec<PersistedReconciliationRow>,
     retired_operation_claims: Vec<RetiredOperationClaim>,
@@ -675,6 +680,46 @@ fn coordination_payloads(
         }
     }
 
+    // Attachment routing is a non-authoritative, credential-free projection.
+    // It is emitted in the same SQL transaction that issues, consumes, or
+    // revokes the attachment, but the worker still performs the authoritative
+    // proof consume under its current fence before binding a private route.
+    let mut attachments = after.attachments.clone();
+    attachments.sort_by(|left, right| {
+        left.token_digest
+            .expose_bytes()
+            .cmp(right.token_digest.expose_bytes())
+    });
+    for attachment in attachments {
+        let previous = before
+            .attachments
+            .iter()
+            .find(|existing| existing.token_digest == attachment.token_digest);
+        if previous == Some(&attachment) {
+            continue;
+        }
+        if attachment.consumed_at.is_none()
+            && attachment.revoked_at.is_none()
+            && attachment.expires_at > recorded_at
+        {
+            payloads.push(CoordinationPayload::AttachmentRoute(AttachmentRouteHint {
+                token_digest: attachment.token_digest,
+                worker: attachment.worker,
+                transport: attachment.transport,
+                tenant_binding: attachment.expected_principal,
+                // Coordination hints are deliberately bounded even if an
+                // authoritative attachment was created with a longer
+                // lifetime. The worker still validates the bearer against
+                // SQL before binding it, and a missing hint fails closed.
+                expires_at: attachment.expires_at.min(route_expiry),
+            }));
+        } else {
+            payloads.push(CoordinationPayload::AttachmentRouteRemoved {
+                token_digest: attachment.token_digest,
+            });
+        }
+    }
+
     let mut replay = after.idempotency.clone();
     replay.sort_by(|left, right| {
         left.tenant_id
@@ -907,6 +952,7 @@ async fn load_sqlite_snapshot(
         control_commands: service.control_commands,
         control_outbox: service.control_outbox,
         outbound_binding_results: service.outbound_binding_results,
+        initial_contexts: service.initial_contexts,
         external_references: service.external_references,
         reconciliation_results: service.reconciliation_results,
         retired_operation_claims: service.retired_operation_claims,
@@ -974,6 +1020,7 @@ async fn load_postgres_snapshot(
         control_commands: service.control_commands,
         control_outbox: service.control_outbox,
         outbound_binding_results: service.outbound_binding_results,
+        initial_contexts: service.initial_contexts,
         external_references: service.external_references,
         reconciliation_results: service.reconciliation_results,
         retired_operation_claims: service.retired_operation_claims,
@@ -1240,6 +1287,7 @@ fn validate_provider_reference_columns(
     tenant_id: &str,
     call_id: &str,
     leg_id: &str,
+    role: &str,
     bound_at: DateTime<Utc>,
 ) -> Result<(), RepositoryError> {
     invalid_if(
@@ -1248,6 +1296,7 @@ fn validate_provider_reference_columns(
             || persisted.row.target.tenant_id.as_str() != tenant_id
             || persisted.row.target.call_id.to_string() != call_id
             || persisted.row.target.leg_id.to_string() != leg_id
+            || persisted.row.target.role.as_str() != role
             || persisted.row.bound_at != bound_at,
     )
 }
@@ -1380,6 +1429,7 @@ fn validate_service_command_columns(
 fn service_payload_kind(payload: &ServiceEffectPayload) -> &'static str {
     match payload {
         ServiceEffectPayload::Transfer { .. } => "transfer",
+        ServiceEffectPayload::LegReplacement { .. } => "leg_replacement",
     }
 }
 
@@ -1509,6 +1559,36 @@ fn validate_outbound_binding_columns(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_initial_context_columns(
+    record: &StoredInitialContext,
+    tenant_id: &str,
+    call_id: &str,
+    target_leg_id: &str,
+    target_binding_generation: i64,
+    source_connection_id: &str,
+    source_leg_id: &str,
+    source_binding_generation: i64,
+    message_id: &str,
+    recorded_at: DateTime<Utc>,
+    envelope_bytes: i64,
+    header_count: i64,
+) -> Result<(), RepositoryError> {
+    invalid_if(
+        record.tenant_id.as_str() != tenant_id
+            || record.call_id.to_string() != call_id
+            || record.target_leg_id.to_string() != target_leg_id
+            || record.target_binding_generation.as_i64() != target_binding_generation
+            || record.source_connection_id.as_str() != source_connection_id
+            || record.source_leg_id.to_string() != source_leg_id
+            || record.source_binding_generation.as_i64() != source_binding_generation
+            || record.message_id.as_str() != message_id
+            || record.recorded_at != recorded_at
+            || i64::try_from(record.envelope.len()).ok() != Some(envelope_bytes)
+            || i64::try_from(record.initial_sip_headers.len()).ok() != Some(header_count),
+    )
+}
+
 fn external_reference_columns(value: &ExternalReferenceValue) -> (&'static str, &str, &str) {
     match value {
         ExternalReferenceValue::ProviderCall {
@@ -1531,6 +1611,7 @@ fn validate_external_reference_columns(
     kind: &str,
     namespace: &str,
     value: &str,
+    role: &str,
     tenant_id: &str,
     call_id: &str,
     leg_id: &str,
@@ -1541,6 +1622,7 @@ fn validate_external_reference_columns(
     let expected = external_reference_columns(&reference.value);
     invalid_if(
         expected != (kind, namespace, value)
+            || reference.role.as_str() != role
             || reference.tenant_id.as_str() != tenant_id
             || reference.call_id.to_string() != call_id
             || reference.leg_id.to_string() != leg_id
@@ -1670,11 +1752,11 @@ async fn load_sqlite_provider_events(
 async fn load_sqlite_provider_references(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<Vec<PersistedProviderReferenceRow>, RepositoryError> {
-    sqlx::query("SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body FROM provider_references ORDER BY account_key, provider_call_id")
+    sqlx::query("SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, reference_role, bound_at, body FROM provider_references ORDER BY account_key, provider_call_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: PersistedProviderReferenceRow = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_provider_reference_columns(&value, &row.try_get::<String, _>("account_key").map_err(database_error)?, &row.try_get::<String, _>("provider_call_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, sqlite_time(&row, "bound_at")?)?;
+            validate_provider_reference_columns(&value, &row.try_get::<String, _>("account_key").map_err(database_error)?, &row.try_get::<String, _>("provider_call_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, &row.try_get::<String, _>("reference_role").map_err(database_error)?, sqlite_time(&row, "bound_at")?)?;
             Ok(value)
         }).collect()
 }
@@ -1768,11 +1850,18 @@ async fn load_sqlite_service_rows(
             validate_outbound_binding_columns(&value, &row.try_get::<String, _>("operation_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("worker_fence").map_err(database_error)?, &row.try_get::<String, _>("connection_id").map_err(database_error)?, &row.try_get::<String, _>("transport_kind").map_err(database_error)?, sqlite_time(&row, "bound_at")?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
-    let external_references = sqlx::query("SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body FROM external_references ORDER BY reference_kind, reference_namespace, reference_value")
+    let initial_contexts = sqlx::query("SELECT tenant_id, call_id, target_leg_id, target_binding_generation, source_connection_id, source_leg_id, source_binding_generation, message_id, recorded_at, envelope_bytes, header_count, body FROM initial_contexts ORDER BY call_id, target_leg_id, target_binding_generation")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: StoredInitialContext = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_initial_context_columns(&value, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("target_leg_id").map_err(database_error)?, row.try_get("target_binding_generation").map_err(database_error)?, &row.try_get::<String, _>("source_connection_id").map_err(database_error)?, &row.try_get::<String, _>("source_leg_id").map_err(database_error)?, row.try_get("source_binding_generation").map_err(database_error)?, &row.try_get::<String, _>("message_id").map_err(database_error)?, sqlite_time(&row, "recorded_at")?, row.try_get("envelope_bytes").map_err(database_error)?, row.try_get("header_count").map_err(database_error)?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let external_references = sqlx::query("SELECT reference_kind, reference_namespace, reference_value, reference_role, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body FROM external_references ORDER BY reference_kind, reference_namespace, reference_value")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: StoredExternalReference = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_external_reference_columns(&value, &row.try_get::<String, _>("reference_kind").map_err(database_error)?, &row.try_get::<String, _>("reference_namespace").map_err(database_error)?, &row.try_get::<String, _>("reference_value").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("effect_id").map_err(database_error)?, sqlite_time(&row, "bound_at")?)?;
+            validate_external_reference_columns(&value, &row.try_get::<String, _>("reference_kind").map_err(database_error)?, &row.try_get::<String, _>("reference_namespace").map_err(database_error)?, &row.try_get::<String, _>("reference_value").map_err(database_error)?, &row.try_get::<String, _>("reference_role").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("effect_id").map_err(database_error)?, sqlite_time(&row, "bound_at")?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
     let reconciliation_results = sqlx::query("SELECT effect_id, effect_source, tenant_id, call_id, worker_id, worker_fence, result_kind, reconciled_at, body FROM reconciliation_results ORDER BY effect_id")
@@ -1804,6 +1893,7 @@ async fn load_sqlite_service_rows(
         control_commands,
         control_outbox,
         outbound_binding_results,
+        initial_contexts,
         external_references,
         reconciliation_results,
         retired_operation_claims,
@@ -1874,11 +1964,11 @@ async fn load_postgres_provider_events(
 async fn load_postgres_provider_references(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<PersistedProviderReferenceRow>, RepositoryError> {
-    sqlx::query("SELECT account_key, provider_call_id, tenant_id, call_id::text AS call_id, leg_id::text AS leg_id, bound_at, body::text AS body FROM provider_references ORDER BY account_key, provider_call_id")
+    sqlx::query("SELECT account_key, provider_call_id, tenant_id, call_id::text AS call_id, leg_id::text AS leg_id, reference_role, bound_at, body::text AS body FROM provider_references ORDER BY account_key, provider_call_id")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: PersistedProviderReferenceRow = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_provider_reference_columns(&value, &row.try_get::<String, _>("account_key").map_err(database_error)?, &row.try_get::<String, _>("provider_call_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("bound_at").map_err(database_error)?)?;
+            validate_provider_reference_columns(&value, &row.try_get::<String, _>("account_key").map_err(database_error)?, &row.try_get::<String, _>("provider_call_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, &row.try_get::<String, _>("reference_role").map_err(database_error)?, row.try_get("bound_at").map_err(database_error)?)?;
             Ok(value)
         }).collect()
 }
@@ -1972,11 +2062,18 @@ async fn load_postgres_service_rows(
             validate_outbound_binding_columns(&value, &row.try_get::<String, _>("operation_id").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("worker_id").map_err(database_error)?, row.try_get("worker_fence").map_err(database_error)?, &row.try_get::<String, _>("connection_id").map_err(database_error)?, &row.try_get::<String, _>("transport_kind").map_err(database_error)?, row.try_get("bound_at").map_err(database_error)?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
-    let external_references = sqlx::query("SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id::text AS call_id, leg_id::text AS leg_id, binding_generation, effect_id::text AS effect_id, bound_at, body::text AS body FROM external_references ORDER BY reference_kind, reference_namespace, reference_value")
+    let initial_contexts = sqlx::query("SELECT tenant_id, call_id::text AS call_id, target_leg_id::text AS target_leg_id, target_binding_generation, source_connection_id, source_leg_id::text AS source_leg_id, source_binding_generation, message_id, recorded_at, envelope_bytes, header_count, body::text AS body FROM initial_contexts ORDER BY call_id, target_leg_id, target_binding_generation")
+        .fetch_all(&mut **transaction).await.map_err(database_error)?
+        .into_iter().map(|row| {
+            let value: StoredInitialContext = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
+            validate_initial_context_columns(&value, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("target_leg_id").map_err(database_error)?, row.try_get("target_binding_generation").map_err(database_error)?, &row.try_get::<String, _>("source_connection_id").map_err(database_error)?, &row.try_get::<String, _>("source_leg_id").map_err(database_error)?, row.try_get("source_binding_generation").map_err(database_error)?, &row.try_get::<String, _>("message_id").map_err(database_error)?, row.try_get("recorded_at").map_err(database_error)?, row.try_get("envelope_bytes").map_err(database_error)?, row.try_get("header_count").map_err(database_error)?)?;
+            Ok(value)
+        }).collect::<Result<Vec<_>, RepositoryError>>()?;
+    let external_references = sqlx::query("SELECT reference_kind, reference_namespace, reference_value, reference_role, tenant_id, call_id::text AS call_id, leg_id::text AS leg_id, binding_generation, effect_id::text AS effect_id, bound_at, body::text AS body FROM external_references ORDER BY reference_kind, reference_namespace, reference_value")
         .fetch_all(&mut **transaction).await.map_err(database_error)?
         .into_iter().map(|row| {
             let value: StoredExternalReference = decode(&row.try_get::<String, _>("body").map_err(database_error)?)?;
-            validate_external_reference_columns(&value, &row.try_get::<String, _>("reference_kind").map_err(database_error)?, &row.try_get::<String, _>("reference_namespace").map_err(database_error)?, &row.try_get::<String, _>("reference_value").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("effect_id").map_err(database_error)?, row.try_get("bound_at").map_err(database_error)?)?;
+            validate_external_reference_columns(&value, &row.try_get::<String, _>("reference_kind").map_err(database_error)?, &row.try_get::<String, _>("reference_namespace").map_err(database_error)?, &row.try_get::<String, _>("reference_value").map_err(database_error)?, &row.try_get::<String, _>("reference_role").map_err(database_error)?, &row.try_get::<String, _>("tenant_id").map_err(database_error)?, &row.try_get::<String, _>("call_id").map_err(database_error)?, &row.try_get::<String, _>("leg_id").map_err(database_error)?, row.try_get("binding_generation").map_err(database_error)?, &row.try_get::<String, _>("effect_id").map_err(database_error)?, row.try_get("bound_at").map_err(database_error)?)?;
             Ok(value)
         }).collect::<Result<Vec<_>, RepositoryError>>()?;
     let reconciliation_results = sqlx::query("SELECT effect_id::text AS effect_id, effect_source, tenant_id, call_id::text AS call_id, worker_id::text AS worker_id, worker_fence, result_kind, reconciled_at, body::text AS body FROM reconciliation_results ORDER BY effect_id")
@@ -2008,6 +2105,7 @@ async fn load_postgres_service_rows(
         control_commands,
         control_outbox,
         outbound_binding_results,
+        initial_contexts,
         external_references,
         reconciliation_results,
         retired_operation_claims,
@@ -2491,6 +2589,15 @@ fn changed_snapshot(
             &after.outbound_binding_results,
             |left, right| left.operation_id == right.operation_id,
         ),
+        initial_contexts: changed_rows(
+            &before.initial_contexts,
+            &after.initial_contexts,
+            |left, right| {
+                left.call_id == right.call_id
+                    && left.target_leg_id == right.target_leg_id
+                    && left.target_binding_generation == right.target_binding_generation
+            },
+        ),
         external_references: changed_rows(
             &before.external_references,
             &after.external_references,
@@ -2620,6 +2727,16 @@ fn validate_supported_removals(
             &before.outbound_binding_results,
             &after.outbound_binding_results,
             |left, right| left.operation_id == right.operation_id,
+        )
+        .len()
+        + removed_rows(
+            &before.initial_contexts,
+            &after.initial_contexts,
+            |left, right| {
+                left.call_id == right.call_id
+                    && left.target_leg_id == right.target_leg_id
+                    && left.target_binding_generation == right.target_binding_generation
+            },
         )
         .len()
         + removed_rows(
@@ -2882,13 +2999,14 @@ async fn upsert_sqlite_rows(
 
     for persisted in &snapshot.provider_references {
         sqlx::query(
-            "INSERT INTO provider_references(account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, provider_call_id) DO UPDATE SET tenant_id=excluded.tenant_id, call_id=excluded.call_id, leg_id=excluded.leg_id, bound_at=excluded.bound_at, body=excluded.body",
+            "INSERT INTO provider_references(account_key, provider_call_id, tenant_id, call_id, leg_id, reference_role, bound_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, provider_call_id) DO UPDATE SET tenant_id=excluded.tenant_id, call_id=excluded.call_id, leg_id=excluded.leg_id, reference_role=excluded.reference_role, bound_at=excluded.bound_at, body=excluded.body",
         )
         .bind(persisted.account.as_str())
         .bind(persisted.provider_call_id.expose_secret())
         .bind(persisted.row.target.tenant_id.as_str())
         .bind(persisted.row.target.call_id.to_string())
         .bind(persisted.row.target.leg_id.to_string())
+        .bind(persisted.row.target.role.as_str())
         .bind(persisted.row.bound_at.to_rfc3339())
         .bind(encode(persisted)?)
         .execute(&mut **connection)
@@ -3104,14 +3222,36 @@ async fn upsert_sqlite_rows(
         .map_err(database_error)?;
     }
 
+    for record in &snapshot.initial_contexts {
+        sqlx::query(
+            "INSERT INTO initial_contexts(tenant_id, call_id, target_leg_id, target_binding_generation, source_connection_id, source_leg_id, source_binding_generation, message_id, recorded_at, envelope_bytes, header_count, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(call_id, target_leg_id, target_binding_generation) DO UPDATE SET tenant_id=excluded.tenant_id, source_connection_id=excluded.source_connection_id, source_leg_id=excluded.source_leg_id, source_binding_generation=excluded.source_binding_generation, message_id=excluded.message_id, recorded_at=excluded.recorded_at, envelope_bytes=excluded.envelope_bytes, header_count=excluded.header_count, body=excluded.body",
+        )
+        .bind(record.tenant_id.as_str())
+        .bind(record.call_id.to_string())
+        .bind(record.target_leg_id.to_string())
+        .bind(record.target_binding_generation.as_i64())
+        .bind(record.source_connection_id.as_str())
+        .bind(record.source_leg_id.to_string())
+        .bind(record.source_binding_generation.as_i64())
+        .bind(record.message_id.as_str())
+        .bind(record.recorded_at.to_rfc3339())
+        .bind(i64::try_from(record.envelope.len()).map_err(|_| RepositoryError::Unavailable)?)
+        .bind(i64::try_from(record.initial_sip_headers.len()).map_err(|_| RepositoryError::Unavailable)?)
+        .bind(encode(record)?)
+        .execute(&mut **connection)
+        .await
+        .map_err(database_error)?;
+    }
+
     for reference in &snapshot.external_references {
         let (kind, namespace, value) = external_reference_columns(&reference.value);
         sqlx::query(
-            "INSERT INTO external_references(reference_kind, reference_namespace, reference_value, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(reference_kind, reference_namespace, reference_value) DO UPDATE SET tenant_id=excluded.tenant_id, call_id=excluded.call_id, leg_id=excluded.leg_id, binding_generation=excluded.binding_generation, effect_id=excluded.effect_id, bound_at=excluded.bound_at, body=excluded.body",
+            "INSERT INTO external_references(reference_kind, reference_namespace, reference_value, reference_role, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(reference_kind, reference_namespace, reference_value) DO UPDATE SET reference_role=excluded.reference_role, tenant_id=excluded.tenant_id, call_id=excluded.call_id, leg_id=excluded.leg_id, binding_generation=excluded.binding_generation, effect_id=excluded.effect_id, bound_at=excluded.bound_at, body=excluded.body",
         )
         .bind(kind)
         .bind(namespace)
         .bind(value)
+        .bind(reference.role.as_str())
         .bind(reference.tenant_id.as_str())
         .bind(reference.call_id.to_string())
         .bind(reference.leg_id.to_string())
@@ -3329,13 +3469,14 @@ async fn upsert_postgres_rows(
 
     for persisted in &snapshot.provider_references {
         sqlx::query(
-            "INSERT INTO provider_references(account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT(account_key, provider_call_id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, call_id=EXCLUDED.call_id, leg_id=EXCLUDED.leg_id, bound_at=EXCLUDED.bound_at, body=EXCLUDED.body",
+            "INSERT INTO provider_references(account_key, provider_call_id, tenant_id, call_id, leg_id, reference_role, bound_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) ON CONFLICT(account_key, provider_call_id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, call_id=EXCLUDED.call_id, leg_id=EXCLUDED.leg_id, reference_role=EXCLUDED.reference_role, bound_at=EXCLUDED.bound_at, body=EXCLUDED.body",
         )
         .bind(persisted.account.as_str())
         .bind(persisted.provider_call_id.expose_secret())
         .bind(persisted.row.target.tenant_id.as_str())
         .bind(persisted.row.target.call_id.as_uuid())
         .bind(persisted.row.target.leg_id.as_uuid())
+        .bind(persisted.row.target.role.as_str())
         .bind(persisted.row.bound_at)
         .bind(encode(persisted)?)
         .execute(&mut **transaction)
@@ -3551,14 +3692,36 @@ async fn upsert_postgres_rows(
         .map_err(database_error)?;
     }
 
+    for record in &snapshot.initial_contexts {
+        sqlx::query(
+            "INSERT INTO initial_contexts(tenant_id, call_id, target_leg_id, target_binding_generation, source_connection_id, source_leg_id, source_binding_generation, message_id, recorded_at, envelope_bytes, header_count, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb) ON CONFLICT(call_id, target_leg_id, target_binding_generation) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, source_connection_id=EXCLUDED.source_connection_id, source_leg_id=EXCLUDED.source_leg_id, source_binding_generation=EXCLUDED.source_binding_generation, message_id=EXCLUDED.message_id, recorded_at=EXCLUDED.recorded_at, envelope_bytes=EXCLUDED.envelope_bytes, header_count=EXCLUDED.header_count, body=EXCLUDED.body",
+        )
+        .bind(record.tenant_id.as_str())
+        .bind(record.call_id.as_uuid())
+        .bind(record.target_leg_id.as_uuid())
+        .bind(record.target_binding_generation.as_i64())
+        .bind(record.source_connection_id.as_str())
+        .bind(record.source_leg_id.as_uuid())
+        .bind(record.source_binding_generation.as_i64())
+        .bind(record.message_id.as_str())
+        .bind(record.recorded_at)
+        .bind(i64::try_from(record.envelope.len()).map_err(|_| RepositoryError::Unavailable)?)
+        .bind(i64::try_from(record.initial_sip_headers.len()).map_err(|_| RepositoryError::Unavailable)?)
+        .bind(encode(record)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+
     for reference in &snapshot.external_references {
         let (kind, namespace, value) = external_reference_columns(&reference.value);
         sqlx::query(
-            "INSERT INTO external_references(reference_kind, reference_namespace, reference_value, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT(reference_kind, reference_namespace, reference_value) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, call_id=EXCLUDED.call_id, leg_id=EXCLUDED.leg_id, binding_generation=EXCLUDED.binding_generation, effect_id=EXCLUDED.effect_id, bound_at=EXCLUDED.bound_at, body=EXCLUDED.body",
+            "INSERT INTO external_references(reference_kind, reference_namespace, reference_value, reference_role, tenant_id, call_id, leg_id, binding_generation, effect_id, bound_at, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb) ON CONFLICT(reference_kind, reference_namespace, reference_value) DO UPDATE SET reference_role=EXCLUDED.reference_role, tenant_id=EXCLUDED.tenant_id, call_id=EXCLUDED.call_id, leg_id=EXCLUDED.leg_id, binding_generation=EXCLUDED.binding_generation, effect_id=EXCLUDED.effect_id, bound_at=EXCLUDED.bound_at, body=EXCLUDED.body",
         )
         .bind(kind)
         .bind(namespace)
         .bind(value)
+        .bind(reference.role.as_str())
         .bind(reference.tenant_id.as_str())
         .bind(reference.call_id.as_uuid())
         .bind(reference.leg_id.as_uuid())
@@ -3638,6 +3801,19 @@ macro_rules! impl_call_repository {
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move { repository.register_worker(request).await })
+                    })
+                    .await
+            }
+
+            async fn activate_worker_capabilities(
+                &self,
+                request: ActivateWorkerCapabilities,
+            ) -> Result<WorkerSnapshot, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(
+                            async move { repository.activate_worker_capabilities(request).await },
+                        )
                     })
                     .await
             }
@@ -3949,6 +4125,32 @@ macro_rules! impl_call_service_repository {
                 <Self as CallRepository>::consume_attachment(self, request).await
             }
 
+            async fn load_attachment_binding(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                leg_id: LegId,
+                binding_generation: BindingGeneration,
+                purpose: AttachmentPurpose,
+            ) -> Result<Option<ConnectionBinding>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_attachment_binding(
+                                    &tenant_id,
+                                    call_id,
+                                    leg_id,
+                                    binding_generation,
+                                    purpose,
+                                )
+                                .await
+                        })
+                    })
+                    .await
+            }
+
             async fn commit_bound_connection_state(
                 &self,
                 request: BoundConnectionStateCommit,
@@ -3992,6 +4194,34 @@ macro_rules! impl_call_service_repository {
                     .await
             }
 
+            async fn load_service_command_replay(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                key_digest: crate::call_engine::IdempotencyKeyDigest,
+                request_digest: crate::call_engine::RequestDigest,
+                operation: ServiceOperationKind,
+                at: DateTime<Utc>,
+            ) -> Result<Option<ServiceCommandView>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_service_command_replay(
+                                    &tenant_id,
+                                    call_id,
+                                    key_digest,
+                                    request_digest,
+                                    operation,
+                                    at,
+                                )
+                                .await
+                        })
+                    })
+                    .await
+            }
+
             async fn create_with_plan(
                 &self,
                 request: ServiceCreateTransaction,
@@ -4027,6 +4257,21 @@ macro_rules! impl_call_service_repository {
                         Box::pin(
                             async move { repository.commit_with_effect_payloads(request).await },
                         )
+                    })
+                    .await
+            }
+
+            async fn commit_leg_replacement_with_worker_guard(
+                &self,
+                request: ServiceCommandTransaction,
+            ) -> Result<ServiceCommandOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .commit_leg_replacement_with_worker_guard(request)
+                                .await
+                        })
                     })
                     .await
             }
@@ -4086,6 +4331,54 @@ macro_rules! impl_call_service_repository {
                     .await
             }
 
+            async fn record_initial_context(
+                &self,
+                request: InitialContextRecordRequest,
+            ) -> Result<InitialContextRecordOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move { repository.record_initial_context(request).await })
+                    })
+                    .await
+            }
+
+            async fn load_initial_context(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                target_leg_id: LegId,
+                target_binding_generation: crate::call_engine::BindingGeneration,
+            ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_initial_context(
+                                    &tenant_id,
+                                    call_id,
+                                    target_leg_id,
+                                    target_binding_generation,
+                                )
+                                .await
+                        })
+                    })
+                    .await
+            }
+
+            async fn load_replacement_initial_context(
+                &self,
+                lookup: crate::call_service::ReplacementInitialContextLookup,
+            ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository.load_replacement_initial_context(lookup).await
+                        })
+                    })
+                    .await
+            }
+
             async fn load_external_reference(
                 &self,
                 tenant_id: &TenantId,
@@ -4098,6 +4391,51 @@ macro_rules! impl_call_service_repository {
                         Box::pin(async move {
                             repository
                                 .load_external_reference(&tenant_id, call_id, leg_id)
+                                .await
+                        })
+                    })
+                    .await
+            }
+
+            async fn load_external_reference_by_role(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                leg_id: LegId,
+                role: ProviderReferenceRole,
+            ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_external_reference_by_role(&tenant_id, call_id, leg_id, role)
+                                .await
+                        })
+                    })
+                    .await
+            }
+
+            async fn load_external_reference_for_binding(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                leg_id: LegId,
+                binding_generation: crate::call_engine::BindingGeneration,
+                role: ProviderReferenceRole,
+            ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_external_reference_for_binding(
+                                    &tenant_id,
+                                    call_id,
+                                    leg_id,
+                                    binding_generation,
+                                    role,
+                                )
                                 .await
                         })
                     })

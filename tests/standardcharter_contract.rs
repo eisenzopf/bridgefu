@@ -9,6 +9,12 @@
 
 #[path = "../src/config.rs"]
 mod config;
+mod handoff_status {
+    pub use bridgefu::handoff_status::HANDOFF_STATUS_LABEL;
+}
+mod private_egress {
+    pub use bridgefu::private_egress::is_private_egress_label;
+}
 #[path = "../src/context.rs"]
 mod context;
 #[path = "../src/imds.rs"]
@@ -16,6 +22,7 @@ mod imds;
 #[path = "../src/providers.rs"]
 mod providers;
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -352,6 +359,22 @@ fn available_udp_port() -> u16 {
         .port()
 }
 
+fn run_on_two_mib_worker_stack<F>(scenario: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("two MiB StandardCharter regression runtime");
+    let task = runtime.spawn(scenario);
+    runtime
+        .block_on(task)
+        .expect("StandardCharter scenario completed on a two MiB worker stack");
+}
+
 fn render_invite(server_port: u16, client_port: u16, media_port: u16) -> Vec<u8> {
     let normalized = VAPI_INVITE.replace("\r\n", "\n");
     let (headers, body) = normalized
@@ -497,7 +520,7 @@ async fn establish_call() -> EstablishedCall {
         session: Arc::clone(&session),
     });
     let server_config = cfg
-        .into_server_config_with_starter(starter)
+        .build_server_config_with_starter(starter)
         .await
         .expect("Bridgefu builds without AWS or IMDS");
     let server = ConnectScreenPopServer::build_with_media_connector(server_config, connector)
@@ -792,30 +815,38 @@ fn assert_stop_request(request: &StopContactRequest) {
     assert_eq!(request.contact_id, CONTACT_ID);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn vapi_to_connect_contract_bridges_media_and_vapi_teardown() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rvoip_amazon_connect=debug,rvoip_sip=info")
-        .with_test_writer()
-        .try_init();
-    let mut call = establish_call().await;
+#[test]
+fn vapi_to_connect_contract_bridges_media_and_vapi_teardown() {
+    run_on_two_mib_worker_stack(async move {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("rvoip_amazon_connect=debug,rvoip_sip=info")
+            .with_test_writer()
+            .try_init();
+        let mut call = establish_call().await;
 
-    assert_pcmu_opus_round_trip(&mut call).await;
-    send_vapi_bye(&call).await;
-    assert_stop_request(&call.wait_for_stop().await);
-    call.session.wait_closed().await;
-    call.wait_for_terminal_lifecycle().await;
-    call.finish().await;
+        assert_pcmu_opus_round_trip(&mut call).await;
+        send_vapi_bye(&call).await;
+        assert_stop_request(&call.wait_for_stop().await);
+        call.session.wait_closed().await;
+        call.wait_for_terminal_lifecycle().await;
+        call.finish().await;
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connect_teardown_sends_vapi_bye_and_stops_contact_once() {
-    let mut call = establish_call().await;
+#[test]
+fn connect_teardown_sends_vapi_bye_and_stops_contact_once() {
+    run_on_two_mib_worker_stack(async move {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("rvoip_amazon_connect=debug,rvoip_sip=debug")
+            .with_test_writer()
+            .try_init();
+        let mut call = establish_call().await;
 
-    call.session.end_remotely();
-    receive_server_bye_and_respond(&call).await;
-    assert_stop_request(&call.wait_for_stop().await);
-    call.session.wait_closed().await;
-    call.wait_for_terminal_lifecycle().await;
-    call.finish().await;
+        call.session.end_remotely();
+        receive_server_bye_and_respond(&call).await;
+        assert_stop_request(&call.wait_for_stop().await);
+        call.session.wait_closed().await;
+        call.wait_for_terminal_lifecycle().await;
+        call.finish().await;
+    });
 }

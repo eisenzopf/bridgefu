@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rvoip_core::ids::ConnectionId;
+use rvoip_core::ids::{ConnectionId, MessageId};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::call_engine::{
@@ -13,7 +13,8 @@ use crate::call_engine::{
     CommandCommitView, CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId,
     FailureDetails, IdempotencyKeyDigest, LegId, LegState, OutboxRecord, OutboxState,
     PrincipalFingerprint, ProviderAccountKey, ProviderEventDigest, ProviderEventEnvelope,
-    ProviderEventTarget, RepositoryError, RequestDigest, StoredCall, TenantId, WorkerLease,
+    ProviderEventTarget, ProviderReferenceRole, RepositoryError, RequestDigest, StoredCall,
+    TenantId, WorkerLease,
 };
 
 use super::{CallExecutionPlan, ControlIntent, ExternalReferenceValue, ServiceEffectPayload};
@@ -101,6 +102,9 @@ impl OperationIdempotency {
             ) | (
                 ServiceOperationKind::TransferCall,
                 CallCommand::BeginTransfer { .. }
+            ) | (
+                ServiceOperationKind::TransferCall,
+                CallCommand::BeginLegReplacement { .. }
             )
         );
         if valid {
@@ -156,6 +160,28 @@ pub struct BoundConnectionGuard {
     pub leg_id: LegId,
     /// Exact signaling/media incarnation.
     pub binding_generation: BindingGeneration,
+}
+
+/// Atomic promotion of an actor-owned pending route when a logical-leg
+/// replacement reports connected. The old route remains process-owned long
+/// enough for the emitted `StopLeg` effect, while durable ownership changes
+/// exactly with the aggregate binding generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplacementConnectionPromotion {
+    /// Exact old connection still current before the commit.
+    pub previous_connection_id: ConnectionId,
+    /// Prepared replacement connection becoming current.
+    pub connection_id: ConnectionId,
+    /// Stable logical leg.
+    pub leg_id: LegId,
+    /// Old aggregate binding generation.
+    pub previous_binding_generation: BindingGeneration,
+    /// Reserved pending generation.
+    pub pending_binding_generation: BindingGeneration,
+    /// Actual replacement transport class.
+    pub transport: AttachmentTransport,
+    /// Principal that authorized the server-controlled replacement route.
+    pub principal_fingerprint: PrincipalFingerprint,
 }
 
 /// Monotonic media-activity observation for one exact connection binding.
@@ -238,6 +264,10 @@ pub struct ServiceCommandTransaction {
     /// Optional exact activity proof for a media-idle deadline refresh.
     #[serde(default)]
     pub media_activity: Option<MediaActivityGuard>,
+    /// Optional atomic current-binding promotion for
+    /// `FinishLegReplacement(Connected)`.
+    #[serde(default)]
+    pub replacement_connection: Option<ReplacementConnectionPromotion>,
 }
 
 /// Fenced lifecycle transition for one exact durably bound connection.
@@ -513,6 +543,10 @@ pub struct ClaimedControlEffect {
 pub struct OutboundConnectionBind {
     /// Operation replay identifier.
     pub operation_id: CommandId,
+    /// Exact claimed `StartLeg` effect authorizing the provisional route.
+    pub effect_id: EffectId,
+    /// Exact incarnation of that effect claim.
+    pub claim_generation: ClaimGeneration,
     /// Authenticated tenant ownership.
     pub tenant_id: TenantId,
     /// Owning call.
@@ -542,6 +576,152 @@ pub enum OutboundConnectionBindOutcome {
     Replayed(ConnectionBinding),
 }
 
+/// Atomic request to retain the first validated context message for one exact
+/// outbound signaling leg incarnation.
+///
+/// Envelope bytes and header values may contain customer context. They are
+/// persisted for signaling, but deliberately omitted from [`Debug`].
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitialContextRecordRequest {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Owning two-leg call.
+    pub call_id: CallId,
+    /// Exact current rvoip route that delivered the context message.
+    pub source_connection_id: ConnectionId,
+    /// Logical source leg bound to `source_connection_id`.
+    pub source_leg_id: LegId,
+    /// Current source signaling/media incarnation.
+    pub source_binding_generation: BindingGeneration,
+    /// Distinct destination leg that will receive the initial signaling context.
+    pub target_leg_id: LegId,
+    /// Current target signaling/media incarnation.
+    pub target_binding_generation: BindingGeneration,
+    /// Stable transport-neutral DataMessage identity.
+    pub message_id: MessageId,
+    /// Validated serialized `bridgefu.context.v1` envelope.
+    pub envelope: Vec<u8>,
+    /// Validated, ordered, duplicate-preserving initial SIP headers. This is
+    /// empty for Amazon Connect attribute projection.
+    pub initial_sip_headers: Vec<(String, String)>,
+    /// Repository observation and persistence time.
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for InitialContextRecordRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialContextRecordRequest")
+            .field("tenant_id", &self.tenant_id)
+            .field("call_id", &self.call_id)
+            .field("source_connection_id", &self.source_connection_id)
+            .field("source_leg_id", &self.source_leg_id)
+            .field("source_binding_generation", &self.source_binding_generation)
+            .field("target_leg_id", &self.target_leg_id)
+            .field("target_binding_generation", &self.target_binding_generation)
+            .field("message_id_present", &!self.message_id.as_str().is_empty())
+            .field("envelope_bytes", &self.envelope.len())
+            .field("initial_sip_header_count", &self.initial_sip_headers.len())
+            .field("recorded_at", &self.recorded_at)
+            .finish()
+    }
+}
+
+/// Immutable context retained for one exact target leg generation.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredInitialContext {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Owning call.
+    pub call_id: CallId,
+    /// Exact source rvoip route at admission time.
+    pub source_connection_id: ConnectionId,
+    /// Source logical leg.
+    pub source_leg_id: LegId,
+    /// Source leg incarnation at admission time.
+    pub source_binding_generation: BindingGeneration,
+    /// Destination signaling leg.
+    pub target_leg_id: LegId,
+    /// Destination leg incarnation.
+    pub target_binding_generation: BindingGeneration,
+    /// Original DataMessage identity.
+    pub message_id: MessageId,
+    /// Serialized, validated `bridgefu.context.v1` envelope.
+    pub envelope: Vec<u8>,
+    /// Ordered initial SIP headers. Values are sensitive and must not be logged;
+    /// Amazon Connect context records retain an empty projection here.
+    pub initial_sip_headers: Vec<(String, String)>,
+    /// Persistence time.
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for StoredInitialContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredInitialContext")
+            .field("tenant_id", &self.tenant_id)
+            .field("call_id", &self.call_id)
+            .field("source_connection_id", &self.source_connection_id)
+            .field("source_leg_id", &self.source_leg_id)
+            .field("source_binding_generation", &self.source_binding_generation)
+            .field("target_leg_id", &self.target_leg_id)
+            .field("target_binding_generation", &self.target_binding_generation)
+            .field("message_id_present", &!self.message_id.as_str().is_empty())
+            .field("envelope_bytes", &self.envelope.len())
+            .field("initial_sip_header_count", &self.initial_sip_headers.len())
+            .field("recorded_at", &self.recorded_at)
+            .finish()
+    }
+}
+
+impl From<InitialContextRecordRequest> for StoredInitialContext {
+    fn from(request: InitialContextRecordRequest) -> Self {
+        Self {
+            tenant_id: request.tenant_id,
+            call_id: request.call_id,
+            source_connection_id: request.source_connection_id,
+            source_leg_id: request.source_leg_id,
+            source_binding_generation: request.source_binding_generation,
+            target_leg_id: request.target_leg_id,
+            target_binding_generation: request.target_binding_generation,
+            message_id: request.message_id,
+            envelope: request.envelope,
+            initial_sip_headers: request.initial_sip_headers,
+            recorded_at: request.recorded_at,
+        }
+    }
+}
+
+/// First durable context admission or an exact lost-response replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitialContextRecordOutcome {
+    /// Context was retained in this transaction.
+    Recorded(StoredInitialContext),
+    /// The byte-for-byte identical request returned the retained record.
+    Replayed(StoredInitialContext),
+}
+
+/// Exact make-before-break fence for reusing a source-admitted initial
+/// context with a pending destination generation.
+///
+/// The retained context row remains immutable at its original target
+/// generation. Repositories use this lookup to prove that the requested
+/// replacement is still active and that the original source connection still
+/// owns its leg before releasing the envelope to a replacement adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplacementInitialContextLookup {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Owning two-leg call.
+    pub call_id: CallId,
+    /// Stable logical destination leg being replaced.
+    pub target_leg_id: LegId,
+    /// Held destination generation that remains current until promotion.
+    pub previous_binding_generation: BindingGeneration,
+    /// Exact pending destination generation authorized to consume the context.
+    pub pending_binding_generation: BindingGeneration,
+}
+
 /// External reference attached to a successful leg effect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExternalReferenceBinding {
@@ -549,6 +729,9 @@ pub struct ExternalReferenceBinding {
     pub leg_id: LegId,
     /// Exact effect binding generation.
     pub binding_generation: BindingGeneration,
+    /// Role occupied by this reference within a provider-controlled leg.
+    #[serde(default)]
+    pub role: ProviderReferenceRole,
     /// Provider or signaling reference.
     pub value: ExternalReferenceValue,
 }
@@ -564,6 +747,9 @@ pub struct StoredExternalReference {
     pub leg_id: LegId,
     /// Binding generation that created the reference.
     pub binding_generation: BindingGeneration,
+    /// Role occupied by this reference within a provider-controlled leg.
+    #[serde(default)]
+    pub role: ProviderReferenceRole,
     /// Effect that returned the reference.
     pub effect_id: EffectId,
     /// Redacted external value.
@@ -599,6 +785,14 @@ pub struct EffectResultReconciliation {
     pub result: ServiceEffectResult,
     /// Optional reference returned by a successful start-leg operation.
     pub external_reference: Option<ExternalReferenceBinding>,
+    /// Additional references returned by one compound provider operation.
+    ///
+    /// Telnyx leg replacement starts the Bridgefu-facing media call and the
+    /// linked destination call under one durable effect. Both identifiers are
+    /// therefore committed with the promotion rather than leaving the
+    /// destination callback unowned after a crash.
+    #[serde(default)]
+    pub additional_external_references: Vec<ExternalReferenceBinding>,
     /// Optional state-machine follow-up committed in the same transaction.
     pub follow_up: Option<ServiceCommandTransaction>,
     /// Reconciliation time.
@@ -622,6 +816,9 @@ pub struct EffectResultView {
     pub effect: CompletedServiceEffect,
     /// Stored external reference when one was supplied.
     pub external_reference: Option<StoredExternalReference>,
+    /// Additional stored references supplied by a compound provider effect.
+    #[serde(default)]
+    pub additional_external_references: Vec<StoredExternalReference>,
     /// Provider callbacks released by binding a provider call reference.
     pub released_provider_events: Vec<ProviderEventEnvelope>,
     /// Optional state-machine result committed atomically.
@@ -707,6 +904,22 @@ pub trait CallServiceRepository: Send + Sync {
         request: AttachmentConsume,
     ) -> Result<ConsumedAttachment, RepositoryError>;
 
+    /// Loads the authenticated connection retained by one exact consumed
+    /// attachment generation. Pending provider replacements use this without
+    /// disturbing the logical leg's still-current binding.
+    async fn load_attachment_binding(
+        &self,
+        _tenant_id: &TenantId,
+        _call_id: CallId,
+        _leg_id: LegId,
+        _binding_generation: BindingGeneration,
+        _purpose: crate::call_engine::AttachmentPurpose,
+    ) -> Result<Option<ConnectionBinding>, RepositoryError> {
+        Err(RepositoryError::InvalidInput(
+            "attachment binding lookup is unsupported",
+        ))
+    }
+
     /// Atomically validates one exact connection binding and commits its
     /// lifecycle observation.
     async fn commit_bound_connection_state(
@@ -735,6 +948,23 @@ pub trait CallServiceRepository: Send + Sync {
         at: DateTime<Utc>,
     ) -> Result<Option<StoredServiceCall>, RepositoryError>;
 
+    /// Returns an unexpired exact state-changing operation receipt before
+    /// endpoint capability validation or current-state evaluation.
+    ///
+    /// This preserves the original result when a provider or transport is
+    /// disabled after an operation committed. A retained tenant/key with a
+    /// different request, call, or operation kind returns
+    /// [`RepositoryError::IdempotencyConflict`].
+    async fn load_service_command_replay(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        key_digest: IdempotencyKeyDigest,
+        request_digest: RequestDigest,
+        operation: ServiceOperationKind,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ServiceCommandView>, RepositoryError>;
+
     /// Creates the core call and immutable execution plan atomically.
     async fn create_with_plan(
         &self,
@@ -750,6 +980,15 @@ pub trait CallServiceRepository: Send + Sync {
 
     /// Commits a core command and service effect payloads atomically.
     async fn commit_with_effect_payloads(
+        &self,
+        request: ServiceCommandTransaction,
+    ) -> Result<ServiceCommandOutcome, RepositoryError>;
+
+    /// Commits `BeginLegReplacement` only after atomically revalidating the
+    /// exact unreleased call assignment and its live, non-draining worker
+    /// capability. An exact retained idempotency receipt is replayed before
+    /// current worker health is considered.
+    async fn commit_leg_replacement_with_worker_guard(
         &self,
         request: ServiceCommandTransaction,
     ) -> Result<ServiceCommandOutcome, RepositoryError>;
@@ -782,6 +1021,46 @@ pub trait CallServiceRepository: Send + Sync {
         request: OutboundConnectionBind,
     ) -> Result<OutboundConnectionBindOutcome, RepositoryError>;
 
+    /// Atomically validates both current leg generations and the exact current
+    /// source connection before retaining one initial context for the target.
+    async fn record_initial_context(
+        &self,
+        _request: InitialContextRecordRequest,
+    ) -> Result<InitialContextRecordOutcome, RepositoryError> {
+        Err(RepositoryError::InvalidInput(
+            "initial context persistence is unsupported",
+        ))
+    }
+
+    /// Loads context for one exact current target leg generation.
+    async fn load_initial_context(
+        &self,
+        _tenant_id: &TenantId,
+        _call_id: CallId,
+        _target_leg_id: LegId,
+        _target_binding_generation: BindingGeneration,
+    ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+        Err(RepositoryError::InvalidInput(
+            "initial context persistence is unsupported",
+        ))
+    }
+
+    /// Loads the immutable source-admitted context only while the exact
+    /// make-before-break replacement remains active and its source connection
+    /// is still current.
+    ///
+    /// Implementations must not copy or retarget the stored row. The pending
+    /// adapter re-projects the validated envelope into its own initial-only
+    /// signaling contract.
+    async fn load_replacement_initial_context(
+        &self,
+        _lookup: ReplacementInitialContextLookup,
+    ) -> Result<Option<StoredInitialContext>, RepositoryError> {
+        Err(RepositoryError::InvalidInput(
+            "replacement initial context persistence is unsupported",
+        ))
+    }
+
     /// Loads the current external reference for a tenant-owned leg.
     async fn load_external_reference(
         &self,
@@ -789,6 +1068,46 @@ pub trait CallServiceRepository: Send + Sync {
         call_id: CallId,
         leg_id: LegId,
     ) -> Result<Option<StoredExternalReference>, RepositoryError>;
+
+    /// Loads one exact role for a tenant-owned provider leg. Implementations
+    /// predating role-aware references remain compatible for the primary
+    /// media role and fail closed for additional roles.
+    async fn load_external_reference_by_role(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        leg_id: LegId,
+        role: ProviderReferenceRole,
+    ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+        if role == ProviderReferenceRole::Media {
+            self.load_external_reference(tenant_id, call_id, leg_id)
+                .await
+        } else {
+            Err(RepositoryError::InvalidInput(
+                "role-aware external references are unsupported",
+            ))
+        }
+    }
+
+    /// Loads one exact external reference incarnation.
+    ///
+    /// Unlike [`Self::load_external_reference_by_role`], this remains usable
+    /// after a logical leg has advanced to a newer binding generation. That
+    /// distinction is required to deterministically retire the held route
+    /// after a make-before-break replacement.
+    async fn load_external_reference_for_binding(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        leg_id: LegId,
+        binding_generation: BindingGeneration,
+        role: ProviderReferenceRole,
+    ) -> Result<Option<StoredExternalReference>, RepositoryError> {
+        Ok(self
+            .load_external_reference_by_role(tenant_id, call_id, leg_id, role)
+            .await?
+            .filter(|reference| reference.binding_generation == binding_generation))
+    }
 
     /// Atomically reconciles a claimed effect and all related durable state.
     async fn reconcile_effect_result(

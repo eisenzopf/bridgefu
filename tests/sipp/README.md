@@ -42,7 +42,7 @@ sipp -sf bridgefu_unknown_tenant.xml 127.0.0.1:5060 -s ghost -m 1
 
 Then check:
 
-- `curl -s localhost:9090/healthz` → `{"ok":true,"tenants":["banking","retail"]}`
+- `curl -s localhost:9090/healthz` → `{"ok":true,"tenant_count":2,...}`
 - `curl -s localhost:9090/metrics | grep bridgefu` → per-tenant labels:
   `bridgefu_calls_routed_total{tenant="banking"}`,
   `bridgefu_unknown_tenant_total`, plus `bridgefu_active_sessions` /

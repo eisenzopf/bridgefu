@@ -35,6 +35,9 @@ const FINGERPRINT_DOMAIN: &[u8] = b"bridgefu.principal-fingerprint.v1\0";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallScope {
     Create,
+    /// Advanced authority to supply endpoint addresses instead of selecting a
+    /// server-owned named route.
+    ArbitraryDestination,
     Read,
     Hangup,
     Transfer,
@@ -48,6 +51,7 @@ impl CallScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Create => "calls:create",
+            Self::ArbitraryDestination => "calls:destinations:arbitrary",
             Self::Read => "calls:read",
             Self::Hangup => "calls:hangup",
             Self::Transfer => "calls:transfer",
@@ -155,7 +159,10 @@ impl ApiPrincipal {
         if self.inner.is_expired_at(now) {
             return Err(ApiPrincipalError::ExpiredCredential);
         }
-        let authorized = if scope == CallScope::TenantOverride {
+        let authorized = if matches!(
+            scope,
+            CallScope::TenantOverride | CallScope::ArbitraryDestination
+        ) {
             self.has_literal_scope(scope)
         } else {
             self.inner.has_scope(scope.as_str())
@@ -395,6 +402,7 @@ impl ConfiguredApiKeyValidator {
                 tenant: Some(tenant),
                 scopes: vec![
                     CallScope::Create.as_str().into(),
+                    CallScope::ArbitraryDestination.as_str().into(),
                     CallScope::Read.as_str().into(),
                     CallScope::Hangup.as_str().into(),
                     CallScope::Transfer.as_str().into(),
@@ -673,6 +681,12 @@ mod tests {
             wildcard.authorize(scope, now()).unwrap();
         }
         assert_eq!(
+            wildcard.authorize(CallScope::ArbitraryDestination, now()),
+            Err(ApiPrincipalError::MissingScope(
+                "calls:destinations:arbitrary"
+            ))
+        );
+        assert_eq!(
             wildcard.authorize(CallScope::TenantOverride, now()),
             Err(ApiPrincipalError::MissingScope("calls:tenant-override"))
         );
@@ -811,6 +825,7 @@ mod tests {
             .unwrap();
         for scope in [
             CallScope::Create,
+            CallScope::ArbitraryDestination,
             CallScope::Read,
             CallScope::Hangup,
             CallScope::Transfer,

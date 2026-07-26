@@ -1,55 +1,95 @@
-# bridgefu — multi-stage build.
+# syntax=docker/dockerfile:1.7
+# Canonical Bridgefu image. The named `rvoip` build context must be the exact
+# reviewed checkout that matches Cargo.lock:
 #
-# The build CONTEXT is the bridgefu repo root; the Dockerfile lives at
-# deploy/Dockerfile. Build from the repo root with:
+#   docker build --build-context rvoip=../rvoip -f deploy/Dockerfile .
 #
-#     docker build -t bridgefu:latest -f deploy/Dockerfile .
-#
-# bridgefu depends on rvoip-amazon-connect from crates.io (Cargo.toml pins
-# `rvoip-amazon-connect = "0.1.2"`, which pulls rvoip-webrtc 0.1.2 + the 0.2.4
-# beta train). Cargo fetches the whole tree from the registry, so there is no
-# rvoip checkout to copy or clone — just this repo.
+# Both base references are multi-platform manifest-list digests. Updating one
+# is an intentional supply-chain change and must be accompanied by a CI build
+# for linux/amd64 and linux/arm64.
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG BUILDER_DEBIAN_SNAPSHOT=20260518T000000Z
+ARG RUNTIME_DEBIAN_SNAPSHOT=20260713T000000Z
 
-# ---- builder ----------------------------------------------------------------
-# NOTE: the resolved dependency tree's rustc floor is set by the AWS SDK crates
-# (aws-smithy-*, aws-types) in our Cargo.lock, which require rustc >= 1.91.1.
-# Pin to 1.95 (matches the dev host). bookworm → glibc, matched by the
-# debian-slim runtime stage.
-FROM rust:1.95-bookworm AS builder
+# A named build context overrides a same-named stage. Without
+# `--build-context rvoip=...`, this local sentinel stage is used so Docker never
+# interprets `rvoip` as a floating registry image.
+FROM scratch AS rvoip
+COPY deploy/missing-rvoip-context /.bridgefu-missing-rvoip-build-context
 
-# Build deps the rvoip dependency tree needs (compiled from crates.io source):
-#  - protobuf-compiler: rvoip-amazon-connect build.rs (prost-build) needs protoc
-#  - cmake + clang + libclang-dev: media-core `opus` feature builds libopus
-#    (audiopus_sys) via cmake and generates bindings with bindgen/libclang
-#  - build-essential + pkg-config: C toolchain for ring/AWS SDK/etc.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        protobuf-compiler \
-        cmake \
-        clang \
-        libclang-dev \
-        build-essential \
-        pkg-config \
+FROM ${RUST_IMAGE} AS builder
+
+ARG BUILDER_DEBIAN_SNAPSHOT
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
+RUN sed -i \
+        -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${BUILDER_DEBIAN_SNAPSHOT}|" \
+        -e "s|URIs: http://deb.debian.org/debian|URIs: http://snapshot.debian.org/archive/debian/${BUILDER_DEBIAN_SNAPSHOT}|" \
+        /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
+        > /etc/apt/apt.conf.d/99snapshot \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential=12.9 \
+        clang=1:14.0-55.7~deb12u1 \
+        cmake=3.25.1-1 \
+        libclang-dev=1:14.0-55.7~deb12u1 \
+        pkg-config=1.8.1-1 \
+        protobuf-compiler=3.21.12-3 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src/bridgefu
-# Copy the repo. `.dockerignore` keeps target/, .git/, and logs out.
+COPY --from=rvoip . /src/rvoip
 COPY . /src/bridgefu
-# Release build uses bridgefu's own [profile.release] (thin LTO, opt-level 2),
-# which governs the whole dependency tree.
-RUN cargo build --release \
-    && cp target/release/bridgefu /usr/local/bin/bridgefu \
-    && strip /usr/local/bin/bridgefu
+WORKDIR /src/bridgefu
 
-# ---- runtime ----------------------------------------------------------------
-# Slim glibc base; ca-certificates for rustls/webpki (Chime WSS + AWS SDK TLS).
-FROM debian:bookworm-slim AS runtime
+RUN if test -e /src/rvoip/.bridgefu-missing-rvoip-build-context; then \
+        echo 'missing required --build-context rvoip=/exact/reviewed/checkout' >&2; \
+        exit 64; \
+    fi \
+    && cargo build --locked --release \
+    && install -D -m 0755 target/release/bridgefu /out/bridgefu \
+    && strip /out/bridgefu
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM ${RUNTIME_IMAGE} AS runtime
 
-COPY --from=builder /usr/local/bin/bridgefu /usr/local/bin/bridgefu
+ARG RUNTIME_DEBIAN_SNAPSHOT
+ARG VCS_REF=unknown
+ARG RVOIP_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="Bridgefu" \
+      org.opencontainers.image.description="Programmable SIP, WebRTC, and QUIC audio bridge" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.rvoip.revision="${RVOIP_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
-# Config is bind-mounted at /etc/bridgefu by the systemd unit / `docker run`.
+RUN sed -i \
+        -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${RUNTIME_DEBIAN_SNAPSHOT}|" \
+        -e "s|URIs: http://deb.debian.org/debian|URIs: http://snapshot.debian.org/archive/debian/${RUNTIME_DEBIAN_SNAPSHOT}|" \
+        /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
+        > /etc/apt/apt.conf.d/99snapshot \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates=20230311+deb12u1 \
+        curl=7.88.1-10+deb12u15 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 65532 bridgefu \
+    && useradd --system --uid 65532 --gid 65532 \
+        --home-dir /nonexistent --shell /usr/sbin/nologin bridgefu \
+    && install -d -o 65532 -g 65532 -m 0750 /var/lib/bridgefu
+
+COPY --from=builder /out/bridgefu /usr/local/bin/bridgefu
+
+USER 65532:65532
+EXPOSE 5060/tcp 5060/udp 5070/tcp 5070/udp \
+       8080/tcp 8081/tcp 9080/tcp 9090/tcp 40000/udp \
+       16384-32767/udp 4433/udp 4443/udp 4444/udp 4445/udp
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["curl", "--fail", "--silent", "http://127.0.0.1:9090/livez"]
+
 ENTRYPOINT ["/usr/local/bin/bridgefu"]
 CMD ["--config", "/etc/bridgefu/bridgefu.yaml"]
