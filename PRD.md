@@ -1,4 +1,4 @@
-# bridgefu — Product Requirements (v0.1, POC)
+# BridgeFu — Product Requirements (1.0)
 
 ## 1. Problem & goal
 
@@ -141,9 +141,10 @@ parse YAML → build `ScreenPopServerConfig` (`SipConfig` + `ConnectConfig` +
 `AttributeMapping` + `AwsConnectStarter`) → `serve()` under a shutdown guard,
 alongside an axum health/metrics server.
 
-- Local dev: depends on `rvoip-amazon-connect` by **path** (`../rvoip`).
-- Production/Docker: depends on the **published `rvoip-amazon-connect = 0.1.1`**
-  from crates.io (the Docker build pins the registry version).
+- Local development and production use the coordinated crates.io rvoip
+  component release at exact version `=0.3.5`, including
+  `rvoip-amazon-connect`. The committed `Cargo.lock` supplies the registry
+  checksums and complete transitive dependency graph.
 
 ## 8. Deployment
 

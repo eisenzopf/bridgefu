@@ -1,0 +1,22 @@
+services:
+  observer:
+    build:
+      context: ../..
+      dockerfile: deploy/vapi-feasibility/Dockerfile
+    environment:
+      VAPI_FIXTURE_MODE: local
+      VAPI_FIXTURE_HTTP_BIND: 0.0.0.0:9088
+      VAPI_FIXTURE_SIP_BIND: 0.0.0.0:5060
+      VAPI_FIXTURE_PUBLIC_SIP_URI: sip:echo@127.0.0.1:5060
+      VAPI_FIXTURE_OBSERVATION_TOKEN: local-observation-token-change-me-000000
+      VAPI_FIXTURE_WEBHOOK_TOKEN: local-webhook-token-change-me-000000000
+      VAPI_FIXTURE_MEDIA_PORT_START: "30000"
+      VAPI_FIXTURE_MEDIA_PORT_END: "30031"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - 127.0.0.1:9088:9088/tcp
+      - 127.0.0.1:5060:5060/udp
+      - 127.0.0.1:30000-30031:30000-30031/udp
+    restart: "no"

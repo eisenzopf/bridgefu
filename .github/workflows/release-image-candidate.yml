@@ -1,0 +1,135 @@
+name: release image candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      bridgefu_revision:
+        description: Exact 40-character Bridgefu commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridgefu-release-image-candidate
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    # Configure required reviewers on this environment before treating a run
+    # as owner-authorized release evidence. The job has no registry permission
+    # and cannot publish an image.
+    environment: bridgefu-release-image-candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.bridgefu_revision }}
+          path: bridgefu
+          persist-credentials: false
+      - name: Prove exact clean source revision
+        env:
+          BRIDGEFU_REVISION: ${{ inputs.bridgefu_revision }}
+        run: |
+          [[ "$BRIDGEFU_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C bridgefu rev-parse HEAD)" = "$BRIDGEFU_REVISION"
+          git -C bridgefu diff --quiet
+          git -C bridgefu diff --cached --quiet
+          printf 'BUILD_DATE=%s\n' "$(git -C bridgefu show -s --format=%cI)" >> "$GITHUB_ENV"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$(git -C bridgefu show -s --format=%ct)" >> "$GITHUB_ENV"
+      - name: Enforce locked crates.io rvoip release policy
+        working-directory: bridgefu
+        run: bash deploy/scripts/check-release-image.sh
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - id: build
+        name: Build one non-published multi-platform OCI candidate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: bridgefu
+          file: bridgefu/deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: bridgefu:candidate-${{ inputs.bridgefu_revision }}
+          outputs: type=oci,dest=${{ runner.temp }}/bridgefu-multiarch.oci.tar
+          push: false
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VCS_REF=${{ inputs.bridgefu_revision }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+      - name: Verify the root digest, exact platforms, SBOM, and provenance
+        working-directory: bridgefu
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BRIDGEFU_REVISION: ${{ inputs.bridgefu_revision }}
+        run: |
+          python3 deploy/scripts/verify-multiarch-oci.py \
+            --archive "${{ runner.temp }}/bridgefu-multiarch.oci.tar" \
+            --expected-digest "$IMAGE_DIGEST" \
+            --source-revision "bridgefu=$BRIDGEFU_REVISION" \
+            --output "${{ runner.temp }}/bridgefu-multiarch.json"
+      - name: Open and select exact-platform OCI layouts for scanning
+        working-directory: bridgefu
+        run: |
+          mkdir -p "${{ runner.temp }}/bridgefu-oci-layout"
+          tar -xf "${{ runner.temp }}/bridgefu-multiarch.oci.tar" \
+            -C "${{ runner.temp }}/bridgefu-oci-layout"
+          python3 deploy/scripts/select-oci-platform.py \
+            --layout "${{ runner.temp }}/bridgefu-oci-layout" \
+            --platform linux/amd64 \
+            --output "${{ runner.temp }}/bridgefu-oci-amd64"
+          python3 deploy/scripts/select-oci-platform.py \
+            --layout "${{ runner.temp }}/bridgefu-oci-layout" \
+            --platform linux/arm64 \
+            --output "${{ runner.temp }}/bridgefu-oci-arm64"
+      - name: Scan exact linux/amd64 candidate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          version: v0.70.0
+          input: ${{ runner.temp }}/bridgefu-oci-amd64
+          scanners: vuln
+          format: json
+          output: ${{ runner.temp }}/trivy-amd64.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+      - name: Scan exact linux/arm64 candidate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          version: v0.70.0
+          input: ${{ runner.temp }}/bridgefu-oci-arm64
+          scanners: vuln
+          format: json
+          output: ${{ runner.temp }}/trivy-arm64.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+      - name: Enforce the retained vulnerability policy
+        working-directory: bridgefu
+        run: |
+          python3 deploy/scripts/verify-trivy-policy.py \
+            --report "linux/amd64=${{ runner.temp }}/trivy-amd64.json" \
+            --report "linux/arm64=${{ runner.temp }}/trivy-arm64.json" \
+            --image-archive "${{ runner.temp }}/bridgefu-multiarch.oci.tar" \
+            --output "${{ runner.temp }}/bridgefu-vulnerability-policy.json"
+      - name: Retain the immutable, non-published release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: bridgefu-release-image-candidate-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/bridgefu-multiarch.oci.tar
+            ${{ runner.temp }}/bridgefu-multiarch.json
+            ${{ runner.temp }}/bridgefu-vulnerability-policy.json
+            ${{ runner.temp }}/trivy-amd64.json
+            ${{ runner.temp }}/trivy-arm64.json

@@ -1,26 +1,39 @@
 [Unit]
-Description=bridgefu — SIP -> Amazon Connect screen-pop gateway
-Documentation=https://github.com/eisenzopf/rvoip
+Description=Bridgefu all-in-one media gateway
+Documentation=https://github.com/eisenzopf/bridgefu
 After=docker.service network-online.target
 Requires=docker.service
 Wants=network-online.target
 
 [Service]
-# Run the container in the FOREGROUND (no -d) so systemd owns the process and
-# drives restarts — we do NOT use docker's own --restart to avoid two
-# supervisors fighting. --network host is required so SIP (5060) + RTP
-# (16384-32767) and the IMDSv2 public-ip lookup work without port mapping.
+Type=simple
+# The environment file must contain one immutable reference, for example:
+# BRIDGEFU_IMAGE=000000000000.dkr.ecr.us-west-2.amazonaws.com/bridgefu@sha256:...
+EnvironmentFile=/etc/bridgefu/image.env
+ExecStartPre=/usr/bin/test -r /etc/bridgefu/bridgefu.yaml
 ExecStartPre=-/usr/bin/docker rm -f bridgefu
 ExecStart=/usr/bin/docker run --rm --name bridgefu \
     --network host \
-    -v /etc/bridgefu:/etc/bridgefu:ro \
-    bridgefu:latest --config /etc/bridgefu/bridgefu.yaml
-ExecStop=/usr/bin/docker stop bridgefu
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+    --user 65532:65532 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --stop-timeout 30 \
+    --env-file /etc/bridgefu/runtime.env \
+    --mount type=bind,src=/etc/bridgefu/bridgefu.yaml,dst=/etc/bridgefu/bridgefu.yaml,readonly \
+    --mount type=volume,src=bridgefu-data,dst=/var/lib/bridgefu \
+    ${BRIDGEFU_IMAGE} --config /etc/bridgefu/bridgefu.yaml
+ExecStop=/usr/bin/docker stop --time 30 bridgefu
 
-Restart=always
+Restart=on-failure
 RestartSec=2
-# Give the daemon time to drain the SIP/Chime legs on SIGTERM.
-TimeoutStopSec=15
+TimeoutStopSec=45
+KillMode=process
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
 
 [Install]
 WantedBy=multi-user.target

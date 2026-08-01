@@ -1,0 +1,2866 @@
+use std::collections::{BTreeSet, HashSet};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bridgefu::call_engine::{
+    AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentPurpose,
+    AttachmentTokenDigest, AttachmentTransport, BindProviderReference, BindingGeneration,
+    CallAggregate, CallCommand, CallRepository, CommandCommit, CommandCommitOutcome, CommandId,
+    CreateCall, CreateCallOutcome, DeadlineKind, EffectIntent, IdempotencyKeyDigest, LegDirection,
+    LegKind, LegSpec, LegState, OutboxCompletion, PrincipalFingerprint, ProviderAccountKey,
+    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
+    ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderPayloadDigest,
+    ProviderReferenceRole, RegisterWorker, RepositoryError, RequestDigest, StoredCall, TenantId,
+    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerId,
+    WorkerLease, WorkerSnapshot,
+};
+use bridgefu::call_service::{
+    CallExecutionPlan, CallServiceRepository, EffectResultOutcome, EffectResultReconciliation,
+    ExternalReferenceBinding, ExternalReferenceValue, LegEndpointConfig, LegExecutionSpec,
+    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEndpointConfig,
+    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction,
+    ProviderEventReconciliationView, ProviderKind, ServiceCommandTransaction, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectResult, SipEndpointConfig, WebRtcEndpointConfig,
+};
+use bridgefu::coordination::{CoordinationPayload, DeploymentId};
+use bridgefu::persistence::{
+    MemoryRepository, PostgresRepository, SqlRetentionPolicy, SqliteRepository,
+};
+use chrono::{DateTime, TimeZone, Utc};
+use rvoip_core::ids::ConnectionId;
+use serde_json::json;
+use sqlx::Row;
+use tokio::sync::Notify;
+
+type Repository = Arc<dyn CallRepository>;
+static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn at(second: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(1_900_000_000 + second, 0).unwrap()
+}
+
+fn digest(byte: u8) -> [u8; 32] {
+    [byte; 32]
+}
+
+fn tenant(name: &str) -> TenantId {
+    TenantId::parse(name).unwrap()
+}
+
+fn principal() -> PrincipalFingerprint {
+    PrincipalFingerprint::new(digest(0xa5))
+}
+
+fn new_call(owner: TenantId) -> CallAggregate {
+    CallAggregate::new(
+        owner,
+        [
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::Sip,
+            },
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::InteractiveWebRtc,
+            },
+        ],
+        at(1),
+    )
+}
+
+fn create_request(call: CallAggregate, worker: WorkerLease, key: u8, request: u8) -> CreateCall {
+    create_request_at(call, worker, key, request, at(2))
+}
+
+fn service_create_request(
+    owner: TenantId,
+    worker: WorkerLease,
+    key: u8,
+    request: u8,
+) -> ServiceCreateTransaction {
+    let aggregate = new_call(owner);
+    let plan = CallExecutionPlan::new(
+        &aggregate,
+        [
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[0].id(),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
+            },
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[1].id(),
+                endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                    signaling_uri: Some("wss://upgrade.example.invalid/session".to_owned()),
+                }),
+            },
+        ],
+        PrincipalFingerprint::new(digest(key)),
+    )
+    .unwrap();
+    ServiceCreateTransaction {
+        create: create_request(aggregate, worker, key, request),
+        plan,
+        alternatives: Vec::new(),
+    }
+}
+
+fn provider_service_create_request(
+    owner: TenantId,
+    worker: WorkerLease,
+) -> ServiceCreateTransaction {
+    let aggregate = CallAggregate::new(
+        owner,
+        [
+            LegSpec {
+                direction: LegDirection::Outbound,
+                kind: LegKind::Telnyx,
+            },
+            LegSpec {
+                direction: LegDirection::Inbound,
+                kind: LegKind::Sip,
+            },
+        ],
+        at(20),
+    );
+    let plan = CallExecutionPlan::new(
+        &aggregate,
+        [
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[0].id(),
+                endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                    provider: ProviderKind::Telnyx,
+                    account_profile: "telnyx-schema-upgrade".to_owned(),
+                    destination: Some("+12065550123".to_owned()),
+                }),
+            },
+            LegExecutionSpec {
+                leg_id: aggregate.legs()[1].id(),
+                endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                    uri: None,
+                    initial_context: Default::default(),
+                }),
+            },
+        ],
+        principal(),
+    )
+    .unwrap();
+    ServiceCreateTransaction {
+        create: CreateCall {
+            initial: aggregate,
+            command_id: CommandId::new(),
+            command: CallCommand::StartConnecting {
+                at: at(21),
+                setup_deadline: at(51),
+            },
+            worker,
+            idempotency_key: IdempotencyKeyDigest::new(digest(0xd0)),
+            request_digest: RequestDigest::new(digest(0xd1)),
+            attachments: Vec::new(),
+            at: at(21),
+        },
+        plan,
+        alternatives: Vec::new(),
+    }
+}
+
+#[derive(Clone)]
+struct LegacyV5ProviderEvidence {
+    owner: TenantId,
+    call_id: bridgefu::call_engine::CallId,
+    provider_leg_id: bridgefu::call_engine::LegId,
+    worker: WorkerLease,
+    reconciliation: ProviderEventReconciliationTransaction,
+    reconciliation_view: ProviderEventReconciliationView,
+}
+
+async fn seed_service_provider_reconciliation<R>(repository: &R) -> LegacyV5ProviderEvidence
+where
+    R: CallRepository + CallServiceRepository + Sync,
+{
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 4,
+            capabilities: BTreeSet::from(["sip".to_owned(), "telnyx".to_owned()]),
+            at: at(0),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+    let owner = tenant("provider-schema-upgrade");
+    let call = match repository
+        .create_with_plan(provider_service_create_request(owner.clone(), worker))
+        .await
+        .unwrap()
+    {
+        ServiceCreateOutcome::Created(call) => call,
+        ServiceCreateOutcome::Replayed(_) => panic!("fresh provider fixture replayed"),
+    };
+    let call_id = call.call.aggregate.id();
+    let provider_leg_id = call.call.aggregate.legs()[0].id();
+    let account = ProviderAccountKey::parse("telnyx-schema-upgrade").unwrap();
+    let provider_call_id = ProviderCallId::parse("CA-schema-v5-upgrade").unwrap();
+    let event_digest = ProviderEventDigest::new(digest(0xd2));
+    assert!(matches!(
+        repository
+            .ingest_provider_event(ProviderEventInput {
+                account: account.clone(),
+                event_digest,
+                payload_digest: ProviderPayloadDigest::new(digest(0xd3)),
+                provider_call_id: provider_call_id.clone(),
+                kind: "ringing".to_owned(),
+                payload: json!({"state": "ringing"}),
+                occurred_at: Some(at(21)),
+                received_at: at(22),
+            })
+            .await
+            .unwrap(),
+        ProviderEventOutcome::Accepted(event)
+            if event.state == ProviderEventState::PendingReference
+    ));
+
+    let claimed_start = repository
+        .claim_outbox(worker, at(22), Duration::from_secs(20), 64)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| {
+            claimed.record.call_id == call_id
+                && matches!(
+                    claimed.record.intent,
+                    EffectIntent::StartLeg { leg_id, .. } if leg_id == provider_leg_id
+                )
+        })
+        .expect("provider start effect was not claimable");
+    let outbound = OutboundConnectionBind {
+        operation_id: CommandId::from_uuid(claimed_start.record.effect_id.as_uuid()).unwrap(),
+        effect_id: claimed_start.record.effect_id,
+        claim_generation: claimed_start.claim_generation,
+        tenant_id: owner.clone(),
+        call_id,
+        leg_id: provider_leg_id,
+        binding_generation: BindingGeneration::INITIAL,
+        worker,
+        connection_id: ConnectionId::from_string("provider-schema-v5-history"),
+        transport: AttachmentTransport::Sip,
+        principal_fingerprint: principal(),
+        at: at(22),
+    };
+    assert!(matches!(
+        repository.bind_outbound_connection(outbound).await.unwrap(),
+        OutboundConnectionBindOutcome::Bound(_)
+    ));
+
+    let EffectResultOutcome::Reconciled(effect_view) = repository
+        .reconcile_effect_result(EffectResultReconciliation {
+            tenant_id: owner.clone(),
+            call_id,
+            effect_id: claimed_start.record.effect_id,
+            worker,
+            claim_generation: claimed_start.claim_generation,
+            result: ServiceEffectResult::Succeeded,
+            external_reference: Some(ExternalReferenceBinding {
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                role: ProviderReferenceRole::Media,
+                value: ExternalReferenceValue::ProviderCall {
+                    account: account.clone(),
+                    provider_call_id: provider_call_id.clone(),
+                },
+            }),
+            additional_external_references: Vec::new(),
+            follow_up: None,
+            at: at(23),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fresh provider start reconciliation replayed")
+    };
+    assert_eq!(effect_view.released_provider_events.len(), 1);
+
+    let claimed_event = repository
+        .claim_provider_events(worker, at(24), Duration::from_secs(30), 8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claimed| claimed.event.event_digest == event_digest)
+        .expect("released provider event was not claimable");
+    let current = repository.load_service_call(&owner, call_id).await.unwrap();
+    let follow_up = ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: owner.clone(),
+            call_id,
+            expected_version: current.call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(25),
+                leg_id: provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(25),
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: None,
+        media_activity: None,
+        replacement_connection: None,
+    };
+    let reconciliation = ProviderEventReconciliationTransaction {
+        account,
+        event_digest,
+        claim_generation: claimed_event.claim_generation,
+        worker,
+        target: ProviderEventTarget {
+            tenant_id: owner.clone(),
+            call_id,
+            leg_id: provider_leg_id,
+            role: ProviderReferenceRole::Media,
+        },
+        follow_up: Some(follow_up),
+        at: at(25),
+    };
+    let ProviderEventReconciliationOutcome::Reconciled(reconciliation_view) = repository
+        .reconcile_provider_event(reconciliation.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh provider event reconciliation replayed")
+    };
+
+    LegacyV5ProviderEvidence {
+        owner,
+        call_id,
+        provider_leg_id,
+        worker,
+        reconciliation,
+        reconciliation_view,
+    }
+}
+
+async fn assert_legacy_v5_history_after_v6<R>(repository: &R, evidence: &LegacyV5ProviderEvidence)
+where
+    R: CallRepository + CallServiceRepository + Sync,
+{
+    let unclaimed_effect = bridgefu::call_engine::EffectId::new();
+    let stored = repository
+        .load_service_call(&evidence.owner, evidence.call_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.plan.version, 1);
+    assert_eq!(
+        stored.plan.authorization_principal_fingerprint(),
+        Err(RepositoryError::InvalidInput(
+            "execution plan has no durable outbound authorization"
+        ))
+    );
+    assert_eq!(
+        repository
+            .reconcile_provider_event(evidence.reconciliation.clone())
+            .await
+            .unwrap(),
+        ProviderEventReconciliationOutcome::Replayed(evidence.reconciliation_view.clone())
+    );
+    assert_eq!(
+        repository
+            .bind_outbound_connection(OutboundConnectionBind {
+                operation_id: CommandId::from_uuid(unclaimed_effect.as_uuid()).unwrap(),
+                effect_id: unclaimed_effect,
+                claim_generation: evidence.reconciliation.claim_generation,
+                tenant_id: evidence.owner.clone(),
+                call_id: evidence.call_id,
+                leg_id: evidence.provider_leg_id,
+                binding_generation: BindingGeneration::INITIAL,
+                worker: evidence.worker,
+                connection_id: ConnectionId::from_string("provider-schema-v6-new-bind"),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: principal(),
+                at: at(26),
+            })
+            .await,
+        Err(RepositoryError::StaleClaim)
+    );
+}
+
+fn create_request_at(
+    call: CallAggregate,
+    worker: WorkerLease,
+    key: u8,
+    request: u8,
+    now: DateTime<Utc>,
+) -> CreateCall {
+    let command = CallCommand::StartConnecting {
+        at: now,
+        setup_deadline: now + chrono::Duration::seconds(30),
+    };
+    let decision = call.decide(command.clone()).unwrap();
+    let leg = &decision.aggregate().legs()[0];
+    CreateCall {
+        initial: call,
+        command_id: CommandId::new(),
+        command,
+        worker,
+        idempotency_key: IdempotencyKeyDigest::new(digest(key)),
+        request_digest: RequestDigest::new(digest(request)),
+        attachments: vec![AttachmentIssue {
+            attachment_id: AttachmentId::new(),
+            token_digest: AttachmentTokenDigest::new(digest(key.wrapping_add(100))),
+            purpose: AttachmentPurpose::PublicInbound,
+            leg_id: leg.id(),
+            binding_generation: leg.binding_generation(),
+            transport: AttachmentTransport::Sip,
+            expected_principal: principal(),
+            expires_at: now + chrono::Duration::seconds(120),
+        }],
+        at: now,
+    }
+}
+
+async fn register(repo: &Repository, max_calls: usize) -> WorkerSnapshot {
+    repo.register_worker(RegisterWorker {
+        worker_id: WorkerId::new(),
+        max_calls,
+        capabilities: BTreeSet::from(["sip".into(), "webrtc_egress".into()]),
+        at: at(0),
+        lease_ttl: std::time::Duration::from_secs(300),
+    })
+    .await
+    .unwrap()
+}
+
+fn created(outcome: CreateCallOutcome) -> StoredCall {
+    match outcome {
+        CreateCallOutcome::Created(call) => call,
+        CreateCallOutcome::Replayed(_) => panic!("expected a new call"),
+    }
+}
+
+async fn shared_repository_conformance(repo: Repository) {
+    let worker = register(&repo, 4).await;
+    let owner = tenant("conformance-a");
+    let request = create_request(new_call(owner.clone()), worker.lease, 1, 2);
+    let attachment_digest = request.attachments[0].token_digest;
+    let call = created(repo.create_call(request.clone()).await.unwrap());
+    assert!(matches!(
+        repo.create_call(request.clone()).await.unwrap(),
+        CreateCallOutcome::Replayed(replayed) if replayed == call
+    ));
+    let mut conflicting = request;
+    conflicting.request_digest = RequestDigest::new(digest(3));
+    assert_eq!(
+        repo.create_call(conflicting).await,
+        Err(RepositoryError::IdempotencyConflict)
+    );
+    assert_eq!(
+        repo.load_call(&tenant("conformance-b"), call.aggregate.id())
+            .await,
+        Err(RepositoryError::NotFound)
+    );
+
+    let candidate = repo
+        .inspect_attachment(AttachmentLookup {
+            token_digest: attachment_digest,
+            tenant_id: owner.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(),
+            worker: worker.lease,
+            at: at(3),
+        })
+        .await
+        .unwrap();
+    let connection_id = ConnectionId::from_string("conn_conformance_single_use");
+    let consumed = repo
+        .consume_attachment(AttachmentConsume {
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(4),
+                leg_id: candidate.leg_id(),
+                binding_generation: candidate.binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            candidate,
+            connection_id: connection_id.clone(),
+            principal_fingerprint: principal(),
+            principal_expires_at: None,
+            at: at(4),
+        })
+        .await
+        .unwrap();
+    assert_eq!(consumed.binding.connection_id, connection_id);
+    assert!(matches!(
+        repo.inspect_attachment(AttachmentLookup {
+            token_digest: attachment_digest,
+            tenant_id: owner.clone(),
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(),
+            worker: worker.lease,
+            at: at(5),
+        })
+        .await,
+        Err(RepositoryError::AttachmentRejected)
+    ));
+
+    let current = repo.load_call(&owner, call.aggregate.id()).await.unwrap();
+    let command = CommandCommit {
+        tenant_id: owner.clone(),
+        call_id: current.aggregate.id(),
+        expected_version: current.aggregate.version(),
+        command_id: CommandId::new(),
+        command: CallCommand::SetLegState {
+            at: at(6),
+            leg_id: current.aggregate.legs()[1].id(),
+            binding_generation: current.aggregate.legs()[1].binding_generation(),
+            state: LegState::Signaling,
+            failure: None,
+        },
+        worker: worker.lease,
+        attachments: Vec::new(),
+        deadline_claim: None,
+        at: at(6),
+    };
+    let committed = repo.commit_command(command.clone()).await.unwrap();
+    assert!(matches!(committed, CommandCommitOutcome::Committed(_)));
+    assert!(matches!(
+        repo.commit_command(command).await.unwrap(),
+        CommandCommitOutcome::Replayed(_)
+    ));
+
+    let account = ProviderAccountKey::parse("conformance-provider").unwrap();
+    let provider_call_id = ProviderCallId::parse("provider-call-conformance").unwrap();
+    let event_digest = ProviderEventDigest::new(digest(40));
+    assert!(matches!(
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest,
+            payload_digest: ProviderPayloadDigest::new(digest(41)),
+            provider_call_id: provider_call_id.clone(),
+            kind: "answered".into(),
+            payload: json!({"state": "answered"}),
+            occurred_at: Some(at(7)),
+            received_at: at(8),
+        })
+        .await
+        .unwrap(),
+        ProviderEventOutcome::Accepted(event)
+            if event.state == ProviderEventState::PendingReference
+    ));
+    let current = repo.load_call(&owner, call.aggregate.id()).await.unwrap();
+    let target_leg = current.aggregate.legs()[1].id();
+    repo.bind_provider_reference(BindProviderReference {
+        tenant_id: owner.clone(),
+        call_id: current.aggregate.id(),
+        leg_id: target_leg,
+        role: ProviderReferenceRole::Media,
+        account: account.clone(),
+        provider_call_id,
+        worker: worker.lease,
+        at: at(9),
+    })
+    .await
+    .unwrap();
+    let claim = repo
+        .claim_provider_events(worker.lease, at(10), Duration::from_secs(10), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let completion = ProviderEventCommit {
+        account: account.clone(),
+        event_digest,
+        claim_generation: claim.claim_generation,
+        worker: worker.lease,
+        command: CommandCommit {
+            tenant_id: owner,
+            call_id: current.aggregate.id(),
+            expected_version: current.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(11),
+                leg_id: target_leg,
+                binding_generation: current.aggregate.legs()[1].binding_generation(),
+                state: LegState::Connected,
+                failure: None,
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(11),
+        },
+        at: at(11),
+    };
+    let first = repo
+        .complete_provider_event(completion.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.event.state, ProviderEventState::Applied);
+    let replay = repo.complete_provider_event(completion).await.unwrap();
+    assert_eq!(replay.event, first.event);
+
+    let terminal_event_digest = ProviderEventDigest::new(digest(42));
+    assert!(matches!(
+        repo.ingest_provider_event(ProviderEventInput {
+            account: account.clone(),
+            event_digest: terminal_event_digest,
+            payload_digest: ProviderPayloadDigest::new(digest(43)),
+            provider_call_id: ProviderCallId::parse("provider-call-conformance").unwrap(),
+            kind: "completed".into(),
+            payload: json!({"state": "completed"}),
+            occurred_at: Some(at(12)),
+            received_at: at(12),
+        })
+        .await
+        .unwrap(),
+        ProviderEventOutcome::Accepted(event) if event.state == ProviderEventState::Ready
+    ));
+
+    let outbox_claim = repo
+        .claim_outbox(worker.lease, at(20), Duration::from_secs(5), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let completed_outbox = repo
+        .complete_outbox(
+            outbox_claim.record.effect_id,
+            worker.lease,
+            outbox_claim.claim_generation,
+            OutboxCompletion::Succeeded,
+            at(21),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed_outbox.state,
+        bridgefu::call_engine::OutboxState::Succeeded { .. }
+    ));
+
+    let deadline_claim = repo
+        .claim_due_deadlines(worker.lease, at(33), Duration::from_secs(5), 4)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.record.kind == DeadlineKind::Setup)
+        .expect("setup deadline remains pending while only one leg is connected");
+    let current = repo
+        .load_call(&tenant("conformance-a"), call.aggregate.id())
+        .await
+        .unwrap();
+    let deadline_outcome = repo
+        .commit_command(CommandCommit {
+            tenant_id: tenant("conformance-a"),
+            call_id: current.aggregate.id(),
+            expected_version: current.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::DeadlineElapsed {
+                at: at(34),
+                kind: deadline_claim.record.kind,
+                generation: deadline_claim.record.generation,
+                ending_deadline: Some(at(44)),
+            },
+            worker: worker.lease,
+            attachments: Vec::new(),
+            deadline_claim: Some(deadline_claim.guard(worker.lease)),
+            at: at(34),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        deadline_outcome,
+        CommandCommitOutcome::Committed(_)
+    ));
+
+    let owner = tenant("conformance-a");
+    let mut current = repo.load_call(&owner, call.aggregate.id()).await.unwrap();
+    for index in 0..2 {
+        if current.aggregate.legs()[index].state().is_terminal() {
+            continue;
+        }
+        let leg = &current.aggregate.legs()[index];
+        let outcome = repo
+            .commit_command(CommandCommit {
+                tenant_id: owner.clone(),
+                call_id: current.aggregate.id(),
+                expected_version: current.aggregate.version(),
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(35 + i64::try_from(index).unwrap()),
+                    leg_id: leg.id(),
+                    binding_generation: leg.binding_generation(),
+                    state: LegState::Ended,
+                    failure: None,
+                },
+                worker: worker.lease,
+                attachments: Vec::new(),
+                deadline_claim: None,
+                at: at(35 + i64::try_from(index).unwrap()),
+            })
+            .await
+            .unwrap();
+        current = match outcome {
+            CommandCommitOutcome::Committed(view) | CommandCommitOutcome::Replayed(view) => {
+                view.call
+            }
+        };
+    }
+    assert!(current.aggregate.state().is_terminal());
+    assert!(current.assignment.released_at.is_some());
+    assert!(!repo
+        .release_assignment(&owner, current.aggregate.id(), worker.lease, at(38))
+        .await
+        .unwrap());
+
+    let terminal_claim = repo
+        .claim_provider_events(worker.lease, at(39), Duration::from_secs(5), 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let acknowledgement = TerminalProviderEventAcknowledge {
+        account,
+        event_digest: terminal_event_digest,
+        claim_generation: terminal_claim.claim_generation,
+        worker: worker.lease,
+        target: ProviderEventTarget {
+            tenant_id: owner.clone(),
+            call_id: current.aggregate.id(),
+            leg_id: target_leg,
+            role: ProviderReferenceRole::Media,
+        },
+        at: at(40),
+    };
+    assert!(matches!(
+        repo.acknowledge_terminal_provider_event(acknowledgement.clone())
+            .await
+            .unwrap(),
+        TerminalProviderEventAcknowledgeOutcome::Acknowledged(_)
+    ));
+    assert!(matches!(
+        repo.acknowledge_terminal_provider_event(acknowledgement)
+            .await
+            .unwrap(),
+        TerminalProviderEventAcknowledgeOutcome::Replayed(_)
+    ));
+
+    let next_worker = repo
+        .register_worker(RegisterWorker {
+            worker_id: worker.lease.worker_id,
+            max_calls: 4,
+            capabilities: BTreeSet::from(["sip".into(), "webrtc_egress".into()]),
+            at: at(41),
+            lease_ttl: std::time::Duration::from_secs(300),
+        })
+        .await
+        .unwrap();
+    let restart_claims = repo
+        .claim_restart_calls(next_worker.lease, at(42), 8)
+        .await
+        .unwrap();
+    assert!(restart_claims
+        .iter()
+        .any(|claim| claim.call.aggregate.id() == current.aggregate.id()));
+    assert!(
+        repo.set_worker_draining(next_worker.lease, true, at(43))
+            .await
+            .unwrap()
+            .draining
+    );
+    assert_eq!(
+        repo.set_worker_draining(next_worker.lease, false, at(44))
+            .await,
+        Err(RepositoryError::StaleWorkerFence)
+    );
+}
+
+fn sqlite_database(label: &str) -> (String, PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "bridgefu-{label}-{}-{}.sqlite3",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    (format!("sqlite://{}", path.display()), path)
+}
+
+const V5_FIXTURE_PRE_PLAN_TABLES: &[&str] = &[
+    "workers",
+    "calls",
+    "legs",
+    "worker_assignments",
+    "commands",
+    "idempotency",
+    "provider_references",
+    "provider_events",
+    "used_connection_ids",
+    "connection_bindings",
+    "outbox",
+    "deadlines",
+];
+
+const V5_FIXTURE_POST_PLAN_TABLES: &[&str] = &[
+    "outbound_binding_results",
+    "external_references",
+    "reconciliation_results",
+];
+
+fn migration_subset(backend: &str, through: u8, label: &str) -> PathBuf {
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-{label}-{backend}-migrations-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for version in 1..=through {
+        let prefix = format!("{version:04}_");
+        let source = std::fs::read_dir(format!("migrations/{backend}"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .unwrap_or_else(|| panic!("missing {backend} migration {version}"));
+        std::fs::copy(&source, migration_dir.join(source.file_name().unwrap())).unwrap();
+    }
+    migration_dir
+}
+
+#[tokio::test]
+async fn memory_repository_shared_conformance() {
+    shared_repository_conformance(Arc::new(MemoryRepository::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_repository_shared_conformance_and_schema() {
+    let (url, path) = sqlite_database("conformance");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    assert_required_sqlite_tables(&repository).await;
+    let reconnected = SqliteRepository::connect(&url).await.unwrap();
+    assert_required_sqlite_tables(&reconnected).await;
+    drop(reconnected);
+    let probe = prepare_read_probe(&repository).await;
+    let epoch_before = sqlite_epoch(&repository).await;
+    exercise_read_probe(&repository, &probe).await;
+    assert_eq!(sqlite_epoch(&repository).await, epoch_before);
+    shared_repository_conformance(Arc::new(repository.clone())).await;
+    assert!(repository
+        .retention_candidates(SqlRetentionPolicy::new(Duration::ZERO), at(1_000), 100)
+        .await
+        .unwrap()
+        .is_empty());
+    exercise_expired_idempotency(&repository).await;
+    assert_eq!(
+        sqlite_idempotency_count(&repository, "expired-idempotency").await,
+        1
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_authoritative_mutations_append_coordination_in_the_same_transaction() {
+    let (url, path) = sqlite_database("transactional-coordination");
+    let deployment = DeploymentId::parse("coordination-test").unwrap();
+    let repository = SqliteRepository::connect_for_deployment(&url, deployment.clone())
+        .await
+        .unwrap();
+    let repository_view: Repository = Arc::new(repository.clone());
+    let worker = register(&repository_view, 2).await;
+    assert_ne!(worker.updated_at, at(0));
+    assert_eq!(
+        worker.lease_expires_at - worker.updated_at,
+        chrono::TimeDelta::seconds(300)
+    );
+    let before_create: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM coordination_outbox WHERE deployment_id = ?")
+            .bind(deployment.as_str())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    assert!(before_create >= 2);
+
+    let request = create_request(
+        new_call(tenant("coordination-owner")),
+        worker.lease,
+        220,
+        221,
+    );
+    repository_view.create_call(request.clone()).await.unwrap();
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json FROM coordination_outbox WHERE deployment_id = ? ORDER BY sequence",
+    )
+    .bind(deployment.as_str())
+    .fetch_all(repository.pool())
+    .await
+    .unwrap();
+    let payloads = rows
+        .iter()
+        .map(|row| serde_json::from_str::<CoordinationPayload>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Worker(_))));
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Route(_))));
+    assert!(payloads
+        .iter()
+        .any(|payload| matches!(payload, CoordinationPayload::Replay(_))));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        CoordinationPayload::WakeWorker { worker_id, .. } if *worker_id == worker.lease.worker_id
+    )));
+
+    let committed_count = i64::try_from(payloads.len()).unwrap();
+    assert!(matches!(
+        repository_view.create_call(request).await.unwrap(),
+        CreateCallOutcome::Replayed(_)
+    ));
+    let replay_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM coordination_outbox WHERE deployment_id = ?")
+            .bind(deployment.as_str())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(replay_count, committed_count);
+
+    repository.pool().close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() {
+    let (source_url, source_path) = sqlite_database("v3-upgrade-source");
+    let source = SqliteRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("v1-upgrade-owner");
+    let request = create_request(new_call(owner.clone()), worker.lease, 91, 92);
+    let call_id = request.initial.id();
+    source_repository.create_call(request).await.unwrap();
+    let claimed = source_repository
+        .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 64)
+        .await
+        .unwrap();
+    assert!(!claimed.is_empty());
+    source.pool().close().await;
+
+    let (target_url, target_path) = sqlite_database("v1-upgrade-target");
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v1-sqlite-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    std::fs::copy(
+        "migrations/sqlite/0001_call_repository.sql",
+        migration_dir.join("0001_call_repository.sql"),
+    )
+    .unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&target_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let target = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS source")
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(&target)
+        .await
+        .unwrap();
+    for statement in [
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, json_remove(body, '$.lease_expires_at') FROM source.workers",
+        "INSERT INTO calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM source.calls",
+        "INSERT INTO legs SELECT * FROM source.legs",
+        "INSERT INTO worker_assignments SELECT * FROM source.worker_assignments",
+        "INSERT INTO commands SELECT * FROM source.commands",
+        "INSERT INTO idempotency(tenant_id, key_digest, request_digest, call_id, expires_at, body) SELECT tenant_id, key_digest, request_digest, call_id, expires_at, body FROM source.idempotency",
+        "INSERT INTO attachments SELECT * FROM source.attachments",
+        "INSERT INTO outbox SELECT * FROM source.outbox",
+        "INSERT INTO deadlines SELECT * FROM source.deadlines",
+    ] {
+        sqlx::query(statement).execute(&target).await.unwrap();
+    }
+    sqlx::query("UPDATE idempotency SET body = json_remove(body, '$.row.receipt')")
+        .execute(&target)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET body = json_remove(body, '$.state.claimed_at') WHERE outbox_state = 'claimed'")
+        .execute(&target)
+        .await
+        .unwrap();
+    sqlx::query("DETACH DATABASE source")
+        .execute(&target)
+        .await
+        .unwrap();
+    target.close().await;
+
+    let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    let migrated_worker = upgraded
+        .worker_snapshot(worker.lease.worker_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        migrated_worker.lease_expires_at, migrated_worker.updated_at,
+        "legacy worker fences must migrate expired"
+    );
+    let idempotency =
+        sqlx::query("SELECT receipt_kind, operation_kind, body FROM idempotency WHERE call_id = ?")
+            .bind(call_id.to_string())
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(idempotency.get::<String, _>("receipt_kind"), "create_call");
+    assert_eq!(
+        idempotency.get::<String, _>("operation_kind"),
+        "create_call"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&idempotency.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/row/receipt/receipt")
+            .and_then(serde_json::Value::as_str),
+        Some("create_call")
+    );
+    let claimed =
+        sqlx::query("SELECT available_at, body FROM outbox WHERE outbox_state = 'claimed' LIMIT 1")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    let available_at = claimed.get::<String, _>("available_at");
+    let body: serde_json::Value = serde_json::from_str(&claimed.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/state/claimed_at")
+            .and_then(serde_json::Value::as_str),
+        Some(available_at.as_str())
+    );
+    assert_eq!(
+        upgraded
+            .load_call(&owner, call_id)
+            .await
+            .unwrap()
+            .aggregate
+            .id(),
+        call_id
+    );
+    upgraded.pool().close().await;
+    std::fs::remove_file(source_path).unwrap();
+    std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
+    let (url, path) = sqlite_database("direct-v3-v4-worker");
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v3-sqlite-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+        "0003_service_integrity.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/sqlite/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new();
+    let updated_at = at(77);
+    let legacy_body = json!({
+        "lease": {"worker_id": worker_id, "fence": 1},
+        "max_calls": 2,
+        "reserved_calls": 0,
+        "draining": false,
+        "capabilities": ["sip"],
+        "updated_at": updated_at,
+    });
+    sqlx::query(
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES (?, 1, 2, 0, 0, ?, ?)",
+    )
+    .bind(worker_id.to_string())
+    .bind(updated_at.to_rfc3339())
+    .bind(legacy_body.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let upgraded = SqliteRepository::connect(&url).await.unwrap();
+    let worker = upgraded.worker_snapshot(worker_id).await.unwrap();
+    assert_eq!(worker.updated_at, updated_at);
+    assert_eq!(worker.lease_expires_at, updated_at);
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM repository_metadata WHERE singleton = 1")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(schema_version, 11);
+    let persisted_body: String = sqlx::query_scalar("SELECT body FROM workers WHERE worker_id = ?")
+        .bind(worker_id.to_string())
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&persisted_body)
+        .unwrap()
+        .get("lease_expires_at")
+        .is_some());
+    upgraded.pool().close().await;
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
+    let (source_url, source_path) = sqlite_database("v3-service-upgrade-source");
+    let source = SqliteRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("sqlite-v2-service-upgrade-owner");
+    let request = service_create_request(owner.clone(), worker.lease, 95, 96);
+    let call_id = request.create.initial.id();
+    source.create_with_plan(request).await.unwrap();
+    source.pool().close().await;
+
+    let (target_url, target_path) = sqlite_database("v3-service-upgrade-target");
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v2-sqlite-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/sqlite/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&target_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let target = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS source")
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(&target)
+        .await
+        .unwrap();
+    for statement in [
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, json_remove(body, '$.lease_expires_at') FROM source.workers",
+        "INSERT INTO calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM source.calls",
+        "INSERT INTO legs SELECT * FROM source.legs",
+        "INSERT INTO worker_assignments SELECT * FROM source.worker_assignments",
+        "INSERT INTO commands SELECT * FROM source.commands",
+        "INSERT INTO idempotency SELECT * FROM source.idempotency",
+        "INSERT INTO attachments SELECT * FROM source.attachments",
+        "INSERT INTO outbox SELECT * FROM source.outbox",
+        "INSERT INTO deadlines SELECT * FROM source.deadlines",
+        "INSERT INTO call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, json_remove(json_set(body, '$.plan.version', 1), '$.plan.authorization_principal_fingerprint', '$.plan.amazon_connect_starts', '$.plan.leg_semantics') FROM source.call_execution_plans",
+    ] {
+        sqlx::query(statement).execute(&target).await.unwrap();
+    }
+    sqlx::query("DETACH DATABASE source")
+        .execute(&target)
+        .await
+        .unwrap();
+    target.close().await;
+
+    let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    let managed: i64 = sqlx::query_scalar("SELECT service_managed FROM calls WHERE call_id = ?")
+        .bind(call_id.to_string())
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap();
+    assert_eq!(managed, 1);
+    let legacy = upgraded.load_service_call(&owner, call_id).await.unwrap();
+    assert_eq!(legacy.call.aggregate.id(), call_id);
+    assert!(legacy.plan.authorization_principal_fingerprint().is_err());
+    upgraded.pool().close().await;
+    std::fs::remove_file(source_path).unwrap();
+    std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
+    let (source_url, source_path) = sqlite_database("v5-provider-source");
+    let source = SqliteRepository::connect(&source_url).await.unwrap();
+    let evidence = seed_service_provider_reconciliation(&source).await;
+    source.pool().close().await;
+
+    let (target_url, target_path) = sqlite_database("v5-provider-target");
+    let migration_dir = migration_subset("sqlite", 5, "v5-provider");
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&target_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let target = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS source")
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(&target)
+        .await
+        .unwrap();
+    for table in V5_FIXTURE_PRE_PLAN_TABLES {
+        let statement = if *table == "provider_references" {
+            "INSERT INTO provider_references(\
+                 account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body\
+             ) \
+             SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, \
+                    json_remove(body, '$.target.role') \
+             FROM source.provider_references"
+                .to_owned()
+        } else {
+            format!("INSERT INTO {table} SELECT * FROM source.{table}")
+        };
+        sqlx::query(&statement).execute(&target).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO call_execution_plans(\
+             call_id, plan_version, first_leg_id, first_endpoint_kind, \
+             second_leg_id, second_endpoint_kind, body\
+         ) \
+         SELECT call_id, 1, first_leg_id, first_endpoint_kind, \
+                second_leg_id, second_endpoint_kind, \
+                json_remove(\
+                    json_set(body, '$.plan.version', 1), \
+                    '$.plan.authorization_principal_fingerprint', \
+                    '$.plan.amazon_connect_starts', \
+                    '$.plan.leg_semantics'\
+                ) \
+         FROM source.call_execution_plans",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO service_command_results(\
+             command_id, tenant_id, call_id, recorded_at, body\
+         ) \
+         SELECT command_id, tenant_id, call_id, recorded_at, \
+                json_remove(body, '$.result.request.media_activity') \
+         FROM source.service_command_results",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    for table in V5_FIXTURE_POST_PLAN_TABLES {
+        let statement = if *table == "external_references" {
+            "INSERT INTO external_references(\
+                 reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                 leg_id, binding_generation, effect_id, bound_at, body\
+             ) \
+             SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                    leg_id, binding_generation, effect_id, bound_at, json_remove(body, '$.role') \
+             FROM source.external_references"
+                .to_owned()
+        } else {
+            format!("INSERT INTO {table} SELECT * FROM source.{table}")
+        };
+        sqlx::query(&statement).execute(&target).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO provider_completions(\
+             account_key, event_digest, completion_kind, body\
+         ) \
+         SELECT account_key, event_digest, completion_kind, \
+                json_remove(\
+                    body, \
+                    '$.row.ServiceReconciliation.request.follow_up.media_activity'\
+                ) \
+         FROM source.provider_completions",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE repository_metadata \
+         SET epoch = (\
+                 SELECT epoch FROM source.repository_metadata WHERE singleton = 1\
+             ), \
+             provider_receipt_sequence = (\
+                 SELECT provider_receipt_sequence \
+                 FROM source.repository_metadata WHERE singleton = 1\
+             ) \
+         WHERE singleton = 1",
+    )
+    .execute(&target)
+    .await
+    .unwrap();
+    let before = sqlx::query(
+        "SELECT completion_kind, body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(&target)
+    .await
+    .unwrap();
+    let before_body: serde_json::Value =
+        serde_json::from_str(&before.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        before.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&target)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DETACH DATABASE source")
+        .execute(&target)
+        .await
+        .unwrap();
+    target.close().await;
+
+    let upgraded = SqliteRepository::connect(&target_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT schema_version FROM repository_metadata WHERE singleton = 1"
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap(),
+        11
+    );
+    let after = sqlx::query(
+        "SELECT completion_kind, body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.get::<String, _>("body")).unwrap(),
+        before_body
+    );
+    assert_legacy_v5_history_after_v6(&upgraded, &evidence).await;
+    upgraded.pool().close().await;
+
+    std::fs::remove_file(source_path).unwrap();
+    std::fs::remove_file(target_path).unwrap();
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_direct_v3_upgrade_expires_and_rewrites_legacy_worker_body() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v3 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("bridgefu_v3_target_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let target_url = scoped.to_string();
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v3-postgres-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+        "0003_service_integrity.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/postgres/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let pool = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new();
+    let updated_at = at(78);
+    let legacy_body = json!({
+        "lease": {"worker_id": worker_id, "fence": 1},
+        "max_calls": 2,
+        "reserved_calls": 0,
+        "draining": false,
+        "capabilities": ["sip"],
+        "updated_at": updated_at,
+    });
+    sqlx::query(
+        "INSERT INTO workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) VALUES ($1, 1, 2, 0, FALSE, $2, $3::jsonb)",
+    )
+    .bind(worker_id.as_uuid())
+    .bind(updated_at)
+    .bind(legacy_body.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    let worker = upgraded.worker_snapshot(worker_id).await.unwrap();
+    assert_eq!(worker.updated_at, updated_at);
+    assert_eq!(worker.lease_expires_at, updated_at);
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM repository_metadata WHERE singleton = TRUE")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(schema_version, 11);
+    let has_expiry: bool =
+        sqlx::query_scalar("SELECT body ? 'lease_expires_at' FROM workers WHERE worker_id = $1")
+            .bind(worker_id.as_uuid())
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert!(has_expiry);
+    upgraded.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_v1_upgrade_rewrites_create_receipt_and_claim_acquisition_time() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v1 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source_schema = format!("bridgefu_v4_source_{suffix}");
+    let target_schema = format!("bridgefu_v1_target_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {target_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let scoped_url = |schema: &str| {
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    };
+    let source_url = scoped_url(&source_schema);
+    let source = PostgresRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("postgres-v1-upgrade-owner");
+    let request = create_request(new_call(owner.clone()), worker.lease, 93, 94);
+    let call_id = request.initial.id();
+    source_repository.create_call(request).await.unwrap();
+    let claimed = source_repository
+        .claim_outbox(worker.lease, at(3), Duration::from_secs(30), 64)
+        .await
+        .unwrap();
+    assert!(!claimed.is_empty());
+
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v1-postgres-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    std::fs::copy(
+        "migrations/postgres/0001_call_repository.sql",
+        migration_dir.join("0001_call_repository.sql"),
+    )
+    .unwrap();
+    let target_url = scoped_url(&target_schema);
+    let target = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    for statement in [
+        format!("INSERT INTO {target_schema}.workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, body - 'lease_expires_at' FROM {source_schema}.workers"),
+        format!("INSERT INTO {target_schema}.calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM {source_schema}.calls"),
+        format!("INSERT INTO {target_schema}.legs SELECT * FROM {source_schema}.legs"),
+        format!("INSERT INTO {target_schema}.worker_assignments SELECT * FROM {source_schema}.worker_assignments"),
+        format!("INSERT INTO {target_schema}.commands SELECT * FROM {source_schema}.commands"),
+        format!("INSERT INTO {target_schema}.idempotency(tenant_id, key_digest, request_digest, call_id, expires_at, body) SELECT tenant_id, key_digest, request_digest, call_id, expires_at, body FROM {source_schema}.idempotency"),
+        format!("INSERT INTO {target_schema}.attachments SELECT * FROM {source_schema}.attachments"),
+        format!("INSERT INTO {target_schema}.outbox SELECT * FROM {source_schema}.outbox"),
+        format!("INSERT INTO {target_schema}.deadlines SELECT * FROM {source_schema}.deadlines"),
+    ] {
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.idempotency SET body = body #- '{{row,receipt}}'"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.outbox SET body = body #- '{{state,claimed_at}}' WHERE outbox_state = 'claimed'"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    target.close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    let idempotency = sqlx::query(
+        "SELECT receipt_kind, operation_kind, body::text AS body FROM idempotency WHERE call_id = $1",
+    )
+    .bind(call_id.as_uuid())
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(idempotency.get::<String, _>("receipt_kind"), "create_call");
+    assert_eq!(
+        idempotency.get::<String, _>("operation_kind"),
+        "create_call"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&idempotency.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        body.pointer("/row/receipt/receipt")
+            .and_then(serde_json::Value::as_str),
+        Some("create_call")
+    );
+    let claimed = sqlx::query(
+        "SELECT available_at, body::text AS body FROM outbox WHERE outbox_state = 'claimed' LIMIT 1",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    let available_at = claimed.get::<DateTime<Utc>, _>("available_at");
+    let body: serde_json::Value = serde_json::from_str(&claimed.get::<String, _>("body")).unwrap();
+    let claimed_at = DateTime::parse_from_rfc3339(
+        body.pointer("/state/claimed_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap(),
+    )
+    .unwrap()
+    .with_timezone(&Utc);
+    assert_eq!(claimed_at, available_at);
+    assert_eq!(
+        upgraded
+            .load_call(&owner, call_id)
+            .await
+            .unwrap()
+            .aggregate
+            .id(),
+        call_id
+    );
+    upgraded.pool().close().await;
+    source.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {source_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_v2_upgrade_marks_existing_execution_plans_as_service_managed() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v2 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source_schema = format!("bridgefu_v4_service_source_{suffix}");
+    let target_schema = format!("bridgefu_v2_service_target_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {target_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let scoped_url = |schema: &str| {
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    };
+
+    let source_url = scoped_url(&source_schema);
+    let source = PostgresRepository::connect(&source_url).await.unwrap();
+    let source_repository: Repository = Arc::new(source.clone());
+    let worker = register(&source_repository, 1).await;
+    let owner = tenant("postgres-v2-service-upgrade-owner");
+    let request = service_create_request(owner.clone(), worker.lease, 97, 98);
+    let call_id = request.create.initial.id();
+    source.create_with_plan(request).await.unwrap();
+
+    let migration_dir = std::env::temp_dir().join(format!(
+        "bridgefu-v2-postgres-migration-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&migration_dir).unwrap();
+    for migration in [
+        "0001_call_repository.sql",
+        "0002_call_service_repository.sql",
+    ] {
+        std::fs::copy(
+            format!("migrations/postgres/{migration}"),
+            migration_dir.join(migration),
+        )
+        .unwrap();
+    }
+    let target_url = scoped_url(&target_schema);
+    let target = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    for statement in [
+        format!("INSERT INTO {target_schema}.workers(worker_id, fence, max_calls, reserved_calls, draining, updated_at, body) SELECT worker_id, fence, max_calls, reserved_calls, draining, updated_at, body - 'lease_expires_at' FROM {source_schema}.workers"),
+        format!("INSERT INTO {target_schema}.calls(call_id, tenant_id, aggregate_version, call_state, body) SELECT call_id, tenant_id, aggregate_version, call_state, body FROM {source_schema}.calls"),
+        format!("INSERT INTO {target_schema}.legs SELECT * FROM {source_schema}.legs"),
+        format!("INSERT INTO {target_schema}.worker_assignments SELECT * FROM {source_schema}.worker_assignments"),
+        format!("INSERT INTO {target_schema}.commands SELECT * FROM {source_schema}.commands"),
+        format!("INSERT INTO {target_schema}.idempotency SELECT * FROM {source_schema}.idempotency"),
+        format!("INSERT INTO {target_schema}.attachments SELECT * FROM {source_schema}.attachments"),
+        format!("INSERT INTO {target_schema}.outbox SELECT * FROM {source_schema}.outbox"),
+        format!("INSERT INTO {target_schema}.deadlines SELECT * FROM {source_schema}.deadlines"),
+        format!("INSERT INTO {target_schema}.call_execution_plans(call_id, plan_version, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, body) SELECT call_id, 1, first_leg_id, first_endpoint_kind, second_leg_id, second_endpoint_kind, (((jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) #- '{{plan,authorization_principal_fingerprint}}') #- '{{plan,amazon_connect_starts}}') #- '{{plan,leg_semantics}}') FROM {source_schema}.call_execution_plans"),
+    ] {
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
+    }
+    target.close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    let managed: bool = sqlx::query_scalar("SELECT service_managed FROM calls WHERE call_id = $1")
+        .bind(call_id.as_uuid())
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap();
+    assert!(managed);
+    let legacy = upgraded.load_service_call(&owner, call_id).await.unwrap();
+    assert_eq!(legacy.call.aggregate.id(), call_id);
+    assert!(legacy.plan.authorization_principal_fingerprint().is_err());
+    upgraded.pool().close().await;
+    source.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {source_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_v5_to_v6_preserves_service_provider_history_and_fails_closed() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL v5 upgrade test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source_schema = format!("bridgefu_v5_provider_source_{suffix}");
+    let target_schema = format!("bridgefu_v5_provider_target_{suffix}");
+    sqlx::query(&format!("CREATE SCHEMA {source_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {target_schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let scoped_url = |schema: &str| {
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    };
+
+    let source_url = scoped_url(&source_schema);
+    let source = PostgresRepository::connect(&source_url).await.unwrap();
+    let evidence = seed_service_provider_reconciliation(&source).await;
+
+    let migration_dir = migration_subset("postgres", 5, "v5-provider");
+    let target_url = scoped_url(&target_schema);
+    let target = sqlx::PgPool::connect(&target_url).await.unwrap();
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await
+        .unwrap()
+        .run(&target)
+        .await
+        .unwrap();
+    for table in V5_FIXTURE_PRE_PLAN_TABLES {
+        let statement = if *table == "provider_references" {
+            format!(
+                "INSERT INTO {target_schema}.provider_references(\
+                     account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, body\
+                 ) \
+                 SELECT account_key, provider_call_id, tenant_id, call_id, leg_id, bound_at, \
+                        body #- '{{target,role}}' \
+                 FROM {source_schema}.provider_references"
+            )
+        } else {
+            format!(
+                "INSERT INTO {target_schema}.{table} \
+                 SELECT * FROM {source_schema}.{table}"
+            )
+        };
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.call_execution_plans(\
+             call_id, plan_version, first_leg_id, first_endpoint_kind, \
+             second_leg_id, second_endpoint_kind, body\
+         ) \
+         SELECT call_id, 1, first_leg_id, first_endpoint_kind, \
+                second_leg_id, second_endpoint_kind, \
+                jsonb_set(body, '{{plan,version}}', '1'::jsonb, TRUE) \
+                    #- '{{plan,authorization_principal_fingerprint}}' \
+                    #- '{{plan,amazon_connect_starts}}' \
+                    #- '{{plan,leg_semantics}}' \
+         FROM {source_schema}.call_execution_plans"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.service_command_results(\
+             command_id, tenant_id, call_id, recorded_at, body\
+         ) \
+         SELECT command_id, tenant_id, call_id, recorded_at, \
+                body #- '{{result,request,media_activity}}' \
+         FROM {source_schema}.service_command_results"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    for table in V5_FIXTURE_POST_PLAN_TABLES {
+        let statement = if *table == "external_references" {
+            format!(
+                "INSERT INTO {target_schema}.external_references(\
+                     reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                     leg_id, binding_generation, effect_id, bound_at, body\
+                 ) \
+                 SELECT reference_kind, reference_namespace, reference_value, tenant_id, call_id, \
+                        leg_id, binding_generation, effect_id, bound_at, body - 'role' \
+                 FROM {source_schema}.external_references"
+            )
+        } else {
+            format!(
+                "INSERT INTO {target_schema}.{table} \
+                 SELECT * FROM {source_schema}.{table}"
+            )
+        };
+        sqlx::query(&statement)
+            .execute(&administration)
+            .await
+            .unwrap();
+    }
+    sqlx::query(&format!(
+        "INSERT INTO {target_schema}.provider_completions(\
+             account_key, event_digest, completion_kind, body\
+         ) \
+         SELECT account_key, event_digest, completion_kind, \
+                body #- '{{row,ServiceReconciliation,request,follow_up,media_activity}}' \
+         FROM {source_schema}.provider_completions"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {target_schema}.repository_metadata AS target \
+         SET epoch = source.epoch, \
+             provider_receipt_sequence = source.provider_receipt_sequence \
+         FROM {source_schema}.repository_metadata AS source \
+         WHERE target.singleton = TRUE AND source.singleton = TRUE"
+    ))
+    .execute(&administration)
+    .await
+    .unwrap();
+    let before = sqlx::query(
+        "SELECT completion_kind, body::text AS body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(&target)
+    .await
+    .unwrap();
+    let before_body: serde_json::Value =
+        serde_json::from_str(&before.get::<String, _>("body")).unwrap();
+    assert_eq!(
+        before.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    target.close().await;
+    source.pool().close().await;
+
+    let upgraded = PostgresRepository::connect(&target_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT schema_version FROM repository_metadata WHERE singleton = TRUE"
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .unwrap(),
+        11
+    );
+    let after = sqlx::query(
+        "SELECT completion_kind, body::text AS body \
+         FROM provider_completions WHERE completion_kind = 'service_reconciliation'",
+    )
+    .fetch_one(upgraded.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after.get::<String, _>("completion_kind"),
+        "service_reconciliation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after.get::<String, _>("body")).unwrap(),
+        before_body
+    );
+    assert_legacy_v5_history_after_v6(&upgraded, &evidence).await;
+    upgraded.pool().close().await;
+
+    sqlx::query(&format!("DROP SCHEMA {target_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {source_schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+    std::fs::remove_dir_all(migration_dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_migration_checksum_drift_fails_closed_and_recovers_after_restore() {
+    let (url, path) = sqlite_database("migration-checksum");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 4")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get::<Vec<u8>, _>("checksum");
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 4")
+        .bind(vec![0_u8; checksum.len()])
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        SqliteRepository::connect(&url).await.err(),
+        Some(RepositoryError::Unavailable)
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 4")
+        .bind(checksum)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let reconnected = SqliteRepository::connect(&url).await.unwrap();
+    reconnected.pool().close().await;
+    repository.pool().close().await;
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn postgres_migration_checksum_drift_fails_closed_and_recovers_after_restore() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL checksum test skipped");
+        return;
+    };
+    let administration = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("bridgefu_checksum_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    let mut scoped = url::Url::parse(&url).unwrap();
+    scoped
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let scoped = scoped.to_string();
+    let repository = PostgresRepository::connect(&scoped).await.unwrap();
+    let checksum = sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = 4")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get::<Vec<u8>, _>("checksum");
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 4")
+        .bind(vec![0_u8; checksum.len()])
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        PostgresRepository::connect(&scoped).await.err(),
+        Some(RepositoryError::Unavailable)
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 4")
+        .bind(checksum)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let reconnected = PostgresRepository::connect(&scoped).await.unwrap();
+    reconnected.pool().close().await;
+    repository.pool().close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&administration)
+        .await
+        .unwrap();
+    administration.close().await;
+}
+
+#[tokio::test]
+async fn postgres_repository_shared_conformance_and_schema() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL conformance skipped");
+        return;
+    };
+    let repository = PostgresRepository::connect(&url).await.unwrap();
+    reset_postgres(&repository).await;
+    assert_required_postgres_tables(&repository).await;
+    let reconnected = PostgresRepository::connect(&url).await.unwrap();
+    assert_required_postgres_tables(&reconnected).await;
+    drop(reconnected);
+    let probe = prepare_read_probe(&repository).await;
+    let epoch_before = postgres_epoch(&repository).await;
+    exercise_read_probe(&repository, &probe).await;
+    assert_eq!(postgres_epoch(&repository).await, epoch_before);
+    shared_repository_conformance(Arc::new(repository.clone())).await;
+    assert!(repository
+        .retention_candidates(SqlRetentionPolicy::new(Duration::ZERO), at(1_000), 100)
+        .await
+        .unwrap()
+        .is_empty());
+    exercise_expired_idempotency(&repository).await;
+    assert_eq!(
+        postgres_idempotency_count(&repository, "expired-idempotency").await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_two_independent_instances_serialize_races() {
+    let (url, path) = sqlite_database("race");
+    let left: Repository = Arc::new(SqliteRepository::connect(&url).await.unwrap());
+    let right: Repository = Arc::new(SqliteRepository::connect(&url).await.unwrap());
+    independent_instance_races(left, right).await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn postgres_two_independent_instances_serialize_races() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL race suite skipped");
+        return;
+    };
+    let left_repo = PostgresRepository::connect(&url).await.unwrap();
+    reset_postgres(&left_repo).await;
+    let left: Repository = Arc::new(left_repo);
+    let right: Repository = Arc::new(PostgresRepository::connect(&url).await.unwrap());
+    independent_instance_races(left, right).await;
+}
+
+#[tokio::test]
+async fn sqlite_delta_writes_ignore_unrelated_history_and_detect_column_drift() {
+    let (url, path) = sqlite_database("delta");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let (owner, worker, changed, untouched) = two_calls_for_delta(&repository).await;
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_unrelated_call_update BEFORE UPDATE ON calls WHEN OLD.call_id = '{}' BEGIN SELECT RAISE(ABORT, 'unrelated call rewritten'); END",
+        untouched.aggregate.id()
+    ))
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    advance_second_leg(&repository, &owner, worker, &changed)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER reject_unrelated_call_update")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE calls SET tenant_id = 'tampered' WHERE call_id = ?")
+        .bind(untouched.aggregate.id().to_string())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_call(&owner, untouched.aggregate.id()).await,
+        Err(RepositoryError::Unavailable)
+    );
+    sqlx::query("UPDATE calls SET tenant_id = ? WHERE call_id = ?")
+        .bind(owner.as_str())
+        .bind(untouched.aggregate.id().to_string())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_rejects_normalized_column_drift_for_every_body_row_family() {
+    let (url, path) = sqlite_database("all-column-drift");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    shared_repository_conformance(Arc::new(repository.clone())).await;
+    let probe_worker_id = prepare_active_binding(&repository).await;
+
+    let cases = [
+        ("workers", "fence", "fence + 1000"),
+        ("calls", "tenant_id", "tenant_id || '-drift'"),
+        ("legs", "binding_generation", "binding_generation + 1000"),
+        (
+            "worker_assignments",
+            "worker_fence",
+            "worker_fence + 1000",
+        ),
+        (
+            "connection_bindings",
+            "principal_fingerprint",
+            "zeroblob(32)",
+        ),
+        ("commands", "result_version", "result_version + 1000"),
+        ("idempotency", "request_digest", "zeroblob(32)"),
+        ("attachments", "worker_fence", "worker_fence + 1000"),
+        (
+            "provider_events",
+            "event_state",
+            "event_state || '_drift'",
+        ),
+        (
+            "provider_references",
+            "tenant_id",
+            "tenant_id || '-drift'",
+        ),
+        (
+            "provider_completions",
+            "completion_kind",
+            "CASE completion_kind WHEN 'command' THEN 'terminal_acknowledgement' ELSE 'command' END",
+        ),
+        ("outbox", "outbox_state", "outbox_state || '_drift'"),
+        (
+            "deadlines",
+            "deadline_state",
+            "deadline_state || '_drift'",
+        ),
+    ];
+
+    for (table, column, mutation) in cases {
+        sqlx::query("DROP TABLE IF EXISTS normalized_drift_backup")
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE normalized_drift_backup AS SELECT rowid AS target_rowid, {column} AS original_value FROM {table} ORDER BY rowid LIMIT 1"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query("SELECT COUNT(*) AS count FROM normalized_drift_backup")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap()
+                .get::<i64, _>("count"),
+            1,
+            "{table} must have a conformance fixture row"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} SET {column} = {mutation} WHERE rowid = (SELECT target_rowid FROM normalized_drift_backup)"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            repository.worker_snapshot(probe_worker_id).await,
+            Err(RepositoryError::Unavailable),
+            "{table}.{column} drift was accepted"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} SET {column} = (SELECT original_value FROM normalized_drift_backup) WHERE rowid = (SELECT target_rowid FROM normalized_drift_backup)"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        repository.worker_snapshot(probe_worker_id).await.unwrap();
+    }
+    sqlx::query("DROP TABLE normalized_drift_backup")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_raii_transaction_recovers_from_rollback_and_cancellation() {
+    let (url, path) = sqlite_database("rollback-cancel");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let (owner, worker, call, _) = two_calls_for_delta(&repository).await;
+    sqlx::query(
+        "CREATE TRIGGER abort_command_insert BEFORE INSERT ON commands BEGIN SELECT RAISE(ABORT, 'forced command rollback'); END",
+    )
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        advance_second_leg(&repository, &owner, worker, &call).await,
+        Err(RepositoryError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .load_call(&owner, call.aggregate.id())
+            .await
+            .unwrap(),
+        call
+    );
+    sqlx::query("DROP TRIGGER abort_command_insert")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    advance_second_leg(&repository, &owner, worker, &call)
+        .await
+        .unwrap();
+
+    sqlx::query("CREATE TABLE cancellation_probe(value INTEGER NOT NULL)")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let entered = Arc::new(Notify::new());
+    let task = {
+        let pool = repository.pool().clone();
+        let entered = Arc::clone(&entered);
+        tokio::spawn(async move {
+            let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("INSERT INTO cancellation_probe(value) VALUES (1)")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            entered.notify_one();
+            std::future::pending::<()>().await;
+        })
+    };
+    entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        repository.register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 1,
+            capabilities: BTreeSet::from(["sip".into()]),
+            at: at(50),
+            lease_ttl: std::time::Duration::from_secs(300),
+        }),
+    )
+    .await
+    .expect("cancelled transaction left the SQLite writer locked")
+    .unwrap();
+    assert_eq!(recovered.reserved_calls, 0);
+    assert_eq!(
+        sqlx::query("SELECT COUNT(*) AS count FROM cancellation_probe")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
+            .get::<i64, _>("count"),
+        0
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn postgres_delta_writes_ignore_unrelated_history_and_detect_column_drift() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL delta suite skipped");
+        return;
+    };
+    let repository = PostgresRepository::connect(&url).await.unwrap();
+    reset_postgres(&repository).await;
+    let (owner, worker, changed, untouched) = two_calls_for_delta(&repository).await;
+    let xmin_before: String =
+        sqlx::query("SELECT xmin::text AS xmin FROM calls WHERE call_id = $1")
+            .bind(untouched.aggregate.id().as_uuid())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
+            .get("xmin");
+    advance_second_leg(&repository, &owner, worker, &changed)
+        .await
+        .unwrap();
+    let xmin_after: String = sqlx::query("SELECT xmin::text AS xmin FROM calls WHERE call_id = $1")
+        .bind(untouched.aggregate.id().as_uuid())
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get("xmin");
+    assert_eq!(xmin_after, xmin_before);
+
+    sqlx::query("UPDATE calls SET tenant_id = 'tampered' WHERE call_id = $1")
+        .bind(untouched.aggregate.id().as_uuid())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_call(&owner, untouched.aggregate.id()).await,
+        Err(RepositoryError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn postgres_rejects_normalized_column_drift_for_every_body_row_family() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    let Some(url) = postgres_test_url() else {
+        eprintln!("BRIDGEFU_TEST_POSTGRES_URL is unset; PostgreSQL drift suite skipped");
+        return;
+    };
+    let repository = PostgresRepository::connect(&url).await.unwrap();
+    reset_postgres(&repository).await;
+    shared_repository_conformance(Arc::new(repository.clone())).await;
+    let probe_worker_id = prepare_active_binding(&repository).await;
+
+    let cases = [
+        ("workers", "worker_id::text", "fence", "fence + 1000"),
+        ("calls", "call_id::text", "tenant_id", "tenant_id || '-drift'"),
+        ("legs", "leg_id::text", "binding_generation", "binding_generation + 1000"),
+        ("worker_assignments", "call_id::text", "worker_fence", "worker_fence + 1000"),
+        ("connection_bindings", "connection_id", "principal_fingerprint", "decode(repeat('00', 32), 'hex')"),
+        ("commands", "command_id::text", "result_version", "result_version + 1000"),
+        ("idempotency", "tenant_id || ':' || encode(key_digest, 'hex')", "request_digest", "decode(repeat('00', 32), 'hex')"),
+        ("attachments", "encode(token_digest, 'hex')", "worker_fence", "worker_fence + 1000"),
+        ("provider_events", "account_key || ':' || encode(event_digest, 'hex')", "event_state", "event_state || '_drift'"),
+        ("provider_references", "account_key || ':' || provider_call_id", "tenant_id", "tenant_id || '-drift'"),
+        ("provider_completions", "account_key || ':' || encode(event_digest, 'hex')", "completion_kind", "CASE completion_kind WHEN 'command' THEN 'terminal_acknowledgement' ELSE 'command' END"),
+        ("outbox", "effect_id::text", "outbox_state", "outbox_state || '_drift'"),
+        ("deadlines", "call_id::text || ':' || deadline_kind || ':' || generation::text", "deadline_state", "deadline_state || '_drift'"),
+    ];
+
+    for (table, key_expression, column, mutation) in cases {
+        sqlx::query("DROP TABLE IF EXISTS normalized_drift_backup")
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE normalized_drift_backup AS SELECT {key_expression} AS target_key, {column} AS original_value FROM {table} ORDER BY {key_expression} LIMIT 1"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query("SELECT COUNT(*) AS count FROM normalized_drift_backup")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap()
+                .get::<i64, _>("count"),
+            1,
+            "{table} must have a PostgreSQL conformance fixture row"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} SET {column} = {mutation} WHERE {key_expression} = (SELECT target_key FROM normalized_drift_backup)"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            repository.worker_snapshot(probe_worker_id).await,
+            Err(RepositoryError::Unavailable),
+            "PostgreSQL {table}.{column} drift was accepted"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} SET {column} = (SELECT original_value FROM normalized_drift_backup) WHERE {key_expression} = (SELECT target_key FROM normalized_drift_backup)"
+        ))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        repository.worker_snapshot(probe_worker_id).await.unwrap();
+    }
+    sqlx::query("DROP TABLE normalized_drift_backup")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+}
+
+async fn independent_instance_races(left: Repository, right: Repository) {
+    let capacity_worker = register(&left, 8).await;
+    let owner = tenant("race-capacity");
+    let mut tasks = Vec::new();
+    for index in 0..9u8 {
+        let repository = if index % 2 == 0 {
+            Arc::clone(&left)
+        } else {
+            Arc::clone(&right)
+        };
+        let request = create_request(
+            new_call(owner.clone()),
+            capacity_worker.lease,
+            50 + index,
+            70 + index,
+        );
+        tasks.push(tokio::spawn(async move {
+            repository.create_call(request).await
+        }));
+    }
+    let mut admitted = 0;
+    let mut rejected = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(CreateCallOutcome::Created(_)) => admitted += 1,
+            Err(RepositoryError::CapacityExceeded) => rejected += 1,
+            other => panic!("unexpected capacity race result: {other:?}"),
+        }
+    }
+    assert_eq!((admitted, rejected), (8, 1));
+    assert_eq!(
+        right
+            .worker_snapshot(capacity_worker.lease.worker_id)
+            .await
+            .unwrap()
+            .reserved_calls,
+        8
+    );
+
+    let idempotency_worker = register(&left, 4).await;
+    let request = create_request(
+        new_call(tenant("race-idempotency")),
+        idempotency_worker.lease,
+        90,
+        91,
+    );
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let repository = if index % 2 == 0 {
+            Arc::clone(&left)
+        } else {
+            Arc::clone(&right)
+        };
+        let request = request.clone();
+        tasks.push(tokio::spawn(async move {
+            repository.create_call(request).await.unwrap()
+        }));
+    }
+    let mut created_count = 0;
+    let mut call_ids = HashSet::new();
+    for task in tasks {
+        match task.await.unwrap() {
+            CreateCallOutcome::Created(call) => {
+                created_count += 1;
+                call_ids.insert(call.aggregate.id());
+            }
+            CreateCallOutcome::Replayed(call) => {
+                call_ids.insert(call.aggregate.id());
+            }
+        }
+    }
+    assert_eq!(created_count, 1);
+    assert_eq!(call_ids.len(), 1);
+    assert_eq!(
+        right
+            .worker_snapshot(idempotency_worker.lease.worker_id)
+            .await
+            .unwrap()
+            .reserved_calls,
+        1
+    );
+
+    let claim_worker = register(&left, 1).await;
+    left.create_call(create_request(
+        new_call(tenant("race-claims")),
+        claim_worker.lease,
+        110,
+        111,
+    ))
+    .await
+    .unwrap();
+    let left_claim = {
+        let left = Arc::clone(&left);
+        tokio::spawn(async move {
+            left.claim_outbox(claim_worker.lease, at(20), Duration::from_secs(10), 1)
+                .await
+                .unwrap()
+        })
+    };
+    let right_claim = {
+        let right = Arc::clone(&right);
+        tokio::spawn(async move {
+            right
+                .claim_outbox(claim_worker.lease, at(20), Duration::from_secs(10), 1)
+                .await
+                .unwrap()
+        })
+    };
+    assert_eq!(
+        left_claim.await.unwrap().len() + right_claim.await.unwrap().len(),
+        1
+    );
+}
+
+async fn two_calls_for_delta<R: CallRepository>(
+    repository: &R,
+) -> (TenantId, WorkerLease, StoredCall, StoredCall) {
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 2,
+            capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+            at: at(0),
+            lease_ttl: std::time::Duration::from_secs(300),
+        })
+        .await
+        .unwrap();
+    let owner = tenant("delta-owner");
+    let changed = created(
+        repository
+            .create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                130,
+                131,
+            ))
+            .await
+            .unwrap(),
+    );
+    let untouched = created(
+        repository
+            .create_call(create_request(
+                new_call(owner.clone()),
+                worker.lease,
+                132,
+                133,
+            ))
+            .await
+            .unwrap(),
+    );
+    (owner, worker.lease, changed, untouched)
+}
+
+async fn prepare_active_binding<R: CallRepository>(repository: &R) -> WorkerId {
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 1,
+            capabilities: BTreeSet::from(["sip".into()]),
+            at: at(45),
+            lease_ttl: std::time::Duration::from_secs(300),
+        })
+        .await
+        .unwrap();
+    let owner = tenant("column-drift-binding");
+    let request = create_request(new_call(owner.clone()), worker.lease, 150, 151);
+    let token_digest = request.attachments[0].token_digest;
+    repository.create_call(request).await.unwrap();
+    let candidate = repository
+        .inspect_attachment(AttachmentLookup {
+            token_digest,
+            tenant_id: owner,
+            transport: AttachmentTransport::Sip,
+            principal_fingerprint: principal(),
+            worker: worker.lease,
+            at: at(46),
+        })
+        .await
+        .unwrap();
+    repository
+        .consume_attachment(AttachmentConsume {
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(47),
+                leg_id: candidate.leg_id(),
+                binding_generation: candidate.binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            candidate,
+            connection_id: ConnectionId::from_string("conn_column_drift_active"),
+            principal_fingerprint: principal(),
+            principal_expires_at: None,
+            at: at(47),
+        })
+        .await
+        .unwrap();
+    worker.lease.worker_id
+}
+
+async fn advance_second_leg<R: CallRepository>(
+    repository: &R,
+    owner: &TenantId,
+    worker: WorkerLease,
+    call: &StoredCall,
+) -> Result<CommandCommitOutcome, RepositoryError> {
+    let leg = &call.aggregate.legs()[1];
+    repository
+        .commit_command(CommandCommit {
+            tenant_id: owner.clone(),
+            call_id: call.aggregate.id(),
+            expected_version: call.aggregate.version(),
+            command_id: CommandId::new(),
+            command: CallCommand::SetLegState {
+                at: at(3),
+                leg_id: leg.id(),
+                binding_generation: leg.binding_generation(),
+                state: LegState::Signaling,
+                failure: None,
+            },
+            worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: at(3),
+        })
+        .await
+}
+
+async fn exercise_expired_idempotency<R: CallRepository>(repository: &R) {
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 3,
+            capabilities: BTreeSet::from(["sip".into()]),
+            at: at(90),
+            lease_ttl: std::time::Duration::from_secs(300),
+        })
+        .await
+        .unwrap();
+    let owner = tenant("expired-idempotency");
+    for (key, request) in [(220, 221), (221, 222)] {
+        repository
+            .create_call(create_request_at(
+                new_call(owner.clone()),
+                worker.lease,
+                key,
+                request,
+                at(100),
+            ))
+            .await
+            .unwrap();
+    }
+    repository
+        .create_call(create_request_at(
+            new_call(owner),
+            worker.lease,
+            222,
+            223,
+            at(100 + 24 * 60 * 60 + 1),
+        ))
+        .await
+        .unwrap();
+}
+
+async fn sqlite_idempotency_count(repository: &SqliteRepository, tenant: &str) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS count FROM idempotency WHERE tenant_id = ?")
+        .bind(tenant)
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get("count")
+}
+
+async fn postgres_idempotency_count(repository: &PostgresRepository, tenant: &str) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS count FROM idempotency WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get("count")
+}
+
+struct ReadProbe {
+    owner: TenantId,
+    worker: WorkerLease,
+    call: StoredCall,
+    attachment_digest: AttachmentTokenDigest,
+}
+
+async fn prepare_read_probe<R: CallRepository>(repository: &R) -> ReadProbe {
+    let worker = repository
+        .register_worker(RegisterWorker {
+            worker_id: WorkerId::new(),
+            max_calls: 1,
+            capabilities: BTreeSet::from(["sip".into()]),
+            at: at(-10),
+            lease_ttl: std::time::Duration::from_secs(300),
+        })
+        .await
+        .unwrap();
+    let owner = tenant("read-probe");
+    let request = create_request(new_call(owner.clone()), worker.lease, 200, 201);
+    let attachment_digest = request.attachments[0].token_digest;
+    let call = created(repository.create_call(request).await.unwrap());
+    ReadProbe {
+        owner,
+        worker: worker.lease,
+        call,
+        attachment_digest,
+    }
+}
+
+async fn exercise_read_probe<R: CallRepository>(repository: &R, probe: &ReadProbe) {
+    assert_eq!(
+        repository
+            .worker_snapshot(probe.worker.worker_id)
+            .await
+            .unwrap()
+            .lease,
+        probe.worker
+    );
+    assert_eq!(
+        repository
+            .load_call(&probe.owner, probe.call.aggregate.id())
+            .await
+            .unwrap(),
+        probe.call
+    );
+    assert_eq!(
+        repository
+            .inspect_attachment(AttachmentLookup {
+                token_digest: probe.attachment_digest,
+                tenant_id: probe.owner.clone(),
+                transport: AttachmentTransport::Sip,
+                principal_fingerprint: principal(),
+                worker: probe.worker,
+                at: at(3),
+            })
+            .await
+            .unwrap()
+            .call_id(),
+        probe.call.aggregate.id()
+    );
+}
+
+async fn sqlite_epoch(repository: &SqliteRepository) -> i64 {
+    sqlx::query("SELECT epoch FROM repository_metadata WHERE singleton = 1")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get("epoch")
+}
+
+async fn postgres_epoch(repository: &PostgresRepository) -> i64 {
+    sqlx::query("SELECT epoch FROM repository_metadata WHERE singleton = TRUE")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
+        .get("epoch")
+}
+
+const REQUIRED_TABLES: &[&str] = &[
+    "amazon_connect_cleanup_authority",
+    "attachments",
+    "broadcast_commands",
+    "broadcast_operation_receipts",
+    "broadcasts",
+    "call_execution_plans",
+    "calls",
+    "commands",
+    "connection_bindings",
+    "control_commands",
+    "control_outbox",
+    "control_outbox_retirements",
+    "control_sequences",
+    "coordination_outbox",
+    "deadlines",
+    "external_references",
+    "idempotency",
+    "initial_contexts",
+    "legs",
+    "outbox",
+    "outbound_binding_results",
+    "provider_completions",
+    "provider_events",
+    "provider_references",
+    "retired_operation_claims",
+    "reconciliation_results",
+    "repository_metadata",
+    "service_command_results",
+    "service_effect_payloads",
+    "used_connection_ids",
+    "worker_assignments",
+    "workers",
+];
+
+async fn assert_required_sqlite_tables(repository: &SqliteRepository) {
+    let rows = sqlx::query(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE '_sqlx_%' AND name <> 'sqlite_sequence' \
+         ORDER BY name",
+    )
+    .fetch_all(repository.pool())
+    .await
+    .unwrap();
+    let actual = rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<HashSet<_>>();
+    for required in REQUIRED_TABLES {
+        assert!(
+            actual.contains(*required),
+            "missing SQLite table {required}"
+        );
+    }
+    assert!(actual.contains("coordination_projection_locks"));
+    assert_eq!(actual.len(), REQUIRED_TABLES.len() + 1);
+    let foreign_key_violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+    assert!(foreign_key_violations.is_empty());
+    let migrations = sqlx::query("SELECT version, success FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(migrations.len(), 11);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=11) {
+        assert_eq!(migration.get::<i64, _>("version"), expected_version);
+        assert!(migration.get::<bool, _>("success"));
+    }
+    assert_eq!(
+        sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = 1")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
+            .get::<i64, _>("schema_version"),
+        11
+    );
+}
+
+async fn assert_required_postgres_tables(repository: &PostgresRepository) {
+    let rows = sqlx::query(
+        "SELECT tablename FROM pg_catalog.pg_tables \
+         WHERE schemaname = current_schema() AND tablename NOT LIKE '_sqlx_%'",
+    )
+    .fetch_all(repository.pool())
+    .await
+    .unwrap();
+    let actual = rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("tablename"))
+        .collect::<HashSet<_>>();
+    for required in REQUIRED_TABLES {
+        assert!(
+            actual.contains(*required),
+            "missing PostgreSQL table {required}"
+        );
+    }
+    assert_eq!(actual.len(), REQUIRED_TABLES.len());
+    let migrations = sqlx::query("SELECT version, success FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(migrations.len(), 11);
+    for (migration, expected_version) in migrations.iter().zip(1_i64..=11) {
+        assert_eq!(migration.get::<i64, _>("version"), expected_version);
+        assert!(migration.get::<bool, _>("success"));
+    }
+    assert_eq!(
+        sqlx::query("SELECT schema_version FROM repository_metadata WHERE singleton = TRUE")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
+            .get::<i64, _>("schema_version"),
+        11
+    );
+}
+
+fn postgres_test_url() -> Option<String> {
+    std::env::var("BRIDGEFU_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+}
+
+async fn reset_postgres(repository: &PostgresRepository) {
+    sqlx::query(
+        "TRUNCATE TABLE provider_completions, deadlines, outbox, provider_events, provider_references, attachments, idempotency, commands, connection_bindings, worker_assignments, legs, calls, used_connection_ids, workers CASCADE",
+    )
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE repository_metadata SET epoch = 0, provider_receipt_sequence = NULL WHERE singleton = TRUE",
+    )
+    .execute(repository.pool())
+    .await
+    .unwrap();
+}

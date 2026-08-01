@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bridgefu MOQT browser conformance</title>
+  </head>
+  <body>
+    <main>
+      <h1>Bridgefu MOQT browser conformance</h1>
+      <form id="connection-form">
+        <label>Endpoint <input data-testid="endpoint" name="endpoint" required></label>
+        <label>Namespace <input data-testid="namespace" name="namespace" required></label>
+        <label>Track <input data-testid="track" name="track" value="catalog" required></label>
+        <label>Certificate SHA-256 <input data-testid="certificate-hash" name="certificateHash" required></label>
+        <label>Single-use token <input data-testid="token" name="token" type="password" required></label>
+        <button data-testid="run" type="submit">Run conformance check</button>
+      </form>
+      <p data-testid="status" data-state="idle">Idle</p>
+      <pre data-testid="result"></pre>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

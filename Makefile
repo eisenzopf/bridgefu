@@ -18,12 +18,12 @@ IP = $(shell $(TF) output -raw public_ip 2>/dev/null)
 
 # --- local dev ---------------------------------------------------------------
 .PHONY: build
-build: ## Release build against ../rvoip (path dep)
-	cargo build --release
+build: ## Locked release build against crates.io rvoip 0.3.5
+	cargo build --locked --release
 
 .PHONY: check
 check: ## cargo check + terraform validate
-	cargo check
+	cargo check --locked
 	$(TF) validate
 
 .PHONY: fmt

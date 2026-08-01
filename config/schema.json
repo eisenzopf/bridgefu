@@ -1,0 +1,1265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/schema/config-v1.json",
+  "title": "Bridgefu configuration v1",
+  "type": "object",
+  "required": ["aws", "sip"],
+  "$defs": {
+    "mapping": {
+      "type": "object",
+      "properties": {
+        "unmapped": { "enum": ["drop", "pass_prefixed"] },
+        "passthrough_prefix": { "type": "string" },
+        "rename": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "tenant": {
+      "type": "object",
+      "required": ["instance_id", "contact_flow_id"],
+      "properties": {
+        "instance_id": { "type": "string", "minLength": 1 },
+        "contact_flow_id": { "type": "string", "minLength": 1 },
+        "default_display_name": { "type": "string" },
+        "mapping": { "$ref": "#/$defs/mapping" }
+      },
+      "additionalProperties": false
+    },
+    "otlpTracing": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https?://[^@/?#]+/?$"
+        },
+        "service_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sampling_ratio": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "max_queue_size": { "type": "integer", "minimum": 1, "maximum": 65536 },
+        "max_export_batch_size": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "scheduled_delay_millis": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "export_timeout_millis": { "type": "integer", "minimum": 100, "maximum": 60000 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          },
+          "then": { "required": ["endpoint"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "moqRelayListener": {
+      "type": "object",
+      "required": ["bind", "advertised_endpoint"],
+      "properties": {
+        "bind": { "type": "string", "minLength": 1 },
+        "advertised_endpoint": {
+          "type": "string",
+          "pattern": "^moqt://[^@/?#]+/?$"
+        },
+        "advertised_socket_addr": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "moqRelayLimits": {
+      "type": "object",
+      "properties": {
+        "max_pending_admissions": { "type": "integer", "minimum": 1 },
+        "max_active_sessions": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_active_sessions_per_tenant": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_replay_claims": { "type": "integer", "minimum": 1 },
+        "max_coordinated_namespaces": { "type": "integer", "minimum": 1 },
+        "max_cached_tracks_per_namespace": { "type": "integer", "minimum": 1 },
+        "max_pending_track_requests_per_namespace": { "type": "integer", "minimum": 1 },
+        "max_upstream_connections": { "type": "integer", "minimum": 1 },
+        "max_upstream_tracks": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "moqRelayTimeouts": {
+      "type": "object",
+      "properties": {
+        "setup_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "admission_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "admission_operation_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "pre_admission_cleanup_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "admission_session_close_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "token_revalidation_interval_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "upstream_track_idle_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "upstream_connection_idle_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "drop_cleanup_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "dependency_check_interval_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
+      },
+      "additionalProperties": false
+    },
+    "privateForwardingTls": {
+      "type": "object",
+      "required": ["certificate_chain", "private_key", "peer_ca_certificates"],
+      "properties": {
+        "certificate_chain": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "private_key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "peer_ca_certificates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "privateForwardingLimits": {
+      "type": "object",
+      "properties": {
+        "max_active_routes": { "type": "integer", "minimum": 1 },
+        "max_peer_connections": { "type": "integer", "minimum": 1 },
+        "max_routes_per_peer": { "type": "integer", "minimum": 1 },
+        "media_queue_capacity": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "reliable_queue_capacity": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "inbound_queue_capacity": { "type": "integer", "minimum": 1, "maximum": 4096 }
+      },
+      "additionalProperties": false
+    },
+    "privateForwardingTimeouts": {
+      "type": "object",
+      "properties": {
+        "connect_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "signaling_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "token_ttl_secs": { "type": "integer", "minimum": 60, "maximum": 3600 },
+        "health_interval_secs": { "type": "integer", "minimum": 1, "maximum": 300 }
+      },
+      "additionalProperties": false
+    },
+    "secretRef": {
+      "anyOf": [
+        { "type": "string", "minLength": 1, "maxLength": 16384 },
+        { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+      ]
+    },
+    "profileTlsIdentity": {
+      "type": "object",
+      "required": ["certificate_chain", "private_key"],
+      "properties": {
+        "certificate_chain": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "private_key": { "$ref": "#/$defs/secretRef" }
+      },
+      "additionalProperties": false
+    },
+    "profileIceServer": {
+      "type": "object",
+      "required": ["urls"],
+      "properties": {
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "type": "string", "pattern": "^(stun|stuns|turn|turns):[^\\s]+$" }
+        },
+        "username": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "credential": { "$ref": "#/$defs/secretRef" }
+      },
+      "dependentRequired": {
+        "username": ["credential"],
+        "credential": ["username"]
+      },
+      "additionalProperties": false
+    },
+    "vapiIngressProfile": {
+      "type": "object",
+      "required": [
+        "tenant_id",
+        "principal_subject",
+        "issuer",
+        "scopes",
+        "trusted_signaling_cidrs",
+        "tls"
+      ],
+      "properties": {
+        "tenant_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "principal_subject": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9:._*-]+$" }
+        },
+        "trusted_signaling_cidrs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 3, "maxLength": 64 }
+        },
+        "tls": { "$ref": "#/$defs/profileTlsIdentity" },
+        "digest": {
+          "type": "object",
+          "required": ["realm", "username", "password"],
+          "properties": {
+            "realm": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "username": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "password": { "$ref": "#/$defs/secretRef" }
+          },
+          "additionalProperties": false
+        },
+        "mtls_peer_ca_certificates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "mtls_leaf_certificate_sha256_fingerprints": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        },
+        "srtp_required": { "const": true },
+        "codecs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["pcmu", "pcma", "opus"] }
+        }
+      },
+      "dependentRequired": {
+        "mtls_peer_ca_certificates": ["mtls_leaf_certificate_sha256_fingerprints"],
+        "mtls_leaf_certificate_sha256_fingerprints": ["mtls_peer_ca_certificates"]
+      },
+      "additionalProperties": false
+    },
+    "sipProfile": {
+      "type": "object",
+      "required": ["allowed_targets", "from_uri"],
+      "properties": {
+        "allowed_targets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^sips?:[^\\s]+$" }
+        },
+        "from_uri": { "type": "string", "pattern": "^sips?:[^\\s]+$" },
+        "outbound_proxy": { "type": "string", "pattern": "^sips?:[^\\s]+$" },
+        "auth": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["type", "username", "password"],
+              "properties": {
+                "type": { "const": "digest" },
+                "realm": { "type": "string", "minLength": 1 },
+                "username": { "type": "string", "minLength": 1 },
+                "password": { "$ref": "#/$defs/secretRef" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["type", "token"],
+              "properties": {
+                "type": { "const": "bearer" },
+                "token": { "$ref": "#/$defs/secretRef" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "tls_roots": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "client_certificate": { "$ref": "#/$defs/profileTlsIdentity" },
+        "srtp": { "enum": ["required", "preferred", "disabled"] },
+        "codecs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["pcmu", "pcma", "opus"] }
+        },
+        "metadata_keys": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "webRtcProfile": {
+      "type": "object",
+      "required": ["allowed_signaling_origins"],
+      "properties": {
+        "allowed_signaling_origins": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^wss://[^@/?#]+/?$" }
+        },
+        "bearer_token": { "$ref": "#/$defs/secretRef" },
+        "tls_roots": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "ice_servers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/profileIceServer" }
+        },
+        "codecs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["pcmu", "pcma", "opus"] }
+        },
+        "data_channels": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "genericSipNetworking": {
+      "type": "object",
+      "properties": {
+        "allow_cleartext_bearer": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit opt-in for the shared API Bearer credential on cleartext SIP UDP/TCP; use only on a separately restricted private or carrier network"
+        },
+        "digest": {
+          "type": "object",
+          "required": ["realm", "username", "password"],
+          "properties": {
+            "realm": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+            },
+            "username": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "password": {
+              "anyOf": [
+                { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]+$" },
+                { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "advertised_addr": { "type": "string", "minLength": 1 },
+        "media_public_addr": { "type": "string", "minLength": 1 },
+        "stun_server": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "secure_listener": {
+          "type": "object",
+          "required": ["bind", "certificate_chain", "private_key"],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1 },
+            "advertised_addr": { "type": "string", "minLength": 1 },
+            "certificate_chain": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "private_key": { "$ref": "#/$defs/secretRef" },
+            "client_ca_certificate": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "require_client_certificate": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "srtp": { "enum": ["required", "preferred", "disabled"] },
+        "rtp_port_start": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "rtp_port_end": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "symmetric_rtp": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "allow_ip_change": { "type": "boolean" },
+            "probation_packets": { "type": "integer", "minimum": 1, "maximum": 32 },
+            "max_rebindings": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "rebind_window_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+            "max_sequence_jump": { "type": "integer", "minimum": 1, "maximum": 32767 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "genericIceServer": {
+      "type": "object",
+      "required": ["urls"],
+      "properties": {
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^(stun|stuns|turn|turns):[^\\s]+$"
+          }
+        },
+        "username": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "credential": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 1024 },
+            { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "genericWebRtcNetworking": {
+      "type": "object",
+      "properties": {
+        "udp_bind": { "type": "string", "minLength": 1 },
+        "audio_codecs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["opus", "pcmu", "pcma"] },
+          "default": ["opus"],
+          "description": "Primary codecs registered by the public WebRTC edge. Opus-only is the deterministic browser default."
+        },
+        "ice_servers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/genericIceServer" }
+        },
+        "ice_transport_policy": { "enum": ["all", "relay"] },
+        "nat_1to1_ips": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "ip-address" }
+        },
+        "nat_1to1_candidate_type": { "enum": ["host", "srflx"] },
+        "gather_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "connection_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "trickle_ice": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "standardCharterCanary": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "tenant": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "trusted_subject": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "trusted_issuer": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "correlation_header": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[Xx]-[A-Za-z0-9.!_+\\-]+$"
+        },
+        "amazon_profile": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "config_version": { "const": 1 },
+    "aws": {
+      "type": "object",
+      "required": ["region"],
+      "properties": {
+        "region": { "type": "string", "minLength": 1 },
+        "instance_id": { "type": "string" },
+        "contact_flow_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "sip": {
+      "type": "object",
+      "properties": {
+        "bind_ip": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "advertised_ip": { "type": "string" },
+        "media_public_ip": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "contact": {
+      "type": "object",
+      "properties": {
+        "default_display_name": { "type": "string" },
+        "signaling_timeout_secs": { "type": "integer", "minimum": 1 },
+        "media_connect_timeout_secs": { "type": "integer", "minimum": 1 },
+        "keepalive_interval_secs": { "type": "integer", "minimum": 1 },
+        "session_idle_ttl_secs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "mapping": { "$ref": "#/$defs/mapping" },
+    "observability": {
+      "type": "object",
+      "properties": {
+        "log_level": { "type": "string", "minLength": 1 },
+        "log_format": { "enum": ["json", "pretty"] },
+        "http_bind": { "type": "string", "minLength": 1 },
+        "otlp": { "$ref": "#/$defs/otlpTracing" }
+      },
+      "additionalProperties": false
+    },
+    "default_tenant": { "type": ["string", "null"] },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["all-in-one", "gateway", "worker", "moq-relay"] },
+        "max_concurrent_calls": { "type": "integer", "minimum": 1 },
+        "setup_timeout_secs": { "type": "integer", "minimum": 1 },
+        "media_idle_timeout_secs": { "type": "integer", "minimum": 1 },
+        "drain_timeout_secs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "private_forwarding": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "token_signing_secret": {
+          "anyOf": [
+            { "type": "string", "minLength": 32, "maxLength": 4096 },
+            { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+          ]
+        },
+        "gateway": {
+          "type": "object",
+          "required": ["gateway_id", "tls", "workers"],
+          "properties": {
+            "gateway_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            },
+            "bind": { "type": "string", "minLength": 1 },
+            "tls": { "$ref": "#/$defs/privateForwardingTls" },
+            "public_uctp": {
+              "type": "object",
+              "required": ["bind", "tls"],
+              "properties": {
+                "bind": { "type": "string", "minLength": 1 },
+                "max_concurrent_connections": { "type": "integer", "minimum": 1 },
+                "tls": {
+                  "type": "object",
+                  "required": ["certificate_chain", "private_key"],
+                  "properties": {
+                    "certificate_chain": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                    },
+                    "private_key": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "workers": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "required": ["worker_id", "endpoint", "server_name"],
+                "properties": {
+                  "worker_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "not": { "const": "00000000-0000-0000-0000-000000000000" }
+                  },
+                  "endpoint": { "type": "string", "minLength": 1 },
+                  "server_name": { "type": "string", "minLength": 1, "maxLength": 253 }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "worker": {
+          "type": "object",
+          "required": ["tls"],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1 },
+            "tls": { "$ref": "#/$defs/privateForwardingTls" }
+          },
+          "additionalProperties": false
+        },
+        "limits": { "$ref": "#/$defs/privateForwardingLimits" },
+        "timeouts": { "$ref": "#/$defs/privateForwardingTimeouts" }
+      },
+      "additionalProperties": false
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "backend": { "enum": ["sqlite", "postgres", "postgresql", "memory"] },
+        "database_url": { "type": "string", "minLength": 1 },
+        "worker_id": {
+          "type": "string",
+          "format": "uuid",
+          "not": { "const": "00000000-0000-0000-0000-000000000000" }
+        },
+        "allow_ephemeral_memory": { "type": "boolean" },
+        "deployment_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,63}$"
+        },
+        "worker_lease_ttl_secs": { "type": "integer", "minimum": 5, "maximum": 300 },
+        "worker_renew_interval_secs": { "type": "integer", "minimum": 1 },
+        "worker_capabilities": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "redis_url": {
+          "type": "string",
+          "pattern": "^(?:rediss?://|env:[A-Za-z_][A-Za-z0-9_]*)$"
+        },
+        "redis_clustered": { "type": "boolean" },
+        "allow_db_only_coordination": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "backend": { "const": "memory" } },
+            "required": ["backend"]
+          },
+          "then": {
+            "required": ["allow_ephemeral_memory"],
+            "properties": { "allow_ephemeral_memory": { "const": true } },
+            "not": { "required": ["database_url"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "backend": { "enum": ["postgres", "postgresql"] } },
+            "required": ["backend"]
+          },
+          "then": {
+            "required": ["database_url"],
+            "anyOf": [
+              {
+                "required": ["redis_url", "redis_clustered"],
+                "properties": { "redis_clustered": { "const": true } }
+              },
+              {
+                "required": ["allow_db_only_coordination"],
+                "properties": { "allow_db_only_coordination": { "const": true } }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "allow_db_only_coordination": { "const": true } },
+            "required": ["allow_db_only_coordination"]
+          },
+          "then": {
+            "required": ["backend"],
+            "properties": { "backend": { "enum": ["postgres", "postgresql"] } }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "http_bind": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "tls": {
+          "type": "object",
+          "required": ["certificate_chain", "private_key"],
+          "properties": {
+            "certificate_chain": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "private_key": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          },
+          "additionalProperties": false
+        },
+        "bearer_token": { "type": "string" },
+        "control_hmac_key": { "type": "string" },
+        "static_tenant": { "type": "string" },
+        "rate_limit": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "control_requests_per_second": { "type": "integer", "minimum": 1, "maximum": 100000 },
+            "control_burst": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "diagnostics_requests_per_second": { "type": "integer", "minimum": 1, "maximum": 100000 },
+            "diagnostics_burst": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "webhook_requests_per_second": { "type": "integer", "minimum": 1, "maximum": 100000 },
+            "webhook_burst": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "max_tracked_identities": { "type": "integer", "minimum": 1, "maximum": 100000 },
+            "identity_idle_ttl_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
+          },
+          "additionalProperties": false
+        },
+        "routes": {
+          "type": "object",
+          "maxProperties": 256,
+          "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
+          "additionalProperties": {
+            "type": "object",
+            "required": ["tenant_id", "destination"],
+            "properties": {
+              "tenant_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "ingress": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "enum": ["sip", "webrtc"] }
+              },
+              "destination": {
+                "type": "object",
+                "description": "Typed server-owned RequestedLeg; Bridgefu performs strict semantic validation"
+              },
+              "vapi_ingress_profile": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$"
+              },
+              "webrtc_ingress_profile": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$"
+              },
+              "destination_profile": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": ["type", "profile_id"],
+                    "properties": {
+                      "type": { "const": "sip" },
+                      "profile_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["type", "profile_id"],
+                    "properties": {
+                      "type": { "const": "webrtc" },
+                      "profile_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["type", "profile_id"],
+                    "properties": {
+                      "type": { "const": "amazon_connect" },
+                      "profile_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["type", "profile_id"],
+                    "properties": {
+                      "type": { "const": "telnyx" },
+                      "profile_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "legacy_embedded_destination": { "type": "boolean" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "route_attachments": {
+          "type": "object",
+          "properties": {
+            "sip_uri_template": {
+              "type": "string",
+              "pattern": "^sips:\\{token\\}@[^\\s]+$"
+            },
+            "webrtc": {
+              "type": "object",
+              "required": ["signaling_uri"],
+              "properties": {
+                "signaling_uri": { "type": "string", "pattern": "^wss://[^@]+$" },
+                "ice_servers": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": { "$ref": "#/$defs/profileIceServer" }
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "vapi_ingress_profiles": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
+      "additionalProperties": { "$ref": "#/$defs/vapiIngressProfile" }
+    },
+    "sip_profiles": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
+      "additionalProperties": { "$ref": "#/$defs/sipProfile" }
+    },
+    "webrtc_profiles": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
+      "additionalProperties": { "$ref": "#/$defs/webRtcProfile" }
+    },
+    "broadcast": {
+      "type": "object",
+      "properties": {
+        "default_transport": { "enum": ["moqt", "uctp-quic"] },
+        "token_ttl_secs": { "type": "integer", "minimum": 1, "maximum": 900 },
+        "max_active": { "type": "integer", "minimum": 1 },
+        "public_endpoint": { "type": "string" },
+        "token_secret": {
+          "anyOf": [
+            { "type": "string", "minLength": 32 },
+            { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+          ]
+        },
+        "sanitized_events": {
+          "type": "object",
+          "properties": {
+            "tenants": {
+              "type": "object",
+              "propertyNames": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "additionalProperties": {
+                "type": "object",
+                "required": ["context_metadata_key"],
+                "properties": {
+                  "context_metadata_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9_.-]+$"
+                  },
+                  "queue_events": { "type": "integer", "minimum": 1, "maximum": 1024 },
+                  "history_events": { "type": "integer", "minimum": 1, "maximum": 256 },
+                  "max_events_per_second": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "uctp_listener": {
+          "type": "object",
+          "required": ["bind", "tls"],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1 },
+            "max_concurrent_connections": { "type": "integer", "minimum": 1 },
+            "tls": {
+              "type": "object",
+              "required": ["certificate_chain", "private_key"],
+              "properties": {
+                "certificate_chain": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                },
+                "private_key": { "type": "string", "minLength": 1, "maxLength": 4096 }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "moq_origin_relay": {
+          "type": "object",
+          "required": [
+            "bind",
+            "publisher_endpoint",
+            "subscriber_endpoint",
+            "root_certificates",
+            "client_certificate",
+            "client_private_key"
+          ],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1 },
+            "publisher_endpoint": {
+              "type": "string",
+              "pattern": "^moqt://[^@/?#]+:[0-9]{1,5}(?:/[^?#]*)?$"
+            },
+            "subscriber_endpoint": {
+              "type": "string",
+              "pattern": "^(moqt|https)://[^@/?#]+:[0-9]{1,5}(?:/[^?#]*)?$"
+            },
+            "root_certificates": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            },
+            "client_certificate": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "client_private_key": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "moq_relay": {
+      "type": "object",
+      "required": [
+        "publisher",
+        "subscriber_webtransport",
+        "subscriber_raw_quic",
+        "tls",
+        "diagnostics_bearer_token"
+      ],
+      "properties": {
+        "publisher": {
+          "type": "object",
+          "required": [
+            "bind",
+            "advertised_endpoint",
+            "certificate_bindings"
+          ],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1 },
+            "advertised_endpoint": {
+              "type": "string",
+              "pattern": "^moqt://[^@/?#]+/?$"
+            },
+            "advertised_socket_addr": { "type": "string", "minLength": 1 },
+            "certificate_bindings": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["certificate_sha256", "scope"],
+                "properties": {
+                  "certificate_sha256": {
+                    "type": "string",
+                    "pattern": "^[A-Fa-f0-9]{64}$"
+                  },
+                  "scope": {
+                    "type": "string",
+                    "pattern": "^/[A-Za-z0-9._~-]+/[A-Za-z0-9._~-]+$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "max_active_sessions_per_certificate": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "subscriber_webtransport": { "$ref": "#/$defs/moqRelayListener" },
+        "subscriber_raw_quic": { "$ref": "#/$defs/moqRelayListener" },
+        "tls": {
+          "type": "object",
+          "required": [
+            "server_certificates",
+            "server_private_keys",
+            "publisher_client_ca_certificates"
+          ],
+          "properties": {
+            "server_certificates": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            },
+            "server_private_keys": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            },
+            "publisher_client_ca_certificates": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            }
+          },
+          "additionalProperties": false
+        },
+        "diagnostics_bearer_token": {
+          "anyOf": [
+            { "type": "string", "minLength": 32, "maxLength": 4096 },
+            { "type": "string", "pattern": "^env:[A-Za-z_][A-Za-z0-9_]*$" }
+          ]
+        },
+        "limits": { "$ref": "#/$defs/moqRelayLimits" },
+        "timeouts": { "$ref": "#/$defs/moqRelayTimeouts" }
+      },
+      "additionalProperties": false
+    },
+    "generic_bridge": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "sip_bind": { "type": "string" },
+        "webrtc_ws_bind": { "type": "string" },
+        "webrtc_whip_bind": { "type": "string" },
+        "sip": { "$ref": "#/$defs/genericSipNetworking" },
+        "webrtc": { "$ref": "#/$defs/genericWebRtcNetworking" },
+        "standardcharter_canary": { "$ref": "#/$defs/standardCharterCanary" },
+        "bearer_token": {
+          "type": "string",
+          "deprecated": true,
+          "description": "Rejected by Bridgefu 1.0; generic signaling shares api.bearer_token"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providers": {
+      "type": "object",
+      "properties": {
+        "twilio": {
+          "type": "object",
+          "deprecated": true,
+          "description": "Deferred beyond Bridgefu 1.0; retained only for configuration migration diagnostics",
+          "required": ["account_sid", "auth_token"],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "twilio",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "account_sid": { "type": "string", "minLength": 1 },
+            "auth_token": { "type": "string", "minLength": 1 },
+            "base_url": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "telnyx": {
+          "type": "object",
+          "required": [
+            "api_key",
+            "connection_id",
+            "webhook_public_key",
+            "from",
+            "media_sip_authority",
+            "media_sip_username",
+            "media_sip_password"
+          ],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "telnyx",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "api_key": { "type": "string", "minLength": 1 },
+            "connection_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+            },
+            "webhook_public_key": { "type": "string", "minLength": 1 },
+            "from": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+            },
+            "media_sip_authority": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[^@;/\\s?#]+(?::[0-9]{1,5})?$"
+            },
+            "media_sip_username": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^@:/;?#[\\]\\s]+$"
+            },
+            "media_sip_password": { "type": "string", "minLength": 1 },
+            "media_sip_realm": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+              "default": "bridgefu"
+            },
+            "media_sip_transport": {
+              "type": "string",
+              "enum": ["UDP", "TCP", "TLS", "udp", "tcp", "tls"],
+              "default": "UDP"
+            },
+            "webhook_url": {
+              "type": "string",
+              "pattern": "^https://[^@/?#]+(?:/[^?#]*)?(?:\\?[^#]*)?$"
+            },
+            "base_url": {
+              "type": "string",
+              "pattern": "^https?://[^@/?#]+(?:/[^?#]*)?$"
+            },
+            "request_timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120000,
+              "default": 15000
+            },
+            "max_retries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5,
+              "default": 2
+            }
+          },
+          "additionalProperties": false
+        },
+        "vonage": {
+          "type": "object",
+          "deprecated": true,
+          "description": "Deferred beyond Bridgefu 1.0; retained only for configuration migration diagnostics",
+          "required": ["application_id", "private_key", "signature_secret"],
+          "properties": {
+            "account_profile": {
+              "type": "string",
+              "default": "vonage",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+            },
+            "application_id": { "type": "string", "minLength": 1 },
+            "private_key": { "type": "string", "minLength": 1 },
+            "signature_secret": { "type": "string", "minLength": 1 },
+            "base_url": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["twilio"] },
+          { "required": ["vonage"] }
+        ]
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "allow_headers": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "pattern": "^[Xx]-[A-Za-z0-9_-]{1,126}$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_.-]+$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "tenants": {
+      "type": "object",
+      "propertyNames": { "type": "string", "minLength": 1 },
+      "additionalProperties": { "$ref": "#/$defs/tenant" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": { "mode": { "enum": ["all-in-one", "worker"] } },
+            "required": ["mode"]
+          },
+          "persistence": {
+            "properties": { "backend": { "enum": ["postgres", "postgresql"] } },
+            "required": ["backend"]
+          }
+        },
+        "required": ["runtime", "persistence"]
+      },
+      "then": {
+        "properties": {
+          "persistence": { "required": ["worker_id"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "persistence": {
+            "properties": { "allow_db_only_coordination": { "const": true } },
+            "required": ["allow_db_only_coordination"]
+          }
+        },
+        "required": ["persistence"]
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": { "mode": { "const": "all-in-one" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": { "mode": { "const": "gateway" } },
+            "required": ["mode"]
+          }
+        },
+        "required": ["runtime"]
+      },
+      "then": {
+        "required": ["api", "persistence", "private_forwarding", "generic_bridge"],
+        "properties": {
+          "api": {
+            "required": ["enabled", "http_bind", "bearer_token", "control_hmac_key"],
+            "properties": { "enabled": { "const": true } }
+          },
+          "persistence": {
+            "required": ["backend", "database_url", "redis_url", "redis_clustered"],
+            "properties": {
+              "backend": { "const": "postgres" },
+              "redis_clustered": { "const": true }
+            }
+          },
+          "private_forwarding": {
+            "required": ["enabled", "token_signing_secret", "gateway"],
+            "properties": {
+              "enabled": { "const": true },
+              "gateway": {
+                "required": ["public_uctp"]
+              }
+            }
+          },
+          "generic_bridge": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": true } }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

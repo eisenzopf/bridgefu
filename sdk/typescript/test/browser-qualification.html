@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bridgefu browser qualification</title>
+  </head>
+  <body>
+    <main>
+      <h1>Bridgefu browser qualification</h1>
+      <output id="status">starting</output>
+    </main>
+    <script type="module">
+      import {
+        BridgefuWebRtcClient,
+        normalizeBridgefuRouteAttachment,
+      } from "/sdk/index.js";
+
+      const status = document.querySelector("#status");
+      const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+      async function waitFor(label, probe, timeoutMs = 15_000) {
+        const deadline = Date.now() + timeoutMs;
+        let last;
+        while (Date.now() < deadline) {
+          last = await probe();
+          if (last) return last;
+          await sleep(50);
+        }
+        throw new Error(`${label} deadline (last=${JSON.stringify(last)})`);
+      }
+
+      async function audioStats(peer, direction) {
+        let bytes = 0;
+        for (const report of (await peer.getStats()).values()) {
+          const kind = report.kind ?? report.mediaType;
+          if (report.type === `${direction}-rtp` && kind === "audio") {
+            bytes += direction === "inbound" ? (report.bytesReceived ?? 0) : (report.bytesSent ?? 0);
+          }
+        }
+        return bytes;
+      }
+
+      async function audioPackets(peer, direction) {
+        let packets = 0;
+        for (const report of (await peer.getStats()).values()) {
+          const kind = report.kind ?? report.mediaType;
+          if (report.type === `${direction}-rtp` && kind === "audio") {
+            packets += direction === "inbound"
+              ? (report.packetsReceived ?? 0)
+              : (report.packetsSent ?? 0);
+          }
+        }
+        return packets;
+      }
+
+      async function selectedIcePath(peer) {
+        const reports = await peer.getStats();
+        let pair = null;
+        for (const report of reports.values()) {
+          if (report.type === "transport" && report.selectedCandidatePairId) {
+            pair = reports.get(report.selectedCandidatePairId) ?? null;
+            break;
+          }
+        }
+        if (!pair) {
+          pair = [...reports.values()].find(
+            (report) =>
+              report.type === "candidate-pair" &&
+              report.state === "succeeded" &&
+              (report.nominated || report.selected),
+          ) ?? null;
+        }
+        const local = pair?.localCandidateId ? reports.get(pair.localCandidateId) : null;
+        const remote = pair?.remoteCandidateId ? reports.get(pair.remoteCandidateId) : null;
+        return {
+          localCandidateType: local?.candidateType ?? null,
+          remoteCandidateType: remote?.candidateType ?? null,
+          relayCandidateSelected:
+            local?.candidateType === "relay" || remote?.candidateType === "relay",
+        };
+      }
+
+      async function reportPhase(phase, detail = {}) {
+        const response = await fetch("/browser-phase", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ phase, ...detail }),
+        });
+        if (!response.ok) throw new Error(`browser phase ${phase} failed: ${response.status}`);
+      }
+
+      function audioSdpLines(description) {
+        const lines = (description?.sdp ?? "").split(/\r?\n/);
+        const selected = [];
+        let inAudio = false;
+        for (const line of lines) {
+          if (line.startsWith("m=")) inAudio = line.startsWith("m=audio ");
+          if (
+            inAudio &&
+            (line.startsWith("m=audio ") ||
+              line.startsWith("a=rtpmap:") ||
+              line.startsWith("a=fmtp:"))
+          ) {
+            selected.push(line);
+          }
+        }
+        return selected;
+      }
+
+      window.__bridgefuQualification = (async () => {
+        const fixture = await fetch("/attachment", { cache: "no-store" }).then((response) => {
+          if (!response.ok) throw new Error(`attachment request failed: ${response.status}`);
+          return response.json();
+        });
+        const attachment = normalizeBridgefuRouteAttachment(
+          fixture.route_attachment,
+          fixture.binding,
+        );
+        const scenario = fixture.scenario ?? {};
+        const qualificationScope = fixture.qualification ?? {};
+        if (
+          qualificationScope.liveProviderQualified !== false ||
+          qualificationScope.turnQualified !== false ||
+          qualificationScope.browserPublicTlsQualified !== false
+        ) {
+          throw new Error(
+            "hermetic Chromium fixture made an unsupported live-provider/TURN/public-TLS claim",
+          );
+        }
+        const configuredIceUrls = (attachment.iceServers ?? []).flatMap((server) =>
+          Array.isArray(server.urls) ? server.urls : [server.urls],
+        );
+        const turnConfigured = configuredIceUrls.some((url) =>
+          typeof url === "string" && /^turns?:/i.test(url),
+        );
+        if (turnConfigured) {
+          throw new Error("non-TURN Chromium qualification unexpectedly configured TURN");
+        }
+        async function rejectedAttachmentCode(candidate, label) {
+          const probe = new BridgefuWebRtcClient({
+            microphone: false,
+            connectTimeoutMs: 5_000,
+            disconnectGraceMs: 0,
+          });
+          try {
+            await probe.connect(candidate);
+            throw new Error(`${label} attachment unexpectedly connected`);
+          } catch (error) {
+            if (error?.message === `${label} attachment unexpectedly connected`) throw error;
+            return error?.code ?? error?.name ?? "unknown";
+          } finally {
+            await probe.disconnect();
+          }
+        }
+        const expiredAttachmentErrorCode = await rejectedAttachmentCode(
+          {
+            ...attachment,
+            expiresAt: new Date(Date.now() - 60_000).toISOString(),
+          },
+          "expired",
+        );
+        if (expiredAttachmentErrorCode !== "invalid-attachment") {
+          throw new Error(`expired attachment returned ${expiredAttachmentErrorCode}`);
+        }
+        const finalTokenCharacter = attachment.attachmentToken.slice(-1);
+        const forgedToken = `${attachment.attachmentToken.slice(0, -1)}${
+          finalTokenCharacter === "A" ? "B" : "A"
+        }`;
+        const forgedAttachmentErrorCode = await rejectedAttachmentCode(
+          {
+            ...attachment,
+            attachmentToken: forgedToken,
+            signalingCredential: attachment.signalingCredential
+              ? { ...attachment.signalingCredential, token: forgedToken }
+              : undefined,
+          },
+          "forged",
+        );
+        const remoteMessages = [];
+        const remoteContexts = [];
+        const handoffMessages = [];
+        const handoffEvents = [];
+        const ringbackStarts = [];
+        const ringbackStops = [];
+        let remoteTrackCount = 0;
+        const client = new BridgefuWebRtcClient({
+          microphone: true,
+          connectTimeoutMs: 20_000,
+          disconnectGraceMs: 0,
+          ringback: {
+            start() {
+              ringbackStarts.push(Date.now());
+            },
+            stop(reason) {
+              ringbackStops.push(reason);
+            },
+          },
+          dataChannels: [
+            {
+              label: "browser.arbitrary.v1",
+              options: { ordered: true, protocol: "rvoip.data.v1" },
+            },
+          ],
+        });
+        client.on("remoteTrack", ({ event }) => {
+          if (event.track.kind === "audio") remoteTrackCount += 1;
+        });
+        client.on("dataMessage", ({ message }) => {
+          remoteMessages.push({
+            label: message.label,
+            contentType: message.contentType,
+            bytes: Array.from(message.data),
+          });
+        });
+        client.on("context", ({ envelope }) => {
+          remoteContexts.push(envelope);
+        });
+        client.on("handoff", ({ previous, status: next, detail }) => {
+          handoffEvents.push({ previous, status: next, detail: detail ?? null });
+        });
+        client.on("handoffMessage", ({ envelope }) => {
+          handoffMessages.push({
+            ...envelope,
+            peerConnectionState: client.peerConnection?.connectionState ?? null,
+            serverConnectionId: client.serverConnectionId,
+          });
+        });
+        client.on("error", ({ error }) => {
+          console.error(JSON.stringify({
+            event: "bridgefu-client-error",
+            code: error.code,
+            message: error.message,
+            cause: error.cause instanceof Error ? error.cause.message : null,
+          }));
+        });
+
+        status.value = "connecting";
+        await client.connect(attachment);
+        const peer = client.peerConnection;
+        if (!peer || peer.connectionState !== "connected") {
+          throw new Error(`peer did not connect (state=${peer?.connectionState ?? "missing"})`);
+        }
+        const connectedServerConnectionId = client.serverConnectionId;
+        if (!connectedServerConnectionId) throw new Error("server connection ID is missing");
+        const managedContextChannel = await waitFor(
+          "managed context DataChannel open",
+          () => {
+            const channel = client.getDataChannel("bridgefu.context.v1");
+            return channel?.readyState === "open" ? channel : null;
+          },
+        );
+        const arbitraryChannel = await waitFor(
+          "arbitrary DataChannel open",
+          () => {
+            const channel = client.getDataChannel("browser.arbitrary.v1");
+            return channel?.readyState === "open" ? channel : null;
+          },
+        );
+
+        client.sendContext({
+          correlationId: scenario.initialCorrelationId ?? "chromium-browser-correlation",
+          metadata: scenario.initialMetadata ?? {
+            account_tier: "chromium",
+            must_not_forward: "private-browser-value",
+          },
+        });
+        await waitFor(
+          "named SIPS destination ready",
+          async () => (await fetch("/destination-ready", { cache: "no-store" }).then((r) => r.json())).ready,
+          20_000,
+        );
+
+        client.sendContext({
+          correlationId:
+            scenario.assistantContextCorrelationId ?? "chromium-browser-later-context",
+          metadata: { account_tier: "chromium-updated" },
+        });
+        const outboundMessage = client.sendDataMessage(
+          "browser.arbitrary.v1",
+          "application/octet-stream",
+          new Uint8Array([0, 255, 66]),
+        );
+        const sender = peer
+          .getSenders()
+          .find((candidate) => candidate.track?.kind === "audio");
+        const dtmfSupported = Boolean(sender?.dtmf?.canInsertDTMF);
+        const dtmfDiagnostics = {
+          senderPresent: Boolean(sender),
+          dtmfObjectPresent: Boolean(sender?.dtmf),
+          canInsertDTMF: sender?.dtmf?.canInsertDTMF ?? null,
+          offerAudio: audioSdpLines(peer.localDescription),
+          answerAudio: audioSdpLines(peer.remoteDescription),
+          toneChanges: [],
+        };
+        if (!dtmfSupported) {
+          throw new Error(
+            `required RTCDTMFSender is unavailable: ${JSON.stringify(dtmfDiagnostics)}`,
+          );
+        }
+        await fetch("/browser-diagnostics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(dtmfDiagnostics),
+        });
+        async function sendDtmfAndWait(digits) {
+          const completion = new Promise((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error(`DTMF tonechange completion deadline (${sender.dtmf.toneBuffer})`)),
+              5_000,
+            );
+            const onToneChange = (event) => {
+              dtmfDiagnostics.toneChanges.push(event.tone);
+              if (event.tone === "") {
+                clearTimeout(timer);
+                sender.dtmf.removeEventListener("tonechange", onToneChange);
+                resolve();
+              }
+            };
+            sender.dtmf.addEventListener("tonechange", onToneChange);
+          });
+          client.sendDtmf(digits, 120, 70);
+          await completion;
+          // The empty tone notification means Chromium's API queue is empty,
+          // but the RTP sender can still be flushing final RFC 4733 end-event
+          // retransmissions.
+          await sleep(1_000);
+        }
+        await sendDtmfAndWait(scenario.assistantDtmfDigits ?? "6");
+
+        const outboundAudioBytes = await waitFor(
+          "fake microphone outbound Opus",
+          () => audioStats(peer, "outbound"),
+          20_000,
+        );
+        const initialInboundAudioBytes = await waitFor(
+          "Vapi-like assistant G.711 to browser Opus audio",
+          () => audioStats(peer, "inbound"),
+          20_000,
+        );
+        await waitFor("remote audio track", () => remoteTrackCount > 0, 10_000);
+        await fetch("/browser-diagnostics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(dtmfDiagnostics),
+        });
+        await reportPhase("assistant-ready", {
+          outboundBytes: outboundAudioBytes,
+          inboundBytes: initialInboundAudioBytes,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+
+        const serverStatuses = () => handoffMessages.map((message) => message.status);
+        await waitFor(
+          "rejected handoff attaching status",
+          () => serverStatuses().filter((value) => value === "attaching").length >= 1,
+          20_000,
+        );
+        await sleep(250);
+        const rejectedHoldStartBytes = await audioStats(peer, "inbound");
+        await reportPhase("reject-hold-ready", {
+          inboundBytes: rejectedHoldStartBytes,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        await waitFor(
+          "rejected handoff resumed status",
+          () => serverStatuses().includes("resumed"),
+          20_000,
+        );
+        await sleep(150);
+        const rejectedHoldEndBytes = await audioStats(peer, "inbound");
+        if (rejectedHoldEndBytes !== rejectedHoldStartBytes) {
+          throw new Error(
+            `held assistant leaked ${rejectedHoldEndBytes - rejectedHoldStartBytes} RTP bytes to Chromium`,
+          );
+        }
+        await reportPhase("reject-resumed", {
+          inboundBytes: rejectedHoldEndBytes,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        const resumedInboundAudioBytes = await waitFor(
+          "resumed assistant audio",
+          async () => {
+            const bytes = await audioStats(peer, "inbound");
+            return bytes > rejectedHoldEndBytes ? bytes : 0;
+          },
+          20_000,
+        );
+        await reportPhase("reject-resume-audio", {
+          inboundBytes: resumedInboundAudioBytes,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+
+        await waitFor(
+          "successful handoff attaching status",
+          () => serverStatuses().filter((value) => value === "attaching").length >= 2,
+          20_000,
+        );
+        await sleep(250);
+        const successfulHoldStartBytes = await audioStats(peer, "inbound");
+        const successfulHoldStartOutboundBytes = await audioStats(peer, "outbound");
+        const successfulHoldStartOutboundPackets = await audioPackets(peer, "outbound");
+        await reportPhase("success-hold-ready", {
+          inboundBytes: successfulHoldStartBytes,
+          outboundBytes: successfulHoldStartOutboundBytes,
+          outboundPackets: successfulHoldStartOutboundPackets,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        await waitFor(
+          "successful handoff connected status",
+          () => serverStatuses().includes("connected"),
+          20_000,
+        );
+        await sleep(150);
+        const successfulHoldEndBytes = await audioStats(peer, "inbound");
+        const successfulHoldEndOutboundBytes = await audioStats(peer, "outbound");
+        const successfulHoldEndOutboundPackets = await audioPackets(peer, "outbound");
+        if (successfulHoldEndBytes !== successfulHoldStartBytes) {
+          throw new Error(
+            `held assistant leaked ${successfulHoldEndBytes - successfulHoldStartBytes} RTP bytes during promotion`,
+          );
+        }
+        await reportPhase("success-connected", {
+          inboundBytes: successfulHoldEndBytes,
+          outboundBytes: successfulHoldEndOutboundBytes,
+          outboundPackets: successfulHoldEndOutboundPackets,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        const promotedOutboundBytes = await waitFor(
+          "browser microphone RTP after atomic promotion",
+          async () => {
+            const bytes = await audioStats(peer, "outbound");
+            return bytes > successfulHoldEndOutboundBytes ? bytes : 0;
+          },
+          20_000,
+        );
+        const promotedOutboundPackets = await audioPackets(peer, "outbound");
+        await reportPhase("success-source-live", {
+          outboundBytes: promotedOutboundBytes,
+          outboundPackets: promotedOutboundPackets,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        const agentInboundAudioBytes = await waitFor(
+          "call-center audio after atomic promotion",
+          async () => {
+            const bytes = await audioStats(peer, "inbound");
+            return bytes > successfulHoldEndBytes ? bytes : 0;
+          },
+          20_000,
+        );
+        await reportPhase("agent-audio", {
+          inboundBytes: agentInboundAudioBytes,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+        const finalContextCorrelationId =
+          scenario.finalContextCorrelationId ?? "chromium-browser-final-context";
+        client.sendContext({
+          correlationId: finalContextCorrelationId,
+          metadata: { handoff_state: "connected" },
+        });
+        const finalOutboundMessage = client.sendDataMessage(
+          "browser.arbitrary.v1",
+          "application/octet-stream",
+          new Uint8Array([7, 0, 255, 42]),
+        );
+        await sendDtmfAndWait(scenario.destinationDtmfDigits ?? "5");
+        await reportPhase("destination-actions-sent", {
+          finalContextCorrelationId,
+          finalMessageId: finalOutboundMessage.messageId,
+          peerConnectionState: peer.connectionState,
+          serverConnectionId: client.serverConnectionId,
+        });
+
+        let remoteDtmfObserved = false;
+        if (scenario.dtmfSemantics === "bidirectional-media-plane") {
+          await sleep(250);
+          const inboundPacketsBeforeDtmf = await audioPackets(peer, "inbound");
+          await reportPhase("remote-dtmf-ready", {
+            inboundPackets: inboundPacketsBeforeDtmf,
+            peerConnectionState: peer.connectionState,
+            serverConnectionId: client.serverConnectionId,
+          });
+          await waitFor(
+            "destination RFC 4733 packets at Chromium",
+            async () => (await audioPackets(peer, "inbound")) > inboundPacketsBeforeDtmf,
+            10_000,
+          );
+          remoteDtmfObserved = true;
+        }
+
+        const expectedContextCorrelationId = scenario.expectedRemoteContextCorrelationId ?? null;
+        const remoteContext = expectedContextCorrelationId
+          ? await waitFor(
+              "destination context to managed context DataChannel",
+              () => remoteContexts.find(
+                (envelope) => envelope.correlation_id === expectedContextCorrelationId,
+              ),
+              20_000,
+            )
+          : null;
+        const expectedMessage = scenario.expectedRemoteMessage ?? null;
+        const remoteMessage = expectedMessage
+          ? await waitFor(
+              "destination arbitrary DataChannel message",
+              () => remoteMessages.find(
+                (message) =>
+                  message.label === expectedMessage.label &&
+                  message.contentType === expectedMessage.contentType &&
+                  JSON.stringify(message.bytes) === JSON.stringify(expectedMessage.bytes),
+              ),
+              20_000,
+            )
+          : null;
+        await waitFor(
+          "server-side destination evidence",
+          async () =>
+            (await fetch("/destination-verified", { cache: "no-store" }).then((r) => r.json()))
+              .verified,
+          20_000,
+        );
+
+        const expectedStatuses = [
+          "preparing",
+          "ringing",
+          "attaching",
+          "resumed",
+          "preparing",
+          "ringing",
+          "attaching",
+          "connected",
+        ];
+        if (JSON.stringify(serverStatuses()) !== JSON.stringify(expectedStatuses)) {
+          throw new Error(`unexpected authenticated handoff statuses: ${JSON.stringify(serverStatuses())}`);
+        }
+        // The controller owns ringback for the initial browser attachment as
+        // well as each of the two authenticated replacement attempts.
+        if (ringbackStarts.length !== 3) {
+          throw new Error(`ringback started ${ringbackStarts.length} times instead of three times`);
+        }
+        if (JSON.stringify(ringbackStops) !== JSON.stringify(["connected", "resumed", "connected"])) {
+          throw new Error(`unexpected ringback stops: ${JSON.stringify(ringbackStops)}`);
+        }
+        const peerStable = peer === client.peerConnection;
+        const serverConnectionStable = client.serverConnectionId === connectedServerConnectionId;
+        if (!peerStable || !serverConnectionStable || peer.connectionState !== "connected") {
+          throw new Error("browser peer/signaling identity changed during make-before-break");
+        }
+        if (
+          handoffMessages.some(
+            (message) =>
+              message.peerConnectionState !== "connected" ||
+              message.serverConnectionId !== connectedServerConnectionId,
+          )
+        ) {
+          throw new Error("browser peer/signaling connection was unstable during a handoff status");
+        }
+
+        const icePath = await selectedIcePath(peer);
+        if (icePath.relayCandidateSelected) {
+          throw new Error("non-TURN Chromium qualification selected a relay candidate");
+        }
+
+        const terminalSide = scenario.terminalSide ?? "browser";
+        let terminalReason;
+        if (terminalSide === "browser") {
+          status.value = "disconnecting";
+          await client.disconnect();
+          terminalReason = "browser-disconnect";
+        } else if (terminalSide === "destination") {
+          status.value = "awaiting-destination-hangup";
+          await reportPhase("destination-hangup-ready", {
+            peerConnectionState: peer.connectionState,
+            serverConnectionId: client.serverConnectionId,
+          });
+          await waitFor("destination-initiated WebRTC BYE", () => client.state === "closed", 20_000);
+          terminalReason = "remote-bye";
+        } else {
+          throw new Error(`unsupported terminal side: ${terminalSide}`);
+        }
+        if (client.state !== "closed") throw new Error(`client did not close: ${client.state}`);
+        await waitFor(
+          "browser transport cleanup",
+          () =>
+            peer.connectionState === "closed" &&
+            sender?.track?.readyState === "ended" &&
+            managedContextChannel.readyState === "closed" &&
+            arbitraryChannel.readyState === "closed" &&
+            client.serverConnectionId === null,
+          5_000,
+        );
+
+        const replayClient = new BridgefuWebRtcClient({
+          microphone: false,
+          connectTimeoutMs: 5_000,
+          disconnectGraceMs: 0,
+        });
+        let replayRejected = false;
+        let replayErrorCode = null;
+        try {
+          await replayClient.connect(attachment);
+          await replayClient.disconnect();
+        } catch (error) {
+          replayRejected = true;
+          replayErrorCode = error?.code ?? error?.name ?? "unknown";
+        }
+        if (!replayRejected) throw new Error("single-use attachment replay was accepted");
+
+        status.value = "passed";
+        return {
+          connected: true,
+          connectedServerConnectionId,
+          localAudioTrackState: sender?.track?.readyState ?? null,
+          finalPeerConnectionState: peer.connectionState,
+          finalManagedContextChannelState: managedContextChannel.readyState,
+          finalArbitraryChannelState: arbitraryChannel.readyState,
+          finalServerConnectionId: client.serverConnectionId,
+          outboundAudioBytes,
+          inboundAudioBytes: agentInboundAudioBytes,
+          initialInboundAudioBytes,
+          resumedInboundAudioBytes,
+          agentInboundAudioBytes,
+          remoteTrackCount,
+          outboundMessageId: outboundMessage.messageId,
+          finalOutboundMessageId: finalOutboundMessage.messageId,
+          remoteContext,
+          remoteMessage,
+          remoteMessages,
+          remoteMessageCount: remoteMessages.length,
+          dtmfSupported,
+          dtmfDiagnostics,
+          handoffMessages,
+          handoffEvents,
+          ringbackStarts: ringbackStarts.length,
+          ringbackStops,
+          rejectedHoldByteDelta: rejectedHoldEndBytes - rejectedHoldStartBytes,
+          successfulHoldByteDelta: successfulHoldEndBytes - successfulHoldStartBytes,
+          peerStable,
+          serverConnectionStable,
+          replayRejected,
+          replayErrorCode,
+          expiredAttachmentErrorCode,
+          forgedAttachmentRejected: true,
+          forgedAttachmentErrorCode,
+          terminalSide,
+          terminalReason,
+          qualification: {
+            destinationBoundary: scenario.destinationBoundary ?? null,
+            contextSemantics: scenario.contextSemantics ?? null,
+            dtmfSemantics: scenario.dtmfSemantics ?? null,
+            remoteDtmfObserved,
+            liveProviderQualified: qualificationScope.liveProviderQualified,
+            turnQualified: qualificationScope.turnQualified,
+            browserPublicTlsQualified: qualificationScope.browserPublicTlsQualified,
+            configuredIceServerCount: (attachment.iceServers ?? []).length,
+            turnConfigured,
+            ...icePath,
+          },
+          finalState: client.state,
+        };
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,265 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: bridgefu
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.15.6
+          terraform_wrapper: false
+      - name: Validate versioned configuration schema and example
+        working-directory: bridgefu
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            'jsonschema==4.25.1' 'PyYAML==6.0.2'
+          python3 scripts/check-config-schema.py
+      - name: Validate every Compose scenario
+        working-directory: bridgefu
+        run: |
+          for profile in standardcharter generic telnyx uctp moqt cluster; do
+            docker compose --profile "${profile}" config --quiet
+          done
+      - name: Terraform formatting
+        working-directory: bridgefu
+        run: terraform fmt -check -recursive deploy/terraform
+      - name: Validate AWS Terraform without applying
+        working-directory: bridgefu/deploy/terraform/aws
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+      - name: Validate GCP Terraform without applying
+        working-directory: bridgefu/deploy/terraform/gcp
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+      - name: Static release-image policy
+        working-directory: bridgefu
+        run: |
+          bash deploy/scripts/check-release-image.sh
+          python3 deploy/scripts/test_verify_multiarch_oci.py
+          python3 deploy/scripts/test_select_oci_platform.py
+          python3 deploy/scripts/test_verify_trivy_policy.py
+          shellcheck deploy.sh deploy/scripts/*.sh
+
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+        env:
+          POSTGRES_USER: bridgefu
+          POSTGRES_PASSWORD: bridgefu-test-only
+          POSTGRES_DB: bridgefu_repository_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bridgefu -d bridgefu_repository_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis@sha256:dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      BRIDGEFU_TEST_POSTGRES_URL: postgres://bridgefu:bridgefu-test-only@127.0.0.1:5432/bridgefu_repository_test
+      BRIDGEFU_TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: bridgefu
+      - name: StandardCharter protected smoke artifact validation
+        run: bash scripts/check-standardcharter-smoke-artifacts.sh
+        working-directory: bridgefu
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pin
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: |
+            bridgefu
+      - name: Install protobuf compiler required by rvoip-amazon-connect
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler
+          protoc --version
+      - name: Verify locked rvoip crates.io graph
+        working-directory: bridgefu
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--format-version", "1"],
+              text=True,
+          ))
+          packages = [
+              package for package in metadata["packages"]
+              if package["name"] == "rvoip"
+              or package["name"].startswith("rvoip-")
+          ]
+          if not packages:
+              raise SystemExit("locked graph contains no rvoip packages")
+          invalid = [
+              (package["name"], package["version"], package["source"])
+              for package in packages
+              if package["version"] != "0.3.5"
+              or not (package["source"] or "").startswith("registry+")
+          ]
+          if invalid:
+              raise SystemExit(f"rvoip graph is not registry-only 0.3.5: {invalid}")
+          print(f"verified {len(packages)} locked rvoip 0.3.5 registry packages")
+          PY
+      - name: Formatting
+        working-directory: bridgefu
+        run: cargo fmt --all -- --check
+      - name: Strict Bridgefu Clippy
+        working-directory: bridgefu
+        run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+      - name: Validate rendered Compose environments with Bridgefu preflight
+        working-directory: bridgefu
+        run: |
+          cargo build --locked --bin bridgefu
+          python3 config/check-compose-profiles.py target/debug/bridgefu
+      - run: cargo test --locked --all-targets
+        working-directory: bridgefu
+      - name: PostgreSQL coordination conformance
+        run: >-
+          cargo test --locked --test coordination_sql
+          -- --ignored --nocapture --test-threads=1
+        working-directory: bridgefu
+      - name: Redis 7.2 coordination conformance
+        run: >-
+          cargo test --locked --test redis_coordination
+          -- --ignored --nocapture --test-threads=1
+        working-directory: bridgefu
+      - name: Redis 7.2 private-egress authority conformance
+        run: >-
+          cargo test --locked --test private_egress_redis
+          -- --ignored --nocapture --test-threads=1
+        working-directory: bridgefu
+      - name: Credential-free role/call/media/context/broadcast runtime smoke
+        working-directory: bridgefu
+        run: >-
+          python3 deploy/scripts/runtime-smoke.py
+          --binary target/debug/bridgefu
+          --output runtime-smoke.json
+      - name: Retain credential-free runtime-smoke evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: bridgefu-runtime-smoke-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          path: bridgefu/runtime-smoke.json
+
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: bridgefu
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: bridgefu
+          file: bridgefu/deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          tags: bridgefu:ci-${{ matrix.arch }}
+          load: true
+          # The Docker exporter cannot retain attestations. CI retains an SBOM
+          # and BuildKit record; registry-attached provenance belongs to the
+          # separately authorized publication workflow.
+          provenance: false
+          sbom: false
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=1970-01-01T00:00:00Z
+            SOURCE_DATE_EPOCH=0
+      - name: Verify native runtime and healthcheck execution
+        run: |
+          set -euo pipefail
+          health_root="${RUNNER_TEMP}/bridgefu-healthcheck"
+          mkdir -p "$health_root"
+          : >"$health_root/livez"
+          python3 -m http.server 19090 --bind 127.0.0.1 \
+            --directory "$health_root" >healthcheck-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:19090/livez >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl --fail --silent http://127.0.0.1:19090/livez >/dev/null
+          docker run --rm --network host \
+            --entrypoint /usr/local/bin/bridgefu \
+            bridgefu:ci-${{ matrix.arch }} \
+            healthcheck --address 127.0.0.1:19090 --path /livez
+          test "$(docker inspect --format '{{json .Config.Healthcheck.Test}}' \
+            bridgefu:ci-${{ matrix.arch }})" = \
+            '["CMD","/usr/local/bin/bridgefu","healthcheck"]'
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: bridgefu:ci-${{ matrix.arch }}
+          format: spdx-json
+          output-file: bridgefu-${{ matrix.arch }}.spdx.json
+      - name: Retain BuildKit metadata
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        run: printf '%s\n' "$BUILD_METADATA" > bridgefu-${{ matrix.arch }}-build-metadata.json
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          image-ref: bridgefu:ci-${{ matrix.arch }}
+          format: sarif
+          output: trivy-${{ matrix.arch }}.sarif
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: "true"
+          exit-code: "1"
+      - uses: github/codeql-action/upload-sarif@641a925cfafe92d0fdf8b239ba4053e3f8d99d6d # v3
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.arch }}.sarif
+          category: bridgefu-image-${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: bridgefu-image-evidence-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            bridgefu-${{ matrix.arch }}.spdx.json
+            bridgefu-${{ matrix.arch }}-build-metadata.json
+            trivy-${{ matrix.arch }}.sarif
