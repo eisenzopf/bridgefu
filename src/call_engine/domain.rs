@@ -1301,6 +1301,19 @@ pub enum CallCommand {
         /// Required only when `state` is `failed`.
         failure: Option<FailureDetails>,
     },
+    /// Records that a remotely initiated source disappeared before Bridgefu
+    /// answered it. The exact source generation becomes terminal while every
+    /// nonterminal peer enters normal teardown in the same decision.
+    SourceTerminatedBeforeAnswer {
+        /// Observation time in UTC.
+        at: DateTime<Utc>,
+        /// Remotely initiated source leg.
+        source_leg_id: LegId,
+        /// Exact source binding generation that disappeared.
+        binding_generation: BindingGeneration,
+        /// Sanitized reason retained with the durable command.
+        reason: SourceBeforeAnswerTermination,
+    },
     /// Confirms that a provider media originate returned and schedules the
     /// independently idempotent remote-destination originate.
     ProviderMediaStarted {
@@ -1412,6 +1425,7 @@ impl CallCommand {
         match self {
             Self::StartConnecting { at, .. }
             | Self::SetLegState { at, .. }
+            | Self::SourceTerminatedBeforeAnswer { at, .. }
             | Self::ProviderMediaStarted { at, .. }
             | Self::ProviderMediaAttached { at, .. }
             | Self::RotateLegBinding { at, .. }
@@ -1424,6 +1438,18 @@ impl CallCommand {
             | Self::DeadlineElapsed { at, .. } => *at,
         }
     }
+}
+
+/// Sanitized reason a remotely initiated source ended before final answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBeforeAnswerTermination {
+    /// The remote caller cancelled the pending attempt.
+    Cancelled,
+    /// The remote transport ended without an explicit failure.
+    RemoteEnded,
+    /// The remote transport failed before admission completed.
+    Failed,
 }
 
 /// Outcome of a provider/signaling transfer command.
@@ -1712,6 +1738,14 @@ impl CallAggregate {
                 state,
                 failure,
             } => self.set_leg_state(at, leg_id, binding_generation, state, failure),
+            CallCommand::SourceTerminatedBeforeAnswer {
+                at,
+                source_leg_id,
+                binding_generation,
+                reason,
+            } => {
+                self.source_terminated_before_answer(at, source_leg_id, binding_generation, reason)
+            }
             CallCommand::ProviderMediaStarted {
                 at,
                 leg_id,
@@ -1868,6 +1902,72 @@ impl CallAggregate {
                 leg.ended_at = Some(at);
             }
             leg.failure = failure;
+        }
+
+        let mut effects = Vec::new();
+        self.reconcile_leg_state(index, at, &mut effects)?;
+        Ok(applied(at, effects))
+    }
+
+    fn source_terminated_before_answer(
+        &mut self,
+        at: DateTime<Utc>,
+        source_leg_id: LegId,
+        supplied_generation: BindingGeneration,
+        reason: SourceBeforeAnswerTermination,
+    ) -> Result<CommandResult, DomainError> {
+        let index = self.leg_index(source_leg_id)?;
+        if let Some(result) = compare_binding_generation(
+            source_leg_id,
+            self.legs[index].binding_generation,
+            supplied_generation,
+            at,
+        )? {
+            return Ok(result);
+        }
+        self.ensure_timestamp(at)?;
+        let source = &self.legs[index];
+        if source.signaling_initiator() != SignalingInitiator::Remote {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "source_terminated_before_answer",
+            });
+        }
+        if source.state.is_terminal() {
+            return Ok(ignored(at, CommandDisposition::IgnoredNoop));
+        }
+        if !matches!(self.state, CallState::Connecting | CallState::Ending)
+            || !matches!(
+                source.state,
+                LegState::Pending
+                    | LegState::AwaitingAttach
+                    | LegState::Signaling
+                    | LegState::Ending
+            )
+        {
+            return Err(DomainError::InvalidCallTransition {
+                from: self.state,
+                command: "source_terminated_before_answer",
+            });
+        }
+
+        let failure = (reason == SourceBeforeAnswerTermination::Failed).then(|| {
+            FailureDetails::sanitized(
+                "source_failed_before_answer",
+                "the remotely initiated source failed before final answer",
+                false,
+            )
+        });
+        {
+            let source = &mut self.legs[index];
+            source.state = if failure.is_some() {
+                LegState::Failed
+            } else {
+                LegState::Ended
+            };
+            source.state_changed_at = at;
+            source.ended_at = Some(at);
+            source.failure = failure;
         }
 
         let mut effects = Vec::new();
@@ -3653,6 +3753,102 @@ mod tests {
             .0;
         assert_eq!(terminal.state(), CallState::Ended);
         assert_eq!(terminal.terminal_outcome(), Some(&TerminalOutcome::Ended));
+    }
+
+    #[test]
+    fn provisional_remote_source_termination_is_atomic_and_generation_fenced() {
+        let mut call = start(&test_call());
+        let source = call.legs()[0].id();
+        let peer = call.legs()[1].id();
+        call = set_leg(&call, source, LegState::Signaling, at(2))
+            .into_parts()
+            .0;
+        call = set_leg(&call, peer, LegState::Signaling, at(3))
+            .into_parts()
+            .0;
+        let generation = call.leg(source).expect("source").binding_generation();
+
+        let ended = decide(
+            &call,
+            CallCommand::SourceTerminatedBeforeAnswer {
+                at: at(4),
+                source_leg_id: source,
+                binding_generation: generation,
+                reason: SourceBeforeAnswerTermination::Cancelled,
+            },
+        );
+        assert_eq!(ended.aggregate().state(), CallState::Ending);
+        assert_eq!(
+            ended.aggregate().leg(source).expect("source").state(),
+            LegState::Ended
+        );
+        assert_eq!(
+            ended.aggregate().leg(peer).expect("peer").state(),
+            LegState::Ending
+        );
+        assert!(ended.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StopLeg {
+                leg_id,
+                binding_generation,
+                reason: StopLegReason::PeerEnded,
+            } if *leg_id == peer && *binding_generation == BindingGeneration::INITIAL
+        )));
+        assert!(!ended.effects().iter().any(|effect| matches!(
+            effect,
+            EffectIntent::StopLeg { leg_id, .. } if *leg_id == source
+        )));
+
+        let replay = decide(
+            ended.aggregate(),
+            CallCommand::SourceTerminatedBeforeAnswer {
+                at: at(4),
+                source_leg_id: source,
+                binding_generation: generation,
+                reason: SourceBeforeAnswerTermination::Cancelled,
+            },
+        );
+        assert_eq!(replay.disposition(), CommandDisposition::IgnoredNoop);
+        assert!(replay.effects().is_empty());
+
+        let rotated = decide(
+            &start(&test_call()),
+            CallCommand::RotateLegBinding {
+                at: at(2),
+                leg_id: source,
+                binding_generation: BindingGeneration::INITIAL,
+            },
+        )
+        .into_parts()
+        .0;
+        let stale = decide(
+            &rotated,
+            CallCommand::SourceTerminatedBeforeAnswer {
+                at: at(3),
+                source_leg_id: source,
+                binding_generation: BindingGeneration::INITIAL,
+                reason: SourceBeforeAnswerTermination::Cancelled,
+            },
+        );
+        assert_eq!(
+            stale.disposition(),
+            CommandDisposition::IgnoredStaleGeneration
+        );
+        assert_eq!(stale.aggregate(), &rotated);
+
+        let local_leg = call.legs()[1].id();
+        assert!(matches!(
+            call.decide(CallCommand::SourceTerminatedBeforeAnswer {
+                at: at(4),
+                source_leg_id: local_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                reason: SourceBeforeAnswerTermination::Cancelled,
+            }),
+            Err(DomainError::InvalidCallTransition {
+                command: "source_terminated_before_answer",
+                ..
+            })
+        ));
     }
 
     #[test]

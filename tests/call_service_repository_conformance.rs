@@ -124,8 +124,7 @@ where
             max_calls,
             capabilities: BTreeSet::from([
                 "sip".to_owned(),
-                "webrtc".to_owned(),
-                "twilio".to_owned(),
+                "webrtc_egress".to_owned(),
                 "telnyx".to_owned(),
             ]),
             at: at(0),

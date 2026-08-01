@@ -86,23 +86,51 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: bridgefu
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: eisenzopf/rvoip
-          # Coordinated Bridgefu 1.0 foundation revision. Update this only
-          # after the matching rvoip change set is green and available on
-          # the remote; never replace it with a floating branch.
-          ref: 1ec7b370e82ed3ba646e795b343a117466667e48
-          path: rvoip
       - name: StandardCharter protected smoke artifact validation
         run: bash scripts/check-standardcharter-smoke-artifacts.sh
         working-directory: bridgefu
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pin
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: |
             bridgefu
-            rvoip
+      - name: Verify locked rvoip crates.io graph
+        working-directory: bridgefu
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--format-version", "1"],
+              text=True,
+          ))
+          packages = [
+              package for package in metadata["packages"]
+              if package["name"] == "rvoip"
+              or package["name"].startswith("rvoip-")
+          ]
+          if not packages:
+              raise SystemExit("locked graph contains no rvoip packages")
+          invalid = [
+              (package["name"], package["version"], package["source"])
+              for package in packages
+              if package["version"] != "0.3.5"
+              or not (package["source"] or "").startswith("registry+")
+          ]
+          if invalid:
+              raise SystemExit(f"rvoip graph is not registry-only 0.3.5: {invalid}")
+          print(f"verified {len(packages)} locked rvoip 0.3.5 registry packages")
+          PY
+      - name: Formatting
+        working-directory: bridgefu
+        run: cargo fmt --all -- --check
+      - name: Strict Bridgefu Clippy
+        working-directory: bridgefu
+        run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
       - name: Validate rendered Compose environments with Bridgefu preflight
         working-directory: bridgefu
         run: |
@@ -125,59 +153,6 @@ jobs:
           cargo test --locked --test private_egress_redis
           -- --ignored --nocapture --test-threads=1
         working-directory: bridgefu
-      # rvoip is a library workspace and intentionally does not commit its
-      # Cargo.lock. Bridgefu's preceding locked build is the reproducible
-      # consumer graph; this second pass exercises rvoip-only package tests.
-      - name: rvoip foundation and QUIC tests
-        run: >-
-          cargo test
-          -p rvoip-auth-core
-          -p rvoip-core
-          -p rvoip-uctp
-          -p rvoip-quic
-          -p rvoip-webtransport
-          -p rvoip-moq
-          --all-targets
-          --no-fail-fast
-        working-directory: rvoip
-      - name: rvoip foundation and UCTP strict clippy
-        run: >-
-          cargo clippy
-          -p rvoip-core
-          -p rvoip-uctp
-          -p rvoip-quic
-          -p rvoip-webtransport
-          -p rvoip-websocket
-          --all-targets
-          --all-features
-          --no-deps
-          -- -D warnings
-        working-directory: rvoip
-      - name: rvoip MOQT Gate 5 matrix
-        run: |
-          cargo test -p rvoip-moq --all-features -- --test-threads=1
-          cargo clippy -p rvoip-moq --all-targets --all-features -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc -p rvoip-moq --all-features --no-deps
-        working-directory: rvoip
-      - name: rvoip peer lifecycle saturation test
-        run: cargo test -p rvoip-websocket --test lifecycle_capacity
-        working-directory: rvoip
-      - name: rvoip SIP authentication tests
-        run: |
-          cargo test -p rvoip-sip-transport --all-features --no-fail-fast
-          cargo test -p rvoip-sip-dialog --lib --no-fail-fast
-          cargo test -p rvoip-sip --lib --no-fail-fast
-        working-directory: rvoip
-      - name: rvoip WebRTC signaling authentication tests
-        run: >-
-          cargo test -p rvoip-webrtc
-          --features signaling-whip,signaling-ws,tls-rustls
-          --test whip_auth
-          --test ws_auth
-          --test signaling_ownership
-          --test tls_termination
-          --no-fail-fast
-        working-directory: rvoip
       - name: Credential-free role/call/media/context/broadcast runtime smoke
         working-directory: bridgefu
         run: >-
@@ -209,18 +184,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: bridgefu
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: eisenzopf/rvoip
-          ref: 1ec7b370e82ed3ba646e795b343a117466667e48
-          path: rvoip
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: bridgefu
           file: bridgefu/deploy/Dockerfile
-          build-contexts: rvoip=./rvoip
           platforms: ${{ matrix.platform }}
           tags: bridgefu:ci-${{ matrix.arch }}
           load: true
@@ -231,7 +200,6 @@ jobs:
           sbom: false
           build-args: |
             VCS_REF=${{ github.sha }}
-            RVOIP_REVISION=1ec7b370e82ed3ba646e795b343a117466667e48
             BUILD_DATE=1970-01-01T00:00:00Z
             SOURCE_DATE_EPOCH=0
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0

@@ -450,6 +450,9 @@ async fn wait_connection_dead(
     );
 }
 
+// This qualification helper keeps each endpoint and event stream explicit so failures can
+// report the complete promoted-route lifecycle without hiding state in a test-only fixture.
+#[allow(clippy::too_many_arguments)]
 async fn wait_promoted_sip_route_dead(
     runtime: &CallServiceRuntime,
     call_id: CallId,
@@ -686,15 +689,15 @@ fn assert_initial_context(context: InboundConnectionContext) {
     );
 }
 
-fn find_playwright(standardcharter_web: &Path) {
+fn find_playwright(sdk: &Path) {
     assert!(
-        standardcharter_web.join("node_modules/playwright").is_dir(),
-        "Playwright is absent; run the pinned StandardCharter web install before this ignored test"
+        sdk.join("node_modules/playwright").is_dir(),
+        "Playwright is absent; run npm ci and npm run browser:install in sdk/typescript"
     );
 }
 
 #[test]
-#[ignore = "requires the pinned StandardCharter Playwright Chromium; run explicitly with --ignored"]
+#[ignore = "requires BridgeFu's pinned Playwright Chromium; run explicitly with --ignored"]
 fn built_typescript_sdk_reaches_named_sips_destination_in_real_chromium() {
     std::thread::Builder::new()
         .name("browser-sdk-chromium-qualification".into())
@@ -724,8 +727,7 @@ async fn run_browser_qualification() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let sdk = repository.join("sdk/typescript");
-    let standardcharter_web = repository.join("../standardcharter/web");
-    find_playwright(&standardcharter_web);
+    find_playwright(&sdk);
     let build = tokio::process::Command::new("npm")
         .args(["run", "build"])
         .current_dir(&sdk)
@@ -1020,7 +1022,7 @@ async fn run_browser_qualification() {
             "BRIDGEFU_BROWSER_QUALIFICATION_URL",
             format!("http://localhost:{}/", http_address.port()),
         )
-        .env("BRIDGEFU_STANDARDCHARTER_WEB", &standardcharter_web)
+        .env("PLAYWRIGHT_BROWSERS_PATH", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

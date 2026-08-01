@@ -5,16 +5,23 @@
 //! child-process output: the retained JSON contains only aggregate test
 //! counts and static scenario descriptors. A passing run is a finite chaos
 //! smoke, never the one-hour release qualification.
+//!
+//! Bridgefu scenarios run under Bridgefu's Cargo.lock. Published rvoip source
+//! scenarios are selected from that locked graph, but each runs under the
+//! registry package's own packaged Cargo.lock. The report records those as
+//! separate dependency graphs rather than attaching Bridgefu lock evidence to
+//! the independently locked package-source test commands.
 
 #[path = "support/qualification.rs"]
 mod qualification_support;
 
 use chrono::{DateTime, Utc};
 use qualification_support::{
-    git_revision, host_evidence, write_report, HostEvidence, RevisionEvidence,
+    git_revision, host_evidence, rvoip_registry_evidence, write_report, HostEvidence,
+    RevisionEvidence, RvoipRegistryEvidence, COORDINATED_RVOIP_VERSION, CRATES_IO_REGISTRY_SOURCE,
 };
-use serde::Serialize;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
@@ -22,7 +29,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const REPORT_SCHEMA: &str = "bridgefu.qualification.chaos.v1";
+const REPORT_SCHEMA: &str = "bridgefu.qualification.chaos.v3";
 const MANUAL_ACKNOWLEDGEMENT: &str = "BRIDGEFU_CHAOS_ACKNOWLEDGE_MANUAL";
 const CHILD_TARGET_ENVIRONMENT: &str = "BRIDGEFU_CHAOS_CHILD_TARGET_DIR";
 const OUTPUT_ENVIRONMENT: &str = "BRIDGEFU_CHAOS_QUALIFICATION_OUTPUT";
@@ -48,6 +55,13 @@ enum ScenarioStatus {
 enum Workspace {
     Bridgefu,
     Rvoip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DependencyResolution {
+    BridgefuCargoLock,
+    IndependentRegistryPackageCargoLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -82,6 +96,7 @@ struct ScenarioEvidence {
     scope: ScenarioScope,
     status: ScenarioStatus,
     workspace: Workspace,
+    dependency_resolution: DependencyResolution,
     package: Option<&'static str>,
     target_kind: TargetKind,
     target: Option<&'static str>,
@@ -95,6 +110,19 @@ struct ScenarioEvidence {
     exit_code: Option<i32>,
     timed_out: bool,
     child_output_retained: bool,
+}
+
+#[derive(Serialize)]
+struct RvoipPackageSourceExecutionEvidence {
+    selected_packages: Vec<String>,
+    release_version: &'static str,
+    source: &'static str,
+    source_selection: &'static str,
+    source_identity_evidence: &'static str,
+    child_command: &'static str,
+    child_lockfile: &'static str,
+    bridgefu_lockfile_applied_to_child_commands: bool,
+    dependency_graph_relation: &'static str,
 }
 
 #[derive(Default, Debug, Eq, PartialEq)]
@@ -123,7 +151,8 @@ struct ChaosQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RevisionEvidence,
+    bridgefu_locked_rvoip_graph: RvoipRegistryEvidence,
+    rvoip_package_source_execution: RvoipPackageSourceExecutionEvidence,
     host: HostEvidence,
     execution_profile: &'static str,
     isolated_child_target: bool,
@@ -133,6 +162,19 @@ struct ChaosQualificationReport {
     release_criterion_satisfied: bool,
     release_criterion_reason: &'static str,
     known_limits: &'static [&'static str],
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoMetadataPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    manifest_path: PathBuf,
 }
 
 const SCENARIOS: &[ScenarioSpec] = &[
@@ -389,14 +431,8 @@ fn qualifies_deterministic_chaos_matrix() {
 
     validate_scenarios(SCENARIOS).expect("static chaos scenario matrix must be valid");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let rvoip_dir = manifest_dir
-        .parent()
-        .expect("Bridgefu repository parent")
-        .join("rvoip");
-    assert!(
-        rvoip_dir.join("Cargo.toml").is_file(),
-        "the sibling rvoip checkout is required"
-    );
+    let rvoip_manifests = resolve_rvoip_registry_manifests(&manifest_dir, SCENARIOS)
+        .expect("resolve exact rvoip 0.3.5 registry package manifests");
     let child_target = env::var_os(CHILD_TARGET_ENVIRONMENT)
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("target/qualification/chaos-cargo-target"));
@@ -408,16 +444,23 @@ fn qualifies_deterministic_chaos_matrix() {
             scenarios.push(skipped_external(spec));
             continue;
         }
-        scenarios.push(run_scenario(spec, &manifest_dir, &rvoip_dir, &child_target));
+        scenarios.push(run_scenario(
+            spec,
+            &manifest_dir,
+            &rvoip_manifests,
+            &child_target,
+        ));
     }
 
     let summary = summarize(&scenarios);
+    let rvoip_package_source_execution = rvoip_package_source_execution_evidence(&rvoip_manifests);
     let report = ChaosQualificationReport {
         schema: REPORT_SCHEMA,
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: git_revision(&rvoip_dir),
+        bridgefu_locked_rvoip_graph: rvoip_registry_evidence(&manifest_dir),
+        rvoip_package_source_execution,
         host: host_evidence(),
         execution_profile: "finite_deterministic_smoke",
         isolated_child_target: true,
@@ -427,6 +470,7 @@ fn qualifies_deterministic_chaos_matrix() {
         release_criterion_satisfied: false,
         release_criterion_reason: "this finite matrix does not execute any one-hour load profile or deployed-cloud chaos campaign",
         known_limits: &[
+            "rvoip source-package tests use each published package's packaged Cargo.lock, not Bridgefu's Cargo.lock; their independently locked transitive graph is not application dependency evidence",
             "local media impairment covers deterministic queue pressure and RTP jitter-buffer loss, not a one-hour network impairment campaign",
             "local provider outage uses Telnyx mocks and does not replace a restricted live test-account workflow",
             "local relay loss uses the rvoip relay connector seam and does not replace a separately deployed relay-tier failure test",
@@ -457,27 +501,40 @@ fn qualifies_deterministic_chaos_matrix() {
 fn run_scenario(
     spec: &ScenarioSpec,
     bridgefu_dir: &Path,
-    rvoip_dir: &Path,
+    rvoip_manifests: &BTreeMap<String, PathBuf>,
     child_target: &Path,
 ) -> ScenarioEvidence {
     let started = Instant::now();
-    let workspace_dir = match spec.workspace {
-        Workspace::Bridgefu => bridgefu_dir,
-        Workspace::Rvoip => rvoip_dir,
-    };
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
-        .current_dir(workspace_dir)
-        .args(["test", "--locked", "--quiet"])
         .env("CARGO_TARGET_DIR", child_target)
         .env("CARGO_TERM_COLOR", "never")
         .env("RUST_BACKTRACE", "0")
         .env("RUST_LOG", "off")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(package) = spec.package {
-        command.args(["-p", package]);
+    match spec.workspace {
+        Workspace::Bridgefu => {
+            command
+                .current_dir(bridgefu_dir)
+                .args(["test", "--locked", "--quiet"]);
+            if let Some(package) = spec.package {
+                command.args(["-p", package]);
+            }
+        }
+        Workspace::Rvoip => {
+            let package = spec
+                .package
+                .expect("rvoip registry scenario must identify its package");
+            let manifest = rvoip_manifests
+                .get(package)
+                .expect("validated rvoip registry package manifest");
+            command
+                .current_dir(manifest.parent().expect("registry package manifest parent"))
+                .args(["test", "--locked", "--quiet", "--manifest-path"])
+                .arg(manifest);
+        }
     }
     if let Some(features) = spec.features {
         command.args(["--features", features]);
@@ -530,6 +587,7 @@ fn run_scenario(
             ScenarioStatus::Failed
         },
         workspace: spec.workspace,
+        dependency_resolution: dependency_resolution(spec.workspace),
         package: spec.package,
         target_kind: spec.target_kind,
         target: spec.target,
@@ -546,6 +604,114 @@ fn run_scenario(
     }
 }
 
+fn resolve_rvoip_registry_manifests(
+    bridgefu_dir: &Path,
+    scenarios: &[ScenarioSpec],
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let expected = scenarios
+        .iter()
+        .filter(|scenario| scenario.workspace == Workspace::Rvoip)
+        .map(|scenario| {
+            scenario
+                .package
+                .ok_or_else(|| format!("rvoip scenario {} has no package", scenario.id))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(bridgefu_dir)
+        .args(["metadata", "--locked", "--format-version", "1"])
+        .output()
+        .map_err(|error| format!("could not execute cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed with status {}",
+            output.status
+        ));
+    }
+    let metadata = serde_json::from_slice::<CargoMetadata>(&output.stdout)
+        .map_err(|error| format!("invalid cargo metadata JSON: {error}"))?;
+    let mut manifests = BTreeMap::new();
+    for package in metadata
+        .packages
+        .into_iter()
+        .filter(|package| expected.contains(package.name.as_str()))
+    {
+        if package.version != COORDINATED_RVOIP_VERSION {
+            return Err(format!(
+                "{} resolved to {}, expected {}",
+                package.name, package.version, COORDINATED_RVOIP_VERSION
+            ));
+        }
+        if package.source.as_deref() != Some(CRATES_IO_REGISTRY_SOURCE) {
+            return Err(format!(
+                "{} did not resolve from crates.io: {:?}",
+                package.name, package.source
+            ));
+        }
+        if !package.manifest_path.is_file() {
+            return Err(format!(
+                "{} registry manifest is unavailable at {}",
+                package.name,
+                package.manifest_path.display()
+            ));
+        }
+        let package_lockfile = package
+            .manifest_path
+            .parent()
+            .expect("registry package manifest parent")
+            .join("Cargo.lock");
+        if !package_lockfile.is_file() {
+            return Err(format!(
+                "{} registry package has no packaged Cargo.lock for independent locked test execution",
+                package.name
+            ));
+        }
+        if manifests
+            .insert(package.name.clone(), package.manifest_path)
+            .is_some()
+        {
+            return Err(format!(
+                "{} resolved to multiple registry manifests",
+                package.name
+            ));
+        }
+    }
+    for package in expected {
+        if !manifests.contains_key(package) {
+            return Err(format!(
+                "cargo metadata did not resolve required registry package {package}"
+            ));
+        }
+    }
+    Ok(manifests)
+}
+
+fn rvoip_package_source_execution_evidence(
+    manifests: &BTreeMap<String, PathBuf>,
+) -> RvoipPackageSourceExecutionEvidence {
+    RvoipPackageSourceExecutionEvidence {
+        selected_packages: manifests.keys().cloned().collect(),
+        release_version: COORDINATED_RVOIP_VERSION,
+        source: CRATES_IO_REGISTRY_SOURCE,
+        source_selection: "cargo metadata --locked from the Bridgefu manifest",
+        source_identity_evidence:
+            "matching name/version/source/checksum entries in bridgefu_locked_rvoip_graph",
+        child_command: "cargo test --locked --manifest-path <registry-package>/Cargo.toml",
+        child_lockfile: "the selected published package's packaged Cargo.lock",
+        bridgefu_lockfile_applied_to_child_commands: false,
+        dependency_graph_relation:
+            "independently locked package-source test graph; not Bridgefu application dependency evidence",
+    }
+}
+
+const fn dependency_resolution(workspace: Workspace) -> DependencyResolution {
+    match workspace {
+        Workspace::Bridgefu => DependencyResolution::BridgefuCargoLock,
+        Workspace::Rvoip => DependencyResolution::IndependentRegistryPackageCargoLock,
+    }
+}
+
 fn skipped_external(spec: &ScenarioSpec) -> ScenarioEvidence {
     debug_assert_eq!(spec.scope, ScenarioScope::ExternalCredentialed);
     ScenarioEvidence {
@@ -554,6 +720,7 @@ fn skipped_external(spec: &ScenarioSpec) -> ScenarioEvidence {
         scope: spec.scope,
         status: ScenarioStatus::SkippedExternal,
         workspace: spec.workspace,
+        dependency_resolution: dependency_resolution(spec.workspace),
         package: spec.package,
         target_kind: spec.target_kind,
         target: spec.target,
@@ -577,6 +744,7 @@ fn failed_to_spawn(spec: &ScenarioSpec, elapsed: Duration) -> ScenarioEvidence {
         scope: spec.scope,
         status: ScenarioStatus::Failed,
         workspace: spec.workspace,
+        dependency_resolution: dependency_resolution(spec.workspace),
         package: spec.package,
         target_kind: spec.target_kind,
         target: spec.target,
@@ -766,6 +934,50 @@ fn parses_exact_test_counts_without_retaining_diagnostics() {
         parse_test_summary(b"running 0 tests", b""),
         ParsedTestSummary::default()
     );
+}
+
+#[test]
+fn resolves_upstream_scenarios_from_locked_registry_packages() {
+    let manifests =
+        resolve_rvoip_registry_manifests(Path::new(env!("CARGO_MANIFEST_DIR")), SCENARIOS)
+            .expect("resolve upstream chaos packages");
+    let expected = SCENARIOS
+        .iter()
+        .filter(|scenario| scenario.workspace == Workspace::Rvoip)
+        .filter_map(|scenario| scenario.package)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        manifests
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert!(manifests.values().all(|manifest| manifest
+        .parent()
+        .expect("registry manifest parent")
+        .join("Cargo.lock")
+        .is_file()));
+}
+
+#[test]
+fn report_separates_bridgefu_lock_evidence_from_rvoip_source_test_resolution() {
+    let manifests =
+        resolve_rvoip_registry_manifests(Path::new(env!("CARGO_MANIFEST_DIR")), SCENARIOS)
+            .expect("resolve upstream chaos packages");
+    let evidence = rvoip_package_source_execution_evidence(&manifests);
+    let json = serde_json::to_value(evidence).expect("serialize source execution evidence");
+
+    assert_eq!(json["release_version"], COORDINATED_RVOIP_VERSION);
+    assert_eq!(json["source"], CRATES_IO_REGISTRY_SOURCE);
+    assert_eq!(json["bridgefu_lockfile_applied_to_child_commands"], false);
+    assert_eq!(
+        json["dependency_graph_relation"],
+        "independently locked package-source test graph; not Bridgefu application dependency evidence"
+    );
+    assert!(json["child_command"]
+        .as_str()
+        .is_some_and(|command| command.contains("cargo test --locked")));
 }
 
 #[test]

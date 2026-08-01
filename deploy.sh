@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Deploy one explicitly reviewed Bridgefu/rvoip source pair to the legacy EC2
-# host-mode service. This script never modifies or deletes a remote git checkout:
-# both repositories are exported from exact commits into a new release directory.
+# Deploy one explicitly reviewed Bridgefu source revision to the legacy EC2
+# host-mode service. The committed Cargo.lock pins the crates.io-hosted rvoip
+# 0.3.5 graph; no sibling source checkout participates in the build.
 set -euo pipefail
 
 : "${INSTANCE_IP:?set INSTANCE_IP to the disposable target host}"
@@ -9,12 +9,11 @@ set -euo pipefail
 : "${CONFIG:?set CONFIG to the reviewed bridgefu.yaml}"
 : "${RUNTIME_ENV:?set RUNTIME_ENV to the mode-0600 container environment file}"
 : "${BRIDGEFU_REVISION:?set BRIDGEFU_REVISION to the exact 40-character commit}"
-: "${RVOIP_REVISION:?set RVOIP_REVISION to the exact reviewed 40-character commit}"
 
 SSH_USER="${SSH_USER:-ec2-user}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/bridgefu-releases}"
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-RVOIP_DIR="${RVOIP_DIR:-${REPO_ROOT}/../rvoip}"
+readonly RVOIP_VERSION=0.3.5
 
 if [[ ! "$INSTANCE_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "INSTANCE_IP must be an IPv4 address or DNS hostname" >&2
@@ -29,13 +28,10 @@ if [[ ! "$REMOTE_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
   exit 1
 fi
 
-for revision_name in BRIDGEFU_REVISION RVOIP_REVISION; do
-  revision=${!revision_name}
-  if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-    printf '%s must be an exact lowercase 40-character commit SHA\n' "$revision_name" >&2
-    exit 1
-  fi
-done
+if [[ ! "$BRIDGEFU_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "BRIDGEFU_REVISION must be an exact lowercase 40-character commit SHA" >&2
+  exit 1
+fi
 
 if [[ ! -f "$CONFIG" ]]; then
   printf 'CONFIG file not found: %s\n' "$CONFIG" >&2
@@ -47,10 +43,6 @@ if [[ ! -f "$RUNTIME_ENV" ]]; then
 fi
 if grep -Eq '^BRIDGEFU_IMAGE=' "$RUNTIME_ENV"; then
   echo "RUNTIME_ENV must not override the deployment-owned BRIDGEFU_IMAGE" >&2
-  exit 1
-fi
-if [[ ! -d "$RVOIP_DIR/.git" ]]; then
-  printf 'RVOIP_DIR is not a git checkout: %s\n' "$RVOIP_DIR" >&2
   exit 1
 fi
 
@@ -67,14 +59,12 @@ verify_revision() {
 }
 
 verify_revision "$REPO_ROOT" "$BRIDGEFU_REVISION" BRIDGEFU_REVISION
-verify_revision "$RVOIP_DIR" "$RVOIP_REVISION" RVOIP_REVISION
 
 BRIDGEFU_BUILD_DATE=$(git -C "$REPO_ROOT" show -s --format=%cI "$BRIDGEFU_REVISION")
 release_nonce=$(printf '%08x' "$(( (RANDOM << 16) | RANDOM ))")
-release_id="${BRIDGEFU_REVISION:0:12}-${RVOIP_REVISION:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-${release_nonce}"
+release_id="${BRIDGEFU_REVISION:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-${release_nonce}"
 remote_release="${REMOTE_DIR}/${release_id}"
 remote_bridgefu_archive="/tmp/bridgefu-${release_id}.tar"
-remote_rvoip_archive="/tmp/rvoip-${release_id}.tar"
 remote_config="/tmp/bridgefu-config-${release_id}.yaml"
 remote_runtime_env="/tmp/bridgefu-runtime-${release_id}.env"
 remote_iidfile="/tmp/bridgefu-image-${release_id}.iid"
@@ -88,7 +78,6 @@ cleanup() {
 trap cleanup EXIT
 
 git -C "$REPO_ROOT" archive --format=tar --output="$stage/bridgefu.tar" "$BRIDGEFU_REVISION"
-git -C "$RVOIP_DIR" archive --format=tar --output="$stage/rvoip.tar" "$RVOIP_REVISION"
 install -m 0600 "$CONFIG" "$stage/bridgefu.yaml"
 install -m 0600 "$RUNTIME_ENV" "$stage/runtime.env"
 
@@ -100,36 +89,33 @@ SSH_OPTS=(
 remote="${SSH_USER}@${INSTANCE_IP}"
 ssh_run() {
   # Every interpolated remote path/identity is validated above or derived only
-  # from exact hexadecimal revisions. The command itself must expand locally.
+  # from the exact hexadecimal revision. The command itself must expand locally.
   # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "$remote" "$1"
 }
 
 cleanup_with_remote() {
   rm -rf "$stage"
-  ssh_run "rm -f '${remote_bridgefu_archive}' '${remote_rvoip_archive}' '${remote_config}' '${remote_runtime_env}' '${remote_iidfile}' '${remote_image_env}'" >/dev/null 2>&1 || true
+  ssh_run "rm -f '${remote_bridgefu_archive}' '${remote_config}' '${remote_runtime_env}' '${remote_iidfile}' '${remote_image_env}'" >/dev/null 2>&1 || true
 }
 trap cleanup_with_remote EXIT
 
-printf '==> [1/6] Uploading exact source archives for %s\n' "$release_id"
+printf '==> [1/6] Uploading exact source archive for %s\n' "$release_id"
 scp "${SSH_OPTS[@]}" \
   "$stage/bridgefu.tar" "${remote}:${remote_bridgefu_archive}"
-scp "${SSH_OPTS[@]}" \
-  "$stage/rvoip.tar" "${remote}:${remote_rvoip_archive}"
 scp "${SSH_OPTS[@]}" \
   "$stage/bridgefu.yaml" "${remote}:${remote_config}"
 scp "${SSH_OPTS[@]}" \
   "$stage/runtime.env" "${remote}:${remote_runtime_env}"
 
-printf '==> [2/6] Expanding into a new revision-isolated sibling checkout\n'
+printf '==> [2/6] Expanding into a new revision-isolated source directory\n'
 ssh_run "set -euo pipefail
   umask 077
   sudo install -d -o \$(id -u) -g \$(id -g) -m 0750 '${REMOTE_DIR}'
   test ! -e '${remote_release}'
-  mkdir -p '${remote_release}/bridgefu' '${remote_release}/rvoip'
+  mkdir -p '${remote_release}/bridgefu'
   tar -xf '${remote_bridgefu_archive}' -C '${remote_release}/bridgefu'
-  tar -xf '${remote_rvoip_archive}' -C '${remote_release}/rvoip'
-  rm -f '${remote_bridgefu_archive}' '${remote_rvoip_archive}'"
+  rm -f '${remote_bridgefu_archive}'"
 
 printf '==> [3/6] Building canonical image and capturing immutable local image ID\n'
 ssh_run "set -euo pipefail
@@ -137,7 +123,6 @@ ssh_run "set -euo pipefail
   rm -f '${remote_iidfile}' '${remote_image_env}'
   docker build \
     --iidfile '${remote_iidfile}' \
-    --build-context rvoip=../rvoip \
     --build-arg VCS_REF='${BRIDGEFU_REVISION}' \
     --build-arg BUILD_DATE='${BRIDGEFU_BUILD_DATE}' \
     -f deploy/Dockerfile .
@@ -212,7 +197,7 @@ if ! ssh_run "curl --fail --silent --show-error http://127.0.0.1:9090/livez >/de
 fi
 
 ssh_run "sudo journalctl -u bridgefu -n 30 --no-pager" || true
-printf 'Bridgefu revision %s with rvoip revision %s is ready on %s\n' \
-  "$BRIDGEFU_REVISION" "$RVOIP_REVISION" "$INSTANCE_IP"
+printf 'Bridgefu revision %s with locked rvoip %s is ready on %s\n' \
+  "$BRIDGEFU_REVISION" "$RVOIP_VERSION" "$INSTANCE_IP"
 printf 'SIP target: sip:%s:5060\n' "$INSTANCE_IP"
 printf 'Metrics: http://%s:9090/metrics (restricted by the host firewall)\n' "$INSTANCE_IP"

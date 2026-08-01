@@ -25,6 +25,20 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TIMEOUT_SECONDS = 600
 OUTPUT_LIMIT = 2 * 1024 * 1024
+RVOIP_RELEASE_VERSION = "0.3.5"
+REQUIRED_RVOIP_PACKAGES = {
+    "rvoip-amazon-connect",
+    "rvoip-auth-core",
+    "rvoip-core",
+    "rvoip-media-core",
+    "rvoip-moq",
+    "rvoip-quic",
+    "rvoip-redis",
+    "rvoip-sip",
+    "rvoip-uctp",
+    "rvoip-webrtc",
+    "rvoip-webrtc-stack",
+}
 REMOVED_ENVIRONMENT_PREFIXES = (
     "AWS_",
     "BRIDGEFU_",
@@ -250,32 +264,55 @@ def repository_state(path: Path, *, required: bool) -> dict[str, object]:
 
 def locked_dependency_state(lock_path: Path) -> dict[str, object]:
     lock = tomllib.loads(lock_path.read_text())
-    result: dict[str, object] = {}
-    for name in ("webrtc", "rtc", "moq-transport"):
-        matches = [package for package in lock["package"] if package["name"] == name]
-        if len(matches) != 1:
-            result[name] = {"resolved": False, "matching_packages": len(matches)}
-            continue
-        package = matches[0]
-        source = package.get("source", "path")
-        entry: dict[str, object] = {
-            "resolved": True,
-            "version": package["version"],
-            "source_kind": source.split("+", 1)[0],
-        }
-        if source.startswith("git+") and "#" in source:
-            entry["git_revision"] = source.rsplit("#", 1)[1]
-        if "checksum" in package:
-            entry["checksum"] = package["checksum"]
-        result[name] = entry
-    return result
+    packages = [
+        package
+        for package in lock["package"]
+        if package["name"] == "rvoip" or package["name"].startswith("rvoip-")
+    ]
+    if not packages:
+        raise SystemExit("Cargo.lock contains no rvoip packages")
+
+    invalid = [
+        (package["name"], package["version"], package.get("source"))
+        for package in packages
+        if package["version"] != RVOIP_RELEASE_VERSION
+        or not package.get("source", "").startswith("registry+")
+        or len(package.get("checksum", "")) != 64
+    ]
+    if invalid:
+        raise SystemExit(
+            "Cargo.lock contains non-registry, non-0.3.5, or unchecked rvoip "
+            f"packages: {invalid}"
+        )
+
+    names = [package["name"] for package in packages]
+    if len(names) != len(set(names)):
+        raise SystemExit("Cargo.lock contains multiple versions of an rvoip package")
+    missing = REQUIRED_RVOIP_PACKAGES - set(names)
+    if missing:
+        raise SystemExit(
+            f"Cargo.lock is missing required rvoip packages: {sorted(missing)}"
+        )
+
+    return {
+        "release_version": RVOIP_RELEASE_VERSION,
+        "lockfile": "Cargo.lock",
+        "packages": [
+            {
+                "name": package["name"],
+                "version": package["version"],
+                "source_kind": "registry",
+                "checksum": package["checksum"],
+            }
+            for package in sorted(packages, key=lambda package: package["name"])
+        ],
+    }
 
 
 def source_state() -> dict[str, object]:
     return {
         "bridgefu": repository_state(ROOT, required=True),
-        "rvoip": repository_state(ROOT.parent / "rvoip", required=False),
-        "locked_dependencies": locked_dependency_state(ROOT / "Cargo.lock"),
+        "rvoip": locked_dependency_state(ROOT / "Cargo.lock"),
     }
 
 

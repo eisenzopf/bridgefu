@@ -1481,12 +1481,12 @@ fn reap_expired_locked(store: &mut Store, ttl: Duration) {
     let expired = store
         .attempts
         .iter()
-        .filter_map(|(correlation, attempt)| {
+        .filter(|(_, attempt)| {
             attempt
                 .created_at
                 .is_some_and(|created| created.elapsed() >= ttl)
-                .then(|| correlation.clone())
         })
+        .map(|(correlation, _)| correlation.clone())
         .collect::<Vec<_>>();
     for correlation in expired {
         if let Some(mut attempt) = store.attempts.remove(&correlation) {

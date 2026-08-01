@@ -1,31 +1,104 @@
 # Changelog
 
-## Unreleased — Bridgefu 1.0 release candidate
+## Unreleased — Bridgefu 0.9.0 customer-preview candidate
 
-This working tree is not yet a published release. Owner-reviewed immutable
-revisions, live Telnyx and StandardCharter checks, cloud deployment evidence,
-and the one-hour qualification profiles remain release gates.
+This working tree is not yet a published release. An owner-reviewed immutable
+revision and the protected two-platform OCI candidate remain 0.9.0 release
+gates. The rvoip #54 fix and fourth exact-Chromium pass, TURN/public-NAT,
+live-provider and StandardCharter checks, cloud deployment evidence, and the
+one-hour qualification profiles remain explicit 1.0 gates.
 
 ### Audit scope and review status
 
 This entry is the review index for the complete coordinated change surface as
-of 2026-07-16, not only the output of an ordinary unstaged `git diff`.
+of 2026-07-31. The owner-authorized candidate is frozen by the commit containing
+this entry on `codex/bridgefu-1.0`; it remains unmerged and unpublished until
+the PR and protected two-platform workflow pass.
 
-- Bridgefu is on `codex/bridgefu-1.0` at `0ea0e177`, 103 commits ahead of
-  `origin/codex/bridgefu-1.0` at `7cbbfd27`. That committed range changes 57
-  files with approximately 25,276 additions and 1,121 deletions.
-- On top of those commits, the current Bridgefu worktree has 62 modified
-  tracked files with approximately 51,023 additions and 3,956 deletions, plus
-  117 untracked files. Many major implementations, migrations, tests, the SDK,
-  and this changelog are untracked, so `git diff` alone is an incomplete review.
-- Bridgefu uses sibling path dependencies under `../rvoip`. That checkout is on
-  `codex/bridgefu-1.0-rvoip` at `85b932e4`, 144 commits ahead of its upstream
-  `1ec7b370`, and additionally has 176 modified and 31 untracked files. The
-  current Bridgefu behavior is therefore a property of both dirty trees.
-- No tests, services, examples, cloud resources, containers, or qualification
-  harnesses were run for this changelog audit. Test results below are previously
-  recorded repository evidence and retain the limitations stated in
-  [the qualification report](docs/qualification.md).
+- The complete candidate diff, not only a historical commit range, is the
+  review scope. Formatting, whitespace validation, strict all-target/all-feature
+  Clippy, the locked all-target Rust suite, and the TypeScript SDK suite pass.
+- The release-candidate build now uses exact crates.io `=0.3.5` rvoip
+  component packages, with registry checksums and the complete transitive graph
+  recorded in `Cargo.lock`; a sibling checkout is no longer a build input.
+  Later references to `../rvoip` retain historical evidence from the original
+  2026-07-16 audit and do not describe the current dependency source.
+- The credential-free nine-check runtime smoke and a hardened native
+  `linux/arm64` image build pass. No cloud infrastructure, live provider call,
+  registry publication, or one-hour release profile was run.
+- Exact built-SDK Chromium qualification passes for generic SIP, Amazon
+  Connect, and Telnyx. Generic WSS reaches Bridgefu's rvoip core but outbound
+  RFC 4733 never reaches Chromium; the dependency defect is recorded as
+  [rvoip issue #54](https://github.com/eisenzopf/rvoip/issues/54).
+
+### rvoip 0.3.5 registry integration — 2026-07-31
+
+- The coordinated 44-crate rvoip 0.3.5 release is published from
+  `c4f95e0c696a11e2e6e15183fbaa9b3dc6f94fec` and tagged `v0.3.5`.
+- Bridgefu resolves 25 rvoip packages at exactly `0.3.5`, all from crates.io
+  with checksums and no Git, path, or temporary Cargo override.
+- The 0.3.5 graph removes Smol, async-std, and their executor/runtime packages
+  from Bridgefu's lockfile. Tokio remains the supported async runtime.
+- `cargo test --locked --all-targets` and strict all-target/all-feature Clippy
+  pass against the published graph. The TypeScript SDK passes 20/20 tests with
+  its own pinned Playwright 1.61.1 installation.
+- Exact Chromium handoffs to generic SIP, Amazon Connect, and Telnyx pass.
+  Generic WSS is blocked by the outbound RFC 4733 defect tracked in rvoip #54;
+  Bridgefu carries no local rvoip patch.
+- The release-image policy, OCI verifier tests, executable Compose preflight,
+  credential-free runtime smoke, and native hardened `linux/arm64` image pass.
+  The retained two-platform OCI candidate remains a protected post-commit
+  workflow gate.
+- All 44 published package archives matched their crates.io checksums. The
+  interrupted strict rvoip beta qualification was not completed before the
+  owner-directed publication and is not represented as a current strict pass.
+
+### Release build-context hardening — 2026-07-31
+
+- Docker build contexts now exclude local agent worktrees, SDK `node_modules`,
+  Playwright browsers, Terraform provider caches and state, editor files,
+  operator environment/configuration files, Compose-mounted `deploy/tls`, and
+  common private-key and certificate formats.
+- The release-image policy requires those exclusions. The measured local
+  context fell from 8.6 GB to 7.96 MB before the successful native image build.
+
+### rvoip 0.3.4 registry integration — 2026-07-29
+
+- Bridgefu now resolves one registry-only rvoip package graph at exactly
+  `0.3.4`; all 25 resolved rvoip packages carry crates.io sources and
+  checksums, with no path, Git, or temporary Cargo patch.
+- Pending inbound attachments subscribe to rvoip's exact-generation
+  `InboundAdmissionTermination` signal. The call actor no longer wakes every
+  25 ms to infer cancellation from principal lookup failure.
+- The terminal signal is translated into Bridgefu's durable
+  `SourceTerminatedBeforeAnswer` command before peer teardown. A pending
+  destination receives CANCEL, a final-answer race receives ACK then BYE, and
+  an established destination receives BYE through the existing idempotent
+  generation-fenced effect path.
+- The real generic-SIP cancellation case passes its one-second destination
+  CANCEL bound. The complete six-case generic SIP reference suite, 40-case
+  call execution supervisor suite, 82-case StandardCharter contract, and two
+  hermetic Amazon Connect qualification cases pass against registry-only
+  rvoip `0.3.4`. The owner-gated Chromium case remains separately ignored.
+
+### Dependency migration verification — 2026-07-26
+
+- Bridgefu resolves 24 checksum-locked rvoip packages at exactly `0.3.1` from
+  crates.io. `cargo metadata --locked` reports no Git or path package sources,
+  and `cargo check --locked --all-targets` passes.
+- The release-image policy, configuration-schema, Compose, OCI-helper,
+  qualification-evidence, browser-SDK, and focused runtime suites pass against
+  the published package graph.
+- The locked all-target regression exposed one release-blocking rvoip lifecycle
+  defect: an inbound SIP CANCEL completes the source transaction but does not
+  promptly invalidate its pending `InboundAdmission`. Bridgefu consequently
+  cancels the already-ringing destination only at its ten-second setup
+  deadline, while the strict reference test requires propagation within five
+  seconds. The test remains strict and unchanged.
+- The dependency migration is complete, but release qualification remains open
+  until the rvoip defect is corrected in an owner-reviewed published patch and
+  Bridgefu is repointed to that patch. No fork push, publication, upstream
+  issue, or maintainer contact is authorized by this work.
 
 ### Product shape
 
@@ -207,6 +280,10 @@ of 2026-07-16, not only the output of an ordinary unstaged `git diff`.
   DataMessage, lifecycle and ACK protocols, Redis-backed gateway epochs/replay
   state, separate target media admission, and local split SIP/WSS initial and
   replacement execution.
+- Added a canonical SHA-256 route/capability catalog identity. Workers advertise
+  it, durable assignments retain it, gateways reject stale or mismatched
+  workers, and a changed catalog cannot strand active calls or released
+  terminal calls whose cleanup is still recoverable.
 - Added a standalone three-listener MOQT relay role with publisher mTLS,
   WebTransport and raw-QUIC subscribers, Redis grants/leases, least-privilege
   diagnostics, health, limits, and drain.

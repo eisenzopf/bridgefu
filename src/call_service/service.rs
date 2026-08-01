@@ -19,10 +19,12 @@ use crate::call_engine::{
     AttachmentPurpose, AttachmentTransport, BindingGeneration, CallAggregate, CallCommand, CallId,
     CallRepository, CommandCommitView, CommandId, ConnectionBinding, LegDirection, LegId,
     LegSemantics, LegSpec, LegState, MediaFlow, PrincipalFingerprint, RepositoryError,
-    SignalingInitiator, StopLegReason, TenantId, WorkerId, WorkerLease,
+    RouteCatalogFingerprint, SignalingInitiator, StopLegReason, TenantId, WorkerId, WorkerLease,
 };
 use crate::coordination::{CoordinationProjection, WorkerSelectionRequest};
 
+#[cfg(test)]
+use super::BoundSourceTerminationCommit;
 use super::{
     digest_presented_attachment_token, AmazonConnectEndpointConfig, AmazonConnectStartSpec,
     AttachmentTokenContext, AttachmentView, BoundConnectionStateCommit, CallExecutionPlan,
@@ -257,6 +259,13 @@ pub trait WorkerPlacement: Send + Sync {
     fn allows_worker(&self, _worker_id: WorkerId) -> bool {
         true
     }
+
+    /// Whether this control process may dispatch fresh work for an existing
+    /// durable assignment. The default preserves the historical worker-ID
+    /// compatibility used by all-in-one runtimes.
+    fn allows_assignment(&self, assignment: &crate::call_engine::WorkerAssignment) -> bool {
+        self.allows_worker(assignment.lease.worker_id)
+    }
 }
 
 const MAX_WORKER_CANDIDATES: usize = 8;
@@ -299,6 +308,10 @@ impl WorkerPlacement for FixedWorkerPlacement {
     ) -> Result<Vec<WorkerLease>, PlacementError> {
         Ok(vec![self.worker])
     }
+
+    fn allows_worker(&self, worker_id: WorkerId) -> bool {
+        self.worker.worker_id == worker_id
+    }
 }
 
 /// Database-authoritative placement used by durable runtimes. Any Redis view
@@ -310,6 +323,7 @@ pub struct RepositoryWorkerPlacement {
     limit: usize,
     replacement_worker_guard: bool,
     allowed_worker_ids: Option<BTreeSet<WorkerId>>,
+    route_catalog_fingerprint: Option<RouteCatalogFingerprint>,
 }
 
 impl RepositoryWorkerPlacement {
@@ -322,6 +336,7 @@ impl RepositoryWorkerPlacement {
             limit: MAX_WORKER_CANDIDATES,
             replacement_worker_guard: false,
             allowed_worker_ids: None,
+            route_catalog_fingerprint: None,
         }
     }
 
@@ -350,6 +365,14 @@ impl RepositoryWorkerPlacement {
         self.allowed_worker_ids = Some(worker_ids);
         self
     }
+
+    /// Restricts placement to workers advertising the gateway's exact route
+    /// and codec catalog fingerprint.
+    #[must_use]
+    pub fn with_route_catalog_fingerprint(mut self, fingerprint: RouteCatalogFingerprint) -> Self {
+        self.route_catalog_fingerprint = Some(fingerprint);
+        self
+    }
 }
 
 impl fmt::Debug for RepositoryWorkerPlacement {
@@ -367,6 +390,7 @@ impl fmt::Debug for RepositoryWorkerPlacement {
                 "allowed_worker_count",
                 &self.allowed_worker_ids.as_ref().map(BTreeSet::len),
             )
+            .field("route_catalog_fingerprint", &self.route_catalog_fingerprint)
             .finish()
     }
 }
@@ -379,9 +403,12 @@ impl WorkerPlacement for RepositoryWorkerPlacement {
         plan: &CallExecutionPlan,
         at: DateTime<Utc>,
     ) -> Result<Vec<WorkerLease>, PlacementError> {
-        let required = plan
+        let mut required = plan
             .required_worker_capabilities()
             .map_err(|_| PlacementError::Unavailable)?;
+        if let Some(fingerprint) = self.route_catalog_fingerprint {
+            required.insert(fingerprint.advertisement_capability());
+        }
         let mut selected = Vec::new();
         let mut reachable_worker_is_live = false;
         let mut reachable_worker_is_capable = false;
@@ -485,6 +512,13 @@ impl WorkerPlacement for RepositoryWorkerPlacement {
         self.allowed_worker_ids
             .as_ref()
             .is_none_or(|allowed| allowed.contains(&worker_id))
+    }
+
+    fn allows_assignment(&self, assignment: &crate::call_engine::WorkerAssignment) -> bool {
+        self.allows_worker(assignment.lease.worker_id)
+            && self
+                .route_catalog_fingerprint
+                .is_none_or(|expected| assignment.route_catalog_fingerprint == Some(expected))
     }
 }
 
@@ -1038,6 +1072,7 @@ impl CallService {
             let consume_at = self.clock.now();
             if principal.authenticated().is_expired_at(consume_at)
                 || candidate.expires_at() <= consume_at
+                || !self.placement.allows_assignment(candidate.assignment())
             {
                 return Err(InboundAttachmentError::ProofRejected);
             }
@@ -1616,7 +1651,9 @@ impl CallService {
         let stored = self.repository.load_service_call(&tenant, call_id).await?;
         // The repository boundary can stall until after a credential expires.
         principal.authorize(CallScope::Read, self.clock.now())?;
-        if stored.call.assignment.released_at.is_some() {
+        if stored.call.assignment.released_at.is_some()
+            || !self.placement.allows_assignment(&stored.call.assignment)
+        {
             return Err(CallServiceError::DependencyUnavailable);
         }
         let leg = stored
@@ -1759,6 +1796,9 @@ impl CallService {
     /// Starts a durable make-before-break replacement of one stable logical
     /// leg. `destination` must come from trusted named-route configuration;
     /// the public request carries only its route ID.
+    // Preserve the public service API: the arguments represent distinct
+    // authenticated and trusted inputs and are not an interchangeable bag.
+    #[allow(clippy::too_many_arguments)]
     pub async fn replace_leg(
         &self,
         principal: &ApiPrincipal,
@@ -1811,11 +1851,7 @@ impl CallService {
         }
 
         let stored = self.repository.load_service_call(&tenant, call_id).await?;
-        if self.placement.requires_replacement_worker_guard()
-            && !self
-                .placement
-                .allows_worker(stored.call.assignment.lease.worker_id)
-        {
+        if !self.placement.allows_assignment(&stored.call.assignment) {
             return Err(CallServiceError::DependencyUnavailable);
         }
         if stored.call.aggregate.state() != crate::call_engine::CallState::Active
@@ -1921,12 +1957,6 @@ impl CallService {
     ) -> Result<CallOperationResult<DtmfAcceptedView>, CallServiceError> {
         let at = self.clock.now();
         let tenant = principal.resolve_tenant(input.tenant_id.as_deref(), CallScope::Dtmf, at)?;
-        let stored = self.repository.load_service_call(&tenant, call_id).await?;
-        let leg = stored
-            .call
-            .aggregate
-            .leg(input.leg_id)
-            .ok_or(CallServiceError::InvalidTransition)?;
         let sequence = DtmfSequence {
             digits: input.digits,
             duration_ms: input.duration_ms,
@@ -1946,6 +1976,32 @@ impl CallService {
             call_id,
             transcript,
         );
+        if let Some(view) = self
+            .repository
+            .load_control_command_replay(
+                &tenant,
+                call_id,
+                operation.key_digest,
+                operation.request_digest,
+                operation.operation,
+                at,
+            )
+            .await?
+        {
+            return Ok(CallOperationResult {
+                value: DtmfAcceptedView::from_control(&view),
+                replayed: true,
+            });
+        }
+        let stored = self.repository.load_service_call(&tenant, call_id).await?;
+        if !self.placement.allows_assignment(&stored.call.assignment) {
+            return Err(CallServiceError::DependencyUnavailable);
+        }
+        let leg = stored
+            .call
+            .aggregate
+            .leg(input.leg_id)
+            .ok_or(CallServiceError::InvalidTransition)?;
         let outcome = self
             .repository
             .enqueue_control(ControlCommandTransaction {
@@ -1996,6 +2052,26 @@ impl CallService {
         operation: OperationIdempotency,
     ) -> Result<CallOperationResult<CallView>, CallServiceError> {
         let at = command.at();
+        if let Some(view) = self
+            .repository
+            .load_service_command_replay(
+                stored.call.aggregate.tenant_id(),
+                stored.call.aggregate.id(),
+                operation.key_digest,
+                operation.request_digest,
+                operation.operation,
+                at,
+            )
+            .await?
+        {
+            return Ok(CallOperationResult {
+                value: CallView::from_aggregate(&view.command.call.aggregate),
+                replayed: true,
+            });
+        }
+        if !self.placement.allows_assignment(&stored.call.assignment) {
+            return Err(CallServiceError::DependencyUnavailable);
+        }
         let guarded_replacement = matches!(&command, CallCommand::BeginLegReplacement { .. })
             && self.placement.requires_replacement_worker_guard();
         let request = ServiceCommandTransaction {
@@ -2862,6 +2938,13 @@ mod tests {
             self.inner.commit_bound_connection_state(request).await
         }
 
+        async fn commit_bound_source_termination(
+            &self,
+            request: BoundSourceTerminationCommit,
+        ) -> Result<ServiceCommandOutcome, RepositoryError> {
+            self.inner.commit_bound_source_termination(request).await
+        }
+
         async fn commit_media_activity(
             &self,
             request: MediaActivityCommit,
@@ -2888,6 +2971,18 @@ mod tests {
             _operation: ServiceOperationKind,
             _at: DateTime<Utc>,
         ) -> Result<Option<crate::call_service::ServiceCommandView>, RepositoryError> {
+            Err(RepositoryError::Unavailable)
+        }
+
+        async fn load_control_command_replay(
+            &self,
+            _tenant_id: &TenantId,
+            _call_id: CallId,
+            _key_digest: IdempotencyKeyDigest,
+            _request_digest: RequestDigest,
+            _operation: ServiceOperationKind,
+            _at: DateTime<Utc>,
+        ) -> Result<Option<crate::call_service::ControlCommandView>, RepositoryError> {
             Err(RepositoryError::Unavailable)
         }
 
@@ -3246,6 +3341,371 @@ mod tests {
         assert_eq!(selected, vec![complete]);
         assert!(!selected.contains(&sip_only));
         assert!(!selected.contains(&egress_only));
+    }
+
+    #[tokio::test]
+    async fn placement_rejects_mismatched_catalog_and_refreshes_after_reconnect() {
+        let plan = execution_plan_for(&generic_input());
+        let expected = RouteCatalogFingerprint::new([0x31; 32]);
+        let changed = RouteCatalogFingerprint::new([0x32; 32]);
+        let worker_id = WorkerId::new();
+        let repository = Arc::new(MemoryRepository::new());
+        let capabilities = |fingerprint: RouteCatalogFingerprint| {
+            BTreeSet::from([
+                "sip".to_owned(),
+                "webrtc_egress".to_owned(),
+                fingerprint.advertisement_capability(),
+            ])
+        };
+        let first = repository
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: capabilities(expected),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let core: Arc<dyn CallRepository> = repository.clone();
+        let expected_placement = RepositoryWorkerPlacement::new(Arc::clone(&core))
+            .with_allowed_workers(BTreeSet::from([worker_id]))
+            .with_route_catalog_fingerprint(expected);
+        assert_eq!(
+            expected_placement
+                .select_workers(&TenantId::parse("tenant-placement").unwrap(), &plan, at(1))
+                .await
+                .unwrap(),
+            vec![first.lease]
+        );
+
+        let reconnected = repository
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: capabilities(changed),
+                at: at(2),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            expected_placement
+                .select_workers(&TenantId::parse("tenant-placement").unwrap(), &plan, at(3))
+                .await
+                .unwrap_err(),
+            PlacementError::UnsupportedCapability
+        );
+        let refreshed = RepositoryWorkerPlacement::new(core)
+            .with_allowed_workers(BTreeSet::from([worker_id]))
+            .with_route_catalog_fingerprint(changed)
+            .select_workers(&TenantId::parse("tenant-placement").unwrap(), &plan, at(3))
+            .await
+            .unwrap();
+        assert_eq!(refreshed, vec![reconnected.lease]);
+    }
+
+    #[tokio::test]
+    async fn restarted_gateway_rejects_fresh_dispatch_for_a_stale_catalog_assignment() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let assigned_fingerprint = RouteCatalogFingerprint::new([0x51; 32]);
+        let restarted_fingerprint = RouteCatalogFingerprint::new([0x52; 32]);
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::from([
+                    "sip".to_owned(),
+                    "webrtc".to_owned(),
+                    assigned_fingerprint.advertisement_capability(),
+                ]),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let service_for = |fingerprint| {
+            let core: Arc<dyn CallRepository> = repository.clone();
+            CallService::new(
+                repository.clone(),
+                Arc::new(
+                    RepositoryWorkerPlacement::new(core)
+                        .with_allowed_workers(BTreeSet::from([worker.worker_id]))
+                        .with_route_catalog_fingerprint(fingerprint)
+                        .with_replacement_worker_guard(),
+                ),
+                Arc::new(SamePrincipalAttachmentResolver),
+                CallServiceCrypto::new(vec![0x61; 32]).unwrap(),
+                clock.clone(),
+                CallTimeoutPolicy::default(),
+            )
+        };
+        let assigned_gateway = service_for(assigned_fingerprint);
+        let restarted_gateway = service_for(restarted_fingerprint);
+        let owner = principal("tenant-a");
+        let created = assigned_gateway
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("catalog-guard-create").unwrap(),
+                two_inbound_input(),
+            )
+            .await
+            .unwrap();
+        connect_created_call(
+            &repository,
+            &assigned_gateway,
+            &owner,
+            worker,
+            &created.value,
+        )
+        .await;
+        clock.set(at(5));
+
+        let call_id = created.value.call.call_id;
+        let leg_id = created.value.call.legs[0].leg_id;
+        assert!(restarted_gateway
+            .get_call(&owner, call_id, GetCallInput::default())
+            .await
+            .is_ok());
+        assert!(matches!(
+            restarted_gateway
+                .resolve_assigned_broadcast_source(&owner, call_id, leg_id, None)
+                .await,
+            Err(CallServiceError::DependencyUnavailable)
+        ));
+
+        let dtmf_key = IdempotencyKey::parse("catalog-guard-dtmf").unwrap();
+        let dtmf = DtmfCallInput {
+            tenant_id: None,
+            leg_id,
+            digits: "5".into(),
+            duration_ms: 120,
+            gap_ms: 70,
+        };
+        assert!(matches!(
+            restarted_gateway
+                .send_dtmf(&owner, call_id, &dtmf_key, dtmf.clone())
+                .await,
+            Err(CallServiceError::DependencyUnavailable)
+        ));
+        assert_eq!(
+            repository
+                .load_service_call(&TenantId::parse("tenant-a").unwrap(), call_id)
+                .await
+                .unwrap()
+                .call
+                .assignment
+                .route_catalog_fingerprint,
+            Some(assigned_fingerprint)
+        );
+        let accepted = assigned_gateway
+            .send_dtmf(&owner, call_id, &dtmf_key, dtmf.clone())
+            .await
+            .unwrap();
+        assert!(!accepted.replayed);
+        let replayed = restarted_gateway
+            .send_dtmf(&owner, call_id, &dtmf_key, dtmf)
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, accepted.value);
+
+        let hangup_key = IdempotencyKey::parse("catalog-guard-hangup").unwrap();
+        assert!(matches!(
+            restarted_gateway
+                .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default(),)
+                .await,
+            Err(CallServiceError::DependencyUnavailable)
+        ));
+        assert_eq!(
+            repository
+                .load_service_call(&TenantId::parse("tenant-a").unwrap(), call_id)
+                .await
+                .unwrap()
+                .call
+                .assignment
+                .route_catalog_fingerprint,
+            Some(assigned_fingerprint)
+        );
+        let ending = assigned_gateway
+            .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default())
+            .await
+            .unwrap();
+        assert!(!ending.replayed);
+        let replayed = restarted_gateway
+            .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, ending.value);
+    }
+
+    #[tokio::test]
+    async fn changed_catalog_replay_cannot_consume_an_old_live_attachment() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let assigned_fingerprint = RouteCatalogFingerprint::new([0x54; 32]);
+        let changed_fingerprint = RouteCatalogFingerprint::new([0x55; 32]);
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::from([
+                    "sip".to_owned(),
+                    "webrtc".to_owned(),
+                    assigned_fingerprint.advertisement_capability(),
+                ]),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let service_for = |fingerprint| {
+            let core: Arc<dyn CallRepository> = repository.clone();
+            CallService::new(
+                repository.clone(),
+                Arc::new(
+                    RepositoryWorkerPlacement::new(core)
+                        .with_allowed_workers(BTreeSet::from([worker.worker_id]))
+                        .with_route_catalog_fingerprint(fingerprint),
+                ),
+                Arc::new(SamePrincipalAttachmentResolver),
+                CallServiceCrypto::new(vec![0x62; 32]).unwrap(),
+                clock.clone(),
+                CallTimeoutPolicy::default(),
+            )
+        };
+        let assigned_gateway = service_for(assigned_fingerprint);
+        let changed_gateway = service_for(changed_fingerprint);
+        let owner = principal("tenant-a");
+        let key = IdempotencyKey::parse("catalog-guard-live-attachment").unwrap();
+        let created = assigned_gateway
+            .create_call(&owner, &key, two_inbound_input())
+            .await
+            .unwrap();
+        let mut replayed = changed_gateway
+            .create_call(&owner, &key, two_inbound_input())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, created.value);
+        let (_, _, token, _) = take_first_attachment(&mut replayed);
+        let matching_token = token.clone();
+        clock.set(at(1));
+
+        assert_eq!(
+            changed_gateway
+                .consume_inbound_attachment(inbound_request(
+                    "tenant-a",
+                    "subject-tenant-a",
+                    None,
+                    Some(token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                ))
+                .await,
+            Err(InboundAttachmentError::ProofRejected)
+        );
+        assigned_gateway
+            .consume_inbound_attachment(inbound_request(
+                "tenant-a",
+                "subject-tenant-a",
+                None,
+                Some(matching_token),
+                AttachmentTransport::Sip,
+                worker,
+                ConnectionId::new(),
+            ))
+            .await
+            .expect("the assignment's exact catalog may still consume its bearer");
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_gateway_cannot_dispatch_or_stamp_a_legacy_assignment() {
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 2,
+                capabilities: BTreeSet::from(["sip".to_owned(), "webrtc_egress".to_owned()]),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let service_for = |fingerprint| {
+            let core: Arc<dyn CallRepository> = repository.clone();
+            let mut placement = RepositoryWorkerPlacement::new(core)
+                .with_allowed_workers(BTreeSet::from([worker.worker_id]));
+            if let Some(fingerprint) = fingerprint {
+                placement = placement.with_route_catalog_fingerprint(fingerprint);
+            }
+            CallService::new(
+                repository.clone(),
+                Arc::new(placement),
+                Arc::new(SamePrincipalAttachmentResolver),
+                CallServiceCrypto::new(vec![0x61; 32]).unwrap(),
+                clock.clone(),
+                CallTimeoutPolicy::default(),
+            )
+        };
+        let legacy_gateway = service_for(None);
+        let fingerprint = RouteCatalogFingerprint::new([0x53; 32]);
+        let fingerprinted_gateway = service_for(Some(fingerprint));
+        let owner = principal("tenant-a");
+        let created = legacy_gateway
+            .create_call(
+                &owner,
+                &IdempotencyKey::parse("legacy-catalog-guard-create").unwrap(),
+                generic_input(),
+            )
+            .await
+            .unwrap();
+        let call_id = created.value.call.call_id;
+        let tenant = TenantId::parse("tenant-a").unwrap();
+        let before = repository
+            .load_service_call(&tenant, call_id)
+            .await
+            .unwrap();
+        assert_eq!(before.call.assignment.route_catalog_fingerprint, None);
+        assert!(fingerprinted_gateway
+            .get_call(&owner, call_id, GetCallInput::default())
+            .await
+            .is_ok());
+
+        clock.set(at(1));
+        let hangup_key = IdempotencyKey::parse("legacy-catalog-guard-hangup").unwrap();
+        assert!(matches!(
+            fingerprinted_gateway
+                .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default())
+                .await,
+            Err(CallServiceError::DependencyUnavailable)
+        ));
+        assert_eq!(
+            repository
+                .load_service_call(&tenant, call_id)
+                .await
+                .unwrap(),
+            before
+        );
+
+        let ending = legacy_gateway
+            .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default())
+            .await
+            .unwrap();
+        assert!(!ending.replayed);
+        let replayed = fingerprinted_gateway
+            .hangup_call(&owner, call_id, &hangup_key, CallMutationInput::default())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, ending.value);
     }
 
     #[test]

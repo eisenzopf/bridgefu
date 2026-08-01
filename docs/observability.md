@@ -45,6 +45,11 @@ Labels listed below are the complete Bridgefu-owned label set for each metric.
 | `bridgefu_operational_ephemeral_total` | counter | `kind` | Non-durable adapter event classes. |
 | `bridgefu_context_data_messages_total` | counter | `result`, `reason` | Bound DataChannel/context forwarding decisions. |
 | `bridgefu_initial_context_total` | counter | `result`, `reason` | Durable pre-INVITE context lifecycle. |
+| `bridgefu_handoff_status_total` | counter | `status`, `result` | Browser handoff-status delivery outcomes. |
+| `bridgefu_destination_progress_total` | counter | `early_media` | Owned destination progress events by early-media indication. |
+| `bridgefu_provisional_early_media_total` | counter | `result` | Provisional attach-then-dial media lifecycle outcomes. |
+| `bridgefu_pending_private_operational_total` | counter | `result` | Private operational events staged before route ownership is complete. |
+| `bridgefu_provider_client_state_total` | counter | `provider`, `role`, `result`, `reason` | Provider client-state validation outcomes. |
 | `bridgefu_active_broadcasts` | gauge | `transport` | Active UCTP or MOQT broadcasts. |
 | `bridgefu_broadcast_commands_total` | counter | `operation`, `result` | Durable remote-broadcast command outcomes. |
 | `bridgefu_sanitized_broadcast_events_total` | counter | `result`, `reason` | Optional public-event track admission and drops. |
@@ -72,6 +77,8 @@ Labels listed below are the complete Bridgefu-owned label set for each metric.
 | `bridgefu_private_forwarding_routes_total` | counter | `outcome` | Private route lifecycle. |
 | `bridgefu_private_forwarding_packets_total` | counter | `direction` | Private RTP/RTCP/data forwarding. |
 | `bridgefu_private_forwarding_drops_total` | counter | `reason` | Invalid, unknown, or backpressured private packets. |
+| `bridgefu_private_egress_active_routes` | gauge | none | Active private worker-owned egress routes. |
+| `bridgefu_private_egress_commands_total` | counter | `operation`, `outcome` | Idempotent private-egress command outcomes. |
 | `bridgefu_amazon_durable_cleanups_pending` | gauge | none | Durable Amazon cleanup journal backlog. |
 | `bridgefu_amazon_cleanup_reconcile_failures_total` | counter | none | Cleanup reconciliation failures. |
 | `bridgefu_amazon_pending_contact_cleanups` | gauge | none | Legacy adapter contact cleanups pending at drain. |

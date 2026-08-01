@@ -1,13 +1,10 @@
 # syntax=docker/dockerfile:1.7
-# Build with the exact reviewed rvoip checkout:
-# docker build --build-context rvoip=../rvoip -f deploy/vapi-feasibility/Dockerfile .
+# The committed Cargo.lock pins the crates.io-hosted rvoip 0.3.5 graph.
+# docker build -f deploy/vapi-feasibility/Dockerfile .
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG BUILDER_DEBIAN_SNAPSHOT=20260518T000000Z
 ARG RUNTIME_DEBIAN_SNAPSHOT=20260713T000000Z
-
-FROM scratch AS rvoip
-COPY deploy/missing-rvoip-context /.bridgefu-missing-rvoip-build-context
 
 FROM ${RUST_IMAGE} AS builder
 ARG BUILDER_DEBIAN_SNAPSHOT
@@ -25,14 +22,9 @@ RUN sed -i \
         pkg-config=1.8.1-1 \
         protobuf-compiler=3.21.12-3 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=rvoip . /src/rvoip
 COPY . /src/bridgefu
 WORKDIR /src/bridgefu
-RUN if test -e /src/rvoip/.bridgefu-missing-rvoip-build-context; then \
-        echo 'missing required --build-context rvoip=/exact/reviewed/checkout' >&2; \
-        exit 64; \
-    fi \
-    && cargo build --locked --release --example vapi_feasibility_observer \
+RUN cargo build --locked --release --example vapi_feasibility_observer \
     && install -D -m 0755 \
         target/release/examples/vapi_feasibility_observer \
         /out/vapi-feasibility-observer \
@@ -40,6 +32,9 @@ RUN if test -e /src/rvoip/.bridgefu-missing-rvoip-build-context; then \
 
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG RUNTIME_DEBIAN_SNAPSHOT
+LABEL org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu" \
+      org.opencontainers.image.version="0.9.0" \
+      org.opencontainers.image.rvoip.version="0.3.5"
 RUN sed -i \
         -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${RUNTIME_DEBIAN_SNAPSHOT}|" \
         -e "s|URIs: http://deb.debian.org/debian|URIs: http://snapshot.debian.org/archive/debian/${RUNTIME_DEBIAN_SNAPSHOT}|" \

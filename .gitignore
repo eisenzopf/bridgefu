@@ -10,6 +10,20 @@ __pycache__/
 # Logs
 *.log
 
+# Local runtime credentials and TLS material. Compose mounts deploy/tls at
+# runtime; none of these files belongs in source control.
+/deploy/tls/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+
 # Operator's filled-in config (contains your instance/flow IDs). Commit only
 # config/bridgefu.example.yaml, not the real one.
 /bridgefu.yaml
@@ -21,6 +35,7 @@ terraform/.terraform/
 *.tfstate
 *.tfstate.*
 crash.log
+.vscode
 crash.*.log
 terraform/terraform.tfvars
 # Keep .terraform.lock.hcl tracked (provider pinning) and tfvars.example tracked.

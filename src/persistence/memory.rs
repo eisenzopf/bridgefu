@@ -17,6 +17,8 @@ use rvoip_core::MAX_DATA_MESSAGE_ID_BYTES;
 use rvoip_sip::SipInitialHeaders;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::call_engine::SourceBeforeAnswerTermination;
 use crate::call_engine::{
     chrono_ttl, idempotency_expiry, validate_attachment_issue, validate_provider_event,
     validate_register_worker, validate_worker_candidate_limit, validate_worker_capabilities,
@@ -33,18 +35,19 @@ use crate::call_engine::{
     ProviderEventCommitOutcome, ProviderEventDigest, ProviderEventEnvelope, ProviderEventInput,
     ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderReceiptSequence,
     ProviderReferenceRole, RegisterWorker, RenewWorkerLease, RepositoryError, RestartClaim,
-    SignalingInitiator, StoredCall, StoredCommand, TenantId, TerminalProviderEventAcknowledge,
-    TerminalProviderEventAcknowledgeOutcome, TransferResult, WorkerAssignment, WorkerFence,
-    WorkerId, WorkerLease, WorkerSnapshot,
+    RouteCatalogFingerprint, SignalingInitiator, StoredCall, StoredCommand, TenantId,
+    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, TransferResult,
+    WorkerAssignment, WorkerFence, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
-    BoundConnectionGuard, BoundConnectionStateCommit, CallExecutionPlan, CallServiceRepository,
-    ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction,
-    ControlCommandView, ControlOutboxRecord, ControlSequence, EffectResultOutcome,
-    EffectResultReconciliation, EffectResultView, ExternalReferenceBinding, ExternalReferenceValue,
-    InitialContextRecordOutcome, InitialContextRecordRequest, MediaActivityCommit,
-    MediaActivityGeneration, MediaActivityGuard, OperationIdempotency, OperationIdempotencyReceipt,
-    OutboundConnectionBind, OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
+    BoundConnectionGuard, BoundConnectionStateCommit, BoundSourceTerminationCommit,
+    CallExecutionPlan, CallServiceRepository, ClaimedControlEffect, CompletedServiceEffect,
+    ControlCommandOutcome, ControlCommandTransaction, ControlCommandView, ControlOutboxRecord,
+    ControlSequence, EffectResultOutcome, EffectResultReconciliation, EffectResultView,
+    ExternalReferenceBinding, ExternalReferenceValue, InitialContextRecordOutcome,
+    InitialContextRecordRequest, MediaActivityCommit, MediaActivityGeneration, MediaActivityGuard,
+    OperationIdempotency, OperationIdempotencyReceipt, OutboundConnectionBind,
+    OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
     ProviderEventReconciliationTransaction, ProviderEventReconciliationView,
     ReplacementInitialContextLookup, ServiceCommandOutcome, ServiceCommandTransaction,
     ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
@@ -627,8 +630,8 @@ impl MemoryRepository {
                     .get(&binding_key.0)
                     .and_then(|call| call.bindings.get(&binding_key.1))
                     .is_some_and(|current| current.connection_id == binding.connection_id);
-                if !current_matches {
-                    if state
+                if !current_matches
+                    && (state
                         .connection_owners
                         .insert(binding.connection_id.clone(), binding_key)
                         .is_some()
@@ -638,10 +641,9 @@ impl MemoryRepository {
                                 (binding.principal_fingerprint, binding_key),
                                 binding.connection_id,
                             )
-                            .is_some()
-                    {
-                        return Err(RepositoryError::Unavailable);
-                    }
+                            .is_some())
+                {
+                    return Err(RepositoryError::Unavailable);
                 }
             }
         }
@@ -1485,6 +1487,14 @@ impl MemoryRepository {
                 ..
             } if *leg_id == guard.leg_id
                 && *binding_generation == guard.binding_generation
+        ) || matches!(
+            &result.request.command.command,
+            CallCommand::SourceTerminatedBeforeAnswer {
+                source_leg_id,
+                binding_generation,
+                ..
+            } if *source_leg_id == guard.leg_id
+                && *binding_generation == guard.binding_generation
         );
         if !command_matches || !state.used_connection_ids.contains(&guard.connection_id) {
             return false;
@@ -1663,7 +1673,7 @@ impl MemoryRepository {
                 && row.call_id == record.call_id
                 && row.leg_id == record.source_leg_id
                 && row.binding_generation == record.source_binding_generation
-                && row.binding.as_ref().is_some_and(|binding| matches(binding))
+                && row.binding.as_ref().is_some_and(&matches)
         }) || state.outbound_binding_results.values().any(|stored| {
             stored.request.tenant_id == record.tenant_id
                 && stored.request.call_id == record.call_id
@@ -2090,8 +2100,7 @@ fn validate_idempotency_snapshot(
                         effect.intent,
                         EffectIntent::ExecuteTransfer { .. }
                             | EffectIntent::StartLegReplacement { .. }
-                    )
-                        != payload_effects.contains(&effect.effect_id)
+                    ) != payload_effects.contains(&effect.effect_id)
                 {
                     return Err(RepositoryError::Unavailable);
                 }
@@ -2145,6 +2154,8 @@ impl CallRepository for MemoryRepository {
         request: RegisterWorker,
     ) -> Result<WorkerSnapshot, RepositoryError> {
         validate_register_worker(&request)?;
+        let requested_route_catalog =
+            RouteCatalogFingerprint::from_capabilities(&request.capabilities)?;
         self.transaction(|state| {
             let at = authoritative_time(state, request.at);
             let lease_expires_at = worker_lease_expiry(at, request.lease_ttl)?;
@@ -2153,6 +2164,15 @@ impl CallRepository for MemoryRepository {
                     if request.max_calls < existing.reserved_calls {
                         return Err(RepositoryError::InvalidInput(
                             "worker capacity is below existing reservations",
+                        ));
+                    }
+                    if state.calls.values().any(|call| {
+                        call.assignment.lease.worker_id == request.worker_id
+                            && call.assignment.route_catalog_fingerprint != requested_route_catalog
+                            && assignment_requires_catalog_continuity(state, call)
+                    }) {
+                        return Err(RepositoryError::InvalidInput(
+                            "worker route catalog change requires draining existing assignments",
                         ));
                     }
                     WorkerSnapshot {
@@ -2445,6 +2465,7 @@ impl CallRepository for MemoryRepository {
                 binding_generation: row.binding_generation,
                 transport: row.transport,
                 worker: row.worker,
+                assignment: call.assignment.clone(),
                 expires_at: row.expires_at,
                 expected_principal: row.expected_principal,
                 expected_version: call.aggregate.version(),
@@ -2529,6 +2550,11 @@ impl CallRepository for MemoryRepository {
                 .get_mut(&request.candidate.call_id)
                 .filter(|call| call.aggregate.tenant_id() == &request.candidate.tenant_id)
                 .ok_or(RepositoryError::AttachmentRejected)?;
+            if call.assignment != request.candidate.assignment
+                || call.assignment.released_at.is_some()
+            {
+                return Err(RepositoryError::AttachmentRejected);
+            }
             if call.bindings.contains_key(&request.candidate.leg_id) && !pending_replacement {
                 return Err(RepositoryError::AttachmentConflict);
             }
@@ -3034,17 +3060,21 @@ impl CallRepository for MemoryRepository {
         }
         self.transaction(|state| {
             ensure_worker(state, worker, true, at)?;
+            let route_catalog_fingerprint = RouteCatalogFingerprint::from_capabilities(
+                &state
+                    .workers
+                    .get(&worker.worker_id)
+                    .ok_or(RepositoryError::StaleWorkerFence)?
+                    .capabilities,
+            )?;
             let mut call_ids = state
                 .calls
                 .iter()
                 .filter(|(_, call)| {
                     call.assignment.lease.worker_id == worker.worker_id
                         && call.assignment.lease.fence < worker.fence
-                        && (call.assignment.released_at.is_none()
-                            || (call.aggregate.state().is_terminal()
-                                && (has_unfinished_outbox(state, call.aggregate.id())
-                                    || has_unfinished_control_outbox(state, call.aggregate.id())
-                                    || has_unfinished_provider_events(state, call.aggregate.id()))))
+                        && call.assignment.route_catalog_fingerprint == route_catalog_fingerprint
+                        && assignment_requires_catalog_continuity(state, call)
                 })
                 .map(|(call_id, _)| *call_id)
                 .collect::<Vec<_>>();
@@ -3208,6 +3238,13 @@ impl CallServiceRepository for MemoryRepository {
         self.transaction(|state| commit_bound_connection_state_in_state(state, request))
     }
 
+    async fn commit_bound_source_termination(
+        &self,
+        request: BoundSourceTerminationCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError> {
+        self.transaction(|state| commit_bound_source_termination_in_state(state, request))
+    }
+
     async fn commit_media_activity(
         &self,
         request: MediaActivityCommit,
@@ -3253,6 +3290,40 @@ impl CallServiceRepository for MemoryRepository {
                 } if *retained_operation == operation
                     && view.command.command.tenant_id == *tenant_id
                     && view.command.command.call_id == call_id =>
+                {
+                    Ok(Some(view.as_ref().clone()))
+                }
+                _ => Err(RepositoryError::IdempotencyConflict),
+            }
+        })
+    }
+
+    async fn load_control_command_replay(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        key_digest: crate::call_engine::IdempotencyKeyDigest,
+        request_digest: crate::call_engine::RequestDigest,
+        operation: ServiceOperationKind,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ControlCommandView>, RepositoryError> {
+        self.read(|state| {
+            let Some(existing) = state.idempotency.get(&(tenant_id.clone(), key_digest)) else {
+                return Ok(None);
+            };
+            if existing.expires_at <= at {
+                return Ok(None);
+            }
+            if existing.request_digest != request_digest || existing.call_id != call_id {
+                return Err(RepositoryError::IdempotencyConflict);
+            }
+            match &existing.receipt {
+                OperationIdempotencyReceipt::ControlCommand {
+                    operation: retained_operation,
+                    view,
+                } if *retained_operation == operation
+                    && view.command.tenant_id == *tenant_id
+                    && view.command.call_id == call_id =>
                 {
                     Ok(Some(view.as_ref().clone()))
                 }
@@ -3928,17 +3999,24 @@ fn normalize_service_command(
         idempotency.validate_service_command(&request.command.command)?;
     }
     if let Some(guard) = &request.bound_connection {
-        if request.operation_idempotency.is_some()
-            || !matches!(
-                &request.command.command,
-                CallCommand::SetLegState {
-                    leg_id,
-                    binding_generation,
-                    ..
-                } if *leg_id == guard.leg_id
-                    && *binding_generation == guard.binding_generation
-            )
-        {
+        let guard_matches = matches!(
+            &request.command.command,
+            CallCommand::SetLegState {
+                leg_id,
+                binding_generation,
+                ..
+            } if *leg_id == guard.leg_id
+                && *binding_generation == guard.binding_generation
+        ) || matches!(
+            &request.command.command,
+            CallCommand::SourceTerminatedBeforeAnswer {
+                source_leg_id,
+                binding_generation,
+                ..
+            } if *source_leg_id == guard.leg_id
+                && *binding_generation == guard.binding_generation
+        );
+        if request.operation_idempotency.is_some() || !guard_matches {
             return Err(RepositoryError::InvalidInput(
                 "bound connection guard does not match lifecycle command",
             ));
@@ -4585,6 +4663,78 @@ fn commit_bound_connection_state_in_state(
     commit_service_command_in_state(state, transaction, false)
 }
 
+fn commit_bound_source_termination_in_state(
+    state: &mut MemoryState,
+    request: BoundSourceTerminationCommit,
+) -> Result<ServiceCommandOutcome, RepositoryError> {
+    let transaction = normalize_service_command(ServiceCommandTransaction {
+        command: CommandCommit {
+            tenant_id: request.tenant_id.clone(),
+            call_id: request.call_id,
+            expected_version: request.expected_version,
+            command_id: request.command_id,
+            command: CallCommand::SourceTerminatedBeforeAnswer {
+                at: request.at,
+                source_leg_id: request.source_leg_id,
+                binding_generation: request.binding_generation,
+                reason: request.reason,
+            },
+            worker: request.worker,
+            attachments: Vec::new(),
+            deadline_claim: None,
+            at: request.at,
+        },
+        effect_payloads: Vec::new(),
+        operation_idempotency: None,
+        bound_connection: Some(BoundConnectionGuard {
+            connection_id: request.connection_id.clone(),
+            leg_id: request.source_leg_id,
+            binding_generation: request.binding_generation,
+        }),
+        media_activity: None,
+        replacement_connection: None,
+    })?;
+
+    // Exact lost-response replay wins even after the source and peer advance.
+    if state
+        .service_command_results
+        .contains_key(&transaction.command.command_id)
+    {
+        return commit_service_command_in_state(state, transaction, false);
+    }
+
+    ensure_call_worker(
+        state,
+        &request.tenant_id,
+        request.call_id,
+        request.worker,
+        request.at,
+    )?;
+    let call = state
+        .calls
+        .get(&request.call_id)
+        .ok_or(RepositoryError::NotFound)?;
+    let binding = call
+        .bindings
+        .get(&request.source_leg_id)
+        .filter(|binding| {
+            binding.connection_id == request.connection_id
+                && binding.binding_generation == request.binding_generation
+        })
+        .ok_or(RepositoryError::StaleClaim)?;
+    let key = (
+        request.call_id,
+        request.source_leg_id,
+        request.binding_generation,
+    );
+    if state.connection_owners.get(&request.connection_id) != Some(&key)
+        || binding.leg_id != request.source_leg_id
+    {
+        return Err(RepositoryError::StaleClaim);
+    }
+    commit_service_command_in_state(state, transaction, false)
+}
+
 fn commit_media_activity_in_state(
     state: &mut MemoryState,
     request: MediaActivityCommit,
@@ -4851,12 +5001,19 @@ fn bind_outbound_connection_in_state(
     if leg.binding_generation() != request.binding_generation {
         return Err(RepositoryError::StaleClaim);
     }
+    // A StartLeg effect may still be running when the source generation is
+    // durably retired. Do not let that stale worker publish a new destination
+    // into an Ending call merely because the outbox claim has not yet been
+    // reconciled.
+    if call.aggregate.state() != CallState::Connecting || leg.state() != LegState::Pending {
+        return Err(RepositoryError::StaleClaim);
+    }
     if request.at < call.aggregate.updated_at() {
         return Err(RepositoryError::InvalidInput(
             "outbound binding time predates call state",
         ));
     }
-    if leg.state().is_terminal() || call.bindings.contains_key(&request.leg_id) {
+    if call.bindings.contains_key(&request.leg_id) {
         return Err(RepositoryError::AttachmentConflict);
     }
     let binding_key = (request.call_id, request.leg_id, request.binding_generation);
@@ -5746,6 +5903,7 @@ fn validate_provider_service_follow_up(
         }
         CallCommand::BeginEnding { .. } => true,
         CallCommand::StartConnecting { .. }
+        | CallCommand::SourceTerminatedBeforeAnswer { .. }
         | CallCommand::ProviderMediaStarted { .. }
         | CallCommand::ProviderMediaAttached { .. }
         | CallCommand::ArmDeadline { .. }
@@ -6645,6 +6803,9 @@ fn create_call_in_state(
 
     let assignment = WorkerAssignment {
         lease: request.worker,
+        route_catalog_fingerprint: RouteCatalogFingerprint::from_capabilities(
+            &worker.capabilities,
+        )?,
         assigned_at: request.at,
         released_at: None,
     };
@@ -7089,6 +7250,14 @@ fn has_unfinished_control_outbox(state: &MemoryState, call_id: CallId) -> bool {
         .control_outbox
         .values()
         .any(|record| record.call_id == call_id && control_outbox_is_unfinished(record))
+}
+
+fn assignment_requires_catalog_continuity(state: &MemoryState, call: &StoredCall) -> bool {
+    call.assignment.released_at.is_none()
+        || (call.aggregate.state().is_terminal()
+            && (has_unfinished_outbox(state, call.aggregate.id())
+                || has_unfinished_control_outbox(state, call.aggregate.id())
+                || has_unfinished_provider_events(state, call.aggregate.id())))
 }
 
 fn control_outbox_claimable(
@@ -7549,6 +7718,333 @@ mod tests {
             CreateCallOutcome::Created(call) => call,
             CreateCallOutcome::Replayed(_) => panic!("expected created call"),
         }
+    }
+
+    #[tokio::test]
+    async fn assignment_retains_catalog_fingerprint_across_compatible_reconnects() {
+        let repo = MemoryRepository::new();
+        let fingerprint = RouteCatalogFingerprint::new([0x41; 32]);
+        let worker_id = WorkerId::new();
+        let capabilities = |fingerprint: RouteCatalogFingerprint| {
+            BTreeSet::from([
+                "sip".to_owned(),
+                "webrtc".to_owned(),
+                fingerprint.advertisement_capability(),
+            ])
+        };
+        let first = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: capabilities(fingerprint),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let owner = tenant("tenant-catalog-assignment");
+        let stored = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                first.lease,
+                0x42,
+                0x43,
+            ))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            stored.assignment.route_catalog_fingerprint,
+            Some(fingerprint)
+        );
+
+        let second = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 2,
+                capabilities: capabilities(fingerprint),
+                at: at(3),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let restarted = repo
+            .claim_restart_calls(second.lease, at(4), 8)
+            .await
+            .unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(
+            restarted[0].call.assignment.route_catalog_fingerprint,
+            Some(fingerprint)
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_and_restart_recovery_reject_catalog_mismatches() {
+        let repo = MemoryRepository::new();
+        let fingerprint_a = RouteCatalogFingerprint::new([0x44; 32]);
+        let fingerprint_b = RouteCatalogFingerprint::new([0x45; 32]);
+        let capabilities = |fingerprint: RouteCatalogFingerprint| {
+            BTreeSet::from([
+                "sip".to_owned(),
+                "webrtc".to_owned(),
+                fingerprint.advertisement_capability(),
+            ])
+        };
+
+        let legacy_worker_id = WorkerId::new();
+        let legacy_worker = repo
+            .register_worker(RegisterWorker {
+                worker_id: legacy_worker_id,
+                max_calls: 2,
+                capabilities: BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()]),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let legacy_owner = tenant("tenant-legacy-catalog-mismatch");
+        let legacy_call = created(
+            repo.create_call(create_request(
+                new_call(legacy_owner.clone()),
+                legacy_worker.lease,
+                0x46,
+                0x47,
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let fingerprinted_worker_id = WorkerId::new();
+        let fingerprinted_worker = repo
+            .register_worker(RegisterWorker {
+                worker_id: fingerprinted_worker_id,
+                max_calls: 2,
+                capabilities: capabilities(fingerprint_a),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let fingerprinted_owner = tenant("tenant-explicit-catalog-mismatch");
+        let fingerprinted_call = created(
+            repo.create_call(create_request(
+                new_call(fingerprinted_owner.clone()),
+                fingerprinted_worker.lease,
+                0x48,
+                0x49,
+            ))
+            .await
+            .unwrap(),
+        );
+
+        for (worker_id, worker_capabilities) in [
+            (legacy_worker_id, capabilities(fingerprint_b)),
+            (fingerprinted_worker_id, capabilities(fingerprint_b)),
+        ] {
+            assert_eq!(
+                repo.register_worker(RegisterWorker {
+                    worker_id,
+                    max_calls: 2,
+                    capabilities: worker_capabilities,
+                    at: at(3),
+                    lease_ttl: Duration::from_secs(300),
+                })
+                .await,
+                Err(RepositoryError::InvalidInput(
+                    "worker route catalog change requires draining existing assignments"
+                ))
+            );
+            let retained = repo.worker_snapshot(worker_id).await.unwrap();
+            assert_eq!(retained.reserved_calls, 1);
+        }
+        assert_eq!(
+            repo.load_call(&legacy_owner, legacy_call.aggregate.id())
+                .await
+                .unwrap()
+                .assignment
+                .route_catalog_fingerprint,
+            None
+        );
+        assert_eq!(
+            repo.load_call(&fingerprinted_owner, fingerprinted_call.aggregate.id())
+                .await
+                .unwrap()
+                .assignment
+                .route_catalog_fingerprint,
+            Some(fingerprint_a)
+        );
+
+        // Simulate a repository written by a pre-gate process to prove the
+        // restart claimant itself remains independently fail-closed.
+        let (legacy_newer, fingerprinted_newer) = repo
+            .transaction(|state| {
+                let advance = |snapshot: &mut WorkerSnapshot,
+                               advertised: BTreeSet<String>|
+                 -> Result<WorkerLease, RepositoryError> {
+                    snapshot.lease.fence = snapshot.lease.fence.next()?;
+                    snapshot.capabilities = advertised;
+                    snapshot.updated_at = at(4);
+                    Ok(snapshot.lease)
+                };
+                let legacy_newer = advance(
+                    state
+                        .workers
+                        .get_mut(&legacy_worker_id)
+                        .ok_or(RepositoryError::NotFound)?,
+                    capabilities(fingerprint_b),
+                )?;
+                let fingerprinted_newer = advance(
+                    state
+                        .workers
+                        .get_mut(&fingerprinted_worker_id)
+                        .ok_or(RepositoryError::NotFound)?,
+                    capabilities(fingerprint_b),
+                )?;
+                Ok((legacy_newer, fingerprinted_newer))
+            })
+            .unwrap();
+        assert!(repo
+            .claim_restart_calls(legacy_newer, at(5), 8)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .claim_restart_calls(fingerprinted_newer, at(5), 8)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.load_call(&legacy_owner, legacy_call.aggregate.id())
+                .await
+                .unwrap()
+                .assignment
+                .route_catalog_fingerprint,
+            None
+        );
+        assert_eq!(
+            repo.load_call(&fingerprinted_owner, fingerprinted_call.aggregate.id())
+                .await
+                .unwrap()
+                .assignment
+                .route_catalog_fingerprint,
+            Some(fingerprint_a)
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_change_waits_for_released_terminal_cleanup_to_drain() {
+        let repo = MemoryRepository::new();
+        let original = RouteCatalogFingerprint::new([0x4a; 32]);
+        let changed = RouteCatalogFingerprint::new([0x4b; 32]);
+        let capabilities = |fingerprint: RouteCatalogFingerprint| {
+            BTreeSet::from([
+                "sip".to_owned(),
+                "webrtc".to_owned(),
+                fingerprint.advertisement_capability(),
+            ])
+        };
+        let worker_id = WorkerId::new();
+        let first = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 1,
+                capabilities: capabilities(original),
+                at: at(0),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let owner = tenant("tenant-terminal-catalog-cleanup");
+        let call = created(
+            repo.create_call(create_request(
+                new_call(owner.clone()),
+                first.lease,
+                0x4c,
+                0x4d,
+            ))
+            .await
+            .unwrap(),
+        );
+        let terminal = end_call(&repo, &owner, first.lease, call).await;
+        assert!(terminal.aggregate.state().is_terminal());
+        assert!(terminal.assignment.released_at.is_some());
+        assert_eq!(
+            repo.worker_snapshot(worker_id)
+                .await
+                .unwrap()
+                .reserved_calls,
+            0
+        );
+        assert!(repo
+            .read(|state| Ok(assignment_requires_catalog_continuity(state, &terminal)))
+            .unwrap());
+
+        assert_eq!(
+            repo.register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 1,
+                capabilities: capabilities(changed),
+                at: at(10),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await,
+            Err(RepositoryError::InvalidInput(
+                "worker route catalog change requires draining existing assignments"
+            ))
+        );
+        assert_eq!(
+            repo.worker_snapshot(worker_id).await.unwrap().lease,
+            first.lease
+        );
+
+        let compatible = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 1,
+                capabilities: capabilities(original),
+                at: at(11),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        let recovered = repo
+            .claim_restart_calls(compatible.lease, at(12), 1)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].call.aggregate.id(), terminal.aggregate.id());
+        assert!(recovered[0].call.assignment.released_at.is_some());
+        drain_outbox(&repo, compatible.lease, at(13)).await;
+        assert!(!repo
+            .read(|state| {
+                let call = state
+                    .calls
+                    .get(&terminal.aggregate.id())
+                    .ok_or(RepositoryError::NotFound)?;
+                Ok(assignment_requires_catalog_continuity(state, call))
+            })
+            .unwrap());
+
+        let changed_worker = repo
+            .register_worker(RegisterWorker {
+                worker_id,
+                max_calls: 1,
+                capabilities: capabilities(changed),
+                at: at(14),
+                lease_ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            RouteCatalogFingerprint::from_capabilities(&changed_worker.capabilities).unwrap(),
+            Some(changed)
+        );
+        assert!(repo
+            .claim_restart_calls(changed_worker.lease, at(15), 1)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     async fn apply_command(
@@ -8966,6 +9462,200 @@ mod tests {
         assert_eq!(
             repo.commit_bound_connection_state(stale_version).await,
             Err(RepositoryError::VersionConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_source_termination_is_atomic_exact_and_replayable() {
+        let repo = MemoryRepository::new();
+        let worker = worker(&repo, 1).await;
+        let owner = tenant("tenant-pending-source-terminal");
+        let aggregate = new_call(owner.clone());
+        let source_leg = aggregate.legs()[0].id();
+        let peer_leg = aggregate.legs()[1].id();
+        let plan = CallExecutionPlan::new(
+            &aggregate,
+            [
+                LegExecutionSpec {
+                    leg_id: source_leg,
+                    endpoint: LegEndpointConfig::Sip(SipEndpointConfig {
+                        uri: None,
+                        initial_context: Default::default(),
+                    }),
+                },
+                LegExecutionSpec {
+                    leg_id: peer_leg,
+                    endpoint: LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                        signaling_uri: Some("wss://webrtc.example.invalid/source-terminal".into()),
+                    }),
+                },
+            ],
+            service_principal(),
+        )
+        .unwrap();
+        let stored = match repo
+            .create_with_plan(ServiceCreateTransaction {
+                create: create_request(aggregate, worker.lease, 41, 42),
+                plan,
+                alternatives: Vec::new(),
+            })
+            .await
+            .unwrap()
+        {
+            ServiceCreateOutcome::Created(stored) => stored,
+            ServiceCreateOutcome::Replayed(_) => panic!("fresh service call replayed"),
+        };
+        let issue = stored.attachments[0].clone();
+        let candidate = repo
+            .inspect_attachment(AttachmentLookup {
+                token_digest: issue.token_digest,
+                tenant_id: owner.clone(),
+                transport: issue.transport,
+                principal_fingerprint: service_principal(),
+                worker: worker.lease,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        let claimed_start = loop {
+            let claimed = repo
+                .claim_outbox(worker.lease, at(3), Duration::from_secs(10), 1)
+                .await
+                .unwrap()
+                .pop()
+                .expect("initial call effect");
+            if matches!(
+                claimed.record.intent,
+                EffectIntent::StartLeg { leg_id, .. } if leg_id == peer_leg
+            ) {
+                break claimed;
+            }
+            repo.reconcile_effect_result(EffectResultReconciliation {
+                tenant_id: owner.clone(),
+                call_id: stored.call.aggregate.id(),
+                effect_id: claimed.record.effect_id,
+                worker: worker.lease,
+                claim_generation: claimed.claim_generation,
+                result: ServiceEffectResult::Succeeded,
+                external_reference: None,
+                additional_external_references: Vec::new(),
+                follow_up: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+        };
+        let connection_id = ConnectionId::from_string("pending-source-exact");
+        let consumed = repo
+            .consume_attachment(AttachmentConsume {
+                candidate,
+                command_id: CommandId::new(),
+                command: CallCommand::SetLegState {
+                    at: at(3),
+                    leg_id: source_leg,
+                    binding_generation: issue.binding_generation,
+                    state: LegState::Signaling,
+                    failure: None,
+                },
+                connection_id: connection_id.clone(),
+                principal_fingerprint: service_principal(),
+                principal_expires_at: None,
+                at: at(3),
+            })
+            .await
+            .unwrap();
+
+        let transition = BoundSourceTerminationCommit {
+            tenant_id: owner.clone(),
+            call_id: consumed.commit.call.aggregate.id(),
+            expected_version: consumed.commit.call.aggregate.version(),
+            command_id: CommandId::new(),
+            source_leg_id: source_leg,
+            binding_generation: issue.binding_generation,
+            connection_id: connection_id.clone(),
+            worker: worker.lease,
+            reason: SourceBeforeAnswerTermination::Cancelled,
+            at: at(4),
+        };
+        let mut wrong_connection = transition.clone();
+        wrong_connection.connection_id = ConnectionId::from_string("other-source");
+        assert_eq!(
+            repo.commit_bound_source_termination(wrong_connection).await,
+            Err(RepositoryError::StaleClaim)
+        );
+        let mut future_generation = transition.clone();
+        future_generation.binding_generation = issue.binding_generation.next().unwrap();
+        assert_eq!(
+            repo.commit_bound_source_termination(future_generation)
+                .await,
+            Err(RepositoryError::StaleClaim)
+        );
+
+        let committed = match repo
+            .commit_bound_source_termination(transition.clone())
+            .await
+            .unwrap()
+        {
+            ServiceCommandOutcome::Committed(view) => view,
+            ServiceCommandOutcome::Replayed(_) => panic!("fresh source terminal replayed"),
+        };
+        assert_eq!(committed.command.call.aggregate.state(), CallState::Ending);
+        assert_eq!(
+            committed
+                .command
+                .call
+                .aggregate
+                .leg(source_leg)
+                .unwrap()
+                .state(),
+            LegState::Ended
+        );
+        assert_eq!(
+            committed
+                .command
+                .call
+                .aggregate
+                .leg(peer_leg)
+                .unwrap()
+                .state(),
+            LegState::Ending
+        );
+        assert!(committed.command.outbox.iter().any(|effect| matches!(
+            effect.intent,
+            EffectIntent::StopLeg {
+                leg_id,
+                binding_generation,
+                reason: StopLegReason::PeerEnded,
+            } if leg_id == peer_leg && binding_generation == BindingGeneration::INITIAL
+        )));
+        assert!(!committed.command.outbox.iter().any(|effect| matches!(
+            effect.intent,
+            EffectIntent::StopLeg { leg_id, .. } if leg_id == source_leg
+        )));
+        assert_eq!(
+            repo.bind_outbound_connection(OutboundConnectionBind {
+                operation_id: CommandId::from_uuid(claimed_start.record.effect_id.as_uuid())
+                    .unwrap(),
+                effect_id: claimed_start.record.effect_id,
+                claim_generation: claimed_start.claim_generation,
+                tenant_id: owner.clone(),
+                call_id: committed.command.call.aggregate.id(),
+                leg_id: peer_leg,
+                binding_generation: BindingGeneration::INITIAL,
+                worker: worker.lease,
+                connection_id: ConnectionId::from_string("late-outbound-after-source-ended"),
+                transport: AttachmentTransport::WebRtc,
+                principal_fingerprint: service_principal(),
+                at: at(4),
+            })
+            .await,
+            Err(RepositoryError::StaleClaim)
+        );
+        assert_eq!(
+            repo.commit_bound_source_termination(transition)
+                .await
+                .unwrap(),
+            ServiceCommandOutcome::Replayed(committed)
         );
     }
 

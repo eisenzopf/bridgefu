@@ -6,9 +6,13 @@
 //! call active. A short `smoke` profile exercises the same code without
 //! representing itself as completion of the release gate.
 
+#[path = "support/qualification.rs"]
+mod qualification_support;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
+use qualification_support::{rvoip_registry_evidence, RvoipRegistryEvidence};
 use rvoip_core::capability::CodecInfo;
 use rvoip_core::ids::StreamId;
 use rvoip_core::media_graph::{ManagedMediaRoute, MediaGraphHandle};
@@ -192,7 +196,7 @@ struct MediaQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RevisionEvidence,
+    rvoip: RvoipRegistryEvidence,
     host: HostEvidence,
     calls: usize,
     media_graphs: usize,
@@ -333,12 +337,12 @@ async fn qualifies_bidirectional_transcoded_worker_media() {
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let report = MediaQualificationReport {
-        schema: "bridgefu.qualification.media.v1",
+        schema: "bridgefu.qualification.media.v2",
         mode,
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: git_revision(&manifest_dir.join("../rvoip")),
+        rvoip: rvoip_registry_evidence(&manifest_dir),
         host: host_evidence(),
         calls: parameters.calls,
         media_graphs: parameters.calls * 2,

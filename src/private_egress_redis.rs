@@ -569,7 +569,7 @@ impl PrivateEgressStateStore for RedisPrivateEgressStateStore {
                     .invoke_async(&mut connection),
             )
             .await?;
-        if values.len() % 2 != 0 {
+        if !values.len().is_multiple_of(2) {
             return Err(PrivateEgressError::StateUnavailable);
         }
         values

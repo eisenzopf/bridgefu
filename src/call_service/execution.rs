@@ -30,15 +30,17 @@ use rvoip_core::ids::{
 };
 use rvoip_core::session::SessionMedium;
 use rvoip_core::{
-    DirectionalMediaBridgePlan, InboundAdmission, OperationalEndReason, OperationalEvent,
-    OperationalEventKind, OperationalEventStreamHealth, OperationalEventStreamHealthSubscription,
-    Orchestrator, ProvisionalMediaRoute, StagedInboundDataChannel, StagedInboundDataPolicy,
+    DirectionalMediaBridgePlan, InboundAdmission, InboundAdmissionTermination,
+    OperationalEndReason, OperationalEvent, OperationalEventKind, OperationalEventStreamHealth,
+    OperationalEventStreamHealthSubscription, Orchestrator, ProvisionalMediaRoute, RvoipError,
+    StagedInboundDataChannel, StagedInboundDataPolicy,
 };
 use rvoip_sip::SipInitialHeaders;
 use rvoip_webrtc::WebRtcOriginateContext;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::broadcast::WorkerBroadcastSubscriptionAuthority;
@@ -46,7 +48,7 @@ use crate::call_engine::{
     AttachmentPurpose, AttachmentTransport, CallCommand, CallId, CallState, ClaimedDeadline,
     ClaimedOutbox, CommandCommit, CommandId, ConnectionBinding, DeadlineKind, EffectIntent,
     FailureDetails, LegId, LegReplacementResult, LegState, ProviderReferenceRole, RepositoryError,
-    RestartClaim, SignalingInitiator, TenantId, TransferResult,
+    RestartClaim, SignalingInitiator, SourceBeforeAnswerTermination, TenantId, TransferResult,
 };
 use crate::context::{
     BridgefuContextBridgePolicy, ContextEnvelope, ContextPolicy, ContextSourceBinding,
@@ -61,11 +63,12 @@ use crate::handoff_status::{HandoffStatusEnvelope, HandoffStatusKind};
 #[cfg(test)]
 use crate::private_egress::PrivateEgressLifecycleEvent;
 use crate::private_egress::{
-    PrivateEgressCommand, PrivateEgressEndReason, PrivateEgressLifecycleDelivery,
-    PrivateEgressLifecycleKind, PrivateEgressLifecycleState, PrivateEgressOperation,
-    PrivateEgressProfile, PrivateEgressSource, PrivateEgressStagedControl, PrivateEgressTarget,
-    PrivateEgressTransport, PRIVATE_EGRESS_COMMAND_LABEL, PRIVATE_EGRESS_LIFECYCLE_ACK_LABEL,
-    PRIVATE_EGRESS_LIFECYCLE_LABEL, PRIVATE_EGRESS_RESPONSE_LABEL,
+    PrivateEgressCommand, PrivateEgressEndReason, PrivateEgressError,
+    PrivateEgressLifecycleDelivery, PrivateEgressLifecycleKind, PrivateEgressLifecycleState,
+    PrivateEgressOperation, PrivateEgressProfile, PrivateEgressSource, PrivateEgressStagedControl,
+    PrivateEgressTarget, PrivateEgressTransport, PRIVATE_EGRESS_COMMAND_LABEL,
+    PRIVATE_EGRESS_LIFECYCLE_ACK_LABEL, PRIVATE_EGRESS_LIFECYCLE_LABEL,
+    PRIVATE_EGRESS_RESPONSE_LABEL,
 };
 use crate::private_egress_stream::{
     PrivateEgressStreamAdmission, PrivateEgressWorkerConnection, PrivateEgressWorkerRuntime,
@@ -75,8 +78,8 @@ use crate::standardcharter_canary::{
 };
 
 use super::{
-    BoundConnectionStateCommit, CallExecutionPlan, CallServiceError, CallServiceRuntime,
-    ClaimedControlEffect, ControlIntent, DisabledOutboundProfileResolver,
+    BoundConnectionStateCommit, BoundSourceTerminationCommit, CallExecutionPlan, CallServiceError,
+    CallServiceRuntime, ClaimedControlEffect, ControlIntent, DisabledOutboundProfileResolver,
     DisabledProviderLegExecutor, EffectResultOutcome, EffectResultReconciliation,
     ExternalReferenceBinding, ExternalReferenceValue, InboundAttachmentError,
     InboundAttachmentRequest, InboundAttachmentResult, InitialContextRecordOutcome,
@@ -474,6 +477,9 @@ impl CallExecutionSupervisor {
     }
 }
 
+// Recovery owns a deliberately explicit dependency boundary; grouping these
+// process-lifetime authorities would obscure which component failed startup.
+#[allow(clippy::too_many_arguments)]
 async fn recover_before_listeners_with_health(
     orchestrator: Arc<Orchestrator>,
     runtime: Arc<CallServiceRuntime>,
@@ -550,7 +556,11 @@ async fn recover_before_listeners(
         }
         for item in work {
             let _ = actor_work_call_id(&item).ok_or(RepositoryError::Unavailable)?;
-            let outcome = execute_actor_work(
+            // Keep the complete effect executor behind the same heap boundary
+            // used by live actors. Cancellation-aware StartLeg branches make
+            // this future intentionally broad; materializing it in the
+            // startup-recovery stack can overflow the default libtest thread.
+            let outcome = Box::pin(execute_actor_work(
                 item,
                 ActorWorkExecutionContext {
                     orchestrator: Arc::clone(&orchestrator),
@@ -567,9 +577,10 @@ async fn recover_before_listeners(
                     bridge_id: None,
                     session_id: None,
                     outbound_registration: None,
+                    setup_cancel: CancellationToken::new(),
                     shutdown: shutdown.clone(),
                 },
-            )
+            ))
             .await;
             outcome.result?;
         }
@@ -633,6 +644,12 @@ struct ProvenAdmission {
     consumed: InboundAttachmentResult,
     staged_private_egress: Option<PrivateEgressStagedControl>,
     signaling_metadata: Vec<(String, String)>,
+    termination_watch_cancel: CancellationToken,
+}
+
+struct PendingAdmissionTermination {
+    binding: ConnectionBinding,
+    reason: SourceBeforeAnswerTermination,
 }
 
 struct ProvenWorkerBroadcastAdmission {
@@ -1031,9 +1048,11 @@ struct PendingReplacementBinding {
 }
 
 struct AdmissionOperationResult {
+    binding: ConnectionBinding,
     connection_id: ConnectionId,
     conversation_id: Option<ConversationId>,
     session_id: Option<SessionId>,
+    source_termination: Option<SourceBeforeAnswerTermination>,
     result: Result<(), rvoip_core::RvoipError>,
 }
 
@@ -1217,12 +1236,14 @@ struct CallActor {
     work: mpsc::Receiver<ActorWork>,
     drain: watch::Receiver<bool>,
     shutdown: watch::Receiver<ActorShutdown>,
+    setup_cancel: CancellationToken,
     bindings: HashMap<LegId, ActorBinding>,
     pending_replacement_bindings: HashMap<LegId, PendingReplacementBinding>,
     replaced_bindings: HashMap<(LegId, crate::call_engine::BindingGeneration), ActorBinding>,
     active_handoff_attempt: Option<ActiveHandoffAttempt>,
     pending_initial_data_messages: HashMap<LegId, rvoip_core::DataMessage>,
     pending_admissions: VecDeque<ProvenAdmission>,
+    pending_admission_terminations: JoinSet<Option<PendingAdmissionTermination>>,
     pending_inbound_authorities: HashMap<PendingInboundAuthorityKey, PendingInboundAuthority>,
     admission_operation: JoinSet<AdmissionOperationResult>,
     private_admission_operation: JoinSet<PrivateEgressAdmissionResult>,
@@ -2413,6 +2434,7 @@ async fn prove_admission_inner(
         consumed,
         staged_private_egress,
         signaling_metadata,
+        termination_watch_cancel: CancellationToken::new(),
     })))
 }
 
@@ -3055,9 +3077,9 @@ fn can_buffer_actor_work(pending: usize) -> bool {
 
 fn first_ready_queue_index<T>(
     queue: &VecDeque<T>,
-    mut is_ready: impl FnMut(&T) -> bool,
+    is_ready: impl FnMut(&T) -> bool,
 ) -> Option<usize> {
-    queue.iter().position(|item| is_ready(item))
+    queue.iter().position(is_ready)
 }
 
 fn is_terminal_cleanup_effect(intent: &EffectIntent) -> bool {
@@ -3546,6 +3568,30 @@ async fn load_service_call_while_runtime_owned(
     .map_err(|()| RepositoryError::Unavailable)?
 }
 
+fn source_before_answer_termination(
+    outcome: InboundAdmissionTermination,
+) -> SourceBeforeAnswerTermination {
+    match outcome {
+        InboundAdmissionTermination::Cancelled => SourceBeforeAnswerTermination::Cancelled,
+        InboundAdmissionTermination::RemoteEnded => SourceBeforeAnswerTermination::RemoteEnded,
+        InboundAdmissionTermination::Failed => SourceBeforeAnswerTermination::Failed,
+        _ => SourceBeforeAnswerTermination::Failed,
+    }
+}
+
+async fn wait_inbound_admission_termination(
+    mut termination: watch::Receiver<Option<InboundAdmissionTermination>>,
+) -> InboundAdmissionTermination {
+    loop {
+        if let Some(outcome) = *termination.borrow_and_update() {
+            return outcome;
+        }
+        if termination.changed().await.is_err() {
+            return InboundAdmissionTermination::Failed;
+        }
+    }
+}
+
 async fn activate_admission(
     proven: ProvenAdmission,
     orchestrator: Arc<Orchestrator>,
@@ -3558,8 +3604,11 @@ async fn activate_admission(
         consumed,
         staged_private_egress: _,
         signaling_metadata: _,
+        termination_watch_cancel: _,
     } = proven;
-    let connection_id = consumed.binding.connection_id;
+    let binding = consumed.binding;
+    let connection_id = binding.connection_id.clone();
+    let termination = admission.termination_receiver();
     let mut created_conversation = None;
     let mut created_session = None;
     let operation = supervise_rvoip_operation(Box::pin(async {
@@ -3609,12 +3658,38 @@ async fn activate_admission(
         .map_err(|_| rvoip_core::RvoipError::InvalidState("inbound routing timed out"))??;
         Ok(())
     }));
-    let result = match await_while_execution_owned(operation, &mut shutdown).await {
-        Ok(result) => result,
-        Err(()) => Err(rvoip_core::RvoipError::InvalidState(
-            "admission activation lost execution authority",
-        )),
+    let mut source_termination = None;
+    let result = {
+        let owned_operation = await_while_execution_owned(operation, &mut shutdown);
+        tokio::pin!(owned_operation);
+        tokio::select! {
+            result = &mut owned_operation => match result {
+                Ok(result) => result,
+                Err(()) => Err(rvoip_core::RvoipError::InvalidState(
+                    "admission activation lost execution authority",
+                )),
+            },
+            outcome = wait_inbound_admission_termination(termination) => {
+                source_termination = Some(source_before_answer_termination(outcome));
+                Err(rvoip_core::RvoipError::AdmissionRejected(
+                    "inbound connection ended during admission",
+                ))
+            }
+        }
     };
+    // A final-answer race can retire the exact provisional route while
+    // `accept()` is in flight. Preserve that distinction so the actor uses the
+    // same generation-fenced cross-leg transition as the pending-signal path instead
+    // of misclassifying a caller CANCEL as a local signaling failure.
+    if result.is_err()
+        && source_termination.is_none()
+        && orchestrator.connection_principal(&connection_id).is_err()
+    {
+        // Compatibility/fail-closed fallback for adapters that predate the
+        // exact terminal signal. This is evaluated once after an activation
+        // failure; it is not a liveness poll.
+        source_termination = Some(SourceBeforeAnswerTermination::RemoteEnded);
+    }
     if result.is_err() {
         if let Some(session_id) = created_session.take() {
             let _ = tokio::time::timeout(
@@ -3632,9 +3707,11 @@ async fn activate_admission(
         }
     }
     AdmissionOperationResult {
+        binding,
         connection_id,
         conversation_id: created_conversation,
         session_id: created_session,
+        source_termination,
         result,
     }
 }
@@ -3823,12 +3900,14 @@ impl CallActor {
             work,
             drain,
             shutdown,
+            setup_cancel: CancellationToken::new(),
             bindings,
             pending_replacement_bindings: HashMap::new(),
             replaced_bindings: HashMap::new(),
             active_handoff_attempt: None,
             pending_initial_data_messages: HashMap::new(),
             pending_admissions: VecDeque::new(),
+            pending_admission_terminations: JoinSet::new(),
             pending_inbound_authorities: HashMap::new(),
             admission_operation: JoinSet::new(),
             private_admission_operation: JoinSet::new(),
@@ -3996,6 +4075,7 @@ impl CallActor {
                 && self.private_admission_operation.is_empty()
                 && self.work_operation.is_empty()
                 && self.pending_admissions.is_empty()
+                && self.pending_admission_terminations.is_empty()
                 && self.pending_work.is_empty()
                 && self.commands.is_empty()
                 && self.work.is_empty();
@@ -4070,6 +4150,11 @@ impl CallActor {
                 changed = self.drain.changed() => {
                     if changed.is_err() || *self.drain.borrow() {
                         self.reject_pending_admissions().await;
+                    }
+                }
+                terminated = self.pending_admission_terminations.join_next(), if !self.pending_admission_terminations.is_empty() => {
+                    if let Some(Ok(Some(terminated))) = terminated {
+                        self.handle_pending_admission_termination(terminated).await;
                     }
                 }
                 event = self.operational.recv() => {
@@ -4230,9 +4315,6 @@ impl CallActor {
                         self.pending_work.push_back(work);
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(25)), if !self.pending_admissions.is_empty() && !self.terminal => {
-                    self.reject_lost_pending_admissions().await;
-                }
                 _ = tokio::time::sleep(Duration::from_millis(25)), if terminal_since.is_some() => {}
             }
         }
@@ -4308,6 +4390,20 @@ impl CallActor {
                 staged_private_egress: proven.staged_private_egress.clone(),
             },
         );
+        let binding = binding.clone();
+        let termination = proven.admission.termination_receiver();
+        let cancelled = proven.termination_watch_cancel.clone();
+        self.pending_admission_terminations.spawn(async move {
+            tokio::select! {
+                _ = cancelled.cancelled() => None,
+                outcome = wait_inbound_admission_termination(termination) => {
+                    Some(PendingAdmissionTermination {
+                        binding,
+                        reason: source_before_answer_termination(outcome),
+                    })
+                }
+            }
+        });
         self.pending_admissions.push_back(proven);
         if pending_provider_replacement && self.next_ready_admission_index().is_some() {
             self.start_next_admission();
@@ -4997,6 +5093,7 @@ impl CallActor {
             .stop_provisional_early_media("pending admission rejected")
             .await;
         while let Some(proven) = self.pending_admissions.pop_front() {
+            proven.termination_watch_cancel.cancel();
             let connection_id = proven.consumed.binding.connection_id.clone();
             let released = self.remove_pending_inbound_authority(&connection_id);
             debug_assert!(
@@ -5007,24 +5104,90 @@ impl CallActor {
         }
     }
 
-    async fn reject_lost_pending_admissions(&mut self) {
-        let source_was_lost = self.pending_admissions.iter().any(|proven| {
-            // rvoip deliberately withholds ordinary operational events until
-            // final admission. Revalidating the lifecycle-bound principal is
-            // the fail-closed way to observe a CANCEL/BYE during provisional
-            // attach-then-dial setup.
-            proven.admission.authenticated_principal().is_err()
+    async fn handle_pending_admission_termination(
+        &mut self,
+        terminated: PendingAdmissionTermination,
+    ) {
+        let exact_pending = self.pending_admissions.iter().any(|proven| {
+            let binding = &proven.consumed.binding;
+            binding.connection_id == terminated.binding.connection_id
+                && binding.leg_id == terminated.binding.leg_id
+                && binding.binding_generation == terminated.binding.binding_generation
         });
-        if !source_was_lost {
+        if !exact_pending {
+            // A cancelled watcher may already have won its select while the
+            // admission was moving into final activation. Exact generation
+            // matching keeps that stale completion from ending the call.
             return;
         }
+        let lost_source = self.pending_admissions.iter().find_map(|proven| {
+            let binding = &proven.consumed.binding;
+            if binding.connection_id != terminated.binding.connection_id
+                || binding.leg_id != terminated.binding.leg_id
+                || binding.binding_generation != terminated.binding.binding_generation
+            {
+                return None;
+            }
+            proven
+                .consumed
+                .commit
+                .call
+                .aggregate
+                .leg(binding.leg_id)
+                .filter(|leg| {
+                    leg.signaling_initiator() == SignalingInitiator::Remote
+                        && self
+                            .attach_then_dial
+                            .is_none_or(|pair| pair.ingress == binding.leg_id)
+                })
+                .map(|_| binding.clone())
+        });
+
+        // The pending admission does not emit a public operational event.
+        // Persist its exact route generation as terminal before releasing the
+        // admission so the aggregate atomically moves every peer to Ending and
+        // emits the normal durable StopLeg effects.
+        let committed_source = if let Some(source) = lost_source.as_ref() {
+            match self
+                .commit_source_terminated_before_answer(
+                    source,
+                    terminated.reason,
+                    self.runtime.observation_time(),
+                )
+                .await
+            {
+                Ok(stored) => Some(stored),
+                Err(error) => {
+                    tracing::warn!(
+                        call_id = %self.call_id,
+                        source_leg_id = %source.leg_id,
+                        source_generation = source.binding_generation.value(),
+                        %error,
+                        "failed to durably record pending source termination"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if committed_source.is_some() {
+            // The durable transition is the authority boundary. From this
+            // point no in-flight StartLeg operation may prepare, publish, or
+            // activate a destination for this call.
+            self.setup_cancel.cancel();
+        }
         self.reject_pending_admissions().await;
-        if let Ok(stored) = self
-            .runtime
-            .service_repository()
-            .load_service_call(&self.tenant_id, self.call_id)
-            .await
-        {
+        let stored = match committed_source {
+            Some(stored) => Ok(stored),
+            None => {
+                self.runtime
+                    .service_repository()
+                    .load_service_call(&self.tenant_id, self.call_id)
+                    .await
+            }
+        };
+        if let Ok(stored) = stored {
             for durable in stored.call.bindings.values() {
                 let Some(pending) = self
                     .pending_replacement_bindings
@@ -5047,7 +5210,13 @@ impl CallActor {
             }
             self.set_terminal(stored.call.aggregate.state().is_terminal());
             if !self.terminal {
+                if let Some(source) = lost_source.as_ref() {
+                    self.stop_ending_peers(source.leg_id, &stored).await;
+                }
+                self.converge_durable_binding_states(&stored);
                 let _ = ensure_ending_deadline(&self.runtime, stored, self.shutdown.clone()).await;
+            } else {
+                self.converge_durable_binding_states(&stored);
             }
         }
     }
@@ -5201,6 +5370,9 @@ impl CallActor {
         complete_on_transport_connected: bool,
         created_session: Option<(ConversationId, SessionId)>,
     ) -> Result<(), ()> {
+        if self.setup_cancel.is_cancelled() {
+            return Err(());
+        }
         let existing_binding_matches = self.bindings.get(&binding.leg_id).is_some_and(|existing| {
             existing.connection_id == binding.connection_id
                 && existing.binding_generation == binding.binding_generation
@@ -5302,6 +5474,7 @@ impl CallActor {
         let Some(proven) = self.pending_admissions.remove(index) else {
             return;
         };
+        proven.termination_watch_cancel.cancel();
         tracing::debug!(
             call_id = %self.call_id,
             leg_id = %proven.consumed.binding.leg_id,
@@ -5351,6 +5524,64 @@ impl CallActor {
                 .increment(1);
             self.deliver_pending_initial_data_messages().await;
             return;
+        }
+        let terminal_source_matches = result.source_termination.is_some()
+            && result.binding.connection_id == result.connection_id
+            && self
+                .bindings
+                .get(&result.binding.leg_id)
+                .is_some_and(|binding| {
+                    binding.connection_id == result.binding.connection_id
+                        && binding.binding_generation == result.binding.binding_generation
+                })
+            && self
+                .plan
+                .leg_signaling_initiator(result.binding.leg_id)
+                .is_ok_and(|initiator| initiator == SignalingInitiator::Remote)
+            && self
+                .attach_then_dial
+                .is_none_or(|pair| pair.ingress == result.binding.leg_id);
+        if terminal_source_matches {
+            match self
+                .commit_source_terminated_before_answer(
+                    &result.binding,
+                    result
+                        .source_termination
+                        .unwrap_or(SourceBeforeAnswerTermination::Failed),
+                    self.runtime.observation_time(),
+                )
+                .await
+            {
+                Ok(stored) => {
+                    // Stop every still-running setup operation before it can
+                    // publish or activate a destination after the durable
+                    // source-generation transition.
+                    self.setup_cancel.cancel();
+                    let _ = self
+                        .stop_provisional_early_media("source ended during final answer")
+                        .await;
+                    self.set_terminal(stored.call.aggregate.state().is_terminal());
+                    if !self.terminal {
+                        self.stop_ending_peers(result.binding.leg_id, &stored).await;
+                        self.converge_durable_binding_states(&stored);
+                        let _ =
+                            ensure_ending_deadline(&self.runtime, stored, self.shutdown.clone())
+                                .await;
+                    } else {
+                        self.converge_durable_binding_states(&stored);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        call_id = %self.call_id,
+                        source_leg_id = %result.binding.leg_id,
+                        source_generation = result.binding.binding_generation.value(),
+                        %error,
+                        "failed to record source termination during final-answer race"
+                    );
+                }
+            }
         }
         metrics::counter!("bridgefu_attachment_admission_total", "result" => "ended").increment(1);
         let Some(binding) = self
@@ -5442,6 +5673,7 @@ impl CallActor {
         let replaced_bindings = self.replaced_bindings.clone();
         let bridge_id = self.bridge_id.clone();
         let session_id = self.session_id.clone();
+        let setup_cancel = self.setup_cancel.clone();
         let shutdown = self.shutdown.clone();
         let panic_work = work.clone();
         let panic_orchestrator = Arc::clone(&orchestrator);
@@ -5473,6 +5705,7 @@ impl CallActor {
                         bridge_id,
                         session_id,
                         outbound_registration: Some(outbound_registration),
+                        setup_cancel,
                         shutdown,
                     },
                 )),
@@ -5693,6 +5926,29 @@ impl CallActor {
         let is_attach_then_dial_destination = self
             .attach_then_dial
             .is_some_and(|pair| binding.leg_id == pair.destination);
+        if matches!(&event.kind, OperationalEventKind::Connected)
+            && is_attach_then_dial_destination
+            && binding.private_egress.is_none()
+            && self
+                .stop_provisional_early_media("destination connected")
+                .await
+                .is_err()
+        {
+            // A final answer would let the normal duplex bridge race a
+            // still-installed graph sink. Fail closed if removal was not
+            // acknowledged.
+            self.reject_pending_admissions().await;
+            let _ = self
+                .orchestrator
+                .end_connection(
+                    event.connection_id,
+                    EndReason::Failed {
+                        detail: "provisional media promotion failed".into(),
+                    },
+                )
+                .await;
+            return;
+        }
         match &event.kind {
             OperationalEventKind::Progress {
                 status_code,
@@ -5700,30 +5956,6 @@ impl CallActor {
             } if is_attach_then_dial_destination => {
                 self.handle_owned_progress(&binding, *status_code, *early_media)
                     .await;
-            }
-            OperationalEventKind::Connected
-                if is_attach_then_dial_destination && binding.private_egress.is_none() =>
-            {
-                if self
-                    .stop_provisional_early_media("destination connected")
-                    .await
-                    .is_err()
-                {
-                    // A final answer would let the normal duplex bridge race a
-                    // still-installed graph sink. Fail closed if removal was
-                    // not acknowledged.
-                    self.reject_pending_admissions().await;
-                    let _ = self
-                        .orchestrator
-                        .end_connection(
-                            event.connection_id,
-                            EndReason::Failed {
-                                detail: "provisional media promotion failed".into(),
-                            },
-                        )
-                        .await;
-                    return;
-                }
             }
             OperationalEventKind::Ended { .. } | OperationalEventKind::Failed { .. }
                 if is_attach_then_dial_member =>
@@ -5750,6 +5982,70 @@ impl CallActor {
             tracing::error!(call_id = %self.call_id, %leg_id, "bound operational leg disappeared");
             return;
         };
+        let durable_source = stored
+            .call
+            .bindings
+            .get(&binding.leg_id)
+            .filter(|durable| {
+                durable.connection_id == binding.connection_id
+                    && durable.binding_generation == binding.binding_generation
+            })
+            .cloned();
+        let source_ended_before_answer = durable_source.is_some()
+            && stored.call.aggregate.state() == CallState::Connecting
+            && leg.signaling_initiator() == SignalingInitiator::Remote
+            && matches!(leg.state(), LegState::AwaitingAttach | LegState::Signaling)
+            && self
+                .attach_then_dial
+                .is_none_or(|pair| pair.ingress == binding.leg_id);
+        let source_termination = match &event.kind {
+            OperationalEventKind::Ended { reason } if source_ended_before_answer => {
+                Some(match reason {
+                    OperationalEndReason::Cancelled => SourceBeforeAnswerTermination::Cancelled,
+                    OperationalEndReason::Normal => SourceBeforeAnswerTermination::RemoteEnded,
+                    _ => SourceBeforeAnswerTermination::Failed,
+                })
+            }
+            OperationalEventKind::Failed { .. } if source_ended_before_answer => {
+                Some(SourceBeforeAnswerTermination::Failed)
+            }
+            _ => None,
+        };
+        if let Some(reason) = source_termination {
+            let durable_source =
+                durable_source.expect("source terminal classification requires an exact binding");
+            match self
+                .commit_source_terminated_before_answer(&durable_source, reason, event.at)
+                .await
+            {
+                Ok(committed) => {
+                    // Once the exact inbound generation is durably terminal,
+                    // no concurrent StartLeg operation may publish or activate
+                    // the independently originated B2BUA peer.
+                    self.setup_cancel.cancel();
+                    self.set_terminal(committed.call.aggregate.state().is_terminal());
+                    if !self.terminal {
+                        self.stop_ending_peers(binding.leg_id, &committed).await;
+                        self.converge_durable_binding_states(&committed);
+                        let _ =
+                            ensure_ending_deadline(&self.runtime, committed, self.shutdown.clone())
+                                .await;
+                    } else {
+                        self.converge_durable_binding_states(&committed);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        call_id = %self.call_id,
+                        source_leg_id = %binding.leg_id,
+                        source_generation = binding.binding_generation.value(),
+                        %error,
+                        "failed to durably record operational source termination before answer"
+                    );
+                }
+            }
+            return;
+        }
         if let OperationalEventKind::MediaActivity { generation } = &event.kind {
             if let Err(error) = self
                 .record_media_activity(&binding, *generation, event.at, stored)
@@ -6377,13 +6673,18 @@ impl CallActor {
             return;
         }
         for binding in self.bindings.values() {
-            if binding.leg_id == source_leg_id
-                || stored
-                    .call
-                    .aggregate
-                    .leg(binding.leg_id)
-                    .is_none_or(|leg| leg.state() != LegState::Ending)
-            {
+            let exact_durable_ending_binding = stored
+                .call
+                .aggregate
+                .leg(binding.leg_id)
+                .zip(stored.call.bindings.get(&binding.leg_id))
+                .is_some_and(|(leg, durable)| {
+                    leg.state() == LegState::Ending
+                        && leg.binding_generation() == binding.binding_generation
+                        && durable.connection_id == binding.connection_id
+                        && durable.binding_generation == binding.binding_generation
+                });
+            if binding.leg_id == source_leg_id || !exact_durable_ending_binding {
                 continue;
             }
             if let (Some(private_egress), Some(route)) =
@@ -6396,9 +6697,7 @@ impl CallActor {
                     &self.runtime,
                     &route.source,
                     route.target,
-                    PrivateEgressOperation::End {
-                        reason: PrivateEgressEndReason::Normal,
-                    },
+                    private_egress_peer_stop_operation(binding.state),
                 )
                 .await;
             }
@@ -6590,11 +6889,111 @@ impl CallActor {
         .await
     }
 
+    async fn commit_source_terminated_before_answer(
+        &self,
+        source: &ConnectionBinding,
+        reason: SourceBeforeAnswerTermination,
+        observed_at: DateTime<Utc>,
+    ) -> Result<StoredServiceCall, RepositoryError> {
+        let actor_binding = self
+            .bindings
+            .get(&source.leg_id)
+            .filter(|binding| {
+                binding.connection_id == source.connection_id
+                    && binding.binding_generation == source.binding_generation
+            })
+            .ok_or(RepositoryError::StaleClaim)?;
+        debug_assert_eq!(actor_binding.leg_id, source.leg_id);
+
+        let tenant_id = self.tenant_id.clone();
+        let mut stored = self
+            .runtime
+            .service_repository()
+            .load_service_call(&tenant_id, self.call_id)
+            .await?;
+        let command_id = CommandId::new();
+        let mut delay = REPOSITORY_RETRY_MIN;
+        loop {
+            let source_leg = stored
+                .call
+                .aggregate
+                .leg(source.leg_id)
+                .filter(|leg| {
+                    leg.binding_generation() == source.binding_generation
+                        && leg.signaling_initiator() == SignalingInitiator::Remote
+                })
+                .ok_or(RepositoryError::StaleClaim)?;
+            if source_leg.state().is_terminal() {
+                return Ok(stored);
+            }
+            let durable_binding = stored
+                .call
+                .bindings
+                .get(&source.leg_id)
+                .filter(|binding| {
+                    binding.connection_id == source.connection_id
+                        && binding.binding_generation == source.binding_generation
+                })
+                .ok_or(RepositoryError::StaleClaim)?;
+            debug_assert_eq!(durable_binding.leg_id, source.leg_id);
+            let at = std::cmp::max(observed_at, stored.call.aggregate.updated_at());
+            let request = BoundSourceTerminationCommit {
+                tenant_id: tenant_id.clone(),
+                call_id: self.call_id,
+                expected_version: stored.call.aggregate.version(),
+                command_id,
+                source_leg_id: source.leg_id,
+                binding_generation: source.binding_generation,
+                connection_id: source.connection_id.clone(),
+                worker: self.runtime.worker().lease,
+                reason,
+                at,
+            };
+            let repository = self.runtime.service_repository();
+            let mut shutdown = self.shutdown.clone();
+            let result = await_while_execution_owned(
+                repository.commit_bound_source_termination(request),
+                &mut shutdown,
+            )
+            .await
+            .map_err(|()| RepositoryError::Unavailable)?;
+            match result {
+                Ok(ServiceCommandOutcome::Committed(view))
+                | Ok(ServiceCommandOutcome::Replayed(view)) => {
+                    return self
+                        .runtime
+                        .service_repository()
+                        .load_service_call(
+                            view.command.call.aggregate.tenant_id(),
+                            view.command.call.aggregate.id(),
+                        )
+                        .await;
+                }
+                Err(RepositoryError::VersionConflict) => {
+                    stored = self
+                        .runtime
+                        .service_repository()
+                        .load_service_call(&tenant_id, self.call_id)
+                        .await?;
+                }
+                Err(RepositoryError::Unavailable) => {
+                    if *self.shutdown.borrow() == ActorShutdown::LeaseLost {
+                        return Err(RepositoryError::Unavailable);
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn cleanup(&mut self, allow_durable_write: bool) {
         let _ = self
             .stop_provisional_early_media("call actor cleanup")
             .await;
         while let Some(proven) = self.pending_admissions.pop_front() {
+            proven.termination_watch_cancel.cancel();
             let connection_id = proven.consumed.binding.connection_id.clone();
             let released = self.remove_pending_inbound_authority(&connection_id);
             debug_assert!(
@@ -6611,6 +7010,13 @@ impl CallActor {
         }
         self.admission_operation.abort_all();
         while self.admission_operation.join_next().await.is_some() {}
+        self.pending_admission_terminations.abort_all();
+        while self
+            .pending_admission_terminations
+            .join_next()
+            .await
+            .is_some()
+        {}
         self.pending_inbound_authorities.clear();
         debug_assert!(self.pending_inbound_authorities.is_empty());
         self.private_admission_operation.abort_all();
@@ -6957,6 +7363,7 @@ struct ActorWorkExecutionContext {
     bridge_id: Option<BridgeId>,
     session_id: Option<SessionId>,
     outbound_registration: Option<mpsc::Sender<OutboundRegistration>>,
+    setup_cancel: CancellationToken,
     shutdown: watch::Receiver<ActorShutdown>,
 }
 
@@ -7019,6 +7426,13 @@ struct PrivateEgressStartExecution {
 }
 
 impl PrivateEgressStartExecution {
+    fn cancelled() -> Self {
+        Self {
+            result: ServiceEffectResult::Succeeded,
+            follow_up: FollowUpPlan::None,
+        }
+    }
+
     fn failed(
         leg_id: LegId,
         binding_generation: crate::call_engine::BindingGeneration,
@@ -7060,6 +7474,14 @@ impl PrivateEgressStartExecution {
 }
 
 impl SipStartExecution {
+    fn cancelled() -> Self {
+        Self {
+            result: ServiceEffectResult::Succeeded,
+            follow_up: FollowUpPlan::None,
+            external_reference: None,
+        }
+    }
+
     fn failed(
         leg_id: LegId,
         binding_generation: crate::call_engine::BindingGeneration,
@@ -7097,6 +7519,13 @@ impl SipStartExecution {
 }
 
 impl WebRtcStartExecution {
+    fn cancelled() -> Self {
+        Self {
+            result: ServiceEffectResult::Succeeded,
+            follow_up: FollowUpPlan::None,
+        }
+    }
+
     fn failed(
         leg_id: LegId,
         binding_generation: crate::call_engine::BindingGeneration,
@@ -7132,6 +7561,14 @@ impl WebRtcStartExecution {
 }
 
 impl AmazonStartExecution {
+    fn cancelled(external_reference: Option<ExternalReferenceBinding>) -> Self {
+        Self {
+            result: ServiceEffectResult::Succeeded,
+            follow_up: FollowUpPlan::None,
+            external_reference,
+        }
+    }
+
     fn failed(
         leg_id: LegId,
         binding_generation: crate::call_engine::BindingGeneration,
@@ -7192,6 +7629,66 @@ async fn open_outbound_voice_session(
             Err(RepositoryError::Unavailable)
         }
     }
+}
+
+async fn open_outbound_voice_session_for_start(
+    orchestrator: &Arc<Orchestrator>,
+    tenant_id: &crate::call_engine::TenantId,
+    shutdown: &mut watch::Receiver<ActorShutdown>,
+    setup_cancel: &CancellationToken,
+) -> Result<Option<(ConversationId, SessionId)>, RepositoryError> {
+    let conversation = match await_start_operation(
+        tokio::time::timeout(
+            EXTERNAL_OPERATION_TIMEOUT,
+            orchestrator.open_conversation(
+                RvoipTenantId::from_string(tenant_id.as_str()),
+                ConversationPolicy::default(),
+                HashMap::new(),
+            ),
+        ),
+        shutdown,
+        setup_cancel,
+    )
+    .await
+    {
+        StartOperationWait::Completed(Ok(Ok(conversation))) => conversation,
+        StartOperationWait::CallEnding => return Ok(None),
+        StartOperationWait::Completed(Ok(Err(_)))
+        | StartOperationWait::Completed(Err(_))
+        | StartOperationWait::AuthorityLost => return Err(RepositoryError::Unavailable),
+    };
+    let session = match await_start_operation(
+        tokio::time::timeout(
+            EXTERNAL_OPERATION_TIMEOUT,
+            orchestrator.start_session(conversation.clone(), SessionMedium::Voice, Vec::new()),
+        ),
+        shutdown,
+        setup_cancel,
+    )
+    .await
+    {
+        StartOperationWait::Completed(Ok(Ok(session))) => Some(session),
+        StartOperationWait::CallEnding => None,
+        StartOperationWait::Completed(Ok(Err(_)))
+        | StartOperationWait::Completed(Err(_))
+        | StartOperationWait::AuthorityLost => {
+            let _ = tokio::time::timeout(
+                AUTHORITY_TEARDOWN_TIMEOUT,
+                orchestrator.close_conversation(conversation, true),
+            )
+            .await;
+            return Err(RepositoryError::Unavailable);
+        }
+    };
+    let Some(session) = session else {
+        let _ = tokio::time::timeout(
+            AUTHORITY_TEARDOWN_TIMEOUT,
+            orchestrator.close_conversation(conversation, true),
+        )
+        .await;
+        return Ok(None);
+    };
+    Ok(Some((conversation, session)))
 }
 
 async fn close_created_voice_session(
@@ -7577,8 +8074,12 @@ async fn execute_private_egress_start_leg(
     bindings: &HashMap<LegId, ActorBinding>,
     pending_inbound_authorities: &HashMap<LegId, PendingInboundAuthority>,
     outbound_registration: Option<&mpsc::Sender<OutboundRegistration>>,
+    setup_cancel: &CancellationToken,
     mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<PrivateEgressStartExecution, RepositoryError> {
+    if setup_cancel.is_cancelled() {
+        return Ok(PrivateEgressStartExecution::cancelled());
+    }
     let principal_fingerprint = match stored.plan.authorization_principal_fingerprint() {
         Ok(principal) => principal,
         Err(_) => {
@@ -7862,6 +8363,9 @@ async fn execute_private_egress_start_leg(
                                 Ok(Some(context)) => break context.initial_sip_headers,
                                 Ok(None) | Err(RepositoryError::Unavailable) => {
                                     tokio::select! {
+                                        _ = setup_cancel.cancelled() => {
+                                            return Ok(PrivateEgressStartExecution::cancelled());
+                                        }
                                         changed = shutdown.changed() => {
                                             if changed.is_err() || *shutdown.borrow() != ActorShutdown::Running {
                                                 return Err(RepositoryError::Unavailable);
@@ -7889,6 +8393,9 @@ async fn execute_private_egress_start_leg(
     } else {
         Vec::new()
     };
+    if setup_cancel.is_cancelled() {
+        return Ok(PrivateEgressStartExecution::cancelled());
+    }
 
     let prepare = match private_egress_command(
         meta.effect_id.as_uuid(),
@@ -7929,24 +8436,46 @@ async fn execute_private_egress_start_leg(
             ));
         }
     };
-    let prepare_response = await_while_execution_owned(
+    let prepare_response = match await_start_operation(
         private_egress.control().execute_with_staged(
             source_binding.connection_id.clone(),
             staged_control,
             prepare,
         ),
         &mut shutdown,
+        setup_cancel,
     )
-    .await;
+    .await
+    {
+        StartOperationWait::Completed(response) => response,
+        StartOperationWait::CallEnding => {
+            reservation.cancel();
+            best_effort_private_egress_finish(
+                private_egress,
+                &source_binding.connection_id,
+                staged_control,
+                runtime,
+                &source,
+                target_binding,
+                PrivateEgressOperation::Abort,
+            )
+            .await;
+            return Ok(PrivateEgressStartExecution::cancelled());
+        }
+        StartOperationWait::AuthorityLost => {
+            reservation.cancel();
+            return Err(RepositoryError::Unavailable);
+        }
+    };
     let prepared = matches!(
         prepare_response,
-        Ok(Ok(ref response))
+        Ok(ref response)
             if response.accepted
                 && response.state == Some(PrivateEgressLifecycleState::Prepared)
     );
     if !prepared {
         match &prepare_response {
-            Ok(Ok(response)) => tracing::warn!(
+            Ok(response) => tracing::warn!(
                 call_id = %meta.call_id,
                 %leg_id,
                 binding_generation = binding_generation.value(),
@@ -7955,24 +8484,15 @@ async fn execute_private_egress_start_leg(
                 failure_code = response.failure_code.as_deref().unwrap_or("none"),
                 "gateway private egress prepare response was rejected"
             ),
-            Ok(Err(error)) => tracing::warn!(
+            Err(error) => tracing::warn!(
                 call_id = %meta.call_id,
                 %leg_id,
                 binding_generation = binding_generation.value(),
                 error_code = error.code(),
                 "gateway private egress prepare command failed"
             ),
-            Err(()) => tracing::warn!(
-                call_id = %meta.call_id,
-                %leg_id,
-                binding_generation = binding_generation.value(),
-                "gateway private egress prepare lost execution authority"
-            ),
         }
         reservation.cancel();
-        if prepare_response.is_err() {
-            return Err(RepositoryError::Unavailable);
-        }
         return Ok(PrivateEgressStartExecution::failed(
             leg_id,
             binding_generation,
@@ -7981,13 +8501,28 @@ async fn execute_private_egress_start_leg(
             true,
         ));
     }
-    let destination_connection = tokio::select! {
-        result = reservation.wait(runtime.timeouts().setup.min(EXTERNAL_OPERATION_TIMEOUT)) => result,
-        changed = shutdown.changed() => {
-            private_egress.admissions().release(admission_id);
-            let _ = changed;
-            return Err(RepositoryError::Unavailable);
+    let destination_connection = match await_start_operation(
+        reservation.wait(runtime.timeouts().setup.min(EXTERNAL_OPERATION_TIMEOUT)),
+        &mut shutdown,
+        setup_cancel,
+    )
+    .await
+    {
+        StartOperationWait::Completed(result) => result,
+        StartOperationWait::CallEnding => {
+            best_effort_private_egress_finish(
+                private_egress,
+                &source_binding.connection_id,
+                staged_control,
+                runtime,
+                &source,
+                target_binding,
+                PrivateEgressOperation::Abort,
+            )
+            .await;
+            return Ok(PrivateEgressStartExecution::cancelled());
         }
+        StartOperationWait::AuthorityLost => return Err(RepositoryError::Unavailable),
     };
     let destination_connection = match destination_connection {
         Ok(connection) => connection,
@@ -8012,6 +8547,22 @@ async fn execute_private_egress_start_leg(
         }
     };
     let connection_id = destination_connection.connection_id().clone();
+    if setup_cancel.is_cancelled() {
+        best_effort_private_egress_finish(
+            private_egress,
+            &source_binding.connection_id,
+            staged_control,
+            runtime,
+            &source,
+            target_binding,
+            PrivateEgressOperation::Abort,
+        )
+        .await;
+        let _ = orchestrator
+            .end_connection(connection_id, EndReason::Cancelled)
+            .await;
+        return Ok(PrivateEgressStartExecution::cancelled());
+    }
     let durable_binding = match runtime
         .service_repository()
         .bind_outbound_connection(OutboundConnectionBind {
@@ -8048,6 +8599,9 @@ async fn execute_private_egress_start_leg(
             let _ = orchestrator
                 .end_connection(connection_id, EndReason::Cancelled)
                 .await;
+            if setup_cancel.is_cancelled() {
+                return Ok(PrivateEgressStartExecution::cancelled());
+            }
             return Err(error);
         }
     };
@@ -8076,6 +8630,9 @@ async fn execute_private_egress_start_leg(
         let _ = orchestrator
             .end_connection(connection_id, EndReason::Cancelled)
             .await;
+        if setup_cancel.is_cancelled() {
+            return Ok(PrivateEgressStartExecution::cancelled());
+        }
         return Err(error);
     }
     let actor_binding = ActorBinding {
@@ -8116,6 +8673,9 @@ async fn execute_private_egress_start_leg(
         let _ = orchestrator
             .end_connection(connection_id, EndReason::Cancelled)
             .await;
+        if setup_cancel.is_cancelled() {
+            return Ok(PrivateEgressStartExecution::cancelled());
+        }
         return Ok(PrivateEgressStartExecution::failed(
             leg_id,
             binding_generation,
@@ -8132,18 +8692,41 @@ async fn execute_private_egress_start_leg(
         PrivateEgressOperation::Activate,
     )
     .map_err(|_| RepositoryError::InvalidInput("private egress activate is invalid"))?;
-    let activation = await_while_execution_owned(
+    let activation = match await_start_operation(
         private_egress.control().execute_with_staged(
             source_binding.connection_id.clone(),
             staged_control,
             activate,
         ),
         &mut shutdown,
+        setup_cancel,
     )
-    .await;
+    .await
+    {
+        StartOperationWait::Completed(result) => result,
+        StartOperationWait::CallEnding => {
+            best_effort_private_egress_finish(
+                private_egress,
+                &source_binding.connection_id,
+                staged_control,
+                runtime,
+                &source,
+                target_binding,
+                PrivateEgressOperation::End {
+                    reason: PrivateEgressEndReason::Normal,
+                },
+            )
+            .await;
+            let _ = orchestrator
+                .end_connection(connection_id, EndReason::Cancelled)
+                .await;
+            return Ok(PrivateEgressStartExecution::cancelled());
+        }
+        StartOperationWait::AuthorityLost => return Err(RepositoryError::Unavailable),
+    };
     let activated = matches!(
         activation,
-        Ok(Ok(ref response))
+        Ok(ref response)
             if response.accepted && response.state == Some(PrivateEgressLifecycleState::Active)
     );
     if !activated {
@@ -8160,8 +8743,8 @@ async fn execute_private_egress_start_leg(
         let _ = orchestrator
             .end_connection(connection_id, EndReason::Cancelled)
             .await;
-        if activation.is_err() {
-            return Err(RepositoryError::Unavailable);
+        if setup_cancel.is_cancelled() {
+            return Ok(PrivateEgressStartExecution::cancelled());
         }
         return Ok(PrivateEgressStartExecution::failed(
             leg_id,
@@ -8203,7 +8786,28 @@ async fn execute_private_egress_start_leg(
         let _ = orchestrator
             .end_connection(connection_id, EndReason::Cancelled)
             .await;
+        if setup_cancel.is_cancelled() {
+            return Ok(PrivateEgressStartExecution::cancelled());
+        }
         return Err(error);
+    }
+    if setup_cancel.is_cancelled() {
+        best_effort_private_egress_finish(
+            private_egress,
+            &source_binding.connection_id,
+            staged_control,
+            runtime,
+            &source,
+            target_binding,
+            PrivateEgressOperation::End {
+                reason: PrivateEgressEndReason::Normal,
+            },
+        )
+        .await;
+        let _ = orchestrator
+            .end_connection(connection_id, EndReason::Cancelled)
+            .await;
+        return Ok(PrivateEgressStartExecution::cancelled());
     }
     Ok(PrivateEgressStartExecution {
         result: ServiceEffectResult::Succeeded,
@@ -8224,8 +8828,12 @@ async fn execute_sip_start_leg(
     existing_binding: Option<&ActorBinding>,
     existing_session: Option<SessionId>,
     outbound_registration: Option<&mpsc::Sender<OutboundRegistration>>,
+    setup_cancel: &CancellationToken,
     mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<SipStartExecution, RepositoryError> {
+    if setup_cancel.is_cancelled() {
+        return Ok(SipStartExecution::cancelled());
+    }
     let principal_fingerprint = match stored.plan.authorization_principal_fingerprint() {
         Ok(principal) => principal,
         Err(_) => {
@@ -8303,6 +8911,9 @@ async fn execute_sip_start_leg(
                             }
                             Ok(None) | Err(RepositoryError::Unavailable) => {
                                 tokio::select! {
+                                    _ = setup_cancel.cancelled() => {
+                                        return Ok(SipStartExecution::cancelled());
+                                    }
                                     changed = shutdown.changed() => {
                                         if changed.is_err() || *shutdown.borrow() != ActorShutdown::Running {
                                             return Err(RepositoryError::Unavailable);
@@ -8402,8 +9013,16 @@ async fn execute_sip_start_leg(
     let (session_id, created_session) = if let Some(session_id) = existing_session {
         (session_id, None)
     } else {
-        let created =
-            open_outbound_voice_session(orchestrator, &meta.tenant_id, &mut shutdown).await?;
+        let Some(created) = open_outbound_voice_session_for_start(
+            orchestrator,
+            &meta.tenant_id,
+            &mut shutdown,
+            setup_cancel,
+        )
+        .await?
+        else {
+            return Ok(SipStartExecution::cancelled());
+        };
         (created.1.clone(), Some(created))
     };
     let request = OriginateRequest::new(
@@ -8415,17 +9034,18 @@ async fn execute_sip_start_leg(
     )
     .with_transport(Transport::Sip)
     .with_context(context);
-    let prepared = match await_while_execution_owned(
+    let prepared = match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             orchestrator.prepare_outbound_connection(request),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(prepared))) => prepared,
-        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+        StartOperationWait::Completed(Ok(Ok(prepared))) => prepared,
+        StartOperationWait::Completed(Ok(Err(_))) | StartOperationWait::Completed(Err(_)) => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Ok(SipStartExecution::failed(
                 leg_id,
@@ -8435,12 +9055,21 @@ async fn execute_sip_start_leg(
                 true,
             ));
         }
-        Err(()) => {
+        StartOperationWait::CallEnding => {
+            close_created_voice_session(orchestrator, &created_session).await;
+            return Ok(SipStartExecution::cancelled());
+        }
+        StartOperationWait::AuthorityLost => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Err(RepositoryError::Unavailable);
         }
     };
     let connection_id = prepared.connection_id().clone();
+    if setup_cancel.is_cancelled() {
+        let _ = prepared.abort().await;
+        close_created_voice_session(orchestrator, &created_session).await;
+        return Ok(SipStartExecution::cancelled());
+    }
     let bind = OutboundConnectionBind {
         operation_id: CommandId::from_uuid(meta.effect_id.as_uuid()).map_err(|_| {
             RepositoryError::InvalidInput("effect ID cannot authorize an outbound binding")
@@ -8467,6 +9096,9 @@ async fn execute_sip_start_leg(
         Err(error) => {
             let _ = prepared.abort().await;
             close_created_voice_session(orchestrator, &created_session).await;
+            if setup_cancel.is_cancelled() {
+                return Ok(SipStartExecution::cancelled());
+            }
             return Err(error);
         }
     };
@@ -8484,6 +9116,9 @@ async fn execute_sip_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(SipStartExecution::cancelled());
+        }
         return Err(error);
     }
     let actor_binding = ActorBinding {
@@ -8506,6 +9141,9 @@ async fn execute_sip_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(SipStartExecution::cancelled());
+        }
         return Ok(SipStartExecution::failed(
             leg_id,
             binding_generation,
@@ -8515,17 +9153,18 @@ async fn execute_sip_start_leg(
         ));
     }
 
-    let handle = match await_while_execution_owned(
+    let handle = match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             prepared.commit(),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(handle))) => handle,
-        Ok(Ok(Err(_))) => {
+        StartOperationWait::Completed(Ok(Ok(handle))) => handle,
+        StartOperationWait::Completed(Ok(Err(_))) => {
             return Ok(SipStartExecution::failed(
                 leg_id,
                 binding_generation,
@@ -8534,7 +9173,7 @@ async fn execute_sip_start_leg(
                 true,
             ));
         }
-        Ok(Err(_)) => {
+        StartOperationWait::Completed(Err(_)) => {
             return Ok(SipStartExecution::failed(
                 leg_id,
                 binding_generation,
@@ -8543,8 +9182,17 @@ async fn execute_sip_start_leg(
                 true,
             ));
         }
-        Err(()) => return Err(RepositoryError::Unavailable),
+        StartOperationWait::CallEnding => {
+            return Ok(SipStartExecution::cancelled());
+        }
+        StartOperationWait::AuthorityLost => return Err(RepositoryError::Unavailable),
     };
+    if setup_cancel.is_cancelled() {
+        let _ = orchestrator
+            .end_connection(connection_id, EndReason::BridgeTorn)
+            .await;
+        return Ok(SipStartExecution::cancelled());
+    }
     let external_reference = match handle.outbound_activation().external_references() {
         [reference] => sip_external_reference_binding(leg_id, binding_generation, reference),
         _ => Err(RepositoryError::InvalidInput(
@@ -8584,8 +9232,12 @@ async fn execute_web_rtc_start_leg(
     existing_binding: Option<&ActorBinding>,
     existing_session: Option<SessionId>,
     outbound_registration: Option<&mpsc::Sender<OutboundRegistration>>,
+    setup_cancel: &CancellationToken,
     mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<WebRtcStartExecution, RepositoryError> {
+    if setup_cancel.is_cancelled() {
+        return Ok(WebRtcStartExecution::cancelled());
+    }
     let principal_fingerprint = match stored.plan.authorization_principal_fingerprint() {
         Ok(principal) => principal,
         Err(_) => {
@@ -8678,8 +9330,16 @@ async fn execute_web_rtc_start_leg(
     let (session_id, created_session) = if let Some(session_id) = existing_session {
         (session_id, None)
     } else {
-        let created =
-            open_outbound_voice_session(orchestrator, &meta.tenant_id, &mut shutdown).await?;
+        let Some(created) = open_outbound_voice_session_for_start(
+            orchestrator,
+            &meta.tenant_id,
+            &mut shutdown,
+            setup_cancel,
+        )
+        .await?
+        else {
+            return Ok(WebRtcStartExecution::cancelled());
+        };
         (created.1.clone(), Some(created))
     };
     let target = context.endpoint().as_str().to_owned();
@@ -8705,17 +9365,18 @@ async fn execute_web_rtc_start_leg(
     )
     .with_transport(Transport::WebRtc)
     .with_context(context);
-    let prepared = match await_while_execution_owned(
+    let prepared = match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             orchestrator.prepare_outbound_connection(request),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(prepared))) => prepared,
-        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+        StartOperationWait::Completed(Ok(Ok(prepared))) => prepared,
+        StartOperationWait::Completed(Ok(Err(_))) | StartOperationWait::Completed(Err(_)) => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Ok(WebRtcStartExecution::failed(
                 leg_id,
@@ -8725,12 +9386,21 @@ async fn execute_web_rtc_start_leg(
                 true,
             ));
         }
-        Err(()) => {
+        StartOperationWait::CallEnding => {
+            close_created_voice_session(orchestrator, &created_session).await;
+            return Ok(WebRtcStartExecution::cancelled());
+        }
+        StartOperationWait::AuthorityLost => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Err(RepositoryError::Unavailable);
         }
     };
     let connection_id = prepared.connection_id().clone();
+    if setup_cancel.is_cancelled() {
+        let _ = prepared.abort().await;
+        close_created_voice_session(orchestrator, &created_session).await;
+        return Ok(WebRtcStartExecution::cancelled());
+    }
     let bind = OutboundConnectionBind {
         operation_id: CommandId::from_uuid(meta.effect_id.as_uuid()).map_err(|_| {
             RepositoryError::InvalidInput("effect ID cannot authorize an outbound binding")
@@ -8757,6 +9427,9 @@ async fn execute_web_rtc_start_leg(
         Err(error) => {
             let _ = prepared.abort().await;
             close_created_voice_session(orchestrator, &created_session).await;
+            if setup_cancel.is_cancelled() {
+                return Ok(WebRtcStartExecution::cancelled());
+            }
             return Err(error);
         }
     };
@@ -8774,10 +9447,13 @@ async fn execute_web_rtc_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(WebRtcStartExecution::cancelled());
+        }
         return Err(error);
     }
     let actor_binding = ActorBinding {
-        connection_id,
+        connection_id: connection_id.clone(),
         leg_id,
         binding_generation,
         state: LegState::Signaling,
@@ -8796,6 +9472,9 @@ async fn execute_web_rtc_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(WebRtcStartExecution::cancelled());
+        }
         return Ok(WebRtcStartExecution::failed(
             leg_id,
             binding_generation,
@@ -8805,34 +9484,42 @@ async fn execute_web_rtc_start_leg(
         ));
     }
 
-    match await_while_execution_owned(
+    match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             prepared.commit(),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(_))) => Ok(WebRtcStartExecution {
+        StartOperationWait::Completed(Ok(Ok(_))) if setup_cancel.is_cancelled() => {
+            let _ = orchestrator
+                .end_connection(connection_id, EndReason::BridgeTorn)
+                .await;
+            Ok(WebRtcStartExecution::cancelled())
+        }
+        StartOperationWait::Completed(Ok(Ok(_))) => Ok(WebRtcStartExecution {
             result: ServiceEffectResult::Succeeded,
             follow_up: FollowUpPlan::None,
         }),
-        Ok(Ok(Err(_))) => Ok(WebRtcStartExecution::failed(
+        StartOperationWait::Completed(Ok(Err(_))) => Ok(WebRtcStartExecution::failed(
             leg_id,
             binding_generation,
             "webrtc_start_failed",
             "outbound WebRTC signaling activation failed",
             true,
         )),
-        Ok(Err(_)) => Ok(WebRtcStartExecution::failed(
+        StartOperationWait::Completed(Err(_)) => Ok(WebRtcStartExecution::failed(
             leg_id,
             binding_generation,
             "webrtc_start_timeout",
             "outbound WebRTC signaling exceeded the call setup deadline",
             true,
         )),
-        Err(()) => Err(RepositoryError::Unavailable),
+        StartOperationWait::CallEnding => Ok(WebRtcStartExecution::cancelled()),
+        StartOperationWait::AuthorityLost => Err(RepositoryError::Unavailable),
     }
 }
 
@@ -8848,8 +9535,12 @@ async fn execute_amazon_start_leg(
     amazon_connect: Option<&Arc<AmazonConnectAdapter>>,
     existing_session: Option<SessionId>,
     outbound_registration: Option<&mpsc::Sender<OutboundRegistration>>,
+    setup_cancel: &CancellationToken,
     mut shutdown: watch::Receiver<ActorShutdown>,
 ) -> Result<AmazonStartExecution, RepositoryError> {
+    if setup_cancel.is_cancelled() && !stored.call.bindings.contains_key(&leg_id) {
+        return Ok(AmazonStartExecution::cancelled(None));
+    }
     let spec = stored.plan.amazon_connect_start_spec(leg_id)?;
     let context_attributes = match named_route_context_envelope(stored, leg_id) {
         Ok(Some(envelope)) => match context_to_amazon_attributes(&envelope, context_policy) {
@@ -8935,6 +9626,9 @@ async fn execute_amazon_start_leg(
                     }
                     Ok(None) | Err(RepositoryError::Unavailable) => {
                         tokio::select! {
+                            _ = setup_cancel.cancelled() => {
+                                return Ok(AmazonStartExecution::cancelled(None));
+                            }
                             changed = shutdown.changed() => {
                                 if changed.is_err() || *shutdown.borrow() != ActorShutdown::Running {
                                     return Err(RepositoryError::Unavailable);
@@ -9013,8 +9707,16 @@ async fn execute_amazon_start_leg(
     let (session_id, created_session) = if let Some(session_id) = existing_session {
         (session_id, None)
     } else {
-        let created =
-            open_outbound_voice_session(orchestrator, &meta.tenant_id, &mut shutdown).await?;
+        let Some(created) = open_outbound_voice_session_for_start(
+            orchestrator,
+            &meta.tenant_id,
+            &mut shutdown,
+            setup_cancel,
+        )
+        .await?
+        else {
+            return Ok(AmazonStartExecution::cancelled(None));
+        };
         (created.1.clone(), Some(created))
     };
     let request = OriginateRequest::new(
@@ -9026,17 +9728,18 @@ async fn execute_amazon_start_leg(
     )
     .with_transport(Transport::AmazonConnect)
     .with_context(context);
-    let prepared = match await_while_execution_owned(
+    let prepared = match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             orchestrator.prepare_outbound_connection(request),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(prepared))) => prepared,
-        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+        StartOperationWait::Completed(Ok(Ok(prepared))) => prepared,
+        StartOperationWait::Completed(Ok(Err(_))) | StartOperationWait::Completed(Err(_)) => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Ok(AmazonStartExecution::failed(
                 leg_id,
@@ -9046,12 +9749,21 @@ async fn execute_amazon_start_leg(
                 true,
             ));
         }
-        Err(()) => {
+        StartOperationWait::CallEnding => {
+            close_created_voice_session(orchestrator, &created_session).await;
+            return Ok(AmazonStartExecution::cancelled(None));
+        }
+        StartOperationWait::AuthorityLost => {
             close_created_voice_session(orchestrator, &created_session).await;
             return Err(RepositoryError::Unavailable);
         }
     };
     let connection_id = prepared.connection_id().clone();
+    if setup_cancel.is_cancelled() {
+        let _ = prepared.abort().await;
+        close_created_voice_session(orchestrator, &created_session).await;
+        return Ok(AmazonStartExecution::cancelled(None));
+    }
     let principal_fingerprint = stored.plan.authorization_principal_fingerprint()?;
     let bind = OutboundConnectionBind {
         operation_id: CommandId::from_uuid(meta.effect_id.as_uuid()).map_err(|_| {
@@ -9079,6 +9791,9 @@ async fn execute_amazon_start_leg(
         Err(error) => {
             let _ = prepared.abort().await;
             close_created_voice_session(orchestrator, &created_session).await;
+            if setup_cancel.is_cancelled() {
+                return Ok(AmazonStartExecution::cancelled(None));
+            }
             return Err(error);
         }
     };
@@ -9096,6 +9811,9 @@ async fn execute_amazon_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(AmazonStartExecution::cancelled(None));
+        }
         return Err(error);
     }
     let actor_binding = ActorBinding {
@@ -9118,6 +9836,9 @@ async fn execute_amazon_start_leg(
     {
         let _ = prepared.abort().await;
         close_created_voice_session(orchestrator, &created_session).await;
+        if setup_cancel.is_cancelled() {
+            return Ok(AmazonStartExecution::cancelled(None));
+        }
         return Ok(AmazonStartExecution::failed(
             leg_id,
             binding_generation,
@@ -9130,17 +9851,18 @@ async fn execute_amazon_start_leg(
     // Amazon retains its adapter-owned signaling/cleanup deadline, while the
     // outer call setup deadline prevents a blocked contact start from
     // starving the call actor's durable timeout/cleanup work.
-    let handle = match await_while_execution_owned(
+    let handle = match await_start_operation(
         tokio::time::timeout(
             bounded_effect_operation_timeout(stored, runtime, DeadlineKind::Setup),
             prepared.commit(),
         ),
         &mut shutdown,
+        setup_cancel,
     )
     .await
     {
-        Ok(Ok(Ok(handle))) => handle,
-        Ok(Ok(Err(_))) => {
+        StartOperationWait::Completed(Ok(Ok(handle))) => handle,
+        StartOperationWait::Completed(Ok(Err(_))) => {
             return Ok(AmazonStartExecution::failed(
                 leg_id,
                 binding_generation,
@@ -9149,7 +9871,7 @@ async fn execute_amazon_start_leg(
                 true,
             ));
         }
-        Ok(Err(_)) => {
+        StartOperationWait::Completed(Err(_)) => {
             return Ok(AmazonStartExecution::failed(
                 leg_id,
                 binding_generation,
@@ -9158,7 +9880,10 @@ async fn execute_amazon_start_leg(
                 true,
             ));
         }
-        Err(()) => return Err(RepositoryError::Unavailable),
+        StartOperationWait::CallEnding => {
+            return Ok(AmazonStartExecution::cancelled(None));
+        }
+        StartOperationWait::AuthorityLost => return Err(RepositoryError::Unavailable),
     };
     let references = handle.outbound_activation().external_references();
     let external_reference = match references {
@@ -9168,6 +9893,12 @@ async fn execute_amazon_start_leg(
         )),
     };
     match external_reference {
+        Ok(external_reference) if setup_cancel.is_cancelled() => {
+            let _ = orchestrator
+                .end_connection(connection_id, EndReason::BridgeTorn)
+                .await;
+            Ok(AmazonStartExecution::cancelled(Some(external_reference)))
+        }
         Ok(external_reference) => Ok(AmazonStartExecution {
             result: ServiceEffectResult::Succeeded,
             follow_up: FollowUpPlan::None,
@@ -9279,6 +10010,7 @@ async fn execute_call_effect(
         bridge_id,
         session_id,
         outbound_registration,
+        setup_cancel,
         shutdown,
     } = context;
     let effect_id = claim.record.effect_id;
@@ -9309,6 +10041,29 @@ async fn execute_call_effect(
                 ..
             } if stored.call.bindings.contains_key(leg_id)
         );
+        let is_setup_effect = matches!(
+            &claim.record.intent,
+            EffectIntent::StartLeg { .. } | EffectIntent::ConnectProviderDestination { .. }
+        );
+        let cancelled_setup_effect = is_setup_effect
+            && (setup_cancel.is_cancelled()
+                || stored.call.aggregate.state() != CallState::Connecting)
+            && !requires_amazon_recovery;
+        if cancelled_setup_effect {
+            return WorkOperationResult {
+                effect_id: Some(effect_id),
+                bridge_update: None,
+                handoff_signal: None,
+                result: reconcile_effect(
+                    meta,
+                    ServiceEffectResult::Succeeded,
+                    FollowUpPlan::None,
+                    runtime,
+                    shutdown,
+                )
+                .await,
+            };
+        }
         if stored.call.aggregate.state().is_terminal()
             && !requires_amazon_recovery
             && !is_terminal_cleanup_effect(&claim.record.intent)
@@ -9755,6 +10510,15 @@ async fn execute_call_effect(
                                 {
                                     Ok(())
                                 }
+                                Ok(Err(PrivateEgressError::InvalidTransition))
+                                    if binding.state == LegState::Ending =>
+                                {
+                                    // The immediate source-loss path may have
+                                    // already aborted a still-prepared route.
+                                    // A later durable End then proves there is
+                                    // no live route left to terminate.
+                                    Ok(())
+                                }
                                 _ => Err(()),
                             },
                             Err(()) => Err(()),
@@ -9772,7 +10536,7 @@ async fn execute_call_effect(
                     )
                     .await
                     .map_err(|_| ())
-                    .and_then(|result| result.map_err(|_| ()))
+                    .and_then(normalize_terminal_transport_cleanup)
                 }
                 _ => Ok(()),
             };
@@ -9824,11 +10588,13 @@ async fn execute_call_effect(
             kind,
             direction: _,
         } => {
-            if matches!(
-                kind,
-                crate::call_engine::LegKind::Sip | crate::call_engine::LegKind::InteractiveWebRtc
-            ) && private_egress.is_some()
-            {
+            if let Some(private_egress) = private_egress.as_ref().filter(|_| {
+                matches!(
+                    kind,
+                    crate::call_engine::LegKind::Sip
+                        | crate::call_engine::LegKind::InteractiveWebRtc
+                )
+            }) {
                 match Box::pin(execute_private_egress_start_leg(
                     &meta,
                     &stored,
@@ -9837,10 +10603,11 @@ async fn execute_call_effect(
                     &orchestrator,
                     &runtime,
                     context_policy.as_ref(),
-                    private_egress.as_ref().expect("checked private egress"),
+                    private_egress,
                     &bindings,
                     &pending_inbound_authorities,
                     outbound_registration.as_ref(),
+                    &setup_cancel,
                     shutdown.clone(),
                 ))
                 .await
@@ -9868,6 +10635,7 @@ async fn execute_call_effect(
                     bindings.get(&leg_id),
                     session_id,
                     outbound_registration.as_ref(),
+                    &setup_cancel,
                     shutdown.clone(),
                 )
                 .await
@@ -9897,6 +10665,7 @@ async fn execute_call_effect(
                     amazon_connect.as_ref(),
                     session_id,
                     outbound_registration.as_ref(),
+                    &setup_cancel,
                     shutdown.clone(),
                 )
                 .await
@@ -9931,6 +10700,7 @@ async fn execute_call_effect(
                     bindings.get(&leg_id),
                     session_id,
                     outbound_registration.as_ref(),
+                    &setup_cancel,
                     shutdown.clone(),
                 )
                 .await
@@ -10007,13 +10777,20 @@ async fn execute_call_effect(
                                     ProviderReferenceRole::Media,
                                     reference,
                                 ));
-                                (
-                                    ServiceEffectResult::Succeeded,
+                                let follow_up = if setup_cancel.is_cancelled() {
+                                    // The provider originate was already submitted, so its
+                                    // future must run to a bounded completion to recover the
+                                    // exact cleanup handle. Persist that handle without trying
+                                    // to advance an Ending call. The serialized StopLeg effect
+                                    // then retires this exact provider generation.
+                                    FollowUpPlan::None
+                                } else {
                                     FollowUpPlan::ProviderMediaStarted {
                                         leg_id,
                                         binding_generation,
-                                    },
-                                )
+                                    }
+                                };
+                                (ServiceEffectResult::Succeeded, follow_up)
                             }
                             Ok(Err(error)) => {
                                 let failure =
@@ -13142,6 +13919,15 @@ async fn build_effect_follow_up(
         .service_repository()
         .load_service_call(&meta.tenant_id, meta.call_id)
         .await?;
+    if matches!(plan, FollowUpPlan::ProviderMediaStarted { .. })
+        && stored.call.aggregate.state() != CallState::Connecting
+    {
+        // Source loss can commit concurrently after StartLeg observes its
+        // cancellation token but before reconciliation is built. Retain the
+        // successful provider reference while suppressing the now-invalid
+        // state advance; the already-enqueued StopLeg owns compensation.
+        return Ok(None);
+    }
     let at = std::cmp::max(requested_at, stored.call.aggregate.updated_at());
     let command = match command {
         CallCommand::SetLegState {
@@ -13607,6 +14393,61 @@ async fn commit_binding_state(
                 delay = (delay * 2).min(REPOSITORY_RETRY_MAX);
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+fn private_egress_peer_stop_operation(state: LegState) -> PrivateEgressOperation {
+    if matches!(state, LegState::Connected | LegState::Held) {
+        PrivateEgressOperation::End {
+            reason: PrivateEgressEndReason::Normal,
+        }
+    } else {
+        // Prepare is deliberately dormant. If source cancellation wins before
+        // activation, abort the prepared destination rather than representing
+        // it as an established call.
+        PrivateEgressOperation::Abort
+    }
+}
+
+fn normalize_terminal_transport_cleanup(result: Result<(), RvoipError>) -> Result<(), ()> {
+    match result {
+        Ok(()) | Err(RvoipError::ConnectionNotFound(_)) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+enum StartOperationWait<T> {
+    Completed(T),
+    CallEnding,
+    AuthorityLost,
+}
+
+async fn await_start_operation<F, T>(
+    future: F,
+    shutdown: &mut watch::Receiver<ActorShutdown>,
+    setup_cancel: &CancellationToken,
+) -> StartOperationWait<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        if setup_cancel.is_cancelled() {
+            return StartOperationWait::CallEnding;
+        }
+        if *shutdown.borrow() == ActorShutdown::LeaseLost {
+            return StartOperationWait::AuthorityLost;
+        }
+        tokio::select! {
+            biased;
+            _ = setup_cancel.cancelled() => return StartOperationWait::CallEnding,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() == ActorShutdown::LeaseLost {
+                    return StartOperationWait::AuthorityLost;
+                }
+            }
+            result = &mut future => return StartOperationWait::Completed(result),
         }
     }
 }
@@ -14601,6 +15442,7 @@ mod tests {
                 bridge_id: None,
                 session_id: None,
                 outbound_registration: None,
+                setup_cancel: CancellationToken::new(),
                 shutdown: shutdown.clone(),
             },
         )
@@ -15298,6 +16140,46 @@ mod tests {
                 OperationalTransition::EndUnexpectedConnected
             ));
         }
+    }
+
+    #[test]
+    fn source_teardown_aborts_prepared_private_egress_and_ends_connected_egress() {
+        for state in [
+            LegState::Pending,
+            LegState::AwaitingAttach,
+            LegState::Signaling,
+            LegState::Ending,
+        ] {
+            assert!(matches!(
+                private_egress_peer_stop_operation(state),
+                PrivateEgressOperation::Abort
+            ));
+        }
+        for state in [LegState::Connected, LegState::Held] {
+            assert!(matches!(
+                private_egress_peer_stop_operation(state),
+                PrivateEgressOperation::End {
+                    reason: PrivateEgressEndReason::Normal
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn repeated_transport_teardown_accepts_only_an_already_absent_route() {
+        assert_eq!(normalize_terminal_transport_cleanup(Ok(())), Ok(()));
+        assert_eq!(
+            normalize_terminal_transport_cleanup(Err(RvoipError::ConnectionNotFound(
+                ConnectionId::new(),
+            ))),
+            Ok(())
+        );
+        assert_eq!(
+            normalize_terminal_transport_cleanup(Err(RvoipError::InvalidState(
+                "route is still active",
+            ))),
+            Err(())
+        );
     }
 
     #[test]

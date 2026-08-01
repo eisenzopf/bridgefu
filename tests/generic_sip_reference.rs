@@ -1575,7 +1575,7 @@ async fn run_provisional_cancel_reference() {
     // race, the caller facade may report the already-terminal session.  The
     // wire and Bridgefu lifecycle assertions below are authoritative.
     let _source_teardown = source_handle.hangup().await;
-    tokio::time::timeout(Duration::from_secs(5), destination_cancel_rx.recv())
+    tokio::time::timeout(Duration::from_secs(1), destination_cancel_rx.recv())
         .await
         .expect("destination CANCEL deadline")
         .expect("destination CANCEL callback remained live");

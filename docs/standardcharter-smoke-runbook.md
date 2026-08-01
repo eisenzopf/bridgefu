@@ -184,9 +184,10 @@ environment-protected workflow for execution.
 ## Evidence and ownership
 
 For a live qualification record, retain the workflow URL, immutable Bridgefu
-and rvoip revisions, approval reference, redacted artifact digest, AWS account
-fingerprint, and result. Never retain tokens, phone numbers, raw correlations,
-SIP headers, call payloads, or Vapi response bodies.
+revision, Cargo.lock digest, exact rvoip 0.3.5 package/checksum evidence,
+approval reference, redacted artifact digest, AWS account fingerprint, and
+result. Never retain tokens, phone numbers, raw correlations, SIP headers, call
+payloads, or Vapi response bodies.
 
 Checking in or validating this workflow and runbook satisfies the Gate 1
 artifact requirement. It does not claim an external run. Owner-authorized live

@@ -1,8 +1,8 @@
 //! Reusable actual-Chromium controller for destination qualification tests.
 //!
 //! The controller deliberately owns only the browser edge: it serves the
-//! built TypeScript SDK, launches StandardCharter's pinned Playwright
-//! Chromium, and exposes explicit phase barriers. Destination simulators stay
+//! built TypeScript SDK, launches BridgeFu's pinned Playwright Chromium, and
+//! exposes explicit phase barriers. Destination simulators stay
 //! in their existing qualification modules so this helper cannot accidentally
 //! replace production-shaped Amazon, Telnyx, SIP, or WSS behavior.
 
@@ -210,6 +210,9 @@ pub fn attachment_fixture(
     })
 }
 
+// The destination-specific qualification tests intentionally pass every expected boundary
+// independently so this shared assertion cannot silently apply destination defaults.
+#[allow(clippy::too_many_arguments)]
 pub fn assert_common_handoff_result(
     result: &Value,
     call_id: &str,
@@ -435,10 +438,10 @@ async fn sdk_file(
     }
 }
 
-fn find_playwright(standardcharter_web: &Path) {
+fn find_playwright(sdk: &Path) {
     assert!(
-        standardcharter_web.join("node_modules/playwright").is_dir(),
-        "Playwright is absent; run the pinned StandardCharter web install before this ignored test"
+        sdk.join("node_modules/playwright").is_dir(),
+        "Playwright is absent; run npm ci and npm run browser:install in sdk/typescript"
     );
 }
 
@@ -456,8 +459,7 @@ impl BrowserSdkController {
     pub async fn launch(fixture: Value) -> Self {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sdk = repository.join("sdk/typescript");
-        let standardcharter_web = repository.join("../standardcharter/web");
-        find_playwright(&standardcharter_web);
+        find_playwright(&sdk);
 
         SDK_BUILD
             .get_or_init(|| async {
@@ -517,7 +519,7 @@ impl BrowserSdkController {
                 "BRIDGEFU_BROWSER_QUALIFICATION_URL",
                 format!("http://localhost:{}/", address.port()),
             )
-            .env("BRIDGEFU_STANDARDCHARTER_WEB", standardcharter_web)
+            .env("PLAYWRIGHT_BROWSERS_PATH", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);

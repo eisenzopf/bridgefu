@@ -20,8 +20,8 @@ use bridgefu::call_service::{
     ConfiguredAttachmentPrincipalResolver, CreateCallInput, DisabledProviderLegExecutor,
     ExternalReferenceValue, IdempotencyKey, InboundAttachmentRequest, LegEndpointConfig,
     NamedProfileBinding, NamedProfileKind, NamedProfileRole, NamedRouteBinding,
-    NamedRouteCallContext, ProviderConnectDestinationRequest, ProviderDtmfRequest,
-    ProviderDialClientState, ProviderDialRole, ProviderEndpointConfig, ProviderExecutionContext,
+    NamedRouteCallContext, ProviderConnectDestinationRequest, ProviderDialClientState,
+    ProviderDialRole, ProviderDtmfRequest, ProviderEndpointConfig, ProviderExecutionContext,
     ProviderExecutionError, ProviderExecutionReference, ProviderHangupRequest, ProviderKind,
     ProviderLegExecutor, ProviderStartMediaRequest, ProviderTransferRequest, ReplaceLegInput,
     RequestedLeg, SamePrincipalAttachmentResolver, SipEndpointConfig, SipInitialContextMode,
@@ -869,6 +869,7 @@ struct TelnyxReplacementExecutor {
     hangups: Mutex<Vec<(ProviderExecutionContext, ProviderExecutionReference)>>,
     attachment_connections: Mutex<HashMap<BindingGeneration, ConnectionId>>,
     connect_failures: Mutex<VecDeque<ProviderExecutionError>>,
+    start_gate: Mutex<Option<AcceptGate>>,
     destination_gate: Mutex<Option<AcceptGate>>,
     start_notify: Notify,
 }
@@ -884,6 +885,7 @@ impl TelnyxReplacementExecutor {
             hangups: Mutex::new(Vec::new()),
             attachment_connections: Mutex::new(HashMap::new()),
             connect_failures: Mutex::new(VecDeque::new()),
+            start_gate: Mutex::new(None),
             destination_gate: Mutex::new(None),
             start_notify: Notify::new(),
         })
@@ -895,6 +897,12 @@ impl TelnyxReplacementExecutor {
 
     fn fail_next_destination(&self, error: ProviderExecutionError) {
         self.connect_failures.lock().unwrap().push_back(error);
+    }
+
+    fn gate_next_start(&self) -> AcceptGate {
+        let gate = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        *self.start_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     fn gate_next_destination(&self) -> AcceptGate {
@@ -959,6 +967,11 @@ impl ProviderLegExecutor for TelnyxReplacementExecutor {
         let context = request.context.clone();
         self.start_calls.lock().unwrap().push(context.clone());
         self.start_notify.notify_waiters();
+        let gate = self.start_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.wait().await;
+            release.wait().await;
+        }
         if self.auto_attach.load(Ordering::SeqCst) {
             let connection_id = ConnectionId::new();
             self.sip.prepare_inbound(
@@ -1134,6 +1147,9 @@ impl ConnectionAdapter for LifecycleTestAdapter {
         if let Some((entered, release)) = gate {
             entered.wait().await;
             release.wait().await;
+        }
+        if !self.live.lock().unwrap().contains(&connection_id) {
+            return Err(RvoipError::ConnectionNotFound(connection_id));
         }
         let events = self
             .accept_events
@@ -1612,6 +1628,7 @@ async fn telnyx_replacement_harness(
     let worker_id = WorkerId::new();
     let mut config = runtime_config(CallRepositoryBackendConfig::Memory, worker_id);
     config.timeouts.transfer = transfer_timeout;
+    config.worker_capabilities.insert("telnyx".into());
     let media_principal = telnyx_media_principal();
     let runtime = Arc::new(
         build_call_service_runtime(
@@ -2057,8 +2074,7 @@ where
                 .unwrap();
             panic!(
                 "call did not reach the expected durable state: aggregate={:?}, bindings={:?}",
-                stored.call.aggregate,
-                stored.call.bindings,
+                stored.call.aggregate, stored.call.bindings,
             );
         }
     }
@@ -3528,6 +3544,205 @@ async fn named_route_source_hangup_cancels_destination_while_dialing() {
     .await
     .expect("source hangup left the dialing destination route live");
     assert!(!sip.admission_was_accepted(&source_connection_id));
+
+    stop_harness(supervisor, orchestrator).await;
+}
+
+#[tokio::test]
+async fn named_route_source_hangup_during_initial_telnyx_start_retires_late_provider_call() {
+    run_bounded_telnyx_replacement_test(async {
+        let (runtime, orchestrator, supervisor, _sip, webrtc, provider) =
+            telnyx_replacement_harness(Duration::from_secs(10)).await;
+        provider.set_auto_attach(false);
+        let start_gate = provider.gate_next_start();
+        let created = runtime
+            .service()
+            .create_named_route_call(
+                &principal(),
+                &IdempotencyKey::parse("execution-initial-telnyx-source-cancel").unwrap(),
+                inbound_web_rtc_outbound_web_rtc(LegEndpointConfig::Provider(
+                    ProviderEndpointConfig {
+                        provider: ProviderKind::Telnyx,
+                        account_profile: "telnyx-test".into(),
+                        destination: Some("+12065550100".into()),
+                    },
+                )),
+                NamedRouteBinding::new_with_profiles(
+                    "initial-telnyx-source-cancel",
+                    Some(NamedRouteCallContext {
+                        correlation_id: "initial-telnyx-source-cancel".into(),
+                        metadata: BTreeMap::new(),
+                    }),
+                    vec![NamedProfileBinding::new(
+                        NamedProfileRole::Destination,
+                        NamedProfileKind::Telnyx,
+                        "telnyx-test",
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    )
+                    .unwrap()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let call_id = created.value.call.call_id;
+        let source = created
+            .value
+            .call
+            .legs
+            .iter()
+            .find(|leg| leg.direction == LegDirection::Inbound)
+            .unwrap();
+        let destination_leg_id = created
+            .value
+            .call
+            .legs
+            .iter()
+            .find(|leg| leg.direction == LegDirection::Outbound)
+            .unwrap()
+            .leg_id;
+        let source_connection_id = attach(
+            &webrtc,
+            principal().authenticated(),
+            source.attachment.as_ref().unwrap().token.clone(),
+            AcceptEvents::Connected,
+        )
+        .await;
+
+        start_gate.0.wait().await;
+        webrtc.remote_end(source_connection_id.clone()).await;
+        wait_for_call(&runtime, call_id, |stored| {
+            matches!(stored.call.aggregate.state(), CallState::Ending)
+                || stored.call.aggregate.state().is_terminal()
+        })
+        .await;
+        start_gate.1.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.hangup_snapshot().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late initial Telnyx media call was not durably retired");
+        let hangups = provider.hangup_snapshot();
+        assert_eq!(hangups.len(), 1);
+        assert_eq!(hangups[0].0.call_id, call_id);
+        assert_eq!(hangups[0].0.leg_id, destination_leg_id);
+        assert_eq!(hangups[0].0.binding_generation, BindingGeneration::INITIAL);
+        assert_eq!(provider.start_count(), 1);
+        assert_eq!(provider.destination_count(), 0);
+        assert!(!webrtc.admission_was_accepted(&source_connection_id));
+
+        let retained = runtime
+            .service_repository()
+            .load_external_reference_for_binding(
+                &TenantId::parse("execution-tenant").unwrap(),
+                call_id,
+                destination_leg_id,
+                BindingGeneration::INITIAL,
+                ProviderReferenceRole::Media,
+            )
+            .await
+            .unwrap()
+            .expect("late provider media reference was not retained for StopLeg");
+        assert!(matches!(
+            retained.value,
+            ExternalReferenceValue::ProviderCall { provider_call_id, .. }
+                if provider_call_id == hangups[0].1.provider_call_id
+        ));
+
+        stop_harness(supervisor, orchestrator).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn named_route_source_hangup_during_final_answer_stops_connected_destination() {
+    let (runtime, orchestrator, supervisor, sip, webrtc) = execution_harness(1).await;
+    let created = runtime
+        .service()
+        .create_named_route_call(
+            &principal(),
+            &IdempotencyKey::parse("execution-named-route-source-final-answer-race").unwrap(),
+            inbound_sip_outbound_web_rtc(LegEndpointConfig::WebRtc(WebRtcEndpointConfig {
+                signaling_uri: Some("wss://connected-agent.example.test/session".into()),
+            })),
+            NamedRouteBinding::new("connected-agent-wss", None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let call_id = created.value.call.call_id;
+    let source = created
+        .value
+        .call
+        .legs
+        .iter()
+        .find(|leg| leg.direction == LegDirection::Inbound)
+        .unwrap();
+    let source_leg_id = source.leg_id;
+    let destination_leg_id = created
+        .value
+        .call
+        .legs
+        .iter()
+        .find(|leg| leg.direction == LegDirection::Outbound)
+        .unwrap()
+        .leg_id;
+    let source_connection_id = ConnectionId::new();
+    let source_accept_gate = sip.gate_accept(&source_connection_id);
+    let owner = principal().authenticated().clone();
+    sip.prepare_inbound(
+        source_connection_id.clone(),
+        &owner,
+        source.attachment.as_ref().unwrap().token.clone(),
+        AcceptEvents::Connected,
+    );
+    sip.announce_inbound(source_connection_id.clone(), owner)
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), source_accept_gate.0.wait())
+        .await
+        .expect("destination readiness did not begin the source final answer");
+    let connecting = wait_for_call(&runtime, call_id, |stored| {
+        stored
+            .call
+            .aggregate
+            .leg(destination_leg_id)
+            .is_some_and(|leg| leg.state() == LegState::Connected)
+    })
+    .await;
+    let destination_connection_id = connecting.call.bindings[&destination_leg_id]
+        .connection_id
+        .clone();
+
+    sip.remote_end(source_connection_id.clone()).await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    source_accept_gate.1.wait().await;
+
+    let final_call = tokio::time::timeout(Duration::from_secs(1), async {
+        let final_call = wait_for_call(&runtime, call_id, |stored| {
+            stored.call.aggregate.state().is_terminal()
+        })
+        .await;
+        while webrtc.route_is_live(&destination_connection_id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        final_call
+    })
+    .await
+    .expect("source loss during final answer did not stop the connected destination promptly");
+    assert_eq!(
+        final_call
+            .call
+            .aggregate
+            .leg(source_leg_id)
+            .unwrap()
+            .state(),
+        LegState::Ended,
+        "the final-answer race must use the durable source-termination transition"
+    );
+    assert!(!sip.route_is_live(&source_connection_id));
 
     stop_harness(supervisor, orchestrator).await;
 }
@@ -5069,6 +5284,7 @@ async fn private_quic_attachment_is_fence_bound_activated_before_receipt_and_sin
                     .unwrap()
                     .digest(),
                 worker,
+                route_catalog_fingerprint: None,
                 transport: AttachmentTransport::Sip,
                 tenant_binding,
                 expires_at: now + chrono::TimeDelta::minutes(1),
@@ -5679,11 +5895,7 @@ async fn stale_provider_generation_cannot_regress_direct_browser_handoff_status(
             payload_digest: ProviderPayloadDigest::new([0xb2; 32]),
             provider_call_id,
             kind: "call.ringing".into(),
-            payload: telnyx_event_payload(
-                "call.ringing",
-                &stale_context,
-                ProviderDialRole::Media,
-            ),
+            payload: telnyx_event_payload("call.ringing", &stale_context, ProviderDialRole::Media),
             occurred_at: Some(received_at),
             received_at,
         };
@@ -6016,11 +6228,7 @@ async fn failed_second_telnyx_replacement_resumes_current_leg_and_cleans_only_pe
             payload_digest: ProviderPayloadDigest::new([0xa2; 32]),
             provider_call_id: hangups[0].1.provider_call_id.clone(),
             kind: "call.hangup".into(),
-            payload: telnyx_event_payload(
-                "call.hangup",
-                &hangups[0].0,
-                ProviderDialRole::Media,
-            ),
+            payload: telnyx_event_payload("call.hangup", &hangups[0].0, ProviderDialRole::Media),
             occurred_at: Some(received_at),
             received_at,
         };

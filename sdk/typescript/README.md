@@ -186,6 +186,8 @@ events. Use `sendRaw` for those channels.
 npm ci
 npm run typecheck
 npm test
+# One-time setup for the opt-in real-Chromium qualification:
+npm run browser:install
 ```
 
 The tests use deterministic WebRTC/WebSocket mocks and cover the request-bound
@@ -204,8 +206,8 @@ cargo test -p bridgefu --test qualification_browser_sdk -- \
   --ignored --nocapture
 ```
 
-It requires StandardCharter's pinned Playwright Chromium. TURN-only remains a
-separate owner-gated qualification.
+It uses this package's exact Playwright 1.61.1 dependency and its local Chromium
+installation. TURN-only remains a separate owner-gated qualification.
 
 See [`example/`](./example/) for a same-origin backend integration page. Build
 the SDK, serve this directory over HTTPS (or localhost), and configure the demo

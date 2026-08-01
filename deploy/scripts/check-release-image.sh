@@ -4,11 +4,72 @@ set -euo pipefail
 dockerfile="${1:-deploy/Dockerfile}"
 
 test -f "$dockerfile"
-test -f deploy/missing-rvoip-context
+test -f Cargo.lock
+test -f .dockerignore
+test ! -e deploy/missing-rvoip-context
 if ! cmp -s Dockerfile deploy/Dockerfile; then
   echo "root Dockerfile diverged from canonical deploy/Dockerfile" >&2
   exit 1
 fi
+
+bridgefu_version="$(
+  python3 - <<'PY'
+from pathlib import Path
+import tomllib
+
+manifest = tomllib.loads(Path("Cargo.toml").read_text())
+print(manifest["package"]["version"])
+PY
+)"
+if ! [[ "$bridgefu_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "Cargo.toml contains an invalid Bridgefu release version" >&2
+  exit 1
+fi
+
+# Docker does not honor .gitignore. Keep local agent worktrees, SDK installs,
+# Terraform caches/state, and the operator's filled-in configuration out of
+# every build context before COPY . reaches the builder layer.
+for ignored_path in \
+  '.claude/' \
+  '.vscode/' \
+  '**/node_modules/' \
+  '**/.terraform/' \
+  '**/*.tfstate' \
+  '**/*.tfstate.*' \
+  'terraform/terraform.tfvars' \
+  'bridgefu.yaml' \
+  'deploy/tls/' \
+  '**/.env' \
+  '**/.env.*' \
+  '**/*.key' \
+  '**/*.pem' \
+  '**/*.crt' \
+  '**/*.cer' \
+  '**/*.p12' \
+  '**/*.pfx' \
+  '**/*.jks'; do
+  if ! grep -Fxq -- "$ignored_path" .dockerignore; then
+    echo "release Docker context does not exclude $ignored_path" >&2
+    exit 1
+  fi
+done
+
+for ignored_path in \
+  '/deploy/tls/' \
+  '.env' \
+  '.env.*' \
+  '*.key' \
+  '*.pem' \
+  '*.crt' \
+  '*.cer' \
+  '*.p12' \
+  '*.pfx' \
+  '*.jks'; do
+  if ! grep -Fxq -- "$ignored_path" .gitignore; then
+    echo "source-control policy does not exclude $ignored_path" >&2
+    exit 1
+  fi
+done
 
 # The canonical image must use immutable multi-platform base manifests.
 base_args=$(grep -Ec '^ARG (RUST_IMAGE|RUNTIME_IMAGE)=.+@sha256:[0-9a-f]{64}$' "$dockerfile")
@@ -27,23 +88,32 @@ grep -Eq 'build-essential=[^ ]+' "$dockerfile"
 grep -Eq 'ca-certificates=[^ ]+' "$dockerfile"
 grep -Eq 'curl=[^ ]+' "$dockerfile"
 
-grep -Eq '^COPY --from=rvoip ' "$dockerfile"
-grep -Eq '^FROM scratch AS rvoip$' "$dockerfile"
-grep -Eq '&& cargo build --locked --release ' "$dockerfile"
-grep -Eq 'bridgefu-missing-rvoip-build-context' "$dockerfile"
+grep -Eq '^COPY \. /src/bridgefu$' "$dockerfile"
+grep -Eq 'cargo build --locked --release' "$dockerfile"
 grep -Eq '^USER 65532:65532$' "$dockerfile"
 grep -Eq '^HEALTHCHECK ' "$dockerfile"
 grep -Eq '^STOPSIGNAL SIGTERM$' "$dockerfile"
 grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
-grep -Eq 'org.opencontainers.image.rvoip.revision=' "$dockerfile"
+grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
+grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" "$dockerfile"
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.5"' "$dockerfile"
+grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" deploy/vapi-feasibility/Dockerfile
+grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' deploy/vapi-feasibility/Dockerfile
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.5"' deploy/vapi-feasibility/Dockerfile
 grep -Eq 'dockerfile: deploy/Dockerfile' compose.yaml
+if grep -Eq 'additional_contexts:' compose.yaml deploy/vapi-feasibility/compose.local.yaml; then
+  echo "Compose must build from the Bridgefu context alone" >&2
+  exit 1
+fi
 grep -Eq 'file: bridgefu/deploy/Dockerfile' .github/workflows/ci.yml
 grep -Eq 'platform: linux/amd64' .github/workflows/ci.yml
 grep -Eq 'platform: linux/arm64' .github/workflows/ci.yml
+grep -Fq 'Verify locked rvoip crates.io graph' .github/workflows/ci.yml
 release_workflow=.github/workflows/release-image-candidate.yml
 test -f "$release_workflow"
 grep -Eq '^  workflow_dispatch:$' "$release_workflow"
 grep -Eq '^    environment: bridgefu-release-image-candidate$' "$release_workflow"
+grep -Fq 'run: bash deploy/scripts/check-release-image.sh' "$release_workflow"
 grep -Eq 'platforms: linux/amd64,linux/arm64' "$release_workflow"
 grep -Eq 'outputs: type=oci,dest=' "$release_workflow"
 grep -Eq '^          push: false$' "$release_workflow"
@@ -60,6 +130,15 @@ if grep -Eq 'packages: write|id-token: write|push: true' "$release_workflow"; th
 fi
 if grep -Eq '^  multiarch-image:$' .github/workflows/ci.yml; then
   echo "multi-architecture candidate assembly must remain manually authorized" >&2
+  exit 1
+fi
+if grep -Eiq \
+  'rvoip_revision|RVOIP_REVISION|RVOIP_DIR|repository:[[:space:]]*eisenzopf/rvoip|--build-context[[:space:]]+rvoip|build-contexts:[[:space:]]*rvoip|COPY --from=rvoip|FROM scratch AS rvoip|rvoip\.revision|[.][.]/rvoip' \
+  Dockerfile deploy/Dockerfile deploy/vapi-feasibility/Dockerfile \
+  compose.yaml deploy/vapi-feasibility/compose.local.yaml \
+  .github/workflows/ci.yml "$release_workflow" deploy.sh \
+  deploy/scripts/runtime-smoke.py; then
+  echo "build and release infrastructure still references a sibling rvoip checkout or revision" >&2
   exit 1
 fi
 
@@ -92,6 +171,42 @@ for name in (
 ):
     ast.parse(Path("deploy/scripts", name).read_text())
 PY
+python3 - <<'PY'
+from pathlib import Path
+import tomllib
+
+lock = tomllib.loads(Path("Cargo.lock").read_text())
+packages = [
+    package for package in lock["package"]
+    if package["name"] == "rvoip" or package["name"].startswith("rvoip-")
+]
+if not packages:
+    raise SystemExit("Cargo.lock contains no rvoip packages")
+invalid = [
+    (package["name"], package["version"], package.get("source"))
+    for package in packages
+    if package["version"] != "0.3.5"
+    or not package.get("source", "").startswith("registry+")
+]
+if invalid:
+    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.5 rvoip packages: {invalid}")
+required = {
+    "rvoip-amazon-connect",
+    "rvoip-auth-core",
+    "rvoip-core",
+    "rvoip-media-core",
+    "rvoip-moq",
+    "rvoip-quic",
+    "rvoip-redis",
+    "rvoip-sip",
+    "rvoip-uctp",
+    "rvoip-webrtc",
+    "rvoip-webrtc-stack",
+}
+missing = required - {package["name"] for package in packages}
+if missing:
+    raise SystemExit(f"Cargo.lock is missing required rvoip packages: {sorted(missing)}")
+PY
 grep -Eq 'runtime-smoke\.py' .github/workflows/ci.yml
 grep -Eq 'bridgefu-runtime-smoke-' .github/workflows/ci.yml
 grep -Eq '^EnvironmentFile=/etc/bridgefu/image.env$' deploy/bridgefu.service
@@ -106,11 +221,10 @@ fi
 
 bash -n deploy.sh deploy/scripts/*.sh
 grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
-grep -Fq ": \"\${RVOIP_REVISION:?" deploy.sh
 grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
-grep -Fq "git -C \"\$RVOIP_DIR\" archive" deploy.sh
+grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
+grep -Fq 'readonly RVOIP_VERSION=0.3.5' deploy.sh
 grep -Fq -- '--iidfile' deploy.sh
-grep -Fq -- '--build-context rvoip=../rvoip' deploy.sh
 grep -Fq '/etc/bridgefu/image.env' deploy.sh
 grep -Fq '/readyz' deploy.sh
 grep -Fq '/livez' deploy.sh

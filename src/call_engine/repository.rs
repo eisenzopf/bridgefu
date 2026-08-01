@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,6 +27,7 @@ pub const MAX_PROVIDER_EVENT_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_IDENTIFIER_BYTES: usize = 512;
 const MAX_PROVIDER_KIND_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
+const ROUTE_CATALOG_CAPABILITY_PREFIX: &str = "bridgefu.route_catalog.sha256:";
 /// Default worker lease duration used by production runtime configuration.
 pub const DEFAULT_WORKER_LEASE_TTL: Duration = Duration::from_secs(30);
 /// Shortest supported worker lease.
@@ -178,6 +181,131 @@ pub struct WorkerSnapshot {
 /// repository query. Public callers cannot force an unbounded collection.
 pub const MAX_WORKER_CANDIDATE_LIMIT: usize = 1_024;
 
+/// Deterministic identity of the exact private-egress route and codec catalog.
+///
+/// Split workers advertise this value as a reserved placement capability.
+/// Gateways require their own value during placement, and durable assignments
+/// retain the selected worker's value for later compatibility checks.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RouteCatalogFingerprint([u8; 32]);
+
+impl RouteCatalogFingerprint {
+    /// Constructs a fingerprint from a SHA-256 digest.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the canonical lower-case hexadecimal representation.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+
+    /// Returns the reserved capability advertised by a compatible worker.
+    #[must_use]
+    pub fn advertisement_capability(self) -> String {
+        format!("{ROUTE_CATALOG_CAPABILITY_PREFIX}{}", self.to_hex())
+    }
+
+    /// Extracts the sole valid advertised fingerprint, if present.
+    pub fn from_capabilities(
+        capabilities: &BTreeSet<String>,
+    ) -> Result<Option<Self>, RepositoryError> {
+        let mut matches = capabilities
+            .iter()
+            .filter(|capability| capability.starts_with(ROUTE_CATALOG_CAPABILITY_PREFIX));
+        let fingerprint = matches
+            .next()
+            .map(|capability| {
+                capability[ROUTE_CATALOG_CAPABILITY_PREFIX.len()..]
+                    .parse()
+                    .map_err(|_| RepositoryError::InvalidInput("invalid route catalog fingerprint"))
+            })
+            .transpose()?;
+        if matches.next().is_some() {
+            return Err(RepositoryError::InvalidInput(
+                "multiple route catalog fingerprints",
+            ));
+        }
+        Ok(fingerprint)
+    }
+}
+
+impl fmt::Display for RouteCatalogFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.to_hex())
+    }
+}
+
+impl fmt::Debug for RouteCatalogFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("RouteCatalogFingerprint")
+            .field(&self.to_hex())
+            .finish()
+    }
+}
+
+impl FromStr for RouteCatalogFingerprint {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(());
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]).ok_or(())?;
+            let low = hex_nibble(pair[1]).ok_or(())?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for RouteCatalogFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteCatalogFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(|()| serde::de::Error::custom("invalid route catalog SHA-256 fingerprint"))
+    }
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Registration request. Re-registering the same ID advances its fence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisterWorker {
@@ -224,6 +352,9 @@ pub struct RenewWorkerLease {
 pub struct WorkerAssignment {
     /// Assigned worker.
     pub lease: WorkerLease,
+    /// Route catalog advertised by the selected worker at assignment time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_catalog_fingerprint: Option<RouteCatalogFingerprint>,
     /// Assignment time.
     pub assigned_at: DateTime<Utc>,
     /// Capacity-release time; set exactly once.
@@ -442,6 +573,7 @@ pub struct AttachmentCandidate {
     pub(crate) binding_generation: BindingGeneration,
     pub(crate) transport: AttachmentTransport,
     pub(crate) worker: WorkerLease,
+    pub(crate) assignment: WorkerAssignment,
     pub(crate) expires_at: DateTime<Utc>,
     pub(crate) expected_principal: PrincipalFingerprint,
     pub(crate) expected_version: AggregateVersion,
@@ -478,6 +610,12 @@ impl AttachmentCandidate {
         self.purpose
     }
 
+    /// Exact durable assignment inspected with the attachment proof.
+    #[must_use]
+    pub const fn assignment(&self) -> &WorkerAssignment {
+        &self.assignment
+    }
+
     /// Token expiry.
     #[must_use]
     pub const fn expires_at(&self) -> DateTime<Utc> {
@@ -502,6 +640,7 @@ impl fmt::Debug for AttachmentCandidate {
             .field("binding_generation", &self.binding_generation)
             .field("transport", &self.transport)
             .field("worker", &self.worker)
+            .field("assignment", &self.assignment)
             .field("expires_at", &self.expires_at)
             .field("expected_principal", &"[redacted]")
             .field("expected_version", &self.expected_version)
@@ -1279,6 +1418,7 @@ pub(crate) fn validate_worker_capabilities(
     }) {
         return Err(RepositoryError::InvalidInput("invalid worker capability"));
     }
+    RouteCatalogFingerprint::from_capabilities(capabilities)?;
     Ok(())
 }
 

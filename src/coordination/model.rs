@@ -11,12 +11,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::call_engine::{
-    AttachmentTokenDigest, AttachmentTransport, CallId, PrincipalFingerprint, WorkerId, WorkerLease,
+    AttachmentTokenDigest, AttachmentTransport, CallId, PrincipalFingerprint,
+    RouteCatalogFingerprint, WorkerId, WorkerLease,
 };
 
 const MAX_DEPLOYMENT_BYTES: usize = 63;
 const MAX_NAME_BYTES: usize = 128;
-const MAX_CAPABILITIES: usize = 64;
+// Operators may configure up to 64 adapter capabilities. Split workers add
+// one reserved route-catalog fingerprint capability at runtime.
+const MAX_CAPABILITIES: usize = 65;
 const MAX_CLAIM_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PROJECTION_LIFETIME: TimeDelta = TimeDelta::hours(24);
@@ -248,6 +251,9 @@ pub struct AttachmentRouteHint {
     pub token_digest: AttachmentTokenDigest,
     /// Exact worker incarnation that issued the attachment.
     pub worker: WorkerLease,
+    /// Route catalog retained by the call assignment that issued the bearer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_catalog_fingerprint: Option<RouteCatalogFingerprint>,
     /// Signaling transport the bearer was issued for.
     pub transport: AttachmentTransport,
     /// Keyed issuer/tenant/subject binding. Debug output is redacted by type.

@@ -7,11 +7,6 @@ on:
         description: Exact 40-character Bridgefu commit to build
         required: true
         type: string
-      rvoip_revision:
-        description: Exact reviewed 40-character rvoip commit to build
-        required: true
-        default: 1ec7b370e82ed3ba646e795b343a117466667e48
-        type: string
 
 permissions:
   contents: read
@@ -34,27 +29,19 @@ jobs:
           ref: ${{ inputs.bridgefu_revision }}
           path: bridgefu
           persist-credentials: false
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          repository: eisenzopf/rvoip
-          ref: ${{ inputs.rvoip_revision }}
-          path: rvoip
-          persist-credentials: false
-      - name: Prove exact clean source revisions
+      - name: Prove exact clean source revision
         env:
           BRIDGEFU_REVISION: ${{ inputs.bridgefu_revision }}
-          RVOIP_REVISION: ${{ inputs.rvoip_revision }}
         run: |
           [[ "$BRIDGEFU_REVISION" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$RVOIP_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C bridgefu rev-parse HEAD)" = "$BRIDGEFU_REVISION"
-          test "$(git -C rvoip rev-parse HEAD)" = "$RVOIP_REVISION"
           git -C bridgefu diff --quiet
           git -C bridgefu diff --cached --quiet
-          git -C rvoip diff --quiet
-          git -C rvoip diff --cached --quiet
           printf 'BUILD_DATE=%s\n' "$(git -C bridgefu show -s --format=%cI)" >> "$GITHUB_ENV"
           printf 'SOURCE_DATE_EPOCH=%s\n' "$(git -C bridgefu show -s --format=%ct)" >> "$GITHUB_ENV"
+      - name: Enforce locked crates.io rvoip release policy
+        working-directory: bridgefu
+        run: bash deploy/scripts/check-release-image.sh
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
@@ -65,7 +52,6 @@ jobs:
         with:
           context: bridgefu
           file: bridgefu/deploy/Dockerfile
-          build-contexts: rvoip=./rvoip
           platforms: linux/amd64,linux/arm64
           tags: bridgefu:candidate-${{ inputs.bridgefu_revision }}
           outputs: type=oci,dest=${{ runner.temp }}/bridgefu-multiarch.oci.tar
@@ -74,7 +60,6 @@ jobs:
           sbom: true
           build-args: |
             VCS_REF=${{ inputs.bridgefu_revision }}
-            RVOIP_REVISION=${{ inputs.rvoip_revision }}
             BUILD_DATE=${{ env.BUILD_DATE }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
       - name: Verify the root digest, exact platforms, SBOM, and provenance
@@ -82,13 +67,11 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           BRIDGEFU_REVISION: ${{ inputs.bridgefu_revision }}
-          RVOIP_REVISION: ${{ inputs.rvoip_revision }}
         run: |
           python3 deploy/scripts/verify-multiarch-oci.py \
             --archive "${{ runner.temp }}/bridgefu-multiarch.oci.tar" \
             --expected-digest "$IMAGE_DIGEST" \
             --source-revision "bridgefu=$BRIDGEFU_REVISION" \
-            --source-revision "rvoip=$RVOIP_REVISION" \
             --output "${{ runner.temp }}/bridgefu-multiarch.json"
       - name: Open and select exact-platform OCI layouts for scanning
         working-directory: bridgefu

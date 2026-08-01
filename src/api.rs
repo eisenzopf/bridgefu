@@ -409,6 +409,10 @@ impl ApiState {
                                 .iter()
                                 .copied()
                                 .collect(),
+                            route_catalog_fingerprint: crate::process_role::worker_egress_routes(
+                                config,
+                            )?
+                            .fingerprint(),
                             coordination: config.call_coordination_config()?,
                         },
                         attachment_principals,
@@ -743,7 +747,7 @@ fn local_runtime_supports_capabilities(
             .iter()
             .any(|provider| provider == "telnyx"),
         // Deferred and unknown executors are never inferred from YAML.
-        "twilio" | "vonage" | _ => false,
+        _ => false,
     })
 }
 
@@ -2347,7 +2351,7 @@ mod tests {
     use rvoip_core::message::Message;
     use rvoip_core::stream::{MediaStream, QualitySnapshot, StreamKind};
     use rvoip_core::{
-        Config as RvoipConfig, CredentialKind, IdentityAssurance, MediaFrame, Orchestrator,
+        Config as RvoipConfig, CredentialKind, IdentityAssurance, Jwk, MediaFrame, Orchestrator,
         Result as RvoipResult, RvoipError,
     };
     use tokio::sync::mpsc;
@@ -2727,6 +2731,23 @@ mod tests {
             .activate_worker_capabilities(test_worker_capabilities())
             .await
             .expect("test worker capabilities activate");
+    }
+
+    fn named_route_vapi_principal() -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            subject: "vapi-edge".into(),
+            tenant: Some("tenant-a".into()),
+            scopes: vec!["calls:create".into()],
+            issuer: Some("vapi-managed".into()),
+            expires_at: None,
+            method: AuthenticationMethod::ApiKey,
+            assurance: IdentityAssurance::Pseudonymous {
+                ephemeral_key: Jwk(json!({
+                    "kty": "bridgefu-profile",
+                    "profile_id": "vapi-public",
+                })),
+            },
+        }
     }
 
     async fn named_route_test_state() -> ApiState {
@@ -3286,7 +3307,12 @@ persistence:
         )
         .await
         .unwrap();
-        activate_test_worker(&state).await;
+        // A multi-tenant legacy bearer without `api.static_tenant` exposes
+        // only the legacy diagnostics surfaces and intentionally has no
+        // transactional call runtime to activate.
+        if state.call_runtime().is_some() {
+            activate_test_worker(&state).await;
+        }
         state
     }
 
@@ -3883,7 +3909,7 @@ persistence:
             axum::http::header::AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer diagnostics-secret"),
         );
-        let principal = state
+        let _api_principal = state
             .bearer_authenticator
             .as_ref()
             .unwrap()
@@ -4097,7 +4123,7 @@ persistence:
 
         let consume = |connection: &str| {
             InboundAttachmentRequest::new(
-                principal.authenticated().clone(),
+                named_route_vapi_principal(),
                 Some(token.clone()),
                 bridgefu::call_engine::AttachmentTransport::Sip,
                 runtime.worker().lease,

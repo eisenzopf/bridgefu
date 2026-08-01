@@ -3,8 +3,6 @@ services:
     build:
       context: ../..
       dockerfile: deploy/vapi-feasibility/Dockerfile
-      additional_contexts:
-        rvoip: ../../../rvoip
     environment:
       VAPI_FIXTURE_MODE: local
       VAPI_FIXTURE_HTTP_BIND: 0.0.0.0:9088

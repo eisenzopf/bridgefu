@@ -20,7 +20,8 @@ use zeroize::Zeroize;
 
 use crate::call_engine::{
     validate_worker_lease_ttl, ActivateWorkerCapabilities, CallRepository, RegisterWorker,
-    RenewWorkerLease, RepositoryError, WorkerId, WorkerSnapshot, DEFAULT_WORKER_LEASE_TTL,
+    RenewWorkerLease, RepositoryError, RouteCatalogFingerprint, WorkerId, WorkerSnapshot,
+    DEFAULT_WORKER_LEASE_TTL,
 };
 use crate::coordination::{
     CoordinationClock, CoordinationError, CoordinationOutbox, CoordinationProjection,
@@ -257,6 +258,9 @@ pub struct CallControlRuntimeConfig {
     /// Exact worker IDs reachable through this gateway's private forwarding
     /// catalog. Placement may not select any other registered worker.
     pub eligible_workers: BTreeSet<WorkerId>,
+    /// Exact route catalog workers must advertise before this gateway can
+    /// select or dispatch work to them.
+    pub route_catalog_fingerprint: RouteCatalogFingerprint,
     /// PostgreSQL/Redis deployment namespace and projection configuration.
     pub coordination: CallServiceCoordinationConfig,
 }
@@ -269,6 +273,7 @@ impl fmt::Debug for CallControlRuntimeConfig {
             .field("control_key", &"[redacted]")
             .field("timeouts", &self.timeouts)
             .field("eligible_worker_count", &self.eligible_workers.len())
+            .field("route_catalog_fingerprint", &self.route_catalog_fingerprint)
             .field("coordination", &self.coordination)
             .finish()
     }
@@ -418,6 +423,7 @@ struct ControlRuntimeParts {
     coordination_outbox: Arc<dyn CoordinationOutbox>,
     projection: Arc<dyn CoordinationProjection>,
     eligible_workers: BTreeSet<WorkerId>,
+    route_catalog_fingerprint: RouteCatalogFingerprint,
 }
 
 struct RuntimeSupervisor {
@@ -1459,6 +1465,7 @@ pub async fn build_call_control_runtime(
             coordination_outbox: outbox,
             projection,
             eligible_workers: std::mem::take(&mut config.eligible_workers),
+            route_catalog_fingerprint: config.route_catalog_fingerprint,
         },
     )
 }
@@ -1476,6 +1483,7 @@ where
         RepositoryWorkerPlacement::new(Arc::clone(&core_repository))
             .with_projection(Arc::clone(&parts.projection))
             .with_allowed_workers(parts.eligible_workers)
+            .with_route_catalog_fingerprint(parts.route_catalog_fingerprint)
             .with_replacement_worker_guard(),
     );
     let service = Arc::new(CallService::new(
@@ -1530,8 +1538,15 @@ where
     let projection = coordination.projection();
     let core_repository: Arc<dyn CallRepository> = repository.clone();
     let service_repository: Arc<dyn CallServiceRepository> = repository;
+    let route_catalog_fingerprint =
+        RouteCatalogFingerprint::from_capabilities(&worker.capabilities)
+            .map_err(CallServiceRuntimeError::Repository)?;
     let placement = RepositoryWorkerPlacement::new(Arc::clone(&core_repository))
         .with_allowed_workers(BTreeSet::from([worker.lease.worker_id]));
+    let placement = match route_catalog_fingerprint {
+        Some(fingerprint) => placement.with_route_catalog_fingerprint(fingerprint),
+        None => placement,
+    };
     let placement = match projection.clone() {
         Some(projection) => placement.with_projection(projection),
         None => placement,
@@ -1744,6 +1759,7 @@ mod tests {
                 coordination_outbox: outbox,
                 projection,
                 eligible_workers: BTreeSet::from([worker.lease.worker_id]),
+                route_catalog_fingerprint: RouteCatalogFingerprint::new([0x63; 32]),
             },
         )
         .unwrap();
@@ -1813,6 +1829,7 @@ mod tests {
                     ending: Duration::from_secs(30),
                 },
                 eligible_workers: BTreeSet::new(),
+                route_catalog_fingerprint: RouteCatalogFingerprint::new([0x72; 32]),
                 coordination: CallServiceCoordinationConfig::new(
                     DeploymentId::parse("control-runtime-local-reject").unwrap(),
                 ),

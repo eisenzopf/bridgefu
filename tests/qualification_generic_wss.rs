@@ -1641,6 +1641,9 @@ async fn establish_browser_to_sips_call(
     }
 }
 
+// This end-to-end helper exposes the negotiated media expectations as independent inputs so
+// each browser/SIP destination case remains visible at its call site and in assertion output.
+#[allow(clippy::too_many_arguments)]
 async fn exercise_browser_sip_media_and_control(
     runtime: &CallServiceRuntime,
     orchestrator: &Orchestrator,
@@ -3580,7 +3583,7 @@ fn direct_browser_vapi_sip_to_generic_wss_handoff_is_connected_gated_and_resumab
 }
 
 #[test]
-#[ignore = "requires the pinned StandardCharter Playwright Chromium; run explicitly with --ignored"]
+#[ignore = "requires BridgeFu's pinned Playwright Chromium; run explicitly with --ignored"]
 fn built_typescript_sdk_hands_off_to_generic_wss_and_cleans_both_terminal_directions() {
     let _serial = QUALIFICATION_TEST_LOCK.lock().unwrap();
     std::thread::Builder::new()
@@ -4243,6 +4246,9 @@ async fn actual_chromium_wss_handoff(
                 .is_some_and(|binding| binding.binding_generation == successful_generation)
     })
     .await;
+    let bridge_destination_connection = active.call.bindings[&call.destination_leg_id]
+        .connection_id
+        .clone();
     call.browser.wait_for_phase("success-connected").await;
     assert_eq!(
         active.call.bindings[&call.source_leg_id].binding_generation,
@@ -4268,6 +4274,12 @@ async fn actual_chromium_wss_handoff(
             .payload_type,
         Some(111)
     );
+    // A real WSS agent continuously consumes its inbound media. Keep draining
+    // after the first asserted frame so the bounded rvoip track queue cannot
+    // fill and starve later RFC 4733 packets while Chromium keeps its
+    // microphone active.
+    let destination_audio_drain =
+        tokio::spawn(async move { while destination_audio.recv().await.is_some() {} });
     send_opus(&destination_stream, 1_248_000).await;
     call.browser.wait_for_phase("agent-audio").await;
     call.browser
@@ -4316,10 +4328,27 @@ async fn actual_chromium_wss_handoff(
     })
     .await;
     call.browser.wait_for_phase("remote-dtmf-ready").await;
+    let mut core_events = orchestrator.subscribe_events();
     destination_adapter
         .send_dtmf(successful_connection.clone(), "7", 140)
         .await
         .unwrap();
+    bounded("generic WSS DTMF reaches the BridgeFu core", async {
+        loop {
+            match core_events.recv().await {
+                Ok(Event::DtmfReceived {
+                    connection_id,
+                    digits,
+                    ..
+                }) if connection_id == bridge_destination_connection && digits == "7" => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("orchestrator event stream closed before generic WSS DTMF")
+                }
+            }
+        }
+    })
+    .await;
     destination_adapter
         .send_data_message(
             successful_connection.clone(),
@@ -4362,6 +4391,8 @@ async fn actual_chromium_wss_handoff(
             .unwrap();
     }
     let result = call.browser.complete().await;
+    destination_audio_drain.abort();
+    let _ = destination_audio_drain.await;
     crate::browser_sdk::assert_common_handoff_result(
         &result,
         &call_id_string,

@@ -477,6 +477,7 @@ async fn attachment_routes_are_owner_bound_revocable_expiring_and_fence_exact() 
     let route = AttachmentRouteHint {
         token_digest,
         worker: first_worker.lease,
+        route_catalog_fingerprint: None,
         transport: crate::call_engine::AttachmentTransport::Sip,
         tenant_binding,
         expires_at: instant() + TimeDelta::seconds(30),
@@ -577,6 +578,7 @@ async fn attachment_routes_are_owner_bound_revocable_expiring_and_fence_exact() 
             CoordinationPayload::AttachmentRoute(AttachmentRouteHint {
                 token_digest: third_digest,
                 worker: first_worker.lease,
+                route_catalog_fingerprint: None,
                 transport: lookup.transport,
                 tenant_binding,
                 expires_at: instant() + TimeDelta::seconds(45),

@@ -79,8 +79,8 @@ async fn register(repository: &MemoryRepository, max_calls: usize) -> WorkerLeas
             max_calls,
             capabilities: BTreeSet::from([
                 "sip".to_owned(),
-                "webrtc".to_owned(),
-                "twilio".to_owned(),
+                "webrtc_egress".to_owned(),
+                "telnyx".to_owned(),
             ]),
             at: at(0),
             lease_ttl: std::time::Duration::from_secs(300),
@@ -169,7 +169,7 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
         [
             LegSpec {
                 direction: LegDirection::Outbound,
-                kind: LegKind::Twilio,
+                kind: LegKind::Telnyx,
             },
             LegSpec {
                 direction: LegDirection::Inbound,
@@ -184,8 +184,8 @@ fn provider_create(owner: TenantId, worker: WorkerLease, key: u8) -> ServiceCrea
             LegExecutionSpec {
                 leg_id: initial.legs()[0].id(),
                 endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
-                    provider: ProviderKind::Twilio,
-                    account_profile: "twilio-sandbox".to_owned(),
+                    provider: ProviderKind::Telnyx,
+                    account_profile: "telnyx-sandbox".to_owned(),
                     destination: Some("+12065550100".to_owned()),
                 }),
             },
@@ -642,7 +642,7 @@ async fn create_atomically_falls_through_capacity_race_to_matching_worker_attach
         .register_worker(RegisterWorker {
             worker_id: WorkerId::new(),
             max_calls: 1,
-            capabilities: BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()]),
+            capabilities: BTreeSet::from(["sip".to_owned(), "webrtc_egress".to_owned()]),
             at: at(0),
             lease_ttl: Duration::from_secs(300),
         })
@@ -1538,8 +1538,8 @@ async fn control_operation_replays_expires_and_conflicts_with_other_receipt_kind
             max_calls: 8,
             capabilities: BTreeSet::from([
                 "sip".to_owned(),
-                "webrtc".to_owned(),
-                "twilio".to_owned(),
+                "webrtc_egress".to_owned(),
+                "telnyx".to_owned(),
             ]),
             at: at(86_409),
             lease_ttl: Duration::from_secs(300),
@@ -1815,8 +1815,8 @@ async fn control_claim_is_recovered_by_a_new_worker_fence() {
             max_calls: 8,
             capabilities: BTreeSet::from([
                 "sip".to_owned(),
-                "webrtc".to_owned(),
-                "twilio".to_owned(),
+                "webrtc_egress".to_owned(),
+                "telnyx".to_owned(),
             ]),
             at: at(12),
             lease_ttl: std::time::Duration::from_secs(300),
@@ -2424,7 +2424,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
             .unwrap(),
     );
     let provider_leg = service_call.call.aggregate.legs()[0].id();
-    let account = ProviderAccountKey::parse("twilio-sandbox").unwrap();
+    let account = ProviderAccountKey::parse("telnyx-sandbox").unwrap();
     let provider_call_id = ProviderCallId::parse("CA-before-reference").unwrap();
     let event_input = ProviderEventInput {
         account: account.clone(),
@@ -2529,7 +2529,7 @@ async fn reconciliation_atomically_releases_callback_binds_reference_and_commits
     else {
         panic!("expected provider reference")
     };
-    *wrong_account_key = ProviderAccountKey::parse("other-twilio-account").unwrap();
+    *wrong_account_key = ProviderAccountKey::parse("other-telnyx-account").unwrap();
     assert_eq!(
         repository.reconcile_effect_result(wrong_account).await,
         Err(RepositoryError::ProviderReferenceConflict)

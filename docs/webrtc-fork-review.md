@@ -7,19 +7,18 @@ maintainer contact.
 
 ## Authoritative release inputs
 
-The tracked and current Bridgefu and rvoip release declarations consume
-`webrtc` `0.20.0-alpha.1` from crates.io and patch `rtc` to the exact reviewed
-revision `1e5b7d4be6d94850694f2519f4c235d16c871d53`; Bridgefu's working lockfile
-again records that exact full Git source. Locked metadata succeeds in both
-repositories and reports the same revision, and Bridgefu passes
-`cargo check --locked -p bridgefu` against it. The validation runs below were
+Bridgefu now consumes exact crates.io
+`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.5 packages. The committed
+Cargo.lock records their registry checksums and contains no Git or path package
+source. The validation runs below predate that package migration and were
 performed while both manifests temporarily used
 `rtc = { path = "../rtc/rtc" }` and Bridgefu's generated lock entry was
 path-resolved. Those overrides have been removed. Because the restored base
-revision lacks the six-file fixes, the recorded RTC-dependent results remain
-local-composite validation rather than evidence for the authoritative release
-build. The local TURN and DTMF candidates described below are not pinned to
-fetchable candidate revisions and must not be represented as integrated.
+and candidate worktrees were not the current published graph, the recorded
+RTC-dependent results remain local-composite validation rather than evidence
+for the authoritative release build. The local TURN and DTMF candidates
+described below must not be represented as qualified in 0.3.5 until their
+behavior is rerun against the locked package set.
 
 ## Local candidate provenance
 
@@ -162,16 +161,16 @@ composite; the TypeScript SDK passes 20/20. Bridgefu library 328/328,
 `call_execution_supervisor` 39/39, and StandardCharter's 48 core, 11 web, and
 16 Python tests plus production web build are also green.
 
-Those results prove only the current composite local checkouts. They are not
-evidence that the crates.io alpha, the tracked immutable Git pin, or any
-published/private artifact contains the fix.
+Those results prove only the recorded composite local checkouts. They do not
+prove that the current published rvoip 0.3.5 package graph has equivalent
+behavior.
 
-Before integration, the project owner must review this six-file diff, approve
-its relationship to the TURN and NACK/statistics candidates, and approve an
-immutable revision on an owner-selected private remote. Only then may rvoip and
-Bridgefu pin that exact revision, restore lockfile provenance, and rerun the
-focused suites, full WebRTC regressions, all four exact Chromium destinations,
-and the StandardCharter regression gate.
+Qualification now requires rerunning the focused suites, full WebRTC
+regressions, all four exact Chromium destinations, and the StandardCharter
+regression gate against Bridgefu's committed Cargo.lock. If that exposes a
+missing engine fix, the project owner must review the minimal fork diff and
+approve a clean rvoip package update before Bridgefu changes versions. No fork
+push or upstream contact is authorized by this packet.
 
 ## Owner-review and adoption sequence
 

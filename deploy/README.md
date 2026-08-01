@@ -1,14 +1,56 @@
 # Deployment assets
 
-`deploy/Dockerfile` is the canonical release image definition. It requires an
-exact rvoip checkout as the named `rvoip` build context, runs as UID/GID 65532,
-and supports a read-only root filesystem. Its Rust and Debian bases are pinned
-to multi-platform manifest digests. Builder and runtime packages come from
-separate immutable Debian snapshots with explicit top-level package versions;
-`Cargo.lock`, the source revisions, commit-derived build date, and
-`SOURCE_DATE_EPOCH` complete the reproducible input record. This is a
-reproducible-input contract, not an unsupported claim that rustc produces a
-byte-identical layer on every BuildKit version and host.
+`deploy/Dockerfile` is the canonical release image definition. It resolves the
+exact crates.io `rvoip` 0.3.5 package set from the committed `Cargo.lock`; no
+separate rvoip checkout or named build context is required. The image runs as
+UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
+bases are pinned to multi-platform manifest digests. Builder and runtime
+packages come from separate immutable Debian snapshots with explicit top-level
+package versions; `Cargo.lock` registry checksums, the Bridgefu source revision,
+commit-derived build date, and `SOURCE_DATE_EPOCH` complete the reproducible
+input record. This is a reproducible-input contract, not an unsupported claim
+that rustc produces a byte-identical layer on every BuildKit version and host.
+
+## Release build hosts and targets
+
+The production artifacts are Linux containers for two 64-bit platforms:
+
+- `linux/amd64` covers both AMD and Intel x86-64 processors.
+- `linux/arm64` covers AArch64 servers and Apple Silicon through Docker's Linux
+  virtual machine. No 32-bit CPU target is released.
+
+macOS on Apple Silicon or Intel and Linux on either supported architecture can
+act as build hosts. A native single-platform build needs Docker. A combined
+candidate needs BuildKit with the Docker Buildx plugin; building the non-native
+platform on one host additionally needs QEMU/binfmt emulation. Native builders
+for both architectures are preferred for ordinary CI because they are faster
+and remove emulation from each architecture's compile result. Python 3 runs the
+OCI verifiers, and Trivy enforces the retained vulnerability policy. ShellCheck
+is required for the complete static CI replica.
+
+Run the static contract before sending any context to Docker:
+
+```sh
+bash deploy/scripts/check-release-image.sh
+```
+
+`.dockerignore` deliberately excludes local agent worktrees, SDK installs and
+browsers, Terraform caches/state, editor files, operator configuration and
+environment files, Compose-mounted `deploy/tls`, and common private-key and
+certificate formats. Docker does not honor `.gitignore`; removing these
+exclusions can leak local state into the builder context even when Git is clean.
+
+The protected `release-image-candidate.yml` workflow is the authoritative way
+to build the non-published `linux/amd64,linux/arm64` OCI archive with embedded
+SBOM and provenance and per-platform Trivy reports. It accepts only an exact
+clean 40-character commit, has no registry write permission, and retains the
+verified archive as a review artifact. A local host may reproduce that workflow
+with Buildx, QEMU, Python 3, and Trivy, but a native `docker build` proves only
+the host architecture.
+
+Allow at least 32 GB of memory and substantial build-cache space for a cold
+compile of the complete rvoip graph. A 32-vCPU, 128-GB RAM, 1.2-TB Linux runner
+is comfortably sized for parallel native jobs and retained OCI evidence.
 
 ## Local profiles
 
@@ -43,6 +85,26 @@ BRIDGEFU_TLS_DIR=/tmp/bridgefu-redis-tls \
   docker compose --profile cluster config --quiet
 ```
 
+### Route-catalog upgrade drain
+
+Split gateway/worker assignments persist the exact SHA-256 identity of their
+route and codec catalog. Bridgefu deliberately does not treat a legacy
+assignment without that identity as compatible with a fingerprinted worker,
+and it does not treat one fingerprint as compatible with another. Before the
+first fingerprinted deployment, or before changing any named route, outbound
+profile revision, target, transport, or codec catalog, stop new call admission
+and drain every affected stable worker ID to zero unreleased assignments. Also
+allow its terminal cleanup/outbox work to finish before restarting the worker
+or gateway with the changed catalog.
+
+Worker registration fails explicitly when the same worker ID still owns an
+unreleased legacy or differently fingerprinted assignment. Do not rotate the
+worker ID to bypass this gate: that strands the old assignment instead of
+making it compatible. If a complete drain cannot be demonstrated, abort the
+upgrade and keep or restore the exact preceding catalog. Release evidence must
+retain the zero-reservation drain observation, successful same-catalog worker
+registration, and rejection of a deliberately mismatched registration.
+
 Telnyx additionally requires `TELNYX_API_KEY`, `TELNYX_WEBHOOK_PUBLIC_KEY`,
 `TELNYX_CONNECTION_ID`, `TELNYX_FROM`, `TELNYX_MEDIA_SIP_AUTHORITY`, and
 `TELNYX_MEDIA_SIP_PASSWORD`. `TELNYX_MEDIA_SIP_USERNAME` defaults to
@@ -71,9 +133,10 @@ UCTP private forwarding. It also runs hermetic durable-call, bidirectional
 media, context/DataMessage, and shared-source broadcast lifecycle checks. It
 writes only hashes and byte counts for command output and removes
 cloud/provider/test-database credentials from child environments. Source
-evidence records Bridgefu and sibling rvoip revisions, tracked and untracked
-dirty state, and the exact resolved WebRTC, RTC, and moq-transport lockfile
-inputs without copying repository paths or dependency URLs:
+evidence records the Bridgefu revision and tracked/untracked dirty state, plus
+the exact resolved crates.io rvoip, WebRTC, RTC, and MOQT package versions and
+checksums from `Cargo.lock`, without copying repository paths or dependency
+URLs:
 
 The child environment strips all `BRIDGEFU_*`, `RVOIP_*`, `OTEL_*`, cloud,
 provider, and arbitrary Cargo/Rust behavior variables inherited from the
@@ -109,9 +172,14 @@ independent SPDX SBOM, and rejects HIGH or CRITICAL vulnerabilities.
 One combined digest is assembled only by the manual
 `release-image-candidate.yml` workflow. Configure required reviewers on its
 `bridgefu-release-image-candidate` environment before treating a run as
-authorized evidence. The workflow accepts full Bridgefu and rvoip commit IDs,
-has read-only repository permission, has no package or OIDC publication
-permission, and always uses `push: false`. It retains one OCI layout containing
+authorized evidence. GitHub accepts `workflow_dispatch` only after the workflow
+definition exists on the default branch, so the owner-reviewed candidate must
+first land on `main`; pushing a candidate branch alone does not make this gate
+runnable. Dispatch the landed workflow with that exact 40-character candidate
+commit. The workflow builds the exact crates.io dependency graph recorded in
+its `Cargo.lock`; it has
+read-only repository permission, has no package or OIDC publication permission,
+and always uses `push: false`. It retains one OCI layout containing
 `linux/amd64` and `linux/arm64`; BuildKit embeds SPDX SBOM and SLSA provenance
 statements. The verifier accepts only the layout root or one top-level image
 index (never a reachable child manifest), verifies every blob, binds each
@@ -137,12 +205,12 @@ systemctl daemon-reload
 systemctl enable --now bridgefu
 ```
 
-`deploy.sh` packages source with `git archive`; it requires exact
-`BRIDGEFU_REVISION` and `RVOIP_REVISION` commit IDs, verifies them locally, and
-expands them into a new remote release directory. It never rsyncs with
-`--delete` and never mutates an existing rvoip checkout. `RVOIP_DIR` defaults to
-the sibling `../rvoip` only as a local source of the explicitly requested
-commit. The Docker build captures an immutable local image ID in
+`deploy.sh` packages Bridgefu source with `git archive`; it requires and
+verifies an exact `BRIDGEFU_REVISION`, expands it into a new remote release
+directory, and runs `cargo build --locked` inside the canonical image. The
+exact rvoip 0.3.5 inputs come from crates.io and are verified against the
+checksums in the committed `Cargo.lock`; `RVOIP_DIR` and `RVOIP_REVISION` are
+not deployment inputs. The Docker build captures an immutable local image ID in
 `/etc/bridgefu/image.env`, then requires `/readyz` and `/livez`; a failed check
 restores the previous config and image ID when one exists.
 `RUNTIME_ENV` is required so `env:` secret references are passed to the

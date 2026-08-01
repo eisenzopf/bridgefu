@@ -2139,13 +2139,13 @@ impl From<bridgefu::secret_ref::SecretRefError> for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridgefu::call_engine::{BindingGeneration, CallId, EffectId, LegId, TenantId};
     use axum::body::Bytes;
     use axum::extract::{Path, State};
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::{Json, Router};
+    use bridgefu::call_engine::{BindingGeneration, CallId, EffectId, LegId, TenantId};
     use bridgefu::context::{ContextEnvelope, ContextPolicy};
     use ring::signature::KeyPair;
     use std::sync::atomic::{AtomicUsize, Ordering};

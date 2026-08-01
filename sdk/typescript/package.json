@@ -38,10 +38,12 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "browser:install": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "devDependencies": {
+    "playwright": "1.61.1",
     "typescript": "7.0.2"
   },
   "engines": {

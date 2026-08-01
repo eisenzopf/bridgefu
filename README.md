@@ -2,9 +2,9 @@
 
 ## Start here
 
-This working tree contains both the preserved Vapi-to-Amazon gateway and a
-larger Bridgefu 1.0 call-control platform. Use these three review artifacts
-before reading the subsystem documentation:
+This working tree contains both the preserved Vapi-to-Amazon gateway and the
+Bridgefu 0.9.0 customer preview of the larger 1.0 call-control platform. Use
+these three review artifacts before reading the subsystem documentation:
 
 - [Product overview](docs/product-overview.md) explains the exactly-two-leg
   model and the two intended Vapi/Amazon call journeys.
@@ -48,7 +48,7 @@ types can observe one source without competing for its receiver. See
 [provider matrix](docs/provider-capabilities.md). A typed call, transfer, DTMF,
 and broadcast walkthrough is in the [v1 API quick start](docs/api.md).
 
-This tree is an implementation branch toward 1.0, not a GA performance claim.
+Version 0.9.0 is a customer preview toward 1.0, not a GA performance claim.
 The ordered implementation gates and their evidence are tracked in the
 [Bridgefu 1.0 roadmap](docs/roadmap.md). Protocol and load requirements are
 also documented in
@@ -72,9 +72,14 @@ MOQT draft-19 qualification is recorded in the
 [fork review packet](docs/moq-fork-review.md). No upstream submission has been
 made.
 
-The separate, unintegrated WebRTC/RTC TURN candidate and its owner-review gate
-are recorded in the private [WebRTC fork review packet](docs/webrtc-fork-review.md).
-It has not been pinned, pushed, or submitted upstream.
+The coordinated WebRTC/RTC implementation is now consumed through the exact
+crates.io `rvoip` 0.3.5 package set and the checksums in `Cargo.lock`. Earlier
+local-candidate evidence and its qualification limits remain recorded in the
+[WebRTC fork review packet](docs/webrtc-fork-review.md). Current published-graph
+Chromium reruns pass for generic SIP, Amazon Connect, and Telnyx. Generic WSS
+is blocked by the outbound RFC 4733 defect tracked in
+[rvoip issue #54](https://github.com/eisenzopf/rvoip/issues/54); Bridgefu
+carries no local rvoip patch.
 
 Bridgefu is MIT licensed. Development and security-reporting expectations are
 in [CONTRIBUTING.md](CONTRIBUTING.md); unreleased compatibility changes are in
@@ -88,9 +93,9 @@ as the one-hour release gate.
 
 ## How it's built and deployed
 
-- Development uses a sibling `../rvoip` workspace because several reusable
-  crates are not yet published. Release inputs name exact Bridgefu and rvoip
-  revisions; floating branches are not release inputs.
+- Development and release builds use exact `=0.3.5` rvoip component packages
+  from crates.io. The committed `Cargo.lock` records their registry checksums
+  and complete transitive graph; a sibling rvoip checkout is not a build input.
 - The multi-stage image supports `linux/amd64` and `linux/arm64`, runs as a
   non-root user, and is compatible with a read-only root filesystem. The
   protected release-candidate workflow assembles one OCI index and verifies
@@ -381,9 +386,9 @@ in place:
 
 | Symptom | Fix |
 |---|---|
-| `docker build` killed / OOM (SIGKILL, signal 9) | Build host ran out of RAM. The full rvoip tree needs real memory — use `t4g.2xlarge` (32 GB) or larger; don't build on a 2 GB box. |
+| `docker build` killed / OOM (SIGKILL, signal 9) | Build host ran out of RAM. The full rvoip dependency graph needs real memory — use `t4g.2xlarge` (32 GB) or larger; don't build on a 2 GB box. |
 | `package X requires rustc 1.9x` | The AWS SDK crates float their MSRV above rvoip's declared 1.88. `deploy/Dockerfile` pins the builder to `rust:1.95`; bump it if a future `cargo update` raises the floor again. |
-| First build very slow | Expected — the full rvoip tree compiles once. Redeploys reuse cached layers. |
+| First build very slow | Expected — the full rvoip dependency graph compiles once. Redeploys reuse cached layers. |
 | `IMDS request timed out (not on EC2?)` | You're running off-EC2, or IMDSv2 is blocked. Set literal IPs for `advertised_ip` / `media_public_ip` instead of `auto`. |
 | Expected `X-` context is absent | Do not enable raw-header or attribute-value logging. Use synthetic values in the protected non-production workflow, inspect redacted context/admission counters and traces, and run the hermetic StandardCharter contract test to isolate mapping from carrier delivery. |
 | `AccessDenied` on StartWebRTCContact | Region mismatch (config vs Connect instance) or the contact flow isn't WebRTC-enabled; confirm `instance_id`/`contact_flow_id`. |
@@ -394,9 +399,8 @@ in place:
 ## Local development
 
 ```bash
-# Builds against ../rvoip (path dep). Requires the rvoip workspace checked out
-# as a sibling of this repo.
-cargo build
+# Resolves the exact crates.io rvoip 0.3.5 packages recorded in Cargo.lock.
+cargo build --locked
 export BRIDGEFU_API_TOKEN=dev-api-token
 export BRIDGEFU_CONTROL_HMAC_KEY=change-this-32-byte-control-key-now
 export BRIDGEFU_BROADCAST_TOKEN_SECRET=dev-broadcast-secret-change-me-32-bytes

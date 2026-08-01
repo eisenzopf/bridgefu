@@ -40,7 +40,7 @@ workflows.
 | Vapi | Runs the voice assistant and either transfers a Vapi-managed call to Bridgefu or receives a SIP call from Bridgefu in direct-browser mode. A Vapi tool can notify the application backend that escalation is required. |
 | Bridgefu | Authenticates and binds call attachments, owns the two-leg call state, translates media and allowed context, controls replacement, and reconciles teardown. |
 | Amazon Connect | Creates the inbound WebRTC contact, runs the configured contact flow, rings the agent, and renders the screen pop from contact attributes. |
-| rvoip | Supplies Bridgefu's SIP, RTP, WebRTC, media graph, authentication, and transport implementations. |
+| rvoip | Supplies Bridgefu's SIP, RTP, WebRTC, media graph, authentication, and transport implementations through exact crates.io 0.3.5 component packages recorded in `Cargo.lock`. |
 
 ## Workflow 1: Vapi SIP transfer to Amazon Connect
 
@@ -96,8 +96,9 @@ evidence rather than by expecting sensitive headers in normal logs.
 
 The relevant implementation starts in
 [`src/main.rs`](../src/main.rs),
-[`src/config.rs`](../src/config.rs), and the sibling rvoip
-`rvoip-amazon-connect` server. Amazon setup is described in
+[`src/config.rs`](../src/config.rs), and the crates.io
+`rvoip-amazon-connect` 0.3.5 server implementation pinned by `Cargo.lock`.
+Amazon setup is described in
 [`amazon-connect.md`](amazon-connect.md).
 
 ### Secure named-route SIP attachment
@@ -436,8 +437,8 @@ The repository distinguishes implemented behavior from release evidence.
   transfer, including preservation of the required headers;
 - live Amazon Connect and agent-screen-pop qualification for the current
   release candidate;
-- an owner-reviewed, clean, fetchable immutable RTC dependency containing the
-  DTMF/codec fixes used by the recorded exact-Chromium handoff runs;
+- a clean rerun of the exact-Chromium handoff matrix against the published,
+  locked rvoip 0.3.5 WebRTC/RTC packages;
 - TURN-only and public-NAT qualification;
 - built-SDK split gateway/worker Amazon execution;
 - process-restart recovery during the handoff matrix;
@@ -447,10 +448,10 @@ The repository distinguishes implemented behavior from release evidence.
   release.
 
 The exact-Chromium direct-browser matrix recorded in the roadmap used a
-temporary local RTC path override. The checkout has returned to the immutable
-`1e5b7d4...` RTC Git source, which does not include that candidate. Those runs
-are useful local-composite evidence, not reproducible release evidence from the
-current pins.
+temporary local RTC path override before the coordinated rvoip 0.3.1 packages
+were published. Those runs remain useful historical local-composite evidence,
+but they do not qualify the current crates.io package graph until the matrix is
+rerun with the committed `Cargo.lock`.
 
 The canonical status and remaining gates are in
 [`roadmap.md`](roadmap.md). Test counts elsewhere in the roadmap are historical

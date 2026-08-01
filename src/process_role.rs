@@ -18,6 +18,7 @@ use bridgefu::broadcast::{
     PostgresBroadcastCommandRepository, RedisBroadcastGrantConfig, RedisBroadcastGrantStore,
     WorkerBroadcastSubscriptionAuthority,
 };
+use bridgefu::call_engine::RouteCatalogFingerprint;
 use bridgefu::call_service::{
     build_call_service_runtime, AttachmentPrincipalResolver, CallControlRuntimeHealth,
     CallExecutionSupervisor, CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy,
@@ -62,6 +63,7 @@ use rvoip_sip::{
     SipInboundContextPolicy, SipInitialHeaders, SipListenerAuthPolicy, SipOriginateContext,
 };
 use rvoip_webrtc::{WebRtcOriginateContext, WebRtcTargetPolicy};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -346,8 +348,100 @@ fn gateway_egress_profiles(
     }))
 }
 
-fn worker_egress_routes(config: &Config) -> Result<Arc<PrivateEgressWorkerRouteCatalog>> {
+fn route_catalog_configuration_fingerprint(
+    configured_capabilities: &std::collections::BTreeSet<String>,
+    routes: &std::collections::BTreeMap<String, NamedRouteCfg>,
+) -> Result<RouteCatalogFingerprint> {
+    let capabilities = configured_capabilities
+        .iter()
+        .filter(|capability| !capability.starts_with("bridgefu.route_catalog.sha256:"))
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    hash_catalog_field(&mut hasher, b"bridgefu.route-catalog-configuration.v2");
+    hash_catalog_count(&mut hasher, capabilities.len());
+    for capability in capabilities {
+        hash_catalog_field(&mut hasher, capability.as_bytes());
+    }
+
+    hash_catalog_count(&mut hasher, routes.len());
+    for (route_id, route) in routes {
+        hash_catalog_field(&mut hasher, route_id.as_bytes());
+        hash_catalog_field(&mut hasher, route.tenant_id.as_bytes());
+        hasher.update([u8::from(route.legacy_embedded_destination)]);
+
+        hash_catalog_count(&mut hasher, route.ingress.len());
+        for ingress in &route.ingress {
+            hasher.update([match ingress {
+                crate::config::NamedRouteIngress::Sip => 1,
+                crate::config::NamedRouteIngress::Webrtc => 2,
+            }]);
+        }
+
+        let destination = serde_json::to_vec(&route.destination)
+            .context("encoding credential-free route destination for fingerprinting")?;
+        hash_catalog_field(&mut hasher, &destination);
+
+        let mut profiles = route
+            .profile_bindings
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("encoding route profile identities for fingerprinting")?;
+        profiles.sort();
+        hash_catalog_count(&mut hasher, profiles.len());
+        for profile in profiles {
+            hash_catalog_field(&mut hasher, &profile);
+        }
+
+        let metadata_keys = route
+            .context_metadata_allowlist
+            .iter()
+            .flat_map(|keys| keys.iter())
+            .collect::<Vec<_>>();
+        hash_catalog_count(&mut hasher, metadata_keys.len());
+        for key in metadata_keys {
+            hash_catalog_field(&mut hasher, key.as_bytes());
+        }
+
+        hash_catalog_count(&mut hasher, route.capability_policy.audio_codecs.len());
+        for codec in &route.capability_policy.audio_codecs {
+            hasher.update([match codec {
+                ProfileAudioCodec::Pcmu => 1,
+                ProfileAudioCodec::Pcma => 2,
+                ProfileAudioCodec::Opus => 3,
+            }]);
+        }
+        hash_catalog_optional_bool(&mut hasher, route.capability_policy.data_channels);
+        hash_catalog_optional_bool(&mut hasher, route.capability_policy.sip_message);
+    }
+    Ok(RouteCatalogFingerprint::new(hasher.finalize().into()))
+}
+
+fn hash_catalog_optional_bool(hasher: &mut Sha256, value: Option<bool>) {
+    hasher.update([match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }]);
+}
+
+fn hash_catalog_count(hasher: &mut Sha256, count: usize) {
+    hasher.update(u64::try_from(count).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+fn hash_catalog_field(hasher: &mut Sha256, value: &[u8]) {
+    hash_catalog_count(hasher, value.len());
+    hasher.update(value);
+}
+
+pub(crate) fn worker_egress_routes(
+    config: &Config,
+) -> Result<Arc<PrivateEgressWorkerRouteCatalog>> {
     let resolved = config.resolved_named_routes()?;
+    let fingerprint = route_catalog_configuration_fingerprint(
+        &config.call_worker_capabilities(),
+        &resolved.routes,
+    )?;
     let entries = resolved
         .routes
         .iter()
@@ -368,7 +462,7 @@ fn worker_egress_routes(config: &Config) -> Result<Arc<PrivateEgressWorkerRouteC
             }
         })
         .collect();
-    PrivateEgressWorkerRouteCatalog::new(entries)
+    PrivateEgressWorkerRouteCatalog::new_with_fingerprint(entries, fingerprint)
         .map_err(anyhow::Error::from)
         .context("building exact worker private-egress route catalog")
 }
@@ -1103,9 +1197,11 @@ impl GatewayEdgeFactory for AuthenticatedGatewayEdgeFactory {
                 .await
                 .map_err(|_| anyhow!("gateway attachment routing projection is unavailable"))?,
         );
+        let route_catalog_fingerprint = worker_egress_routes(config)?.fingerprint();
         let resolver = Arc::new(
             GatewayAttachmentResolver::new(projection, fingerprint_key)
-                .map_err(|_| anyhow!("gateway attachment resolver configuration is invalid"))?,
+                .map_err(|_| anyhow!("gateway attachment resolver configuration is invalid"))?
+                .with_route_catalog_fingerprint(route_catalog_fingerprint),
         );
         let database_url = config
             .persistence
@@ -1207,15 +1303,14 @@ impl GatewayEdgeFactory for AuthenticatedGatewayEdgeFactory {
                 native.egress_event_router(),
                 PrivateEgressGatewayProxyConfig {
                     media_setup_timeout: Duration::from_secs(
-                        config.runtime.setup_timeout_secs.min(30).max(1),
+                        config.runtime.setup_timeout_secs.clamp(1, 30),
                     ),
                     operation_timeout: Duration::from_secs(
                         config
                             .private_forwarding
                             .timeouts
                             .signaling_secs
-                            .min(30)
-                            .max(1),
+                            .clamp(1, 30),
                     ),
                 },
             )
@@ -1243,8 +1338,7 @@ impl GatewayEdgeFactory for AuthenticatedGatewayEdgeFactory {
                     .private_forwarding
                     .timeouts
                     .signaling_secs
-                    .min(10)
-                    .max(1),
+                    .clamp(1, 10),
             );
             let state_store: Arc<dyn PrivateEgressStateStore> =
                 RedisPrivateEgressStateStore::connect(state_config)
@@ -1266,8 +1360,7 @@ impl GatewayEdgeFactory for AuthenticatedGatewayEdgeFactory {
                             .private_forwarding
                             .timeouts
                             .signaling_secs
-                            .min(30)
-                            .max(1),
+                            .clamp(1, 30),
                     ),
                 },
                 gateway_epoch,
@@ -2092,6 +2185,9 @@ fn worker_capabilities_for_registered_adapters(
     registered_providers: &std::collections::BTreeSet<String>,
     private_egress_routes: Option<&PrivateEgressWorkerRouteCatalog>,
 ) -> std::collections::BTreeSet<String> {
+    if let Some(routes) = private_egress_routes {
+        configured.insert(routes.fingerprint().advertisement_capability());
+    }
     let sip_requested = configured.remove("sip_egress");
     if sip_requested
         && private_egress_routes
@@ -2192,8 +2288,7 @@ impl WorkerRoleRuntime {
                     .private_forwarding
                     .timeouts
                     .signaling_secs
-                    .min(30)
-                    .max(1),
+                    .clamp(1, 30),
             ),
         };
         let mut worker = Self::start_with_components(
@@ -2368,6 +2463,9 @@ impl WorkerRoleRuntime {
         .await
     }
 
+    // Startup keeps independently fallible authorities explicit so cleanup
+    // can report and drain the exact component that failed to initialize.
+    #[allow(clippy::too_many_arguments)]
     async fn start_with_components(
         runtime_config: CallServiceRuntimeConfig,
         admission_capacity: usize,
@@ -2625,7 +2723,7 @@ async fn wait_for_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
@@ -2635,7 +2733,8 @@ mod tests {
     use bridgefu::call_service::{
         AmazonConnectEndpointConfig, AmazonConnectStartSpec, CallRepositoryBackendConfig,
         CallServiceCoordinationConfig, CreateCallInput, IdempotencyKey, LegEndpointConfig,
-        RequestedLeg, WebRtcEndpointConfig,
+        NamedProfileBinding, NamedProfileKind, NamedProfileRole, ProviderEndpointConfig,
+        ProviderKind, RequestedLeg, WebRtcEndpointConfig,
     };
     use bridgefu::coordination::DeploymentId;
     use bridgefu::private_egress::{
@@ -2666,6 +2765,98 @@ sip: {advertised_ip: 127.0.0.1, media_public_ip: 127.0.0.1}
 
     fn parse(extra: &str) -> Config {
         serde_yaml::from_str(&format!("{BASE}\n{extra}")).expect("config parses")
+    }
+
+    fn provider_route(destination: &str, revision: char) -> NamedRouteCfg {
+        NamedRouteCfg {
+            tenant_id: "tenant-catalog".into(),
+            ingress: BTreeSet::from([crate::config::NamedRouteIngress::Webrtc]),
+            destination: RequestedLeg {
+                direction: LegDirection::Outbound,
+                signaling_initiator: Some(SignalingInitiator::Bridgefu),
+                media_flow: MediaFlow::SendReceive,
+                endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
+                    provider: ProviderKind::Telnyx,
+                    account_profile: "telnyx-primary".into(),
+                    destination: Some(destination.into()),
+                }),
+                amazon_connect_start: None,
+            },
+            vapi_ingress_profile: None,
+            webrtc_ingress_profile: Some("browser-primary".into()),
+            destination_profile: Some(crate::config::RouteDestinationProfileRef::Telnyx {
+                profile_id: "telnyx-primary".into(),
+            }),
+            legacy_embedded_destination: false,
+            profile_bindings: vec![
+                NamedProfileBinding::new(
+                    NamedProfileRole::Ingress,
+                    NamedProfileKind::WebRtc,
+                    "browser-primary",
+                    "a".repeat(64),
+                )
+                .unwrap(),
+                NamedProfileBinding::new(
+                    NamedProfileRole::Destination,
+                    NamedProfileKind::Telnyx,
+                    "telnyx-primary",
+                    revision.to_string().repeat(64),
+                )
+                .unwrap(),
+            ],
+            context_metadata_allowlist: None,
+            capability_policy: crate::config::NamedRouteCapabilityPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn catalog_fingerprint_is_canonical_and_tracks_provider_routes_and_capabilities() {
+        let capabilities = BTreeSet::from([
+            "telnyx".to_owned(),
+            "webrtc".to_owned(),
+            "webrtc_egress".to_owned(),
+        ]);
+        let routes = BTreeMap::from([
+            ("support".to_owned(), provider_route("+12065550100", 'b')),
+            ("sales".to_owned(), provider_route("+12065550101", 'c')),
+        ]);
+        let baseline = route_catalog_configuration_fingerprint(&capabilities, &routes).unwrap();
+
+        let reordered_capabilities = BTreeSet::from([
+            "webrtc_egress".to_owned(),
+            "webrtc".to_owned(),
+            "telnyx".to_owned(),
+        ]);
+        let reordered_routes = BTreeMap::from([
+            ("sales".to_owned(), provider_route("+12065550101", 'c')),
+            ("support".to_owned(), provider_route("+12065550100", 'b')),
+        ]);
+        assert_eq!(
+            baseline,
+            route_catalog_configuration_fingerprint(&reordered_capabilities, &reordered_routes)
+                .unwrap()
+        );
+
+        let mut changed_destination = routes.clone();
+        changed_destination.insert("support".into(), provider_route("+12065550999", 'b'));
+        assert_ne!(
+            baseline,
+            route_catalog_configuration_fingerprint(&capabilities, &changed_destination).unwrap()
+        );
+
+        let mut changed_profile = routes.clone();
+        changed_profile.insert("support".into(), provider_route("+12065550100", 'd'));
+        assert_ne!(
+            baseline,
+            route_catalog_configuration_fingerprint(&capabilities, &changed_profile).unwrap()
+        );
+
+        let mut changed_capabilities = capabilities;
+        changed_capabilities.insert("amazon_connect".into());
+        assert_ne!(
+            baseline,
+            route_catalog_configuration_fingerprint(&changed_capabilities, &routes).unwrap()
+        );
     }
 
     struct NoopPrivateEgressHandler;
@@ -3887,6 +4078,7 @@ private_forwarding:
                 Some(sip_routes.as_ref()),
             ),
             BTreeSet::from([
+                sip_routes.fingerprint().advertisement_capability(),
                 "sip".to_owned(),
                 "sip_egress".to_owned(),
                 "webrtc".to_owned(),
@@ -3914,6 +4106,7 @@ private_forwarding:
                 codecs: vec![CodecInfo::from_name_with_defaults("g.711-mu")],
             }])
             .unwrap();
+        let route_catalog_capability = route.fingerprint().advertisement_capability();
         let worker = WorkerRoleRuntime::start_with_components(
             CallServiceRuntimeConfig {
                 backend: CallRepositoryBackendConfig::Memory,
@@ -3956,6 +4149,11 @@ private_forwarding:
             .worker()
             .capabilities
             .contains("sip_egress"));
+        assert!(worker
+            .call_runtime
+            .worker()
+            .capabilities
+            .contains(&route_catalog_capability));
         assert!(!worker
             .call_runtime
             .worker()

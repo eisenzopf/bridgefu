@@ -2786,7 +2786,7 @@ mod direct_assistant_handoff {
     }
 
     #[test]
-    #[ignore = "requires the pinned StandardCharter Playwright Chromium; run explicitly with --ignored"]
+    #[ignore = "requires BridgeFu's pinned Playwright Chromium; run explicitly with --ignored"]
     fn built_typescript_sdk_hands_off_to_amazon_and_cleans_both_terminal_directions() {
         let _serial = AMAZON_QUALIFICATION_TEST_LOCK.lock().unwrap();
         std::thread::Builder::new()

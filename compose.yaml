@@ -3,8 +3,6 @@ name: bridgefu
 x-bridgefu-build: &bridgefu-build
   context: .
   dockerfile: deploy/Dockerfile
-  additional_contexts:
-    rvoip: ../rvoip
 
 x-bridgefu-environment: &bridgefu-environment
   BRIDGEFU_API_TOKEN: ${BRIDGEFU_API_TOKEN:-development-api-token}

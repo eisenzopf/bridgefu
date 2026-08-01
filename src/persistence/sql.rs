@@ -41,16 +41,16 @@ use crate::call_engine::{
     WorkerId, WorkerLease, WorkerSnapshot,
 };
 use crate::call_service::{
-    BoundConnectionStateCommit, CallServiceRepository, ClaimedControlEffect,
-    CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction, ControlIntent,
-    ControlOutboxRecord, EffectResultOutcome, EffectResultReconciliation, ExternalReferenceValue,
-    InitialContextRecordOutcome, InitialContextRecordRequest, LegEndpointConfig,
-    MediaActivityCommit, OperationIdempotencyReceipt, OutboundConnectionBind,
-    OutboundConnectionBindOutcome, ProviderEventReconciliationOutcome,
-    ProviderEventReconciliationTransaction, ServiceCommandOutcome, ServiceCommandTransaction,
-    ServiceCommandView, ServiceCreateOutcome, ServiceCreateTransaction, ServiceEffectPayload,
-    ServiceEffectResult, ServiceOperationKind, StoredExternalReference, StoredInitialContext,
-    StoredServiceCall, StoredServiceEffectPayload,
+    BoundConnectionStateCommit, BoundSourceTerminationCommit, CallServiceRepository,
+    ClaimedControlEffect, CompletedServiceEffect, ControlCommandOutcome, ControlCommandTransaction,
+    ControlCommandView, ControlIntent, ControlOutboxRecord, EffectResultOutcome,
+    EffectResultReconciliation, ExternalReferenceValue, InitialContextRecordOutcome,
+    InitialContextRecordRequest, LegEndpointConfig, MediaActivityCommit,
+    OperationIdempotencyReceipt, OutboundConnectionBind, OutboundConnectionBindOutcome,
+    ProviderEventReconciliationOutcome, ProviderEventReconciliationTransaction,
+    ServiceCommandOutcome, ServiceCommandTransaction, ServiceCommandView, ServiceCreateOutcome,
+    ServiceCreateTransaction, ServiceEffectPayload, ServiceEffectResult, ServiceOperationKind,
+    StoredExternalReference, StoredInitialContext, StoredServiceCall, StoredServiceEffectPayload,
 };
 use crate::coordination::{
     AttachmentRouteHint, CallRouteHint, CoordinationPayload, DeploymentId,
@@ -705,6 +705,11 @@ fn coordination_payloads(
             payloads.push(CoordinationPayload::AttachmentRoute(AttachmentRouteHint {
                 token_digest: attachment.token_digest,
                 worker: attachment.worker,
+                route_catalog_fingerprint: after
+                    .calls
+                    .iter()
+                    .find(|call| call.aggregate.id() == attachment.call_id)
+                    .and_then(|call| call.assignment.route_catalog_fingerprint),
                 transport: attachment.transport,
                 tenant_binding: attachment.expected_principal,
                 // Coordination hints are deliberately bounded even if an
@@ -4164,6 +4169,19 @@ macro_rules! impl_call_service_repository {
                     .await
             }
 
+            async fn commit_bound_source_termination(
+                &self,
+                request: BoundSourceTerminationCommit,
+            ) -> Result<ServiceCommandOutcome, RepositoryError> {
+                self.inner
+                    .transaction(move |repository| {
+                        Box::pin(async move {
+                            repository.commit_bound_source_termination(request).await
+                        })
+                    })
+                    .await
+            }
+
             async fn commit_media_activity(
                 &self,
                 request: MediaActivityCommit,
@@ -4209,6 +4227,34 @@ macro_rules! impl_call_service_repository {
                         Box::pin(async move {
                             repository
                                 .load_service_command_replay(
+                                    &tenant_id,
+                                    call_id,
+                                    key_digest,
+                                    request_digest,
+                                    operation,
+                                    at,
+                                )
+                                .await
+                        })
+                    })
+                    .await
+            }
+
+            async fn load_control_command_replay(
+                &self,
+                tenant_id: &TenantId,
+                call_id: CallId,
+                key_digest: crate::call_engine::IdempotencyKeyDigest,
+                request_digest: crate::call_engine::RequestDigest,
+                operation: ServiceOperationKind,
+                at: DateTime<Utc>,
+            ) -> Result<Option<ControlCommandView>, RepositoryError> {
+                let tenant_id = tenant_id.clone();
+                self.inner
+                    .read(move |repository| {
+                        Box::pin(async move {
+                            repository
+                                .load_control_command_replay(
                                     &tenant_id,
                                     call_id,
                                     key_digest,

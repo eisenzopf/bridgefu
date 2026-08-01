@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,22 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
+pub const COORDINATED_RVOIP_VERSION: &str = "0.3.5";
 const LATENCY_MAX_US: u64 = 1_000_000;
+pub const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
+    "rvoip-amazon-connect",
+    "rvoip-auth-core",
+    "rvoip-core",
+    "rvoip-media-core",
+    "rvoip-moq",
+    "rvoip-quic",
+    "rvoip-redis",
+    "rvoip-sip",
+    "rvoip-uctp",
+    "rvoip-webrtc",
+    "rvoip-webrtc-stack",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +68,21 @@ impl QualificationMode {
 pub struct RevisionEvidence {
     revision: String,
     dirty: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CargoPackageEvidence {
+    name: String,
+    version: String,
+    source: String,
+    checksum: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RvoipRegistryEvidence {
+    release_version: &'static str,
+    lockfile: &'static str,
+    packages: Vec<CargoPackageEvidence>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +223,63 @@ pub fn git_revision(path: &Path) -> RevisionEvidence {
     }
 }
 
+pub fn rvoip_registry_evidence(manifest_dir: &Path) -> RvoipRegistryEvidence {
+    let lockfile = fs::read_to_string(manifest_dir.join("Cargo.lock"))
+        .expect("read Bridgefu Cargo.lock for rvoip dependency evidence");
+    let mut packages = parse_lock_packages(&lockfile)
+        .into_iter()
+        .filter(|package| package.name.starts_with("rvoip-"))
+        .map(|package| {
+            assert_eq!(
+                package.version, COORDINATED_RVOIP_VERSION,
+                "{} must resolve to the coordinated rvoip release",
+                package.name
+            );
+            assert_eq!(
+                package.source.as_deref(),
+                Some(CRATES_IO_REGISTRY_SOURCE),
+                "{} must resolve from the crates.io registry",
+                package.name
+            );
+            let checksum = package
+                .checksum
+                .filter(|checksum| {
+                    checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .unwrap_or_else(|| panic!("{} must have a Cargo.lock checksum", package.name));
+            CargoPackageEvidence {
+                name: package.name,
+                version: package.version,
+                source: package.source.expect("validated registry source"),
+                checksum,
+            }
+        })
+        .collect::<Vec<_>>();
+    packages.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let package_names = packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        package_names.len(),
+        packages.len(),
+        "Cargo.lock must contain one coordinated version of each rvoip package"
+    );
+    for required in REQUIRED_RVOIP_PACKAGES {
+        assert!(
+            package_names.contains(required),
+            "Cargo.lock is missing required coordinated package {required}"
+        );
+    }
+
+    RvoipRegistryEvidence {
+        release_version: COORDINATED_RVOIP_VERSION,
+        lockfile: "Cargo.lock",
+        packages,
+    }
+}
+
 pub fn host_evidence() -> HostEvidence {
     HostEvidence {
         os: env::consts::OS,
@@ -266,4 +354,66 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Default)]
+struct LockPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+fn parse_lock_packages(lockfile: &str) -> Vec<LockPackage> {
+    let mut packages = Vec::new();
+    let mut current = None;
+    for line in lockfile.lines().map(str::trim) {
+        if line == "[[package]]" {
+            if let Some(package) = current.take() {
+                packages.push(package);
+            }
+            current = Some(LockPackage::default());
+            continue;
+        }
+        let Some(package) = current.as_mut() else {
+            continue;
+        };
+        if let Some(value) = lock_string_value(line, "name") {
+            package.name = value.to_string();
+        } else if let Some(value) = lock_string_value(line, "version") {
+            package.version = value.to_string();
+        } else if let Some(value) = lock_string_value(line, "source") {
+            package.source = Some(value.to_string());
+        } else if let Some(value) = lock_string_value(line, "checksum") {
+            package.checksum = Some(value.to_string());
+        }
+    }
+    if let Some(package) = current {
+        packages.push(package);
+    }
+    packages
+}
+
+fn lock_string_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let (name, value) = line.split_once('=')?;
+    if name.trim() != field {
+        return None;
+    }
+    value.trim().strip_prefix('"')?.strip_suffix('"')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_evidence_uses_the_coordinated_checked_release() {
+        let evidence = rvoip_registry_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert_eq!(evidence.release_version, "0.3.5");
+        assert!(evidence.packages.iter().all(|package| {
+            package.version == "0.3.5"
+                && package.source == CRATES_IO_REGISTRY_SOURCE
+                && package.checksum.len() == 64
+        }));
+    }
 }

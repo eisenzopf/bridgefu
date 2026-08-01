@@ -1,18 +1,14 @@
-import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 
 const baseUrl = process.env.BRIDGEFU_BROWSER_QUALIFICATION_URL;
-const standardcharterWeb = process.env.BRIDGEFU_STANDARDCHARTER_WEB;
 if (!baseUrl) throw new Error("BRIDGEFU_BROWSER_QUALIFICATION_URL is required");
-if (!standardcharterWeb) throw new Error("BRIDGEFU_STANDARDCHARTER_WEB is required");
 
-const requireFromStandardcharter = createRequire(resolve(standardcharterWeb, "package.json"));
-const { chromium } = requireFromStandardcharter("playwright");
+process.env.PLAYWRIGHT_BROWSERS_PATH ??= "0";
+const { chromium } = await import("playwright");
 const executablePath = chromium.executablePath();
 if (!existsSync(executablePath)) {
   throw new Error(
-    `Playwright Chromium is absent at ${executablePath}; install the pinned StandardCharter browser first`,
+    `Playwright Chromium is absent at ${executablePath}; run npm run browser:install in sdk/typescript`,
   );
 }
 

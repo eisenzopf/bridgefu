@@ -1715,6 +1715,9 @@ impl TransferTarget {
 }
 
 /// Additional service-owned data required to execute a core outbox effect.
+// The larger replacement payload is a persisted wire shape. Boxing it would
+// break the stable JSON representation for negligible queue-scale savings.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceEffectPayload {

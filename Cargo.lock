@@ -224,117 +224,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-channel"
-version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81953c529336010edd6d8e358f886d9581267795c61b19475b71314bffa46d35"
-dependencies = [
- "concurrent-queue",
- "event-listener 2.5.3",
- "futures-core",
-]
-
-[[package]]
-name = "async-channel"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
-dependencies = [
- "concurrent-queue",
- "event-listener-strategy",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-executor"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
-dependencies = [
- "async-task",
- "concurrent-queue",
- "fastrand",
- "futures-lite",
- "pin-project-lite",
- "slab",
-]
-
-[[package]]
-name = "async-global-executor"
-version = "2.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b1b633a2115cd122d73b955eadd9916c18c8f510ec9cd1686404c60ad1c29c"
-dependencies = [
- "async-channel 2.5.0",
- "async-executor",
- "async-io",
- "async-lock",
- "blocking",
- "futures-lite",
- "once_cell",
-]
-
-[[package]]
-name = "async-io"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "456b8a8feb6f42d237746d4b3e9a178494627745c3c56c6ea55d92ba50d026fc"
-dependencies = [
- "autocfg",
- "cfg-if",
- "concurrent-queue",
- "futures-io",
- "futures-lite",
- "parking",
- "polling",
- "rustix",
- "slab",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener",
  "event-listener-strategy",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "async-std"
-version = "1.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c8e079a4ab67ae52b7403632e4618815d6db36d2a010cfe41b02c1b1578f93b"
-dependencies = [
- "async-channel 1.9.0",
- "async-global-executor",
- "async-io",
- "async-lock",
- "crossbeam-utils",
- "futures-channel",
- "futures-core",
- "futures-io",
- "futures-lite",
- "gloo-timers",
- "kv-log-macro",
- "log",
- "memchr",
- "once_cell",
- "pin-project-lite",
- "pin-utils",
- "slab",
- "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "async-task"
-version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
 name = "async-trait"
@@ -966,21 +864,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "blocking"
-version = "1.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83f8d02be6967315521be875afa792a316e28d57b5a2d401897e2a7921b7f21"
-dependencies = [
- "async-channel 2.5.0",
- "async-task",
- "futures-io",
- "futures-lite",
- "piper",
-]
-
-[[package]]
 name = "bridgefu"
-version = "0.1.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1017,6 +902,7 @@ dependencies = [
  "rvoip-sip",
  "rvoip-uctp",
  "rvoip-webrtc",
+ "rvoip-webrtc-stack",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -1036,7 +922,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "webrtc",
  "zeroize",
 ]
 
@@ -1809,12 +1694,6 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "2.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
-
-[[package]]
-name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
@@ -1830,7 +1709,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
- "event-listener 5.4.1",
+ "event-listener",
  "pin-project-lite",
 ]
 
@@ -1994,19 +1873,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
-name = "futures-lite"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
-dependencies = [
- "fastrand",
- "futures-core",
- "futures-io",
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
 name = "futures-macro"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2104,18 +1970,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
-]
-
-[[package]]
-name = "gloo-timers"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
-dependencies = [
- "futures-channel",
- "futures-core",
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2866,15 +2720,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kv-log-macro"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0de8b303297635ad57c9f5059fd9cee7a47f8e8daa09df0fcd07dd39fb22977f"
-dependencies = [
- "log",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2959,9 +2804,6 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
-dependencies = [
- "value-bag",
-]
 
 [[package]]
 name = "lru-slab"
@@ -3113,81 +2955,13 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "equivalent",
- "event-listener 5.4.1",
+ "event-listener",
  "futures-util",
  "parking_lot",
  "portable-atomic",
  "smallvec",
  "tagptr",
  "uuid",
-]
-
-[[package]]
-name = "moq-native-ietf"
-version = "0.8.0"
-source = "git+https://github.com/eisenzopf/moq-rs?rev=ef52ac8656513bb3b07b4b9b80152ac24bb2467e#ef52ac8656513bb3b07b4b9b80152ac24bb2467e"
-dependencies = [
- "anyhow",
- "clap",
- "futures",
- "hex",
- "http 1.4.2",
- "moq-transport",
- "quinn",
- "rand 0.8.7",
- "ring",
- "rustls 0.23.42",
- "rustls-native-certs 0.7.3",
- "rustls-pemfile",
- "socket2 0.5.10",
- "tokio",
- "tracing",
- "url",
- "web-transport",
- "web-transport-quinn",
- "webpki",
-]
-
-[[package]]
-name = "moq-relay-ietf"
-version = "0.7.18"
-source = "git+https://github.com/eisenzopf/moq-rs?rev=ef52ac8656513bb3b07b4b9b80152ac24bb2467e#ef52ac8656513bb3b07b4b9b80152ac24bb2467e"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "hex",
- "metrics 0.24.6",
- "moq-native-ietf",
- "moq-transport",
- "ring",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "web-transport",
-]
-
-[[package]]
-name = "moq-transport"
-version = "0.14.2"
-source = "git+https://github.com/eisenzopf/moq-rs?rev=ef52ac8656513bb3b07b4b9b80152ac24bb2467e#ef52ac8656513bb3b07b4b9b80152ac24bb2467e"
-dependencies = [
- "bytes",
- "futures",
- "paste",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "web-transport",
 ]
 
 [[package]]
@@ -3656,17 +3430,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
-name = "piper"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c835479a4443ded371d6c535cbfd8d31ad92c5d23ae9770a61bc155e4992a3c1"
-dependencies = [
- "atomic-waker",
- "fastrand",
- "futures-io",
-]
-
-[[package]]
 name = "pkcs1"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3698,20 +3461,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "polling"
-version = "3.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0e4f59085d47d8241c88ead0f274e8a0cb551f3625263c05eb8dd897c34218"
-dependencies = [
- "cfg-if",
- "concurrent-queue",
- "hermit-abi",
- "pin-project-lite",
- "rustix",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "poly1305"
@@ -4485,43 +4234,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtc"
-version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
-dependencies = [
- "bytes",
- "hex",
- "log",
- "rand 0.9.5",
- "rcgen",
- "ring",
- "rtc-datachannel",
- "rtc-dtls",
- "rtc-ice",
- "rtc-interceptor",
- "rtc-mdns",
- "rtc-media",
- "rtc-rtcp",
- "rtc-rtp",
- "rtc-sctp",
- "rtc-sdp",
- "rtc-shared",
- "rtc-srtp",
- "rtc-stun",
- "rtc-turn",
- "rustls 0.23.42",
- "sansio",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "unicase",
- "url",
-]
-
-[[package]]
 name = "rtc-datachannel"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19b532151afaf5f8af7f36b8a57e687dd5ed238117cd29d4bf3a3f68fa8fe035"
 dependencies = [
  "bytes",
  "log",
@@ -4533,7 +4249,8 @@ dependencies = [
 [[package]]
 name = "rtc-dtls"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "067a19d0491fa2b09363bf9fdab2b3889447498844da092f875a1de9968750d0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4566,7 +4283,8 @@ dependencies = [
 [[package]]
 name = "rtc-ice"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c90a85ecfc2b18ee7697342974afa55d36667d9ca7bec3a5eae63322da997c"
 dependencies = [
  "bytes",
  "crc",
@@ -4584,7 +4302,8 @@ dependencies = [
 [[package]]
 name = "rtc-interceptor"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5d531f43e290ee72bc782225ecb23d82b38994d69b6c8db9fbdc8eed07ed35e"
 dependencies = [
  "log",
  "rand 0.9.5",
@@ -4598,7 +4317,8 @@ dependencies = [
 [[package]]
 name = "rtc-interceptor-derive"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39d78fc2ae7d5e99881d6604a972e99d97d839e5b3d0668018f82f0faa9bfb7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4608,7 +4328,8 @@ dependencies = [
 [[package]]
 name = "rtc-mdns"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57deeaa15ece574bf4b6ecd697e4b036aff0bc042e56fb811921eef063a2fdd5"
 dependencies = [
  "bytes",
  "log",
@@ -4620,7 +4341,8 @@ dependencies = [
 [[package]]
 name = "rtc-media"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f73afea835cfb207f22f4a22952538e3c7cc0ab14dee913b702134178adf2462"
 dependencies = [
  "byteorder",
  "bytes",
@@ -4633,7 +4355,8 @@ dependencies = [
 [[package]]
 name = "rtc-rtcp"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b922f475a00c6f853b0c4a3d66c9984fceed368f56dba5fe82af3aff1c77edc7"
 dependencies = [
  "bytes",
  "rtc-shared",
@@ -4642,7 +4365,8 @@ dependencies = [
 [[package]]
 name = "rtc-rtp"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1076beeb0f13d4d38e7fe23c46896de638eeea9a7f2cb13209c31c42d37fe290"
 dependencies = [
  "bytes",
  "memchr",
@@ -4654,7 +4378,8 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d63968f1f8c2c016d04fc16c5a43608772e5b02f9657eed659273dd01b825f7"
 dependencies = [
  "bytes",
  "crc",
@@ -4668,7 +4393,8 @@ dependencies = [
 [[package]]
 name = "rtc-sdp"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8598470804b29e4f3d3486226b43f84db6c0f64311bd1c9e8ec1d9172c3e4c3"
 dependencies = [
  "rand 0.9.5",
  "rtc-shared",
@@ -4678,7 +4404,8 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b76f42332957719c1922bc9a4ba67ed348d12fca8705c3df171c44058d8f90"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4699,7 +4426,8 @@ dependencies = [
 [[package]]
 name = "rtc-srtp"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91a79f9ac2db5fb54358d6ec6d51dcee64088507f2035b743f28dc9eabac7de5"
 dependencies = [
  "aead",
  "aes",
@@ -4718,7 +4446,8 @@ dependencies = [
 [[package]]
 name = "rtc-stun"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4492e747d6468f0e69f5e186639b4075cb777a9a983be5c7d51493c2a05245"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4736,7 +4465,8 @@ dependencies = [
 [[package]]
 name = "rtc-turn"
 version = "0.20.0-alpha.1"
-source = "git+https://github.com/eisenzopf/rtc?rev=1e5b7d4be6d94850694f2519f4c235d16c871d53#1e5b7d4be6d94850694f2519f4c235d16c871d53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c52c4a3b6d9fea3cb7d1365ff88ee1610ac6c57d0ee126b3b4a26b5debdda6f"
 dependencies = [
  "bytes",
  "log",
@@ -4935,7 +4665,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rvoip-amazon-connect"
-version = "0.1.3"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cca6317886caa626287e0037452b2f5485c1dc86c52df8ab5da756ccf3d786f"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4968,7 +4700,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-auth-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928072029143fd44922ed3d930b3329942f9a00b9ffd4a61063942c3a55ce42f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4996,8 +4730,11 @@ dependencies = [
 
 [[package]]
 name = "rvoip-codec-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "176c9b6ab1b50e5e345c6394a194892bd897dda2602bfc79678fdc0c376949c3"
 dependencies = [
+ "opus",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
@@ -5005,9 +4742,12 @@ dependencies = [
 
 [[package]]
 name = "rvoip-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44d300cb616e6d1b312ec6a75b8c7f23dacb921337518a6dbdfde33bc20c4d52"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dashmap",
@@ -5015,6 +4755,7 @@ dependencies = [
  "rvoip-core-traits",
  "rvoip-infra-common",
  "rvoip-media-core",
+ "rvoip-vcon",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5026,7 +4767,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-core-traits"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efd3dd6caa0538530d29460cd50b8ba5dad9f51d1d9a2d018edc196615aab0f2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5042,7 +4785,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-infra-common"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b80f4d5f88b7cab657f5897bbe04a962e644627e9a9a626643756eceb7deaf0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5063,11 +4808,12 @@ dependencies = [
 
 [[package]]
 name = "rvoip-media-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8055514ad62d3e0a3b974ee3a961d347b74e455df9c0a8110953942ca0b3fd5a"
 dependencies = [
  "anyhow",
  "apodize",
- "async-std",
  "async-trait",
  "biquad",
  "bytes",
@@ -5077,7 +4823,6 @@ dependencies = [
  "num-complex",
  "num_cpus",
  "once_cell",
- "opus",
  "parking_lot",
  "rand 0.8.7",
  "rustfft",
@@ -5095,18 +4840,20 @@ dependencies = [
 
 [[package]]
 name = "rvoip-moq"
-version = "0.1.0"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c25124db3d2221e2ede1528ea9198f1a9de27285cea9be0b82d6264d1428ac0"
 dependencies = [
  "async-trait",
  "bytes",
  "chrono",
  "futures",
  "metrics 0.23.1",
- "moq-native-ietf",
- "moq-relay-ietf",
- "moq-transport",
  "rvoip-auth-core",
  "rvoip-core-traits",
+ "rvoip-moq-native",
+ "rvoip-moq-relay",
+ "rvoip-moq-transport",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5120,8 +4867,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvoip-moq-native"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04f12770192c008a9a85f863a946d61eb503245ffeeebf93dcfba34edb3f77c3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "hex",
+ "http 1.4.2",
+ "quinn",
+ "rand 0.8.7",
+ "ring",
+ "rustls 0.23.42",
+ "rustls-native-certs 0.7.3",
+ "rustls-pemfile",
+ "rvoip-moq-transport",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
+ "url",
+ "web-transport",
+ "web-transport-quinn",
+ "webpki",
+]
+
+[[package]]
+name = "rvoip-moq-relay"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb6ea4d5b3c91fa09a3a7060caf6e111a74b63107de4878e1183a5cea032baa0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "metrics 0.24.6",
+ "ring",
+ "rvoip-moq-native",
+ "rvoip-moq-transport",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "web-transport",
+]
+
+[[package]]
+name = "rvoip-moq-transport"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cff6b1c25592a15e6d21ab9bd6400292824301f3a5b24aa1c72f14db8156431"
+dependencies = [
+ "bytes",
+ "futures",
+ "paste",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "web-transport",
+]
+
+[[package]]
 name = "rvoip-quic"
-version = "0.2.0"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebf81c855a250a1180e951024a7d51066be8219562f54ad5fc5d75467e0c6824"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5144,7 +4964,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-redis"
-version = "0.1.3"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a07a7cc6755bc84179bcf6d1362658057c2cb06adfad674ac11ab27b34a1f3a8"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5158,8 +4980,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvoip-rtc"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c8f847e10d2cd6d59248ebc94c7d79d128c78d20c925316918b678ca539e40b"
+dependencies = [
+ "bytes",
+ "hex",
+ "log",
+ "rand 0.9.5",
+ "rcgen",
+ "ring",
+ "rtc-datachannel",
+ "rtc-dtls",
+ "rtc-ice",
+ "rtc-interceptor",
+ "rtc-interceptor-derive",
+ "rtc-mdns",
+ "rtc-media",
+ "rtc-rtcp",
+ "rtc-rtp",
+ "rtc-sctp",
+ "rtc-sdp",
+ "rtc-shared",
+ "rtc-srtp",
+ "rtc-stun",
+ "rtc-turn",
+ "rustls 0.23.42",
+ "sansio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "unicase",
+ "url",
+]
+
+[[package]]
 name = "rvoip-rtp-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34150fba29d13661ba8d85c8e65c8714c3dff7a1f9f8f4feaeda7a6129c484a1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5195,7 +5055,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2fd66d3a21140eacaf96a0ed057ce5199c57745c237bca324bf32eeeade67a7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5235,7 +5097,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-core"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27817bc4225a6f34b9c62a95847b0090f8917d24dd520fad6d6e9c3893aa371f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5253,7 +5117,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-dialog"
-version = "0.3.0"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b958c0152026f657686bd76e6da5173ab97728c0df1da2339c07668c4f40c9ee"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5269,6 +5135,7 @@ dependencies = [
  "rvoip-sip-transport",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -5277,13 +5144,16 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-proxy"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36ebc41adffb17ddeefe8dae6881f0d0b1a763fe6f6c7762c3dfee799821e34c"
 dependencies = [
  "async-trait",
  "dashmap",
  "rvoip-sip-core",
  "rvoip-sip-dialog",
  "rvoip-sip-transport",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -5292,7 +5162,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-registrar"
-version = "0.2.5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f133aadd274e7c3e0e4ea44ece90e85265a94f2de007e2eaaa8e22c2edc2b112"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5313,7 +5185,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-transport"
-version = "0.3.0"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff576ffb6ecada18ecaf037dd1ff0fce0653fc136fb1040482d3c136190d202"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5339,7 +5213,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-uctp"
-version = "0.2.0"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1038f0ee436873d4ba99c84fa4a0900bdf3dd9da9cb8ae5c71c45f5f542c8657"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5366,8 +5242,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvoip-vcon"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1d730667e8f66cfd708238dc528f3c07e8c9d0df4ee2432661f580202a2d134"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "dashmap",
+ "jsonwebtoken",
+ "mime",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+ "uuid",
+ "x509-parser 0.18.1",
+]
+
+[[package]]
 name = "rvoip-webrtc"
-version = "0.1.3"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0db3e9f2dee27be25591c04a4771a8791840c34607f59262c3a5bb4edd8ed9da"
 dependencies = [
  "async-trait",
  "axum",
@@ -5381,12 +5280,13 @@ dependencies = [
  "hyper 1.10.1",
  "parking_lot",
  "reqwest 0.12.28",
- "rtc",
  "rustls 0.23.42",
  "rustls-pemfile",
  "rvoip-auth-core",
  "rvoip-core",
+ "rvoip-rtc",
  "rvoip-sip-core",
+ "rvoip-webrtc-stack",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5399,8 +5299,21 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots 0.26.11",
- "webrtc",
  "zeroize",
+]
+
+[[package]]
+name = "rvoip-webrtc-stack"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb1b26d943ab85260f0920bd6f0b379ac79dd3685cc7ecfda4e971cefaaf911e"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "log",
+ "rvoip-rtc",
+ "tokio",
 ]
 
 [[package]]
@@ -5864,7 +5777,7 @@ dependencies = [
  "crc",
  "crossbeam-queue",
  "either",
- "event-listener 5.4.1",
+ "event-listener",
  "futures-core",
  "futures-intrusive",
  "futures-io",
@@ -6788,12 +6701,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "value-bag"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd4ec1eb1d240636e354a30110a1dfcb37047169a4d9bd6d9d3469df574b5c4"
-
-[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7045,20 +6952,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webrtc"
-version = "0.20.0-alpha.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c747ddba952c11f0847312a6c56fdcec9b89258937e5b5a35c20110d2670304"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "log",
- "rtc",
- "tokio",
 ]
 
 [[package]]

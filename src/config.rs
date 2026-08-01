@@ -1885,14 +1885,13 @@ impl Config {
                     "api.route_attachments.sip_uri_template is required by a SIP route ingress"
                 ));
             }
-            if route.ingress.contains(&NamedRouteIngress::Sip) {
-                if self.generic_bridge.sip.secure_listener.is_none()
-                    || self.generic_bridge.sip.srtp != ProfileSrtpPolicy::Required
-                {
-                    return Err(anyhow!(
-                        "SIP named-route attachments require a configured SIP TLS listener and mandatory SRTP"
-                    ));
-                }
+            if route.ingress.contains(&NamedRouteIngress::Sip)
+                && (self.generic_bridge.sip.secure_listener.is_none()
+                    || self.generic_bridge.sip.srtp != ProfileSrtpPolicy::Required)
+            {
+                return Err(anyhow!(
+                    "SIP named-route attachments require a configured SIP TLS listener and mandatory SRTP"
+                ));
             }
             if route.ingress.contains(&NamedRouteIngress::Webrtc)
                 && self.api.route_attachments.webrtc.is_none()
@@ -2123,15 +2122,14 @@ impl Config {
                 "Vapi ingress TLS/SRTP policy must exactly match the shared SIP listener"
             ));
         }
-        if !profile.mtls_peer_ca_certificates.is_empty() {
-            if profile.mtls_peer_ca_certificates.len() != 1
+        if !profile.mtls_peer_ca_certificates.is_empty()
+            && (profile.mtls_peer_ca_certificates.len() != 1
                 || listener.client_ca_certificate.as_ref()
-                    != profile.mtls_peer_ca_certificates.first()
-            {
-                return Err(anyhow!(
-                    "Vapi ingress mTLS CA must match the shared SIP listener CA"
-                ));
-            }
+                    != profile.mtls_peer_ca_certificates.first())
+        {
+            return Err(anyhow!(
+                "Vapi ingress mTLS CA must match the shared SIP listener CA"
+            ));
         }
         if let Some(profile_digest) = &profile.digest {
             let runtime_digest = self.generic_bridge.sip.digest.as_ref().ok_or_else(|| {
@@ -2535,14 +2533,14 @@ fn partition_rtp_port_range(start: u16, end: u16, partitions: usize) -> Result<V
     if partitions == 1 {
         return Ok(vec![(start, end)]);
     }
-    let first_even = if start % 2 == 0 {
+    let first_even = if start.is_multiple_of(2) {
         start
     } else {
         start
             .checked_add(1)
             .ok_or_else(|| anyhow!("generic SIP RTP range has no usable port pair"))?
     };
-    let last_odd = if end % 2 == 1 {
+    let last_odd = if !end.is_multiple_of(2) {
         end
     } else {
         end.checked_sub(1)
@@ -2551,7 +2549,7 @@ fn partition_rtp_port_range(start: u16, end: u16, partitions: usize) -> Result<V
     if first_even >= last_odd {
         return Err(anyhow!("generic SIP RTP range has no usable port pair"));
     }
-    let pair_count = ((u32::from(last_odd) - u32::from(first_even) + 1) / 2) as usize;
+    let pair_count = (u32::from(last_odd) - u32::from(first_even)).div_ceil(2) as usize;
     if pair_count < partitions {
         return Err(anyhow!(
             "generic SIP RTP range needs at least one port pair for the listener and every referenced SIP profile"

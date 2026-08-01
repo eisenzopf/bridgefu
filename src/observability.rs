@@ -411,6 +411,14 @@ mod tests {
             &["result", "reason"],
         ),
         ("bridgefu_initial_context_total", &["result", "reason"]),
+        ("bridgefu_handoff_status_total", &["status", "result"]),
+        ("bridgefu_destination_progress_total", &["early_media"]),
+        ("bridgefu_provisional_early_media_total", &["result"]),
+        ("bridgefu_pending_private_operational_total", &["result"]),
+        (
+            "bridgefu_provider_client_state_total",
+            &["provider", "role", "result", "reason"],
+        ),
         ("bridgefu_active_broadcasts", &["transport"]),
         (
             "bridgefu_broadcast_commands_total",
@@ -468,6 +476,11 @@ mod tests {
         ("bridgefu_private_forwarding_routes_total", &["outcome"]),
         ("bridgefu_private_forwarding_packets_total", &["direction"]),
         ("bridgefu_private_forwarding_drops_total", &["reason"]),
+        ("bridgefu_private_egress_active_routes", &[]),
+        (
+            "bridgefu_private_egress_commands_total",
+            &["operation", "outcome"],
+        ),
         ("bridgefu_amazon_durable_cleanups_pending", &[]),
         ("bridgefu_amazon_cleanup_reconcile_failures_total", &[]),
         ("bridgefu_amazon_pending_contact_cleanups", &[]),

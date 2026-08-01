@@ -2019,7 +2019,7 @@ impl PrivateEgressControlClient {
 
     fn handle_data_message(&self, connection_id: &ConnectionId, message: &DataMessage) -> bool {
         if message.label == PRIVATE_EGRESS_RESPONSE_LABEL {
-            let Ok(response) = PrivateEgressResponse::from_data_message(&message) else {
+            let Ok(response) = PrivateEgressResponse::from_data_message(message) else {
                 return true;
             };
             let matching = self

@@ -13,8 +13,8 @@ use crate::call_engine::{
     CommandCommitView, CommandId, ConnectionBinding, ConsumedAttachment, CreateCall, EffectId,
     FailureDetails, IdempotencyKeyDigest, LegId, LegState, OutboxRecord, OutboxState,
     PrincipalFingerprint, ProviderAccountKey, ProviderEventDigest, ProviderEventEnvelope,
-    ProviderEventTarget, ProviderReferenceRole, RepositoryError, RequestDigest, StoredCall,
-    TenantId, WorkerLease,
+    ProviderEventTarget, ProviderReferenceRole, RepositoryError, RequestDigest,
+    SourceBeforeAnswerTermination, StoredCall, TenantId, WorkerLease,
 };
 
 use super::{CallExecutionPlan, ControlIntent, ExternalReferenceValue, ServiceEffectPayload};
@@ -319,6 +319,35 @@ impl std::fmt::Debug for BoundConnectionStateCommit {
             .field("at", &self.at)
             .finish()
     }
+}
+
+/// Fenced terminal transition for a remotely initiated source that vanished
+/// before final answer.
+///
+/// The repository validates the current connection ID and binding generation
+/// in the same transaction that ends the source and starts peer teardown.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoundSourceTerminationCommit {
+    /// Authenticated tenant ownership.
+    pub tenant_id: TenantId,
+    /// Durable call receiving the observation.
+    pub call_id: CallId,
+    /// Compare-and-swap version retained across lost-response retries.
+    pub expected_version: AggregateVersion,
+    /// Stable event delivery identity retained across retries.
+    pub command_id: CommandId,
+    /// Exact remotely initiated source leg.
+    pub source_leg_id: LegId,
+    /// Exact signaling incarnation that disappeared.
+    pub binding_generation: BindingGeneration,
+    /// Exact rvoip route that disappeared.
+    pub connection_id: ConnectionId,
+    /// Current fenced worker.
+    pub worker: WorkerLease,
+    /// Sanitized source termination reason.
+    pub reason: SourceBeforeAnswerTermination,
+    /// Observation and commit time.
+    pub at: DateTime<Utc>,
 }
 
 /// Fenced media activity that arms or refreshes the call's media-idle timer.
@@ -927,6 +956,12 @@ pub trait CallServiceRepository: Send + Sync {
         request: BoundConnectionStateCommit,
     ) -> Result<ServiceCommandOutcome, RepositoryError>;
 
+    /// Atomically validates one exact pending source and begins peer teardown.
+    async fn commit_bound_source_termination(
+        &self,
+        request: BoundSourceTerminationCommit,
+    ) -> Result<ServiceCommandOutcome, RepositoryError>;
+
     /// Atomically validates exact, consecutive media activity and arms or
     /// refreshes `DeadlineKind::Media` without allowing stale activity to
     /// resurrect a cancelled timer.
@@ -964,6 +999,19 @@ pub trait CallServiceRepository: Send + Sync {
         operation: ServiceOperationKind,
         at: DateTime<Utc>,
     ) -> Result<Option<ServiceCommandView>, RepositoryError>;
+
+    /// Returns an unexpired exact control-operation receipt before current
+    /// assignment validation. This lets a gateway preserve the original
+    /// response without dispatching new work after its route catalog changes.
+    async fn load_control_command_replay(
+        &self,
+        tenant_id: &TenantId,
+        call_id: CallId,
+        key_digest: IdempotencyKeyDigest,
+        request_digest: RequestDigest,
+        operation: ServiceOperationKind,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ControlCommandView>, RepositoryError>;
 
     /// Creates the core call and immutable execution plan atomically.
     async fn create_with_plan(

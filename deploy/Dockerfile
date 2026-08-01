@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# Canonical Bridgefu image. The named `rvoip` build context must be the exact
-# reviewed checkout that matches Cargo.lock:
+# Canonical Bridgefu image. The committed Cargo.lock is the complete source of
+# truth for the crates.io-hosted rvoip 0.3.5 dependency graph:
 #
-#   docker build --build-context rvoip=../rvoip -f deploy/Dockerfile .
+#   docker build -f deploy/Dockerfile .
 #
 # Both base references are multi-platform manifest-list digests. Updating one
 # is an intentional supply-chain change and must be accompanied by a CI build
@@ -11,12 +11,6 @@ ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd9
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG BUILDER_DEBIAN_SNAPSHOT=20260518T000000Z
 ARG RUNTIME_DEBIAN_SNAPSHOT=20260713T000000Z
-
-# A named build context overrides a same-named stage. Without
-# `--build-context rvoip=...`, this local sentinel stage is used so Docker never
-# interprets `rvoip` as a floating registry image.
-FROM scratch AS rvoip
-COPY deploy/missing-rvoip-context /.bridgefu-missing-rvoip-build-context
 
 FROM ${RUST_IMAGE} AS builder
 
@@ -40,15 +34,10 @@ RUN sed -i \
         protobuf-compiler=3.21.12-3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=rvoip . /src/rvoip
 COPY . /src/bridgefu
 WORKDIR /src/bridgefu
 
-RUN if test -e /src/rvoip/.bridgefu-missing-rvoip-build-context; then \
-        echo 'missing required --build-context rvoip=/exact/reviewed/checkout' >&2; \
-        exit 64; \
-    fi \
-    && cargo build --locked --release \
+RUN cargo build --locked --release \
     && install -D -m 0755 target/release/bridgefu /out/bridgefu \
     && strip /out/bridgefu
 
@@ -56,13 +45,14 @@ FROM ${RUNTIME_IMAGE} AS runtime
 
 ARG RUNTIME_DEBIAN_SNAPSHOT
 ARG VCS_REF=unknown
-ARG RVOIP_REVISION=unknown
 ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="Bridgefu" \
       org.opencontainers.image.description="Programmable SIP, WebRTC, and QUIC audio bridge" \
       org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu" \
+      org.opencontainers.image.version="0.9.0" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.rvoip.revision="${RVOIP_REVISION}" \
+      org.opencontainers.image.rvoip.version="0.3.5" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 RUN sed -i \

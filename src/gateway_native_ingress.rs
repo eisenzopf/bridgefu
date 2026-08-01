@@ -2152,7 +2152,18 @@ mod tests {
         assert!(!Arc::ptr_eq(&sip_routes[0], &sip_routes[1]));
         assert!(!sip_routes[1].closed.load(Ordering::Acquire));
 
-        caller.hangup(&session).await.unwrap();
+        // Route provisioning deliberately precedes the SIP 200/ACK lifecycle,
+        // so observing the opened attachment is not proof that the caller has
+        // finished processing the answer. Wait for authoritative answer
+        // evidence before issuing teardown; otherwise a busy executor can
+        // make hangup classify the session as early while its dialog is
+        // already confirmed and incorrectly attempt CANCEL instead of BYE.
+        let answered = caller
+            .session(&session)
+            .wait_for_answered(Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        answered.hangup().await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while runtime.active_routes() != 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;

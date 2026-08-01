@@ -28,13 +28,14 @@ use rvoip_core::session::SessionMedium;
 use rvoip_core::stream::{MediaFrame, MediaStream, StreamKind};
 use rvoip_core::{Orchestrator, PreparedOutboundConnection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::call_engine::{TenantId, WorkerLease};
+use crate::call_engine::{RouteCatalogFingerprint, TenantId, WorkerLease};
 use crate::gateway_forwarding::{ForwardedPacket, GatewayForwarder, GatewayForwardingRoute};
 use crate::private_egress::{
     PrivateEgressCommand, PrivateEgressControlClient, PrivateEgressEndReason, PrivateEgressError,
@@ -190,6 +191,7 @@ impl PrivateEgressWorkerRouteDescriptor {
 /// a worker can never select between two conflicting profile snapshots.
 pub struct PrivateEgressWorkerRouteCatalog {
     entries: Vec<PrivateEgressWorkerRouteDescriptor>,
+    fingerprint: RouteCatalogFingerprint,
 }
 
 impl fmt::Debug for PrivateEgressWorkerRouteCatalog {
@@ -197,6 +199,7 @@ impl fmt::Debug for PrivateEgressWorkerRouteCatalog {
         formatter
             .debug_struct("PrivateEgressWorkerRouteCatalog")
             .field("entries", &self.entries.len())
+            .field("fingerprint", &self.fingerprint)
             .finish()
     }
 }
@@ -204,6 +207,18 @@ impl fmt::Debug for PrivateEgressWorkerRouteCatalog {
 impl PrivateEgressWorkerRouteCatalog {
     pub fn new(
         entries: Vec<PrivateEgressWorkerRouteDescriptor>,
+    ) -> Result<Arc<Self>, PrivateEgressStreamError> {
+        let fingerprint = route_catalog_fingerprint(&entries);
+        Self::new_with_fingerprint(entries, fingerprint)
+    }
+
+    /// Builds an exact private-egress resolver while retaining the broader
+    /// gateway/worker configuration fingerprint used for placement. The
+    /// supplied fingerprint may cover provider and Amazon routes plus worker
+    /// capability policy that are intentionally absent from this resolver.
+    pub fn new_with_fingerprint(
+        entries: Vec<PrivateEgressWorkerRouteDescriptor>,
+        fingerprint: RouteCatalogFingerprint,
     ) -> Result<Arc<Self>, PrivateEgressStreamError> {
         for (index, entry) in entries.iter().enumerate() {
             entry.validate()?;
@@ -215,7 +230,10 @@ impl PrivateEgressWorkerRouteCatalog {
                 return Err(PrivateEgressStreamError::InvalidAdmission);
             }
         }
-        Ok(Arc::new(Self { entries }))
+        Ok(Arc::new(Self {
+            entries,
+            fingerprint,
+        }))
     }
 
     #[must_use]
@@ -226,6 +244,12 @@ impl PrivateEgressWorkerRouteCatalog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Deterministic SHA-256 identity of the canonical sorted route catalog.
+    #[must_use]
+    pub const fn fingerprint(&self) -> RouteCatalogFingerprint {
+        self.fingerprint
     }
 
     #[must_use]
@@ -255,6 +279,73 @@ impl PrivateEgressWorkerRouteCatalog {
             .cloned()
             .ok_or(PrivateEgressStreamError::OwnershipMismatch)
     }
+}
+
+fn route_catalog_fingerprint(
+    entries: &[PrivateEgressWorkerRouteDescriptor],
+) -> RouteCatalogFingerprint {
+    let mut canonical_entries = entries.iter().collect::<Vec<_>>();
+    canonical_entries.sort_by(|left, right| {
+        left.tenant_id
+            .cmp(&right.tenant_id)
+            .then_with(|| left.route_id.cmp(&right.route_id))
+            .then_with(|| transport_tag(left.transport).cmp(&transport_tag(right.transport)))
+            .then_with(|| left.profile.profile_id.cmp(&right.profile.profile_id))
+            .then_with(|| left.profile.revision.cmp(&right.profile.revision))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"bridgefu.private-egress-route-catalog.v1");
+    hash_count(&mut hasher, canonical_entries.len());
+    for entry in canonical_entries {
+        hash_field(&mut hasher, entry.tenant_id.as_str().as_bytes());
+        hash_field(&mut hasher, entry.route_id.as_bytes());
+        hasher.update([transport_tag(entry.transport)]);
+        hash_field(&mut hasher, entry.profile.profile_id.as_bytes());
+        hash_field(&mut hasher, entry.profile.revision.as_bytes());
+        hash_field(&mut hasher, entry.target.as_bytes());
+
+        let mut codecs = entry.codecs.iter().collect::<Vec<_>>();
+        codecs.sort_by_cached_key(|codec| {
+            (
+                codec.name.to_ascii_lowercase(),
+                codec.clock_rate_hz,
+                codec.channels,
+                codec.fmtp.clone(),
+            )
+        });
+        hash_count(&mut hasher, codecs.len());
+        for codec in codecs {
+            hash_field(&mut hasher, codec.name.to_ascii_lowercase().as_bytes());
+            hasher.update(codec.clock_rate_hz.to_be_bytes());
+            hasher.update([codec.channels]);
+            match &codec.fmtp {
+                Some(fmtp) => {
+                    hasher.update([1]);
+                    hash_field(&mut hasher, fmtp.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+    }
+    RouteCatalogFingerprint::new(hasher.finalize().into())
+}
+
+const fn transport_tag(transport: PrivateEgressTransport) -> u8 {
+    match transport {
+        PrivateEgressTransport::Sip => 1,
+        PrivateEgressTransport::WebRtc => 2,
+    }
+}
+
+fn hash_count(hasher: &mut Sha256, count: usize) {
+    hasher.update(u64::try_from(count).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hash_count(hasher, value.len());
+    hasher.update(value);
 }
 
 /// Immutable descriptor for the second, destination-side private media
@@ -1034,6 +1125,9 @@ impl PrivateEgressGatewayProxyHandler {
         self.close_native_scope(conversation_id).await;
     }
 
+    // These values are the independently authenticated pieces of a private
+    // route command; retaining them as parameters keeps validation explicit.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare(
         &self,
         authority: &PrivateEgressRouteAuthority,
@@ -1057,9 +1151,8 @@ impl PrivateEgressGatewayProxyHandler {
             );
             return Err(PrivateEgressError::InvalidTransition);
         }
-        let adapter = self.adapters.adapter(transport).map_err(|error| {
+        let adapter = self.adapters.adapter(transport).inspect_err(|&error| {
             Self::log_prepare_failure(authority, command, "adapter_lookup", error);
-            error
         })?;
         let resolved = self
             .profiles
@@ -1072,9 +1165,8 @@ impl PrivateEgressGatewayProxyHandler {
                 initial_context,
             )
             .await
-            .map_err(|error| {
+            .inspect_err(|&error| {
                 Self::log_prepare_failure(authority, command, "profile_resolution", error);
-                error
             })?;
         if !resolved
             .capabilities
@@ -1780,6 +1872,11 @@ async fn wait_for_native_audio_stream(
     }
 }
 
+// A proxy pump owns a complete, immutable route authority snapshot. Keeping
+// those ownership fields explicit avoids a second partially validated type;
+// the nested event arms must also move their payloads after pattern matching,
+// which Rust does not permit from a collapsed pattern guard.
+#[allow(clippy::too_many_arguments, clippy::collapsible_match)]
 fn spawn_proxy_pump(
     orchestrator: Arc<Orchestrator>,
     native_connection_id: ConnectionId,
@@ -1911,10 +2008,14 @@ fn spawn_proxy_pump(
                             }
                         }
                         OperationalEventKind::DataMessage { message } => {
-                            if private_route.try_send_data(message).is_err() { break; }
+                            if private_route.try_send_data(message).is_err() {
+                                break;
+                            }
                         }
                         OperationalEventKind::Dtmf { digits, duration_ms } => {
-                            if private_route.try_send_dtmf(digits, duration_ms).is_err() { break; }
+                            if private_route.try_send_dtmf(digits, duration_ms).is_err() {
+                                break;
+                            }
                         }
                         OperationalEventKind::Ended { .. } => {
                             terminal = Some((PrivateEgressLifecycleState::Ended, "remote_ended"));
@@ -2143,6 +2244,59 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn catalog_route(
+        route_id: &str,
+        target: &str,
+        codecs: Vec<CodecInfo>,
+    ) -> PrivateEgressWorkerRouteDescriptor {
+        PrivateEgressWorkerRouteDescriptor {
+            tenant_id: TenantId::parse("tenant-a").unwrap(),
+            route_id: route_id.to_owned(),
+            transport: PrivateEgressTransport::Sip,
+            profile: PrivateEgressProfile {
+                profile_id: "primary".into(),
+                revision: "a".repeat(64),
+            },
+            target: target.to_owned(),
+            codecs,
+        }
+    }
+
+    #[test]
+    fn route_catalog_fingerprint_is_order_independent_and_configuration_sensitive() {
+        let opus = CodecInfo::from_name_with_defaults("Opus");
+        let pcmu = CodecInfo::from_name_with_defaults("g.711-mu");
+        let first = catalog_route(
+            "alpha",
+            "sips:alpha@example.test",
+            vec![opus.clone(), pcmu.clone()],
+        );
+        let second = catalog_route(
+            "beta",
+            "sips:beta@example.test",
+            vec![pcmu.clone(), opus.clone()],
+        );
+        let forward =
+            PrivateEgressWorkerRouteCatalog::new(vec![first.clone(), second.clone()]).unwrap();
+        let reversed =
+            PrivateEgressWorkerRouteCatalog::new(vec![second.clone(), first.clone()]).unwrap();
+        assert_eq!(forward.fingerprint(), reversed.fingerprint());
+
+        let changed = PrivateEgressWorkerRouteCatalog::new(vec![
+            first,
+            catalog_route("beta", "sips:changed@example.test", vec![opus, pcmu]),
+        ])
+        .unwrap();
+        assert_ne!(forward.fingerprint(), changed.fingerprint());
+
+        let capability = forward.fingerprint().advertisement_capability();
+        let advertised = std::collections::BTreeSet::from([capability]);
+        assert_eq!(
+            RouteCatalogFingerprint::from_capabilities(&advertised).unwrap(),
+            Some(forward.fingerprint())
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,8 @@ use zeroize::Zeroize;
 
 use crate::api_principal::{ApiPrincipal, PrincipalFingerprintKey};
 use crate::call_engine::{
-    AttachmentTransport, BindingGeneration, CallId, LegId, TenantId, WorkerLease,
+    AttachmentTransport, BindingGeneration, CallId, LegId, RouteCatalogFingerprint, TenantId,
+    WorkerLease,
 };
 use crate::call_service::{parse_presented_attachment_token, PresentedAttachmentToken};
 use crate::coordination::{
@@ -172,6 +173,7 @@ impl GatewayAttachmentAuthorization {
 pub struct GatewayAttachmentResolver {
     projection: Arc<dyn CoordinationProjection>,
     fingerprint_key: PrincipalFingerprintKey,
+    route_catalog_fingerprint: Option<RouteCatalogFingerprint>,
 }
 
 impl fmt::Debug for GatewayAttachmentResolver {
@@ -180,6 +182,7 @@ impl fmt::Debug for GatewayAttachmentResolver {
             .debug_struct("GatewayAttachmentResolver")
             .field("projection", &"[configured]")
             .field("fingerprint_key", &"[configured]")
+            .field("route_catalog_fingerprint", &self.route_catalog_fingerprint)
             .finish()
     }
 }
@@ -194,7 +197,16 @@ impl GatewayAttachmentResolver {
         Ok(Self {
             projection,
             fingerprint_key,
+            route_catalog_fingerprint: None,
         })
+    }
+
+    /// Requires projected attachment assignments to match this gateway's
+    /// exact route/capability catalog before any private worker dial occurs.
+    #[must_use]
+    pub fn with_route_catalog_fingerprint(mut self, fingerprint: RouteCatalogFingerprint) -> Self {
+        self.route_catalog_fingerprint = Some(fingerprint);
+        self
     }
 
     pub async fn resolve(
@@ -223,6 +235,9 @@ impl GatewayAttachmentResolver {
             || route.transport != transport
             || route.tenant_binding != lookup.tenant_binding
             || route.expires_at <= now
+            || self
+                .route_catalog_fingerprint
+                .is_some_and(|expected| route.route_catalog_fingerprint != Some(expected))
         {
             return Err(GatewayAttachmentError::ProofRejected);
         }
@@ -639,6 +654,7 @@ mod tests {
         let token_digest = parse_presented_attachment_token(token.clone())
             .expect("token")
             .digest();
+        let route_catalog_fingerprint = RouteCatalogFingerprint::new([0x71; 32]);
         coordinator
             .apply(&event(
                 &deployment,
@@ -646,6 +662,7 @@ mod tests {
                 CoordinationPayload::AttachmentRoute(AttachmentRouteHint {
                     token_digest,
                     worker,
+                    route_catalog_fingerprint: Some(route_catalog_fingerprint),
                     transport: AttachmentTransport::Sip,
                     tenant_binding,
                     expires_at: now() + TimeDelta::minutes(1),
@@ -653,7 +670,9 @@ mod tests {
             ))
             .await
             .expect("attachment projection");
-        let resolver = GatewayAttachmentResolver::new(coordinator.clone(), key).expect("resolver");
+        let resolver = GatewayAttachmentResolver::new(coordinator.clone(), key)
+            .expect("resolver")
+            .with_route_catalog_fingerprint(route_catalog_fingerprint);
         (
             resolver,
             coordinator,
@@ -699,6 +718,25 @@ mod tests {
         );
         assert_eq!(parts.routing_token, token);
         parts.routing_token.zeroize();
+    }
+
+    #[tokio::test]
+    async fn restarted_gateway_rejects_old_catalog_attachment_before_private_dial() {
+        let (_, coordinator, _, public_principal, token, _) = routed_resolver().await;
+        let changed = RouteCatalogFingerprint::new([0x72; 32]);
+        let resolver = GatewayAttachmentResolver::new(
+            coordinator,
+            b"gateway-attachment-fingerprint-key-32-bytes".to_vec(),
+        )
+        .expect("resolver")
+        .with_route_catalog_fingerprint(changed);
+
+        assert!(matches!(
+            resolver
+                .resolve(public_principal, token, AttachmentTransport::Sip, now(),)
+                .await,
+            Err(GatewayAttachmentError::ProofRejected)
+        ));
     }
 
     #[tokio::test]

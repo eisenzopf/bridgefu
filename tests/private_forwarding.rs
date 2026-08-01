@@ -1303,6 +1303,7 @@ impl DurableSplitHarness {
                         .unwrap()
                         .digest(),
                     worker: self.runtime.worker().lease,
+                    route_catalog_fingerprint: None,
                     transport: attachment.transport,
                     tenant_binding,
                     expires_at: attachment.expires_at,
@@ -1712,6 +1713,9 @@ impl DurableSplitHarness {
         client.peer.close().await.unwrap();
     }
 
+    // Replacement qualification keeps both old and new route identities explicit; grouping
+    // them would obscure which durable binding a failed assertion is diagnosing.
+    #[allow(clippy::too_many_arguments)]
     async fn exercise_split_replacement(
         &self,
         tenant: &TenantId,
@@ -3359,6 +3363,7 @@ async fn native_whip_edge_reaches_call_pinned_worker_over_mtls_uctp_and_drains_c
                         .unwrap()
                         .digest(),
                     worker: worker.lease,
+                    route_catalog_fingerprint: None,
                     transport: attachment.transport,
                     tenant_binding,
                     expires_at: attachment.expires_at,
@@ -3567,9 +3572,33 @@ async fn native_whip_edge_reaches_call_pinned_worker_over_mtls_uctp_and_drains_c
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let received_from_first = receive_audible_opus(&mut second_media).await;
+    let next_from_first = receive_audible_opus(&mut second_media).await;
     let received_from_second = receive_audible_opus(&mut first_media).await;
-    assert!((48_000..=51_840).contains(&received_from_first.timestamp_rtp));
-    assert!((57_600..=61_440).contains(&received_from_second.timestamp_rtp));
+    let next_from_second = receive_audible_opus(&mut first_media).await;
+    assert_eq!(received_from_first.payload_type, Some(111));
+    assert_eq!(next_from_first.payload_type, Some(111));
+    assert_eq!(received_from_second.payload_type, Some(111));
+    assert_eq!(next_from_second.payload_type, Some(111));
+    assert_eq!(received_from_first.payload, first_payload);
+    assert_eq!(next_from_first.payload, first_payload);
+    assert_eq!(received_from_second.payload, second_payload);
+    assert_eq!(next_from_second.payload, second_payload);
+    // The WebRTC transport owns one stable RTP timeline per outbound SSRC.
+    // Track priming may precede these test frames, so the absolute source
+    // timestamp is intentionally rebased on the wire. Consecutive 20 ms Opus
+    // frames must still advance by exactly 960 ticks at the 48 kHz RTP clock.
+    assert_eq!(
+        next_from_first
+            .timestamp_rtp
+            .wrapping_sub(received_from_first.timestamp_rtp),
+        960
+    );
+    assert_eq!(
+        next_from_second
+            .timestamp_rtp
+            .wrapping_sub(received_from_second.timestamp_rtp),
+        960
+    );
 
     let first_context = ContextEnvelope::new(
         "private-composite-first",

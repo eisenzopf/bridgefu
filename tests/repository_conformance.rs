@@ -117,7 +117,7 @@ fn provider_service_create_request(
         [
             LegSpec {
                 direction: LegDirection::Outbound,
-                kind: LegKind::Twilio,
+                kind: LegKind::Telnyx,
             },
             LegSpec {
                 direction: LegDirection::Inbound,
@@ -132,8 +132,8 @@ fn provider_service_create_request(
             LegExecutionSpec {
                 leg_id: aggregate.legs()[0].id(),
                 endpoint: LegEndpointConfig::Provider(ProviderEndpointConfig {
-                    provider: ProviderKind::Twilio,
-                    account_profile: "twilio-schema-upgrade".to_owned(),
+                    provider: ProviderKind::Telnyx,
+                    account_profile: "telnyx-schema-upgrade".to_owned(),
                     destination: Some("+12065550123".to_owned()),
                 }),
             },
@@ -185,7 +185,7 @@ where
         .register_worker(RegisterWorker {
             worker_id: WorkerId::new(),
             max_calls: 4,
-            capabilities: BTreeSet::from(["sip".to_owned(), "twilio".to_owned()]),
+            capabilities: BTreeSet::from(["sip".to_owned(), "telnyx".to_owned()]),
             at: at(0),
             lease_ttl: Duration::from_secs(300),
         })
@@ -203,7 +203,7 @@ where
     };
     let call_id = call.call.aggregate.id();
     let provider_leg_id = call.call.aggregate.legs()[0].id();
-    let account = ProviderAccountKey::parse("twilio-schema-upgrade").unwrap();
+    let account = ProviderAccountKey::parse("telnyx-schema-upgrade").unwrap();
     let provider_call_id = ProviderCallId::parse("CA-schema-v5-upgrade").unwrap();
     let event_digest = ProviderEventDigest::new(digest(0xd2));
     assert!(matches!(
@@ -430,7 +430,7 @@ async fn register(repo: &Repository, max_calls: usize) -> WorkerSnapshot {
     repo.register_worker(RegisterWorker {
         worker_id: WorkerId::new(),
         max_calls,
-        capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+        capabilities: BTreeSet::from(["sip".into(), "webrtc_egress".into()]),
         at: at(0),
         lease_ttl: std::time::Duration::from_secs(300),
     })
@@ -753,7 +753,7 @@ async fn shared_repository_conformance(repo: Repository) {
         .register_worker(RegisterWorker {
             worker_id: worker.lease.worker_id,
             max_calls: 4,
-            capabilities: BTreeSet::from(["sip".into(), "webrtc".into()]),
+            capabilities: BTreeSet::from(["sip".into(), "webrtc_egress".into()]),
             at: at(41),
             lease_ttl: std::time::Duration::from_secs(300),
         })
