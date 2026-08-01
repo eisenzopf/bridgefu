@@ -97,6 +97,11 @@ jobs:
         with:
           workspaces: |
             bridgefu
+      - name: Install protobuf compiler required by rvoip-amazon-connect
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler
+          protoc --version
       - name: Verify locked rvoip crates.io graph
         working-directory: bridgefu
         run: |

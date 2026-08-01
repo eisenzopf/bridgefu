@@ -175,6 +175,16 @@ if [ "$trivy_version_pins" -ne 3 ]; then
   exit 1
 fi
 
+# rvoip-amazon-connect compiles its published protobuf schema at build time.
+# The canonical image installs protoc from its pinned Debian snapshot; the
+# host-based Rust CI job must provision and identify the same required tool
+# before Clippy or tests can compile the registry package.
+grep -Fq 'Install protobuf compiler required by rvoip-amazon-connect' \
+  .github/workflows/ci.yml
+grep -Fq 'sudo apt-get install --yes --no-install-recommends protobuf-compiler' \
+  .github/workflows/ci.yml
+grep -Fq 'protoc --version' .github/workflows/ci.yml
+
 test -x deploy/scripts/verify-multiarch-oci.py
 test -x deploy/scripts/verify-trivy-policy.py
 test -x deploy/scripts/select-oci-platform.py
