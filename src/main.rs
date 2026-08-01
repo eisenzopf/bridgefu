@@ -83,49 +83,49 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
     let command = args.command.clone().unwrap_or(Command::Run);
 
-    // Printing must remain available before runtime secrets are provisioned.
-    // The helper still parses the complete typed shape and rejects unknown
-    // fields before redacting every credential-bearing value.
-    if matches!(command, Command::PrintEffectiveConfig) {
-        print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
-        return Ok(());
-    }
-
-    // Container liveness must work in a package-free runtime before a config
-    // file or any deployment secret is mounted. Keeping the probe in this
-    // executable removes curl and its transitive userland from the image.
-    if let Command::Healthcheck {
-        address,
-        path,
-        timeout_ms,
-    } = &command
-    {
-        probe_liveness(*address, path, Duration::from_millis(*timeout_ms))?;
-        return Ok(());
-    }
-
-    let cfg = config::Config::load(&args.config)?;
-
     match command {
+        // Printing must remain available before runtime secrets are
+        // provisioned. The helper still parses the complete typed shape and
+        // rejects unknown fields before redacting every credential-bearing
+        // value.
+        Command::PrintEffectiveConfig => {
+            print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
+            Ok(())
+        }
+        // Container liveness must work in a package-free runtime before a
+        // config file or deployment secret is mounted. Dispatching before
+        // constructing Tokio also keeps each frequent probe to one thread.
+        Command::Healthcheck {
+            address,
+            path,
+            timeout_ms,
+        } => probe_liveness(address, &path, Duration::from_millis(timeout_ms)),
         Command::Validate => {
+            let cfg = config::Config::load(&args.config)?;
             process_role::preflight(&cfg)?;
             println!("configuration is valid: {}", args.config.display());
-            return Ok(());
+            Ok(())
         }
-        Command::PrintEffectiveConfig => unreachable!("handled before secret-resolving load"),
-        Command::Healthcheck { .. } => unreachable!("handled before configuration load"),
         Command::Run => {
-            // Role prerequisites are checked before tracing, metrics, or any
-            // listener/task is installed. Unsupported topologies never fall
-            // back to the all-in-one compatibility process.
-            process_role::preflight(&cfg)?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the Bridgefu Tokio runtime")?;
+            runtime.block_on(run(args))
         }
     }
+}
+
+async fn run(args: Args) -> Result<()> {
+    let cfg = config::Config::load(&args.config)?;
+    // Role prerequisites are checked before tracing, metrics, or any
+    // listener/task is installed. Unsupported topologies never fall back to
+    // the all-in-one compatibility process.
+    process_role::preflight(&cfg)?;
 
     let tracing_guard = observability::init_tracing(&cfg.observability)?;
     let process_result = async {

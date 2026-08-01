@@ -4437,8 +4437,10 @@ Gate 10 local container/CI evidence recorded on 2026-07-14:
   database correctly blocked its unfixed HIGH/CRITICAL Debian userland. The
   canonical final stage now uses a pinned, nonroot distroless Debian 13 `cc`
   manifest and Bridgefu's own configuration-independent `/livez` probe, so the
-  image carries no runtime APT, shell, or curl. The exact base manifest scans
-  clean on both release architectures without weakening the severity policy.
+  image carries no runtime APT, shell, or curl. Compose, ECS, and GCP use
+  direct binary commands; GCP secret and CA preparation remains isolated in
+  its init container. The exact base manifest scans clean on both release
+  architectures without weakening the severity policy.
 - `deploy/scripts/check-release-image.sh` passes. The multi-architecture OCI
   verifier passes 5/5 root/digest/platform/attestation regressions, the
   exact-platform selector passes 2/2 nested-index regressions, and the retained

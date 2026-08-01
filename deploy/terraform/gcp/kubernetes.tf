@@ -11,7 +11,7 @@ locals {
       path,
     )],
     [format(
-      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; chmod -R go-rwx /run/bridgefu-secrets",
+      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /run/bridgefu-secrets/ca-bundle.pem; chmod -R go-rwx /run/bridgefu-secrets",
       google_secret_manager_secret_version.redis_url.version,
       google_secret_manager_secret.redis_url.secret_id,
       var.project_id,
@@ -31,7 +31,7 @@ locals {
       path,
     )],
     [format(
-      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; chmod -R go-rwx /run/bridgefu-secrets",
+      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /run/bridgefu-secrets/ca-bundle.pem; chmod -R go-rwx /run/bridgefu-secrets",
       google_secret_manager_secret_version.redis_url.version,
       google_secret_manager_secret.redis_url.secret_id,
       var.project_id,
@@ -51,7 +51,7 @@ locals {
       path,
     )],
     [format(
-      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; chmod -R go-rwx /run/bridgefu-secrets",
+      "gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-url'; gcloud secrets versions access '%s' --secret='%s' --project='%s' --quiet > '/run/bridgefu-secrets/redis-ca.pem'; cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /run/bridgefu-secrets/ca-bundle.pem; chmod -R go-rwx /run/bridgefu-secrets",
       google_secret_manager_secret_version.redis_url.version,
       google_secret_manager_secret.redis_url.secret_id,
       var.project_id,
@@ -208,13 +208,19 @@ resource "kubernetes_daemon_set_v1" "gateway" {
         container {
           name    = "bridgefu"
           image   = var.image
-          command = ["/bin/sh", "-ec"]
-          args = [
-            "cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /tmp/bridgefu-ca.pem; export SSL_CERT_FILE=/tmp/bridgefu-ca.pem; export BRIDGEFU_REDIS_URL=\"$(cat /run/bridgefu-secrets/redis-url)\"; exec /usr/local/bin/bridgefu --config /run/bridgefu-secrets/bridgefu.yaml run",
-          ]
+          command = ["/usr/local/bin/bridgefu"]
+          args    = ["--config", "/run/bridgefu-secrets/bridgefu.yaml", "run"]
           env {
             name  = "BRIDGEFU_DATABASE_URL"
             value = local.database_url
+          }
+          env {
+            name  = "BRIDGEFU_REDIS_URL_FILE"
+            value = "/run/bridgefu-secrets/redis-url"
+          }
+          env {
+            name  = "SSL_CERT_FILE"
+            value = "/run/bridgefu-secrets/ca-bundle.pem"
           }
           port {
             name           = "gateway-quic"
@@ -465,13 +471,25 @@ resource "kubernetes_stateful_set_v1" "worker" {
         container {
           name    = "bridgefu"
           image   = var.image
-          command = ["/bin/sh", "-ec"]
-          args = [
-            "cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /tmp/bridgefu-ca.pem; export SSL_CERT_FILE=/tmp/bridgefu-ca.pem; export BRIDGEFU_REDIS_URL=\"$(cat /run/bridgefu-secrets/redis-url)\"; test -r \"/run/bridgefu-secrets/$${HOSTNAME}.yaml\"; exec /usr/local/bin/bridgefu --config \"/run/bridgefu-secrets/$${HOSTNAME}.yaml\" run",
-          ]
+          command = ["/usr/local/bin/bridgefu"]
+          args    = ["--config", "/run/bridgefu-secrets/$(BRIDGEFU_CONFIG_NAME).yaml", "run"]
+          env {
+            name = "BRIDGEFU_CONFIG_NAME"
+            value_from {
+              field_ref { field_path = "metadata.name" }
+            }
+          }
           env {
             name  = "BRIDGEFU_DATABASE_URL"
             value = local.database_url
+          }
+          env {
+            name  = "BRIDGEFU_REDIS_URL_FILE"
+            value = "/run/bridgefu-secrets/redis-url"
+          }
+          env {
+            name  = "SSL_CERT_FILE"
+            value = "/run/bridgefu-secrets/ca-bundle.pem"
           }
           port {
             name           = "forwarding"
@@ -697,10 +715,16 @@ resource "kubernetes_daemon_set_v1" "moq_relay" {
         container {
           name    = "bridgefu"
           image   = var.image
-          command = ["/bin/sh", "-ec"]
-          args = [
-            "cat /etc/ssl/certs/ca-certificates.crt /run/bridgefu-secrets/redis-ca.pem > /tmp/bridgefu-ca.pem; export SSL_CERT_FILE=/tmp/bridgefu-ca.pem; export BRIDGEFU_REDIS_URL=\"$(cat /run/bridgefu-secrets/redis-url)\"; exec /usr/local/bin/bridgefu --config /run/bridgefu-secrets/bridgefu.yaml run",
-          ]
+          command = ["/usr/local/bin/bridgefu"]
+          args    = ["--config", "/run/bridgefu-secrets/bridgefu.yaml", "run"]
+          env {
+            name  = "BRIDGEFU_REDIS_URL_FILE"
+            value = "/run/bridgefu-secrets/redis-url"
+          }
+          env {
+            name  = "SSL_CERT_FILE"
+            value = "/run/bridgefu-secrets/ca-bundle.pem"
+          }
           port {
             name           = "publisher"
             container_port = var.moq_publisher_port

@@ -333,7 +333,7 @@ resource "aws_ecs_task_definition" "role" {
       secrets      = [for name, arn in var.secret_arns : { name = name, valueFrom = arn }]
       portMappings = each.value.ports
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:${var.operations_port}/readyz || exit 1"]
+        command     = ["CMD", "/usr/local/bin/bridgefu", "healthcheck", "--address", "127.0.0.1:${var.operations_port}", "--path", "/readyz", "--timeout-ms", "5000"]
         interval    = 15
         timeout     = 5
         retries     = 3

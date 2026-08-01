@@ -165,7 +165,11 @@ values. Copy each module's `terraform.tfvars.example` and replace every
 placeholder. The AWS module rejects tagged images and exposes the security
 group that must be attached to every instance in the supplied ECS capacity
 provider. The GCP module references an existing Secret Manager secret so its
-contents are not copied into Terraform state.
+contents are not copied into Terraform state. Its init containers fetch the
+Redis URL and private CA into a memory-backed volume, build the combined trust
+bundle, and pass only file paths to the shell-free Bridgefu workload. Existing
+`env:BRIDGEFU_REDIS_URL` config references resolve through the standard
+`BRIDGEFU_REDIS_URL_FILE` fallback; a direct environment value still wins.
 
 Static validation never applies infrastructure. Credentialed smoke tests must
 use disposable projects/accounts and run `terraform destroy` even after a

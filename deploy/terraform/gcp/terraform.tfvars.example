@@ -11,7 +11,9 @@ otel_collector_image  = "otel/opentelemetry-collector-contrib@sha256:00000000000
 # Every value is an immutable Secret Manager version. Init containers fetch
 # these directly through Workload Identity into memory-backed emptyDir volumes;
 # Terraform never reads the secret payloads. Role configs should reference
-# BRIDGEFU_DATABASE_URL and BRIDGEFU_REDIS_URL through env: secret refs.
+# BRIDGEFU_DATABASE_URL and BRIDGEFU_REDIS_URL through env: secret refs. The
+# workload supplies BRIDGEFU_REDIS_URL_FILE so the distroless Bridgefu process
+# reads the fetched URL without a shell or placing its value in the pod spec.
 gateway_secret_versions = {
   "bridgefu.yaml"   = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-config/versions/1"
   "gateway.pem"     = "projects/bridgefu-smoke-project/secrets/bridgefu-gateway-cert/versions/1"

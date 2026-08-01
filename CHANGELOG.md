@@ -70,6 +70,10 @@ the PR and protected two-platform workflow pass.
 - Bridgefu now provides a configuration-independent `healthcheck` command that
   performs the local `/livez` probe itself. The final image no longer needs a
   shell, package manager, curl, or their transitive userland.
+- Compose and ECS invoke that probe directly. GCP init containers prepare the
+  Redis trust bundle and URL file, while every Bridgefu workload starts the
+  binary directly and resolves `env:NAME` secrets from `NAME_FILE` only when
+  the direct environment variable is absent.
 - The exact pinned runtime manifest reports zero HIGH/CRITICAL findings under
   Trivy 0.70.0 on both release architectures. The strict vulnerability policy
   is unchanged; the complete images remain subject to protected CI scans.

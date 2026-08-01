@@ -102,7 +102,9 @@ as a tenant boundary.
   remains fail-closed at startup until an owner-reviewed private relay revision
   with continuous expiring mTLS lease revalidation is immutably pinned; the
   uncommitted local candidate is not treated as an installed security control.
-- Secrets can use `env:VARIABLE`; effective-config output always redacts them.
+- Secrets can use `env:VARIABLE`; when that variable is absent,
+  `VARIABLE_FILE` may point to a bounded UTF-8 secret file. A direct variable
+  always wins, and effective-config output always redacts either source.
 
 Transfer effects retain both the selected call leg and its binding generation,
 so a delayed transfer cannot be redirected to a replacement session. Media-idle

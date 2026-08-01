@@ -137,9 +137,44 @@ grep -Eq 'outputs: type=oci,dest=' "$release_workflow"
 grep -Eq '^          push: false$' "$release_workflow"
 grep -Eq 'provenance: mode=max' "$release_workflow"
 
-grep -Fq 'name: Verify native runtime and healthcheck command' .github/workflows/ci.yml
+grep -Fq 'name: Verify native runtime and healthcheck execution' .github/workflows/ci.yml
 grep -Fq -- '--entrypoint /usr/local/bin/bridgefu' .github/workflows/ci.yml
-grep -Fq 'healthcheck --help' .github/workflows/ci.yml
+grep -Fq 'healthcheck --address 127.0.0.1:19090 --path /livez' .github/workflows/ci.yml
+grep -Fq "docker inspect --format '{{json .Config.Healthcheck.Test}}'" \
+  .github/workflows/ci.yml
+
+# Every deployment of the canonical distroless image must execute Bridgefu
+# directly. Shell-based startup and curl healthchecks cannot work in the final
+# stage and would make a successfully built image undeployable.
+grep -Fq 'test: [CMD, /usr/local/bin/bridgefu, healthcheck, --path, /readyz]' compose.yaml
+grep -Fq 'command     = ["CMD", "/usr/local/bin/bridgefu", "healthcheck"' \
+  deploy/terraform/aws/main.tf
+
+gcp_bridgefu_commands=$(grep -Fc 'command = ["/usr/local/bin/bridgefu"]' \
+  deploy/terraform/gcp/kubernetes.tf)
+if [ "$gcp_bridgefu_commands" -ne 3 ]; then
+  echo "every GCP Bridgefu workload must use the direct distroless entrypoint" >&2
+  exit 1
+fi
+if grep -Fq 'exec /usr/local/bin/bridgefu' deploy/terraform/gcp/kubernetes.tf; then
+  echo "GCP Bridgefu workloads must not depend on a shell wrapper" >&2
+  exit 1
+fi
+gcp_redis_file_refs=$(grep -Fc 'name  = "BRIDGEFU_REDIS_URL_FILE"' \
+  deploy/terraform/gcp/kubernetes.tf)
+gcp_ca_file_refs=$(grep -Fc 'name  = "SSL_CERT_FILE"' \
+  deploy/terraform/gcp/kubernetes.tf)
+gcp_ca_bundles=$(grep -Fc '> /run/bridgefu-secrets/ca-bundle.pem' \
+  deploy/terraform/gcp/kubernetes.tf)
+if [ "$gcp_redis_file_refs" -ne 3 ] || [ "$gcp_ca_file_refs" -ne 3 ] || \
+  [ "$gcp_ca_bundles" -ne 3 ]; then
+  echo "GCP Bridgefu workloads must receive file-backed Redis and CA secrets" >&2
+  exit 1
+fi
+grep -Fq 'args    = ["--config", "/run/bridgefu-secrets/$(BRIDGEFU_CONFIG_NAME).yaml", "run"]' \
+  deploy/terraform/gcp/kubernetes.tf
+grep -Fq 'let path_variable = format!("{name}_FILE");' src/secret_ref.rs
+
 grep -Eq '^          sbom: true$' "$release_workflow"
 grep -Eq 'verify-multiarch-oci\.py' "$release_workflow"
 grep -Eq 'verify-trivy-policy\.py' "$release_workflow"
