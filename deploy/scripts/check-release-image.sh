@@ -171,6 +171,8 @@ if [ "$gcp_redis_file_refs" -ne 3 ] || [ "$gcp_ca_file_refs" -ne 3 ] || \
   echo "GCP Bridgefu workloads must receive file-backed Redis and CA secrets" >&2
   exit 1
 fi
+# Kubernetes, not this shell, expands the worker pod-name variable.
+# shellcheck disable=SC2016
 grep -Fq 'args    = ["--config", "/run/bridgefu-secrets/$(BRIDGEFU_CONFIG_NAME).yaml", "run"]' \
   deploy/terraform/gcp/kubernetes.tf
 grep -Fq 'let path_variable = format!("{name}_FILE");' src/secret_ref.rs
@@ -229,6 +231,30 @@ trivy_version_pins="$(awk '
 ' .github/workflows/ci.yml "$release_workflow")"
 if [ "$trivy_version_pins" -ne 3 ]; then
   echo "all three Trivy scans must pin scanner version v0.70.0" >&2
+  exit 1
+fi
+sarif_severity_limits=$(grep -Ec \
+  '^          limit-severities-for-sarif: "true"$' .github/workflows/ci.yml)
+if [ "$sarif_severity_limits" -ne 1 ]; then
+  echo "CI SARIF must apply the configured HIGH/CRITICAL exit threshold" >&2
+  exit 1
+fi
+ci_strict_severities=$(grep -Ec '^          severity: HIGH,CRITICAL$' \
+  .github/workflows/ci.yml || true)
+ci_strict_exits=$(grep -Ec '^          exit-code: "1"$' \
+  .github/workflows/ci.yml || true)
+if [ "$ci_strict_severities" -ne 1 ] || [ "$ci_strict_exits" -ne 1 ]; then
+  echo "CI image scanning must fail on every HIGH/CRITICAL finding" >&2
+  exit 1
+fi
+candidate_all_severities=$(grep -Ec \
+  '^          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL$' "$release_workflow" || true)
+candidate_json_reports=$(grep -Ec '^          format: json$' "$release_workflow" || true)
+candidate_vuln_scanners=$(grep -Ec '^          scanners: vuln$' "$release_workflow" || true)
+candidate_retained_exits=$(grep -Ec '^          exit-code: "0"$' "$release_workflow" || true)
+if [ "$candidate_all_severities" -ne 2 ] || [ "$candidate_json_reports" -ne 2 ] || \
+  [ "$candidate_vuln_scanners" -ne 2 ] || [ "$candidate_retained_exits" -ne 2 ]; then
+  echo "candidate scans must retain all vulnerability severities for both platforms" >&2
   exit 1
 fi
 

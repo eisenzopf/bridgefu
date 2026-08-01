@@ -74,9 +74,10 @@ the PR and protected two-platform workflow pass.
   Redis trust bundle and URL file, while every Bridgefu workload starts the
   binary directly and resolves `env:NAME` secrets from `NAME_FILE` only when
   the direct environment variable is absent.
-- The exact pinned runtime manifest reports zero HIGH/CRITICAL findings under
-  Trivy 0.70.0 on both release architectures. The strict vulnerability policy
-  is unchanged; the complete images remain subject to protected CI scans.
+- The exact pinned runtime manifest and complete native images report zero
+  HIGH/CRITICAL findings under Trivy 0.70.0 on both release architectures. CI
+  limits retained SARIF to that exit threshold, while the protected candidate
+  gate retains all severities in JSON. The strict policy is unchanged.
 
 ### rvoip 0.3.4 registry integration — 2026-07-29
 
