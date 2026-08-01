@@ -69,6 +69,18 @@ enum Command {
     Validate,
     /// Print the effective configuration with all secrets redacted.
     PrintEffectiveConfig,
+    /// Probe the local liveness endpoint without loading configuration.
+    Healthcheck {
+        /// Local operations endpoint to probe.
+        #[arg(long, default_value = "127.0.0.1:9090")]
+        address: SocketAddr,
+        /// HTTP liveness path to request.
+        #[arg(long, default_value = "/livez")]
+        path: String,
+        /// Per-operation network timeout in milliseconds.
+        #[arg(long, default_value_t = 2_500)]
+        timeout_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -84,6 +96,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Container liveness must work in a package-free runtime before a config
+    // file or any deployment secret is mounted. Keeping the probe in this
+    // executable removes curl and its transitive userland from the image.
+    if let Command::Healthcheck {
+        address,
+        path,
+        timeout_ms,
+    } = &command
+    {
+        probe_liveness(*address, path, Duration::from_millis(*timeout_ms))?;
+        return Ok(());
+    }
+
     let cfg = config::Config::load(&args.config)?;
 
     match command {
@@ -93,6 +118,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::PrintEffectiveConfig => unreachable!("handled before secret-resolving load"),
+        Command::Healthcheck { .. } => unreachable!("handled before configuration load"),
         Command::Run => {
             // Role prerequisites are checked before tracing, metrics, or any
             // listener/task is installed. Unsupported topologies never fall
@@ -130,6 +156,63 @@ async fn main() -> Result<()> {
             Err(process.context(format!("OTLP trace shutdown also failed: {shutdown:#}")))
         }
     }
+}
+
+fn probe_liveness(address: SocketAddr, path: &str, timeout: Duration) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+
+    anyhow::ensure!(!timeout.is_zero(), "healthcheck timeout must be non-zero");
+    anyhow::ensure!(
+        path.starts_with('/')
+            && path.len() <= 2_048
+            && path.is_ascii()
+            && !path.bytes().any(|byte| byte <= b' ' || byte == 0x7f),
+        "healthcheck path must be a safe absolute ASCII HTTP path"
+    );
+
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .with_context(|| format!("connecting to Bridgefu liveness endpoint at {address}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("setting healthcheck read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("setting healthcheck write timeout")?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .context("sending Bridgefu liveness request")?;
+    stream
+        .flush()
+        .context("flushing Bridgefu liveness request")?;
+
+    let mut status_line = String::new();
+    BufReader::new(stream)
+        .take(1_025)
+        .read_line(&mut status_line)
+        .context("reading Bridgefu liveness response")?;
+    anyhow::ensure!(
+        status_line.ends_with('\n') && status_line.len() <= 1_024,
+        "Bridgefu liveness endpoint returned an invalid HTTP status line"
+    );
+    let mut fields = status_line.split_whitespace();
+    let protocol = fields.next().unwrap_or_default();
+    anyhow::ensure!(
+        matches!(protocol, "HTTP/1.0" | "HTTP/1.1"),
+        "Bridgefu liveness endpoint returned an invalid HTTP status line"
+    );
+    let status = fields
+        .next()
+        .context("Bridgefu liveness response omitted its status code")?
+        .parse::<u16>()
+        .context("Bridgefu liveness response contained an invalid status code")?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "Bridgefu liveness endpoint returned HTTP {status}"
+    );
+    Ok(())
 }
 
 /// Existing StandardCharter-compatible single-process lifecycle. This remains
@@ -562,6 +645,9 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     use bridgefu::call_engine::WorkerId;
     use bridgefu::call_service::{
@@ -587,6 +673,70 @@ mod tests {
             process_runner(RuntimeMode::MoqRelay),
             ProcessRunner::MoqRelay
         );
+    }
+
+    fn spawn_liveness_endpoint(status: &'static str) -> (SocketAddr, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request_line = String::new();
+            BufReader::new(&mut connection)
+                .read_line(&mut request_line)
+                .unwrap();
+            write!(
+                connection,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request_line
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn native_healthcheck_accepts_a_live_endpoint() {
+        let (address, server) = spawn_liveness_endpoint("200 OK");
+        probe_liveness(address, "/livez", Duration::from_secs(2)).unwrap();
+        assert_eq!(server.join().unwrap(), "GET /livez HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn native_healthcheck_rejects_an_unhealthy_endpoint() {
+        let (address, server) = spawn_liveness_endpoint("503 Service Unavailable");
+        let error = probe_liveness(address, "/livez", Duration::from_secs(2)).unwrap_err();
+        assert!(error.to_string().contains("returned HTTP 503"));
+        assert_eq!(server.join().unwrap(), "GET /livez HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn native_healthcheck_rejects_unsafe_inputs_before_connecting() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        for path in ["livez", "/livez\r\nInjected: true", "/bad path"] {
+            let error = probe_liveness(address, path, Duration::from_secs(1)).unwrap_err();
+            assert!(error.to_string().contains("safe absolute ASCII HTTP path"));
+        }
+        let error = probe_liveness(address, "/livez", Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("timeout must be non-zero"));
+    }
+
+    #[test]
+    fn healthcheck_cli_defaults_do_not_require_a_config_path() {
+        let args = Args::try_parse_from(["bridgefu", "healthcheck"]).unwrap();
+        let Some(Command::Healthcheck {
+            address,
+            path,
+            timeout_ms,
+        }) = args.command
+        else {
+            panic!("healthcheck command was not parsed");
+        };
+        assert_eq!(address, "127.0.0.1:9090".parse::<SocketAddr>().unwrap());
+        assert_eq!(path, "/livez");
+        assert_eq!(timeout_ms, 2_500);
     }
 
     #[tokio::test]

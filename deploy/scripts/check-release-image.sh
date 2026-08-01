@@ -77,21 +77,39 @@ if [ "$base_args" -ne 2 ]; then
   echo "release Dockerfile must pin both base manifest digests" >&2
   exit 1
 fi
-snapshot_args=$(grep -Ec '^ARG (BUILDER_DEBIAN_SNAPSHOT|RUNTIME_DEBIAN_SNAPSHOT)=[0-9]{8}T[0-9]{6}Z$' "$dockerfile")
-if [ "$snapshot_args" -ne 2 ]; then
-  echo "release Dockerfile must pin both Debian package snapshots" >&2
+snapshot_args=$(grep -Ec '^ARG BUILDER_DEBIAN_SNAPSHOT=[0-9]{8}T[0-9]{6}Z$' "$dockerfile")
+if [ "$snapshot_args" -ne 1 ]; then
+  echo "release Dockerfile must pin the Debian builder package snapshot" >&2
   exit 1
 fi
+if grep -Eq '^ARG RUNTIME_DEBIAN_SNAPSHOT=' "$dockerfile"; then
+  echo "distroless release runtime must not carry a Debian package snapshot" >&2
+  exit 1
+fi
+grep -Eq '^ARG RUNTIME_IMAGE=gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}$' \
+  "$dockerfile"
 grep -Eq 'snapshot\.debian\.org/archive/debian/' "$dockerfile"
 grep -Eq 'snapshot\.debian\.org/archive/debian-security/' "$dockerfile"
 grep -Eq 'build-essential=[^ ]+' "$dockerfile"
-grep -Eq 'ca-certificates=[^ ]+' "$dockerfile"
-grep -Eq 'curl=[^ ]+' "$dockerfile"
+
+runtime_run_steps="$(awk '
+  /^FROM \$\{RUNTIME_IMAGE\} AS runtime$/ { in_runtime = 1; next }
+  in_runtime && /^FROM / { in_runtime = 0 }
+  in_runtime && /^RUN / { count++ }
+  END { print count + 0 }
+' "$dockerfile")"
+if [ "$runtime_run_steps" -ne 0 ]; then
+  echo "distroless release runtime must not execute package or shell setup" >&2
+  exit 1
+fi
 
 grep -Eq '^COPY \. /src/bridgefu$' "$dockerfile"
 grep -Eq 'cargo build --locked --release' "$dockerfile"
+grep -Fq 'COPY --from=builder --chown=65532:65532 /out/bridgefu /usr/local/bin/bridgefu' \
+  "$dockerfile"
 grep -Eq '^USER 65532:65532$' "$dockerfile"
 grep -Eq '^HEALTHCHECK ' "$dockerfile"
+grep -Fq 'CMD ["/usr/local/bin/bridgefu", "healthcheck"]' "$dockerfile"
 grep -Eq '^STOPSIGNAL SIGTERM$' "$dockerfile"
 grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
@@ -118,6 +136,10 @@ grep -Eq 'platforms: linux/amd64,linux/arm64' "$release_workflow"
 grep -Eq 'outputs: type=oci,dest=' "$release_workflow"
 grep -Eq '^          push: false$' "$release_workflow"
 grep -Eq 'provenance: mode=max' "$release_workflow"
+
+grep -Fq 'name: Verify native runtime and healthcheck command' .github/workflows/ci.yml
+grep -Fq -- '--entrypoint /usr/local/bin/bridgefu' .github/workflows/ci.yml
+grep -Fq 'healthcheck --help' .github/workflows/ci.yml
 grep -Eq '^          sbom: true$' "$release_workflow"
 grep -Eq 'verify-multiarch-oci\.py' "$release_workflow"
 grep -Eq 'verify-trivy-policy\.py' "$release_workflow"
@@ -176,8 +198,9 @@ if [ "$trivy_version_pins" -ne 3 ]; then
 fi
 
 # rvoip-amazon-connect compiles its published protobuf schema at build time.
-# The canonical image installs protoc from its pinned Debian snapshot; the
-# host-based Rust CI job must provision and identify the same required tool
+# The canonical builder installs protoc from its pinned Debian snapshot; the
+# distroless runtime contains neither protoc nor a package manager. The
+# host-based Rust CI job must provision and identify the required build tool
 # before Clippy or tests can compile the registry package.
 grep -Fq 'Install protobuf compiler required by rvoip-amazon-connect' \
   .github/workflows/ci.yml

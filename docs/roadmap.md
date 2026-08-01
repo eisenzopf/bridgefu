@@ -4433,6 +4433,12 @@ Gate 10 local container/CI evidence recorded on 2026-07-14:
   Builder and runtime APT inputs now use immutable 2026-05-18 and 2026-07-13
   Debian snapshots plus explicit top-level package versions; this is a
   reproducible-input claim, not a byte-identical-rustc claim.
+- That historical runtime was superseded on 2026-07-31 after the current Trivy
+  database correctly blocked its unfixed HIGH/CRITICAL Debian userland. The
+  canonical final stage now uses a pinned, nonroot distroless Debian 13 `cc`
+  manifest and Bridgefu's own configuration-independent `/livez` probe, so the
+  image carries no runtime APT, shell, or curl. The exact base manifest scans
+  clean on both release architectures without weakening the severity policy.
 - `deploy/scripts/check-release-image.sh` passes. The multi-architecture OCI
   verifier passes 5/5 root/digest/platform/attestation regressions, the
   exact-platform selector passes 2/2 nested-index regressions, and the retained

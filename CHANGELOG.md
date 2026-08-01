@@ -62,6 +62,18 @@ the PR and protected two-platform workflow pass.
 - The release-image policy requires those exclusions. The measured local
   context fell from 8.6 GB to 7.96 MB before the successful native image build.
 
+### Minimal OCI runtime hardening — 2026-07-31
+
+- The canonical final image moves from Debian `bookworm-slim` plus APT and
+  curl to a digest-pinned, nonroot distroless Debian 13 `cc` runtime for both
+  `linux/amd64` and `linux/arm64`.
+- Bridgefu now provides a configuration-independent `healthcheck` command that
+  performs the local `/livez` probe itself. The final image no longer needs a
+  shell, package manager, curl, or their transitive userland.
+- The exact pinned runtime manifest reports zero HIGH/CRITICAL findings under
+  Trivy 0.70.0 on both release architectures. The strict vulnerability policy
+  is unchanged; the complete images remain subject to protected CI scans.
+
 ### rvoip 0.3.4 registry integration — 2026-07-29
 
 - Bridgefu now resolves one registry-only rvoip package graph at exactly

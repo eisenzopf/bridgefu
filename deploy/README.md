@@ -4,12 +4,15 @@
 exact crates.io `rvoip` 0.3.5 package set from the committed `Cargo.lock`; no
 separate rvoip checkout or named build context is required. The image runs as
 UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
-bases are pinned to multi-platform manifest digests. Builder and runtime
-packages come from separate immutable Debian snapshots with explicit top-level
-package versions; `Cargo.lock` registry checksums, the Bridgefu source revision,
-commit-derived build date, and `SOURCE_DATE_EPOCH` complete the reproducible
-input record. This is a reproducible-input contract, not an unsupported claim
-that rustc produces a byte-identical layer on every BuildKit version and host.
+bases are pinned to multi-platform manifest digests. Builder packages come from
+an immutable Debian snapshot with explicit top-level package versions. The
+final stage is the package-manager-free distroless Debian 13 `cc` runtime: it
+contains no shell or curl, and `bridgefu healthcheck` probes `/livez` without
+loading configuration or secrets. `Cargo.lock` registry checksums, the Bridgefu
+source revision, commit-derived build date, and `SOURCE_DATE_EPOCH` complete the
+reproducible input record. This is a reproducible-input contract, not an
+unsupported claim that rustc produces a byte-identical layer on every BuildKit
+version and host.
 
 ## Release build hosts and targets
 

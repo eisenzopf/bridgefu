@@ -8,9 +8,8 @@
 # is an intentional supply-chain change and must be accompanied by a CI build
 # for linux/amd64 and linux/arm64.
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
-ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 ARG BUILDER_DEBIAN_SNAPSHOT=20260518T000000Z
-ARG RUNTIME_DEBIAN_SNAPSHOT=20260713T000000Z
 
 FROM ${RUST_IMAGE} AS builder
 
@@ -39,11 +38,11 @@ WORKDIR /src/bridgefu
 
 RUN cargo build --locked --release \
     && install -D -m 0755 target/release/bridgefu /out/bridgefu \
-    && strip /out/bridgefu
+    && strip /out/bridgefu \
+    && install -d -m 0750 /out/var/lib/bridgefu
 
 FROM ${RUNTIME_IMAGE} AS runtime
 
-ARG RUNTIME_DEBIAN_SNAPSHOT
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="Bridgefu" \
@@ -55,23 +54,8 @@ LABEL org.opencontainers.image.title="Bridgefu" \
       org.opencontainers.image.rvoip.version="0.3.5" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
-RUN sed -i \
-        -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${RUNTIME_DEBIAN_SNAPSHOT}|" \
-        -e "s|URIs: http://deb.debian.org/debian|URIs: http://snapshot.debian.org/archive/debian/${RUNTIME_DEBIAN_SNAPSHOT}|" \
-        /etc/apt/sources.list.d/debian.sources \
-    && printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
-        > /etc/apt/apt.conf.d/99snapshot \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates=20230311+deb12u1 \
-        curl=7.88.1-10+deb12u15 \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 65532 bridgefu \
-    && useradd --system --uid 65532 --gid 65532 \
-        --home-dir /nonexistent --shell /usr/sbin/nologin bridgefu \
-    && install -d -o 65532 -g 65532 -m 0750 /var/lib/bridgefu
-
-COPY --from=builder /out/bridgefu /usr/local/bin/bridgefu
+COPY --from=builder --chown=65532:65532 /out/bridgefu /usr/local/bin/bridgefu
+COPY --from=builder --chown=65532:65532 /out/var/lib/bridgefu/ /var/lib/bridgefu/
 
 USER 65532:65532
 EXPOSE 5060/tcp 5060/udp 5070/tcp 5070/udp \
@@ -79,7 +63,7 @@ EXPOSE 5060/tcp 5060/udp 5070/tcp 5070/udp \
        16384-32767/udp 4433/udp 4443/udp 4444/udp 4445/udp
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
-  CMD ["curl", "--fail", "--silent", "http://127.0.0.1:9090/livez"]
+  CMD ["/usr/local/bin/bridgefu", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/bridgefu"]
 CMD ["--config", "/etc/bridgefu/bridgefu.yaml"]
