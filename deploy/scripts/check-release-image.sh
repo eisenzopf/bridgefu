@@ -152,6 +152,29 @@ while IFS= read -r use; do
   fi
 done < <(grep -hE '^[[:space:]]+- uses:' .github/workflows/ci.yml "$release_workflow")
 
+# Trivy's action and scanner are separate supply-chain inputs. Keep both
+# immutable and synchronized across ordinary image CI and the retained
+# multi-platform candidate workflow. The previous v0.28.0 action depended on a
+# removed setup-trivy tag and could not even prepare a GitHub Actions job.
+trivy_action_uses="$(awk '
+  /uses: aquasecurity\/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25/ {
+    count++
+  }
+  END { print count + 0 }
+' .github/workflows/ci.yml "$release_workflow")"
+if [ "$trivy_action_uses" -ne 3 ]; then
+  echo "all three Trivy scans must use the reviewed v0.36.0 action commit" >&2
+  exit 1
+fi
+trivy_version_pins="$(awk '
+  /^[[:space:]]+version: v0[.]70[.]0$/ { count++ }
+  END { print count + 0 }
+' .github/workflows/ci.yml "$release_workflow")"
+if [ "$trivy_version_pins" -ne 3 ]; then
+  echo "all three Trivy scans must pin scanner version v0.70.0" >&2
+  exit 1
+fi
+
 test -x deploy/scripts/verify-multiarch-oci.py
 test -x deploy/scripts/verify-trivy-policy.py
 test -x deploy/scripts/select-oci-platform.py

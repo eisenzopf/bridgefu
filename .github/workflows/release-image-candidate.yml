@@ -88,10 +88,11 @@ jobs:
             --platform linux/arm64 \
             --output "${{ runner.temp }}/bridgefu-oci-arm64"
       - name: Scan exact linux/amd64 candidate
-        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
+          version: v0.70.0
           input: ${{ runner.temp }}/bridgefu-oci-amd64
           scanners: vuln
           format: json
@@ -99,10 +100,11 @@ jobs:
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           exit-code: "0"
       - name: Scan exact linux/arm64 candidate
-        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
+          version: v0.70.0
           input: ${{ runner.temp }}/bridgefu-oci-arm64
           scanners: vuln
           format: json
