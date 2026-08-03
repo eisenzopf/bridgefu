@@ -9751,6 +9751,95 @@ def ec2_nat_gateway_is_tombstone(region: str, nat_gateway_id: str) -> bool:
     return not states or states == ["deleted"]
 
 
+def tagged_resource_is_proven_absent(
+    arn: str, account_id: str, region: str
+) -> bool:
+    """Ignore a stale tag-index ARN only when its provider proves absence."""
+    connect_match = re.fullmatch(
+        rf"arn:aws[-a-z0-9]*:connect:{re.escape(region)}:"
+        rf"{re.escape(account_id)}:instance/([A-Za-z0-9-]+)(?:/.*)?",
+        arn,
+    )
+    if connect_match:
+        probe = command(
+            [
+                "aws",
+                "connect",
+                "describe-instance",
+                "--region",
+                region,
+                "--instance-id",
+                connect_match.group(1),
+                "--no-cli-pager",
+            ],
+            check=False,
+        )
+        return probe.returncode != 0 and "ResourceNotFoundException" in (
+            probe.stderr or ""
+        )
+    instance_match = re.fullmatch(
+        rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
+        rf"{re.escape(account_id)}:instance/(i-[0-9a-f]+)",
+        arn,
+    )
+    if instance_match:
+        return ec2_instance_is_tombstone(region, instance_match.group(1))
+    nat_gateway_match = re.fullmatch(
+        rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
+        rf"{re.escape(account_id)}:natgateway/(nat-[0-9a-f]+)",
+        arn,
+    )
+    if nat_gateway_match:
+        return ec2_nat_gateway_is_tombstone(region, nat_gateway_match.group(1))
+    provider_probes = (
+        (
+            "vpc-endpoint",
+            r"(vpce-[0-9a-f]+)",
+            "describe-vpc-endpoints",
+            "--vpc-endpoint-ids",
+            "InvalidVpcEndpointId.NotFound",
+        ),
+        (
+            "subnet",
+            r"(subnet-[0-9a-f]+)",
+            "describe-subnets",
+            "--subnet-ids",
+            "InvalidSubnetID.NotFound",
+        ),
+        (
+            "volume",
+            r"(vol-[0-9a-f]+)",
+            "describe-volumes",
+            "--volume-ids",
+            "InvalidVolume.NotFound",
+        ),
+    )
+    for resource_type, identifier_pattern, operation, identifier_flag, absent in (
+        provider_probes
+    ):
+        match = re.fullmatch(
+            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
+            rf"{re.escape(account_id)}:{resource_type}/{identifier_pattern}",
+            arn,
+        )
+        if match:
+            probe = command(
+                [
+                    "aws",
+                    "ec2",
+                    operation,
+                    "--region",
+                    region,
+                    identifier_flag,
+                    match.group(1),
+                    "--no-cli-pager",
+                ],
+                check=False,
+            )
+            return probe.returncode != 0 and absent in (probe.stderr or "")
+    return False
+
+
 def exact_probe_exists(
     arguments: list[str],
     *,
@@ -10256,117 +10345,8 @@ def inventory_for_execution(ledger: dict[str, Any]) -> dict[str, Any]:
     tagged_resource_arns: list[str] = []
     for item in tagged.get("ResourceTagMappingList", []):
         arn = item["ResourceARN"]
-        connect_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:connect:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:instance/([A-Za-z0-9-]+)"
-            r"(?:/.*)?",
-            arn,
-        )
-        if connect_match:
-            probe = command(
-                [
-                    "aws",
-                    "connect",
-                    "describe-instance",
-                    "--region",
-                    region,
-                    "--instance-id",
-                    connect_match.group(1),
-                    "--no-cli-pager",
-                ],
-                check=False,
-            )
-            if probe.returncode != 0 and "ResourceNotFoundException" in (
-                probe.stderr or ""
-            ):
-                continue
-        instance_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:instance/(i-[0-9a-f]+)",
-            arn,
-        )
-        if instance_match and ec2_instance_is_tombstone(
-            region, instance_match.group(1)
-        ):
+        if tagged_resource_is_proven_absent(arn, ledger["account_id"], region):
             continue
-        nat_gateway_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:natgateway/(nat-[0-9a-f]+)",
-            arn,
-        )
-        if nat_gateway_match and ec2_nat_gateway_is_tombstone(
-            region, nat_gateway_match.group(1)
-        ):
-            continue
-        endpoint_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:vpc-endpoint/(vpce-[0-9a-f]+)",
-            arn,
-        )
-        if endpoint_match:
-            probe = command(
-                [
-                    "aws",
-                    "ec2",
-                    "describe-vpc-endpoints",
-                    "--region",
-                    region,
-                    "--vpc-endpoint-ids",
-                    endpoint_match.group(1),
-                    "--no-cli-pager",
-                ],
-                check=False,
-            )
-            if probe.returncode != 0 and "InvalidVpcEndpointId.NotFound" in (
-                probe.stderr or ""
-            ):
-                continue
-        subnet_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:subnet/(subnet-[0-9a-f]+)",
-            arn,
-        )
-        if subnet_match:
-            probe = command(
-                [
-                    "aws",
-                    "ec2",
-                    "describe-subnets",
-                    "--region",
-                    region,
-                    "--subnet-ids",
-                    subnet_match.group(1),
-                    "--no-cli-pager",
-                ],
-                check=False,
-            )
-            if probe.returncode != 0 and "InvalidSubnetID.NotFound" in (
-                probe.stderr or ""
-            ):
-                continue
-        volume_match = re.fullmatch(
-            rf"arn:aws[-a-z0-9]*:ec2:{re.escape(region)}:"
-            rf"{re.escape(ledger['account_id'])}:volume/(vol-[0-9a-f]+)",
-            arn,
-        )
-        if volume_match:
-            probe = command(
-                [
-                    "aws",
-                    "ec2",
-                    "describe-volumes",
-                    "--region",
-                    region,
-                    "--volume-ids",
-                    volume_match.group(1),
-                    "--no-cli-pager",
-                ],
-                check=False,
-            )
-            if probe.returncode != 0 and "InvalidVolume.NotFound" in (
-                probe.stderr or ""
-            ):
-                continue
         tagged_resource_arns.append(arn)
     active_codebuild_build_ids = inventory_headless_build_ids(ledger)
     vapi_bindings = bound_vapi_resource_ids(ledger)
@@ -12425,6 +12405,13 @@ def assert_no_account_live_state_for_init(
                 request_token="--pagination-token",
             )
         )
+    tagged_resources = [
+        item
+        for item in tagged_resources
+        if not tagged_resource_is_proven_absent(
+            str(item.get("ResourceARN", "")), account_id, region
+        )
+    ]
     if tagged_resources:
         raise LiveTestError(
             "AWS account still contains Bridgefu test-owned resources; prove zero "

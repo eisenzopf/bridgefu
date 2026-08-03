@@ -2916,6 +2916,32 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         with mock.patch.object(LIVE, "command", return_value=denied):
             self.assertFalse(LIVE.ec2_nat_gateway_is_tombstone("us-east-1", "nat-123"))
 
+    def test_tagged_resource_tombstones_require_exact_provider_identity(self):
+        arn = "arn:aws:ec2:us-west-2:123456789012:natgateway/nat-123"
+        with mock.patch.object(
+            LIVE, "ec2_nat_gateway_is_tombstone", return_value=True
+        ) as tombstone:
+            self.assertTrue(
+                LIVE.tagged_resource_is_proven_absent(
+                    arn, "123456789012", "us-west-2"
+                )
+            )
+            self.assertFalse(
+                LIVE.tagged_resource_is_proven_absent(
+                    arn, "999999999999", "us-west-2"
+                )
+            )
+            self.assertFalse(
+                LIVE.tagged_resource_is_proven_absent(
+                    arn, "123456789012", "us-east-1"
+                )
+            )
+        tombstone.assert_called_once_with("us-west-2", "nat-123")
+        init_guard = SCRIPT.read_text().split(
+            "def assert_no_account_live_state_for_init", 1
+        )[1].split("def ", 1)[0]
+        self.assertIn("tagged_resource_is_proven_absent", init_guard)
+
     def test_starter_capacity_gate_reserves_the_complete_two_stack_path(self):
         ledger = {
             "runtime_profile": "starter",
