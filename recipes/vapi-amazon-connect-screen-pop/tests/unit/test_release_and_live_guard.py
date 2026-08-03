@@ -823,6 +823,25 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         with self.assertRaises(LIVE.LiveTestError):
             LIVE.refresh_publication_candidate(reviewed)
 
+        reviewed_but_retired = {
+            "status": "change_set_reviewed",
+            "execution_id": "bft-safe1",
+            "publication_generation": 2,
+            "published_objects": {},
+        }
+        LIVE.refresh_publication_candidate(reviewed_but_retired)
+        self.assertEqual(reviewed_but_retired["status"], "publishing")
+        self.assertEqual(reviewed_but_retired["publication_generation"], 3)
+
+        for status in (
+            "qualification_runner_deploying",
+            "qualification_runner_deployed",
+            "deploying",
+            "deployed",
+        ):
+            with self.subTest(status=status), self.assertRaises(LIVE.LiveTestError):
+                LIVE.refresh_publication_candidate({"status": status})
+
     def test_partial_publication_candidate_can_be_explicitly_refreshed(self):
         ledger = {
             "status": "publishing",

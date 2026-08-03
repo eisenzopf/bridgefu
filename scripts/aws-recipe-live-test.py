@@ -4402,8 +4402,13 @@ def candidate_image_tag(ledger: dict[str, Any]) -> str:
     return f"{ledger['execution_id']}-r{generation}"
 
 
+REFRESHABLE_PUBLICATION_STATUSES = frozenset(
+    {"published", "publishing", "change_set_reviewed"}
+)
+
+
 def refresh_publication_candidate(ledger: dict[str, Any]) -> None:
-    if ledger.get("status") not in {"published", "publishing"}:
+    if ledger.get("status") not in REFRESHABLE_PUBLICATION_STATUSES:
         raise LiveTestError(
             "candidate refresh requires an undeployed publication candidate"
         )
@@ -4762,7 +4767,7 @@ def publish(args: argparse.Namespace) -> None:
     refresh = bool(getattr(args, "refresh_candidate", False))
     allowed_statuses = {"bootstrap_complete", "publishing"}
     if refresh:
-        if ledger.get("status") not in {"published", "publishing"}:
+        if ledger.get("status") not in REFRESHABLE_PUBLICATION_STATUSES:
             raise LiveTestError(
                 "--refresh-candidate requires an undeployed publication candidate"
             )
