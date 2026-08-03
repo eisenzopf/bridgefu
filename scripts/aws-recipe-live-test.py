@@ -4452,6 +4452,17 @@ def refresh_publication_candidate(ledger: dict[str, Any]) -> None:
         "release_manifest_public_key_sha256",
     ):
         ledger.pop(field, None)
+    for field in (
+        "change_set_arn",
+        "change_set_name",
+        "review_stack_id",
+        "change_set_review_sha256",
+        "qualification_change_set_arn",
+        "qualification_change_set_name",
+        "qualification_review_stack_id",
+        "qualification_change_set_review_sha256",
+    ):
+        ledger.pop(field, None)
     ledger["published_objects"] = {}
     ledger["bootstrap_refresh_complete"] = False
     for field in (
@@ -4472,17 +4483,20 @@ def retire_unexecuted_create_review(
     stack_name_key: str,
     change_set_arn_key: str,
     change_set_name_key: str,
+    review_stack_id_key: str,
+    review_sha256_key: str,
     expected_change_set_name: str,
 ) -> str | None:
     """Remove an exact failed or available CREATE review with zero resources."""
     change_set_arn = ledger.get(change_set_arn_key)
     change_set_name = ledger.get(change_set_name_key)
     if not change_set_arn and not change_set_name and existing_stack is None:
+        ledger.pop(review_stack_id_key, None)
+        ledger.pop(review_sha256_key, None)
         return None
     stack_name = ledger.get(stack_name_key)
     if (
-        not change_set_arn
-        or change_set_name != expected_change_set_name
+        bool(change_set_arn) != bool(change_set_name)
         or existing_stack is None
         or existing_stack.get("StackName") != stack_name
         or existing_stack.get("StackStatus") != "REVIEW_IN_PROGRESS"
@@ -4496,6 +4510,40 @@ def retire_unexecuted_create_review(
         stack_name,
         "unexecuted review",
     )
+    recorded_review_stack_id = ledger.get(review_stack_id_key)
+    if (
+        recorded_review_stack_id is not None
+        and recorded_review_stack_id != expected_stack_id
+    ):
+        recorded_review_stack_id = require_stack_id_for_name(
+            ledger,
+            recorded_review_stack_id,
+            stack_name,
+            "stale unexecuted review",
+        )
+        stale_review_status = stack_status_if_exists(
+            recorded_review_stack_id, ledger["region"], environment
+        )
+        if stale_review_status not in {None, "DELETE_COMPLETE"}:
+            raise LiveTestError("stale review stack identity is still active")
+    if not change_set_arn:
+        recovered = describe_change_set_if_exists(
+            ledger,
+            environment,
+            stack_name,
+            expected_change_set_name,
+            expected_stack_id=expected_stack_id,
+        )
+        if recovered is None:
+            raise LiveTestError(
+                "unrecorded review stack has no exact recoverable change set"
+            )
+        change_set_arn = recovered["ChangeSetId"]
+        change_set_name = expected_change_set_name
+    if change_set_name != expected_change_set_name:
+        raise LiveTestError(
+            "candidate refresh is forbidden after deployment review starts"
+        )
     change_set_arn = require_change_set_id_authority(
         ledger,
         change_set_arn,
@@ -4594,6 +4642,8 @@ def retire_unexecuted_create_review(
     )
     ledger.pop(change_set_arn_key, None)
     ledger.pop(change_set_name_key, None)
+    ledger.pop(review_stack_id_key, None)
+    ledger.pop(review_sha256_key, None)
     return expected_change_set_name
 
 
@@ -4609,6 +4659,8 @@ def retire_unexecuted_application_review(
         stack_name_key="stack_name",
         change_set_arn_key="change_set_arn",
         change_set_name_key="change_set_name",
+        review_stack_id_key="review_stack_id",
+        review_sha256_key="change_set_review_sha256",
         expected_change_set_name=f"reviewed-{ledger['execution_id']}",
     )
 
@@ -4625,6 +4677,8 @@ def retire_unexecuted_qualification_review(
         stack_name_key="qualification_stack_name",
         change_set_arn_key="qualification_change_set_arn",
         change_set_name_key="qualification_change_set_name",
+        review_stack_id_key="qualification_review_stack_id",
+        review_sha256_key="qualification_change_set_review_sha256",
         expected_change_set_name=f"qualification-{ledger['execution_id']}",
     )
 

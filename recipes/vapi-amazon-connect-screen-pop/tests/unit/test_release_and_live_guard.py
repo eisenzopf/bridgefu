@@ -951,6 +951,8 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             "stack_name": "bridgefu-bft-safe1",
             "change_set_arn": change_set_id,
             "change_set_name": "reviewed-bft-safe1",
+            "review_stack_id": stack_id,
+            "change_set_review_sha256": "a" * 64,
         }
         existing = {
             "StackName": ledger["stack_name"],
@@ -998,6 +1000,10 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         self.assertEqual(
             wait_arguments[wait_arguments.index("--stack-name") + 1], stack_id
         )
+        self.assertNotIn("change_set_arn", ledger)
+        self.assertNotIn("change_set_name", ledger)
+        self.assertNotIn("review_stack_id", ledger)
+        self.assertNotIn("change_set_review_sha256", ledger)
 
         unsafe_ledger = {
             **ledger,
@@ -1015,6 +1021,85 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
                 )
         aws.assert_called_once()
         waiter.assert_not_called()
+
+    def test_candidate_refresh_recovers_unrecorded_review_after_stale_id(self):
+        stack_name = "bridgefu-bft-safe1-qualification"
+        stale_stack_id = (
+            "arn:aws:cloudformation:us-west-2:111122223333:stack/"
+            f"{stack_name}/11111111-1111-1111-1111-111111111111"
+        )
+        current_stack_id = (
+            "arn:aws:cloudformation:us-west-2:111122223333:stack/"
+            f"{stack_name}/22222222-2222-2222-2222-222222222222"
+        )
+        change_set_id = (
+            "arn:aws:cloudformation:us-west-2:111122223333:changeSet/"
+            "qualification-bft-safe1/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        )
+        ledger = {
+            "execution_id": "bft-safe1",
+            "account_id": "111122223333",
+            "partition": "aws",
+            "region": "us-west-2",
+            "qualification_stack_name": stack_name,
+            "qualification_review_stack_id": stale_stack_id,
+            "qualification_change_set_review_sha256": "b" * 64,
+        }
+        existing = {
+            "StackName": stack_name,
+            "StackId": current_stack_id,
+            "StackStatus": "REVIEW_IN_PROGRESS",
+        }
+        description = {
+            "ChangeSetId": change_set_id,
+            "ChangeSetName": "qualification-bft-safe1",
+            "StackName": stack_name,
+            "StackId": current_stack_id,
+            "Status": "CREATE_COMPLETE",
+            "ExecutionStatus": "AVAILABLE",
+            "Tags": [
+                {"Key": "Project", "Value": LIVE.PROJECT},
+                {"Key": "ManagedBy", "Value": LIVE.MANAGED_BY},
+                {"Key": "BridgefuExecutionId", "Value": ledger["execution_id"]},
+                {"Key": "BridgefuRecipe", "Value": LIVE.RECIPE},
+            ],
+        }
+
+        def response(arguments, **_kwargs):
+            operation = arguments[1]
+            if operation == "describe-change-set":
+                return description
+            if operation == "list-stack-resources":
+                return {"StackResourceSummaries": []}
+            if operation in {"delete-change-set", "delete-stack"}:
+                return {}
+            self.fail(f"unexpected AWS operation: {arguments}")
+
+        with mock.patch.object(
+            LIVE, "stack_status_if_exists", return_value="DELETE_COMPLETE"
+        ) as stale_status, mock.patch.object(
+            LIVE, "describe_change_set_if_exists", return_value=description
+        ) as reconcile, mock.patch.object(
+            LIVE, "aws_json", side_effect=response
+        ), mock.patch.object(LIVE, "aws_wait"):
+            self.assertEqual(
+                LIVE.retire_unexecuted_qualification_review(
+                    ledger, {"SAFE": "1"}, existing
+                ),
+                "qualification-bft-safe1",
+            )
+        stale_status.assert_called_once_with(
+            stale_stack_id, "us-west-2", {"SAFE": "1"}
+        )
+        reconcile.assert_called_once_with(
+            ledger,
+            {"SAFE": "1"},
+            stack_name,
+            "qualification-bft-safe1",
+            expected_stack_id=current_stack_id,
+        )
+        self.assertNotIn("qualification_review_stack_id", ledger)
+        self.assertNotIn("qualification_change_set_review_sha256", ledger)
 
     def test_cost_guard_is_conservative_and_bounded(self):
         estimate = LIVE.cost_estimate(8, 30)
