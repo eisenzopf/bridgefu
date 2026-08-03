@@ -323,7 +323,7 @@ Resources:
               Action:
                 - logs:DeleteLogGroup
                 - logs:ListTagsForResource
-              Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/connect/${ExecutionId}-connect'
+              Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/connect/${ExecutionId}-connect:*'
             - !Ref AWS::NoValue
           - !If
             - CreateDisposableConnect

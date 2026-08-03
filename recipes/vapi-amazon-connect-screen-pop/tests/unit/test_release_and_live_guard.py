@@ -96,7 +96,11 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             if "Sid" in mapping
         ]
         by_sid = {statement.get("Sid"): statement for statement in statements}
-        expected_sids = {"ManageRecipeLogsOnly", "ManageExactConnectLogGroup"}
+        expected_sids = {
+            "DeleteExactDisposableConnectLogFallback",
+            "ManageRecipeLogsOnly",
+            "ManageExactConnectLogGroup",
+        }
         self.assertTrue(expected_sids.issubset(by_sid))
         for sid in expected_sids:
             statement = by_sid[sid]
