@@ -9742,7 +9742,7 @@ def ec2_nat_gateway_is_tombstone(region: str, nat_gateway_id: str) -> bool:
         check=False,
     )
     if probe.returncode != 0:
-        return False
+        return "NatGatewayNotFound" in (probe.stderr or "")
     try:
         document = json.loads(probe.stdout)
     except (TypeError, json.JSONDecodeError):

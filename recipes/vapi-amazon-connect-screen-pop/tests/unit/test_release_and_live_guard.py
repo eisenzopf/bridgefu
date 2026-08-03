@@ -2908,11 +2908,16 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             stdout=json.dumps({"NatGateways": [{"State": "available"}]}),
             stderr="",
         )
+        absent = mock.Mock(
+            returncode=254, stdout="", stderr="NatGatewayNotFound"
+        )
         denied = mock.Mock(returncode=255, stdout="", stderr="AccessDenied")
         with mock.patch.object(LIVE, "command", return_value=deleted):
             self.assertTrue(LIVE.ec2_nat_gateway_is_tombstone("us-east-1", "nat-123"))
         with mock.patch.object(LIVE, "command", return_value=available):
             self.assertFalse(LIVE.ec2_nat_gateway_is_tombstone("us-east-1", "nat-123"))
+        with mock.patch.object(LIVE, "command", return_value=absent):
+            self.assertTrue(LIVE.ec2_nat_gateway_is_tombstone("us-east-1", "nat-123"))
         with mock.patch.object(LIVE, "command", return_value=denied):
             self.assertFalse(LIVE.ec2_nat_gateway_is_tombstone("us-east-1", "nat-123"))
 
