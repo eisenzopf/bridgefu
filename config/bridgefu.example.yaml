@@ -13,8 +13,8 @@ aws:
   # Legacy single-tenant schema (still accepted when `tenants:` is absent):
   # instance_id / contact_flow_id here become one catch-all tenant named
   # "default" that answers every user part.
-  #instance_id: 83a72e61-0000-0000-0000-000000000000
-  #contact_flow_id: 2a3b3059-0000-0000-0000-000000000000
+  #instance_id: 11111111-1111-1111-1111-111111111111
+  #contact_flow_id: 22222222-2222-2222-2222-222222222222
 
 sip:
   bind_ip: 0.0.0.0
@@ -46,8 +46,8 @@ default_tenant: null
 
 tenants:
   banking:                   # ← sip:banking@<eip>
-    instance_id: 83a72e61-0000-0000-0000-000000000000        # Connect instance id
-    contact_flow_id: 2a3b3059-0000-0000-0000-000000000000     # this tenant's inbound flow
+    instance_id: 11111111-1111-1111-1111-111111111111        # Connect instance id
+    contact_flow_id: 22222222-2222-2222-2222-222222222222     # this tenant's inbound flow
     default_display_name: "Vapi caller"
     mapping:                 # optional; omit to inherit the global mapping
       unmapped: drop
@@ -55,8 +55,8 @@ tenants:
         X-Correlation-Id: correlation_id
         X-Vapi-Call-Id: HostedWidget-vapiCallId
   #retail:                   # ← sip:retail@<eip> — same instance, different flow
-  #  instance_id: 83a72e61-0000-0000-0000-000000000000
-  #  contact_flow_id: 7c1d2e3f-0000-0000-0000-000000000000
+  #  instance_id: 11111111-1111-1111-1111-111111111111
+  #  contact_flow_id: 33333333-3333-3333-3333-333333333333
 
 observability:
   log_level: "info,rvoip_amazon_connect=debug"
@@ -240,12 +240,12 @@ api:
 #     codecs: [pcmu, opus]
 # sip_profiles:
 #   vapi-direct-assistant:
-#     allowed_targets: ["sips:standard-charter-direct@sip.vapi.ai;transport=tls"]
+#     allowed_targets: ["sips:reference-tenant-direct@sip.vapi.ai;transport=tls"]
 #     from_uri: "sips:bridgefu@bridge.example"
 #     tls_roots: [/etc/ssl/certs/ca-certificates.crt]
 #     srtp: required
 #     codecs: [pcmu, opus]
-#     # StandardCharter signs this opaque value; Vapi receives it as a SIP
+#     # ReferenceTenant signs this opaque value; Vapi receives it as a SIP
 #     # template variable and injects it into a static (non-LLM) tool field.
 #     metadata_keys: [correlation_id, handoff_token]
 #   support-sbc:
@@ -290,7 +290,7 @@ api:
 #       endpoint:
 #         type: sip
 #         config:
-#           uri: "sips:standard-charter-direct@sip.vapi.ai;transport=tls"
+#           uri: "sips:reference-tenant-direct@sip.vapi.ai;transport=tls"
 #           initial_context: required
 #   support:
 #     tenant_id: banking
@@ -314,7 +314,7 @@ context:
     X-Correlation-Id: correlation_id
     X-Vapi-Call-Id: vapi_call_id
     X-Account-Tier: account_tier
-    # Direct-browser calls carry only a signed opaque StandardCharter session
+    # Direct-browser calls carry only a signed opaque ReferenceTenant session
     # mapping. It is never a Bridgefu API credential or destination selector.
     # Vapi removes the leading X- and exposes this as the trusted template
     # variable `bridgefu_handoff_token` for static custom-tool parameters.
@@ -461,7 +461,7 @@ generic_bridge:
   # mapping must rename X-Correlation-Id to the Amazon `correlation_id`
   # attribute. The legacy listener above remains unchanged and continues to be
   # the default production route.
-  standardcharter_canary:
+  reference_tenant_canary:
     enabled: false
     # tenant: banking # must equal api.static_tenant and a configured tenant
     trusted_subject: bridgefu-static-api-key

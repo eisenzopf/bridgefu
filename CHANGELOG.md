@@ -5,8 +5,75 @@
 This working tree is not yet a published release. An owner-reviewed immutable
 revision and the protected two-platform OCI candidate remain 0.9.0 release
 gates. The rvoip #54 fix and fourth exact-Chromium pass, TURN/public-NAT,
-live-provider and StandardCharter checks, cloud deployment evidence, and the
+live-provider and reference tenant checks, cloud deployment evidence, and the
 one-hour qualification profiles remain explicit 1.0 gates.
+
+### Neutral-label compatibility note
+
+- Intentionally renamed the preview canary config key and metric, observer
+  schema IDs, Compose and GitHub identifiers, secret names, scripts and
+  fixtures, and the public Rust module and types. Strict v1 configuration
+  accepts `generic_bridge.reference_tenant_canary` only and does not accept the
+  retired canary field. Operators must update every surface together before
+  rollout; mixed-name deployments are unsupported.
+- Advanced the preview canary's durable idempotency namespace to neutral v2.
+  Fresh installations use v2 directly. A durable store that ran an earlier
+  preview must disable canary admission, drain calls and pending cleanup, wait
+  the full 24-hour idempotency-retention window, deploy while disabled, and
+  verify before re-enabling.
+
+### Recipe-first product and AWS packaging — 2026-07-31
+
+- Added a versioned, data-only recipe catalog/compiler and administrator CLI
+  for listing, inspecting, initializing, validating, explaining, deploying,
+  checking, testing, and safely destroying recipe deployments.
+- Added preview recipes for Vapi SIP/SIPS to Amazon Connect WebRTC with an
+  AWS-native DynamoDB/Lambda screen pop, SIP/SIPS to WebRTC, WebRTC to
+  SIP/SIPS, and WebRTC directly to Amazon Connect.
+- Added generic exact stable-URI admission for fixed authenticated SIP/RTP
+  peers. It creates the same durable named-route call, pinned profile
+  revisions, bounded correlation context, and internal one-use proof as
+  managed admission; SIPS/SRTP continues to require managed attachments.
+- Registered every projected named Amazon Connect profile in recipe/all-in-one
+  runtimes so a recipe profile reaches `StartWebRTCContact` instead of failing
+  at adapter profile resolution.
+- Corrected recipe-only Starter/HA telemetry and lifecycle guards to use the
+  emitted generic route and durable Amazon cleanup metrics. Certificate reload
+  now waits for the real all-in-one route count; HA scale-in protection fails
+  closed when telemetry is unavailable; HA EMF explicitly targets the
+  `Bridgefu/Runtime` namespace; capacity and cleanup alarms use real series.
+- Added a normal existing-Connect CloudFormation application that owns only a
+  wrapper flow, plus a separate acknowledged demo template that may create a
+  first/disposable Connect instance.
+- Added hardened Starter and bounded multi-AZ HA AWS profiles, matching
+  CloudWatch dashboards/alarms/runbooks, and Terraform modules that wrap the
+  same canonical CloudFormation application.
+- Added deterministic Lambda, runtime, browser-test, and signed release bundle
+  builders; strict recipe/schema/documentation tests; CloudFormation lint and
+  Guard policy; and a cost-bounded live lifecycle with exact teardown
+  inventory. Support remains `preview` until retained live interoperability,
+  recovery, load, latency, and soak evidence passes for the published assets.
+- Extended the guarded AWS lifecycle with a non-replacing update and
+  intentional bad-artifact rollback drill. It reuses NoEcho parameters without
+  reading them, reviews Modify-only changes, proves restoration of the working
+  immutable Lambda version, and requires post-rollback verification.
+- Made AWS change-set review recursive across every nested child change set,
+  with strict depth/count/action/replacement/resource bounds. The existing-
+  Connect workflow now explicitly reviews Backup and Vapi custom resources
+  while still rejecting disposable Connect instance/user/queue creation.
+- Kept the mutable root implementation-progress journal outside the immutable
+  release source hash so audited live-test updates do not invalidate an
+  otherwise unchanged candidate; product source, recipe assets, documentation,
+  and the approved implementation plan remain frozen.
+- Added protected real-source qualification for the four SIP/RTP and
+  SIPS/SRTP codec cases plus the stock Vapi browser-transfer case. Independent
+  source and Agent Workspace observers now bind audio markers, DTMF, both
+  hangup directions, the exact synthetic screen pop, Vapi's prepare/transfer
+  call object, and Bridgefu's post-consumption proof of one actual correlation
+  header without retaining raw identifiers.
+- Bound the direct test runner to one immutable public IPv4 `/32`, rechecked it
+  immediately before media, and corrected the controller's correlation
+  derivation to the exact AWS Lambda `bridgefu|deployment|org|call` contract.
 
 ### Audit scope and review status
 
@@ -94,7 +161,7 @@ the PR and protected two-platform workflow pass.
   generation-fenced effect path.
 - The real generic-SIP cancellation case passes its one-second destination
   CANCEL bound. The complete six-case generic SIP reference suite, 40-case
-  call execution supervisor suite, 82-case StandardCharter contract, and two
+  call execution supervisor suite, 82-case reference tenant contract, and two
   hermetic Amazon Connect qualification cases pass against registry-only
   rvoip `0.3.4`. The owner-gated Chromium case remains separately ignored.
 
@@ -178,7 +245,7 @@ the PR and protected two-platform workflow pass.
 
 ### Added — Vapi to Amazon Connect
 
-- Preserved the frozen StandardCharter-compatible Vapi SIP-transfer listener on
+- Preserved the frozen reference-tenant-compatible Vapi SIP-transfer listener on
   the configured legacy SIP port (default `5060`). It routes by Request-URI,
   then `To`, then optional default tenant; maps allowlisted `X-*` headers to
   Amazon attributes; starts `StartWebRTCContact`; bridges SIP G.711 to Chime
@@ -201,7 +268,7 @@ the PR and protected two-platform workflow pass.
 - Added [src/amazon_cleanup.rs](src/amazon_cleanup.rs): successful Amazon starts
   retain exact `StopContact` authority before media proceeds, and startup/drain
   reconcile unresolved cleanup records without exposing contact identifiers.
-- Added an optional, false-by-default durable StandardCharter canary on the
+- Added an optional, false-by-default durable reference tenant canary on the
   generic listener while leaving the original listener independent.
 
 ### Added — browser WebRTC to Vapi assistant to Amazon handoff
@@ -346,7 +413,7 @@ the PR and protected two-platform workflow pass.
 - Added a hardened multi-stage, non-root, read-only-root-compatible image for
   linux/amd64 and linux/arm64 with immutable base/package inputs and explicit
   build provenance metadata.
-- Added Compose profiles for StandardCharter, generic SIP/WebRTC, Telnyx, UCTP,
+- Added Compose profiles for reference tenant, generic SIP/WebRTC, Telnyx, UCTP,
   MOQT, PostgreSQL/Redis, Coturn, and clustered gateway/worker/relay roles.
 - Added a protected, manually dispatched release-image candidate workflow that
   builds a no-push OCI layout and verifies exact platforms, SPDX SBOMs, SLSA
@@ -354,7 +421,7 @@ the PR and protected two-platform workflow pass.
 - Added credential-free runtime/configuration smoke tooling, OCI/platform/Trivy
   policy validators, schema and Compose checkers, local Redis TLS generation,
   and a retained evidence format that records dirty tracked and untracked state.
-- Added the protected, manually dispatched StandardCharter nonproduction smoke
+- Added the protected, manually dispatched reference tenant nonproduction smoke
   workflow, runbook, retained-artifact verifier, and bounded drain/rollback
   scripts. They do not authorize or imply a production deployment.
 - Expanded AWS Terraform to a role-separated ECS-on-EC2/NLB/RDS/ElastiCache
@@ -363,7 +430,7 @@ the PR and protected two-platform workflow pass.
   isolation. These roots are static definitions, not proof of a successful
   cloud apply.
 - Preserved the legacy single-host `deploy.sh` and systemd path as an isolated
-  StandardCharter compatibility deployment rather than the clustered reference.
+  reference tenant compatibility deployment rather than the clustered reference.
 - Added MIT licensing and contribution/security-reporting guidance.
 
 ### Changed
@@ -420,7 +487,7 @@ the PR and protected two-platform workflow pass.
 
 ### Security notes
 
-- The legacy `:5060` StandardCharter listener remains plain SIP/RTP and relies
+- The legacy `:5060` reference tenant listener remains plain SIP/RTP and relies
   on carrier CIDR/firewall isolation; it is not upgraded in place to SIP auth,
   TLS, or SRTP. Use the managed named-SIPS path where those controls are needed.
 - Named Vapi profiles require a real shared TLS listener and mandatory SRTP.
@@ -438,7 +505,7 @@ the PR and protected two-platform workflow pass.
 
 ### Compatibility and breaking protocol changes
 
-- The existing Vapi-to-Amazon StandardCharter listener remains the default
+- The existing Vapi-to-Amazon reference tenant listener remains the default
   all-in-one compatibility path and is protected by frozen contract tests.
 - UCTP 0.2 datagrams contain the eight-byte UCTP header followed by a complete
   RTP packet; payload-only alpha datagrams are not wire compatible.
@@ -461,7 +528,7 @@ the PR and protected two-platform workflow pass.
 - Added repository-conformance suites across memory, SQLite, PostgreSQL, Redis
   coordination, Amazon start specs, initial contexts, private egress, and
   durable broadcast commands.
-- Added frozen StandardCharter routing/header/media/lifecycle contracts, generic
+- Added frozen reference tenant routing/header/media/lifecycle contracts, generic
   SIP reference tests, call-directionality checks, and execution-supervisor
   recovery/teardown matrices.
 - Added hermetic all-in-one qualification for browser/Vapi-like SIPS assistant
@@ -496,7 +563,7 @@ the PR and protected two-platform workflow pass.
 - Added or expanded architecture, security, observability, provider capability,
   protocol compatibility, migration, repository, Amazon, gateway-ingress,
   qualification, benchmark, MOQT/RTC fork-review, interop, packet-capture,
-  deployment, Terraform, and StandardCharter smoke/rollback documentation.
+  deployment, Terraform, and reference tenant smoke/rollback documentation.
 - Added a non-secret managed-route fixture and the comprehensive illustrative
   browser/Vapi/Amazon configuration. The latter contains placeholder addresses,
   UUIDs, CIDRs, certificates, and `env:` secrets and was intentionally not run
@@ -587,7 +654,7 @@ listing them here does not make them part of a Bridgefu commit.
 3. Legacy Vapi-to-Amazon path:
    [src/main.rs](src/main.rs), [src/config.rs](src/config.rs),
    [src/amazon_cleanup.rs](src/amazon_cleanup.rs), and
-   [tests/standardcharter_contract.rs](tests/standardcharter_contract.rs).
+   [tests/reference_tenant_contract.rs](tests/reference_tenant_contract.rs).
 4. Named route/API contract:
    [src/api.rs](src/api.rs), [src/api/calls.rs](src/api/calls.rs),
    [src/api_principal.rs](src/api_principal.rs), and

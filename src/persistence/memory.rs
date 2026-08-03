@@ -2455,6 +2455,12 @@ impl CallRepository for MemoryRepository {
             {
                 return Err(RepositoryError::AttachmentRejected);
             }
+            let required_sip_correlation = state
+                .execution_plans
+                .get(&row.call_id)
+                .and_then(CallExecutionPlan::named_route)
+                .and_then(|route| route.required_sip_correlation_header().zip(route.context()))
+                .map(|(header, context)| (header.to_owned(), context.correlation_id.clone()));
             Ok(AttachmentCandidate {
                 attachment_id: row.attachment_id,
                 token_digest: row.token_digest,
@@ -2469,6 +2475,7 @@ impl CallRepository for MemoryRepository {
                 expires_at: row.expires_at,
                 expected_principal: row.expected_principal,
                 expected_version: call.aggregate.version(),
+                required_sip_correlation,
             })
         })
     }

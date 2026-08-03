@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/bridgefu/runtime.conf
+token=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+instance_id=$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)
+group=$(aws autoscaling describe-auto-scaling-instances \
+  --region "$AWS_REGION" \
+  --instance-ids "$instance_id" \
+  --query 'AutoScalingInstances[0].AutoScalingGroupName' \
+  --output text)
+[[ -n "$group" && "$group" != None ]] || exit 1
+protected=true
+if metrics=$(curl --silent --show-error --fail --max-time 3 http://127.0.0.1:9090/metrics); then
+  active=$(awk '
+    /^bridgefu_gateway_native_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+    /^bridgefu_private_forwarding_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+    /^bridgefu_private_egress_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+    /^bridgefu_amazon_durable_cleanups_pending([{ ]|$)/ {sum += $NF; seen = 1}
+    END {if (seen) print sum; else exit 1}
+  ' <<<"$metrics") || active=''
+  if [[ -n "$active" ]] && ! awk -v value="$active" 'BEGIN {exit !(value == 0)}'; then
+    protected=true
+  elif [[ -n "$active" ]]; then
+    protected=false
+  fi
+fi
+aws autoscaling set-instance-protection \
+  --region "$AWS_REGION" \
+  --auto-scaling-group-name "$group" \
+  --instance-ids "$instance_id" \
+  --protected-from-scale-in "$protected"

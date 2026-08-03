@@ -1,6 +1,6 @@
 //! Versioned SIP header ↔ WebRTC/UCTP data contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use anyhow::{anyhow, Result};
@@ -60,6 +60,10 @@ pub struct ContextPolicy {
     /// SIP header name → canonical metadata key.
     #[serde(default)]
     pub allow_headers: BTreeMap<String, String>,
+    /// Canonical metadata keys allowed for non-SIP transports such as an
+    /// authenticated WebRTC context envelope. This never creates a SIP header.
+    #[serde(default)]
+    pub allow_metadata_keys: BTreeSet<String>,
 }
 
 impl ContextPolicy {
@@ -67,12 +71,17 @@ impl ContextPolicy {
     /// listener is bound. This is the same policy used for every message at
     /// the translation boundary, with an aggregate cap matching config v1.
     pub fn validate(&self) -> Result<()> {
-        if self.allow_headers.len() > MAX_CONTEXT_METADATA_ENTRIES {
+        if self.allow_headers.len() + self.allow_metadata_keys.len() > MAX_CONTEXT_METADATA_ENTRIES
+        {
             return Err(anyhow!(
                 "context allowlist exceeds {MAX_CONTEXT_METADATA_ENTRIES} entries"
             ));
         }
-        normalized_policy(self).map(|_| ())
+        normalized_policy(self)?;
+        for key in &self.allow_metadata_keys {
+            validate_metadata_key_or_correlation(key)?;
+        }
+        Ok(())
     }
 
     /// Whether an exact metadata key is reachable through the configured SIP
@@ -81,7 +90,8 @@ impl ContextPolicy {
     pub fn allows_metadata_key(&self, key: &str) -> Result<bool> {
         self.validate()?;
         validate_metadata_key_or_correlation(key)?;
-        Ok(normalized_policy(self)?.values().any(|value| value == key))
+        Ok(self.allow_metadata_keys.contains(key)
+            || normalized_policy(self)?.values().any(|value| value == key))
     }
 }
 
@@ -444,6 +454,7 @@ mod tests {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }
     }
 
@@ -456,6 +467,7 @@ mod tests {
                 "X-Bridgefu_Handoff_Token".into(),
                 "handoff_token".into(),
             )]),
+            ..ContextPolicy::default()
         };
         vapi_template_header.validate().unwrap();
 
@@ -463,6 +475,7 @@ mod tests {
             allow_headers: (0..=MAX_CONTEXT_METADATA_ENTRIES)
                 .map(|index| (format!("X-Test-{index}"), format!("test_{index}")))
                 .collect(),
+            ..ContextPolicy::default()
         };
         assert!(oversized
             .validate()
@@ -472,10 +485,12 @@ mod tests {
 
         let unsafe_header = ContextPolicy {
             allow_headers: BTreeMap::from([("Authorization".into(), "credential".into())]),
+            ..ContextPolicy::default()
         };
         assert!(unsafe_header.validate().is_err());
         let injected_header = ContextPolicy {
             allow_headers: BTreeMap::from([("X-Safe: X-Injected".into(), "handoff_token".into())]),
+            ..ContextPolicy::default()
         };
         assert!(injected_header.validate().is_err());
     }
@@ -495,6 +510,19 @@ mod tests {
         assert_eq!(envelope.correlation_id, "corr");
         assert_eq!(envelope.metadata.get("account_tier").unwrap(), "gold");
         assert!(!envelope.metadata.values().any(|value| value == "secret"));
+    }
+
+    #[test]
+    fn transport_metadata_allowlist_does_not_create_a_sip_header_mapping() {
+        let direct = ContextPolicy {
+            allow_metadata_keys: BTreeSet::from(["correlation_id".into(), "customer_name".into()]),
+            ..ContextPolicy::default()
+        };
+        direct.validate().unwrap();
+        assert!(direct.allows_metadata_key("correlation_id").unwrap());
+        assert!(direct.allows_metadata_key("customer_name").unwrap());
+        assert!(!direct.allows_metadata_key("issue_summary").unwrap());
+        assert!(direct.allow_headers.is_empty());
     }
 
     #[test]

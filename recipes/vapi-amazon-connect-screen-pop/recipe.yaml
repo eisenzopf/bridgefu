@@ -1,0 +1,92 @@
+api_version: bridgefu.dev/recipe/v1
+kind: bridge_recipe
+
+metadata:
+  name: vapi-amazon-connect-screen-pop
+  version: 1
+  title: Vapi to Amazon Connect screen pop
+  support: preview
+  description: >-
+    Receives a Vapi SIP transfer, carries one opaque correlation ID into an
+    Amazon Connect WebRTC contact, and enables an AWS-native agent screen pop.
+
+inputs:
+  vapi_signaling_cidrs:
+    type: cidr_list
+    required: true
+    description: Verified Vapi SIP signaling networks admitted by the recipe.
+  connect_instance_arn:
+    type: aws_arn
+    required: true
+    description: ARN of the customer's existing Amazon Connect instance.
+  connect_entry_contact_flow_id:
+    type: aws_connect_resource_id
+    required: true
+    description: >-
+      ID of the recipe-owned wrapper entry flow generated in the customer's
+      existing instance. This is not the customer's target flow ID.
+  sip_security:
+    type: enum
+    values: [sips_srtp, sip_rtp]
+    default: sips_srtp
+    description: SIPS/SRTP is the production default; SIP/RTP is compatibility-only.
+
+spec:
+  bridges:
+    transfer:
+      source:
+        type: sip
+        security:
+          $input: sip_security
+        admission:
+          mode: managed_attachment
+          trusted_cidrs:
+            $input: vapi_signaling_cidrs
+      destination:
+        type: amazon_connect
+        media: webrtc
+        instance_arn:
+          $input: connect_instance_arn
+        contact_flow_id:
+          $input: connect_entry_contact_flow_id
+      context:
+        correlation:
+          required: true
+          from_sip_header: X-Correlation-Id
+          to_amazon_attribute: correlation_id
+          format: opaque_id_v1
+
+deployments:
+  aws_cloudformation:
+    starter: cloudformation/template.yaml
+    high_availability: cloudformation/template.yaml
+    full_demo_new_connect: cloudformation/demo-template.yaml
+  terraform:
+    aws_starter: terraform/modules/aws-starter/main.tf
+    aws_high_availability: terraform/modules/aws-ha/main.tf
+
+assets:
+  admin_deployment: deployment.example.yaml
+  admin_deployment_nonproduction: deployment.nonproduction.example.yaml
+  admin_parameters: parameters-starter.json
+  admin_parameters_nonproduction: parameters-nonproduction-starter.json
+  admin_parameters_ha: parameters-ha.json
+  documentation: README.md
+  contract: handoff-contract.json
+  connect_entry_flow: connect/inbound-flow.json.tmpl
+  connect_agent_guide: connect/agent-guide-flow.json.tmpl
+  connect_flow_test: connect/flow-test.json.tmpl
+  demo_site: demo-site/index.html
+  demo_site_lock: demo-site/package-lock.json
+  vapi_assistant: vapi/assistant.json.tmpl
+  vapi_prepare_tool: vapi/prepare-handoff-tool.json.tmpl
+  vapi_transfer_tool: vapi/transfer-tool.json.tmpl
+  runtime_bootstrap: runtime/bootstrap.sh
+  qualification_matrix: qualification/matrix.yaml
+  qualification_evidence_schema: qualification/evidence-v1.schema.json
+  qualification_call_schema: qualification/call-observation-v1.schema.json
+  qualification_missing_context_participant_schema: qualification/missing-context-participant-observation-v1.schema.json
+  qualification_failure_drill_schema: qualification/failure-drill-observation-v1.schema.json
+  qualification_negative_schema: qualification/negative-observation-v1.schema.json
+  qualification_soak_schema: qualification/soak-observation-v1.schema.json
+  qualification_zero_state_schema: qualification/zero-state-observation-v1.schema.json

@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/evidence-v1.schema.json",
+  "title": "Bridgefu flagship protected qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "recipe",
+    "execution_id",
+    "deployment_profile",
+    "sip_security",
+    "region",
+    "started_at",
+    "ended_at",
+    "revisions",
+    "scenarios",
+    "failure_drills",
+    "negative_cases",
+    "soak",
+    "zero_state",
+    "teardown",
+    "provenance",
+    "redacted",
+    "customer_data_retained"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "recipe": {"const": "vapi-amazon-connect-screen-pop@1"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "deployment_profile": {"enum": ["starter", "high_availability"]},
+    "sip_security": {"enum": ["sip_rtp", "sips_srtp"]},
+    "region": {"type": "string", "pattern": "^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]$"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "source_tree_sha256", "image", "recipe_fingerprint", "release_manifest_sha256", "cloudformation_sha256", "qualification_controller_sha256"],
+      "properties": {
+        "release_id": {"type": "string", "pattern": "^[0-9a-f]{20}$"},
+        "source_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"},
+        "recipe_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "release_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cloudformation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "qualification_controller_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "network_profile", "call_evidence_sha256", "checks", "setup_latency_ms_p95", "audio_latency_ms_p95", "passed"],
+        "properties": {
+          "id": {"enum": ["sip-rtp-pcmu", "sip-rtp-pcma", "sips-srtp-pcmu", "sips-srtp-pcma", "vapi-web-transfer"]},
+          "network_profile": {"enum": ["baseline", "moderate-wan"]},
+          "call_evidence_sha256": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          },
+          "checks": {
+            "type": "object",
+            "minProperties": 14,
+            "additionalProperties": {"type": "boolean"}
+          },
+          "setup_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 30000},
+          "audio_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 5000},
+          "passed": {"const": true}
+        }
+      }
+    },
+    "failure_drills": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "evidence_sha256", "passed", "recovery_seconds", "cleanup_zero"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{2,63}$"},
+          "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "passed": {"const": true},
+          "recovery_seconds": {"type": "number", "minimum": 0, "maximum": 3600},
+          "cleanup_zero": {"const": true}
+        }
+      }
+    },
+    "negative_cases": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "evidence_sha256", "passed", "cleanup_zero"],
+        "properties": {
+          "id": {
+            "enum": [
+              "prepare_auth_rejected",
+              "prepare_conflicting_replay_rejected",
+              "malformed_payload_rejected",
+              "missing_correlation_header_rejected",
+              "duplicate_correlation_header_rejected",
+              "expired_attachment_rejected",
+              "attachment_replay_rejected",
+              "source_cancellation_cleanup",
+              "missing_context_fail_open"
+            ]
+          },
+          "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "passed": {"const": true},
+          "cleanup_zero": {"const": true}
+        }
+      }
+    },
+    "soak": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "minutes", "attempted_calls", "completed_calls", "unexpected_failures", "setup_latency_ms_p95", "audio_latency_ms_p95", "call_evidence_sha256", "telemetry", "evidence_sha256", "cleanup_zero"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"},
+        "minutes": {"type": "integer", "minimum": 60, "maximum": 1440},
+        "attempted_calls": {"type": "integer", "minimum": 1},
+        "completed_calls": {"type": "integer", "minimum": 1},
+        "unexpected_failures": {"const": 0},
+        "setup_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 30000},
+        "audio_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 5000},
+        "call_evidence_sha256": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_percent_max", "memory_percent_max", "file_descriptors_max", "rtp_ports_in_use_max", "network_errors", "media_drops", "lambda_errors", "dynamodb_errors", "cleanup_backlog_max"],
+          "properties": {
+            "cpu_percent_max": {"type": "number", "minimum": 0, "maximum": 100},
+            "memory_percent_max": {"type": "number", "minimum": 0, "maximum": 100},
+            "file_descriptors_max": {"type": "integer", "minimum": 0, "maximum": 1000000},
+            "rtp_ports_in_use_max": {"type": "integer", "minimum": 0, "maximum": 16384},
+            "network_errors": {"const": 0},
+            "media_drops": {"const": 0},
+            "lambda_errors": {"const": 0},
+            "dynamodb_errors": {"const": 0},
+            "cleanup_backlog_max": {"const": 0}
+          }
+        },
+        "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cleanup_zero": {"const": true}
+      }
+    },
+    "zero_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observed_at", "evidence_sha256", "active_calls", "active_contacts", "active_routes", "cleanup_backlog"],
+      "properties": {
+        "observed_at": {"type": "string", "format": "date-time"},
+        "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "active_calls": {"const": 0},
+        "active_contacts": {"const": 0},
+        "active_routes": {"const": 0},
+        "cleanup_backlog": {"const": 0}
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observed_at", "inventory_sha256", "test_owned_resources", "customer_resources_mutated"],
+      "properties": {
+        "observed_at": {"type": "string", "format": "date-time"},
+        "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "test_owned_resources": {"const": 0},
+        "customer_resources_mutated": {"const": false}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["structural_evidence_sha256", "lifecycle_evidence_sha256", "call_evidence_count", "failure_evidence_count", "negative_evidence_count"],
+      "properties": {
+        "structural_evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "lifecycle_evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "call_evidence_count": {"const": 12},
+        "failure_evidence_count": {"type": "integer", "minimum": 3, "maximum": 32},
+        "negative_evidence_count": {"type": "integer", "minimum": 9, "maximum": 16}
+      }
+    },
+    "redacted": {"const": true},
+    "customer_data_retained": {"const": false}
+  }
+}

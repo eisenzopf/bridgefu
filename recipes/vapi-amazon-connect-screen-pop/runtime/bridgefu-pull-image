@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/bridgefu/runtime.conf
+if [[ ! "$BRIDGEFU_IMAGE_URI" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "Bridgefu image must be pinned by sha256 digest" >&2
+  exit 1
+fi
+
+registry="${BRIDGEFU_IMAGE_URI%%/*}"
+logged_in=false
+docker_config="$(mktemp -d /run/bridgefu/docker-config.XXXXXX)"
+chmod 0700 "$docker_config"
+export DOCKER_CONFIG="$docker_config"
+cleanup() {
+  if $logged_in; then
+    docker logout "$registry" >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$docker_config"
+}
+trap cleanup EXIT
+if [[ "$BRIDGEFU_REGISTRY_TYPE" == "PrivateEcr" ]]; then
+  aws ecr get-login-password --region "$AWS_REGION" \
+    | docker login --username AWS --password-stdin "$registry" >/dev/null
+  logged_in=true
+elif [[ "$BRIDGEFU_REGISTRY_TYPE" != "Anonymous" ]]; then
+  echo "Unsupported Bridgefu registry type" >&2
+  exit 1
+fi
+docker pull "$BRIDGEFU_IMAGE_URI" >/dev/null
+docker image inspect "$BRIDGEFU_IMAGE_URI" >/dev/null

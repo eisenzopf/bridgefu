@@ -158,7 +158,7 @@ retains a supplemental encoding. The exact built-SDK Chromium handoffs to
 generic SIP, generic WSS, Amazon Connect, and Telnyx all pass against this local
 composite; the TypeScript SDK passes 20/20. Bridgefu library 328/328,
 `private_forwarding` 7/7, `call_directionality` 3/3,
-`call_execution_supervisor` 39/39, and StandardCharter's 48 core, 11 web, and
+`call_execution_supervisor` 39/39, and the reference tenant's 48 core, 11 web, and
 16 Python tests plus production web build are also green.
 
 Those results prove only the recorded composite local checkouts. They do not
@@ -166,7 +166,7 @@ prove that the current published rvoip 0.3.5 package graph has equivalent
 behavior.
 
 Qualification now requires rerunning the focused suites, full WebRTC
-regressions, all four exact Chromium destinations, and the StandardCharter
+regressions, all four exact Chromium destinations, and the reference tenant
 regression gate against Bridgefu's committed Cargo.lock. If that exposes a
 missing engine fix, the project owner must review the minimal fork diff and
 approve a clean rvoip package update before Bridgefu changes versions. No fork
@@ -189,7 +189,7 @@ push or upstream contact is authorized by this packet.
    owner-approved private remote.
 5. Update rvoip and Bridgefu pins and lockfiles together, verify the fetched
    source, and rerun the full WebRTC, all four exact Chromium destinations, and
-   StandardCharter regressions.
+   reference tenant regressions.
 6. Retain the exact commands, revisions, dirty flags, and packet-level evidence
    in release qualification.
 

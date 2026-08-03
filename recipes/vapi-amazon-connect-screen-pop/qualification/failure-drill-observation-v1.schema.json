@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/failure-drill-observation-v1.schema.json",
+  "title": "Bridgefu protected failure-drill observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_revision_sha256",
+    "execution_id",
+    "recipe",
+    "deployment_profile",
+    "id",
+    "started_at",
+    "ended_at",
+    "revisions",
+    "fault",
+    "recovery",
+    "zero_state",
+    "passed",
+    "redacted",
+    "customer_data_retained"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-qualification-controller@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "recipe": {"const": "vapi-amazon-connect-screen-pop@1"},
+    "deployment_profile": {"enum": ["starter", "high_availability"]},
+    "id": {
+      "enum": [
+        "process_restart",
+        "host_recovery",
+        "dependency_timeout",
+        "gateway_a_loss",
+        "gateway_b_loss",
+        "worker_a_loss",
+        "worker_b_loss",
+        "availability_zone_loss",
+        "postgres_failover",
+        "redis_failover",
+        "rolling_update",
+        "rollback"
+      ]
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "source_tree_sha256", "image"],
+      "properties": {
+        "release_id": {"type": "string", "pattern": "^[0-9a-f]{20}$"},
+        "source_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["controller", "target_count", "applied", "degraded_state_observed"],
+      "properties": {
+        "controller": {"enum": ["aws-ssm", "aws-ec2", "aws-ecs", "aws-rds", "aws-elasticache", "aws-cloudformation"]},
+        "target_count": {"type": "integer", "minimum": 1, "maximum": 16},
+        "applied": {"const": true},
+        "degraded_state_observed": {"const": true}
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "readiness_restored", "post_recovery_call_sha256"],
+      "properties": {
+        "seconds": {"type": "number", "minimum": 0, "maximum": 3600},
+        "readiness_restored": {"const": true},
+        "post_recovery_call_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "zero_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_calls", "active_contacts", "active_routes", "cleanup_backlog"],
+      "properties": {
+        "active_calls": {"const": 0},
+        "active_contacts": {"const": 0},
+        "active_routes": {"const": 0},
+        "cleanup_backlog": {"const": 0}
+      }
+    },
+    "passed": {"const": true},
+    "redacted": {"const": true},
+    "customer_data_retained": {"const": false}
+  }
+}

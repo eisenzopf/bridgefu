@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS-native bounded context service for the Bridgefu Vapi to Amazon Connect
+  screen-pop recipe.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: handoff-service
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  PrepareArtifactKey:
+    Type: String
+  PrepareArtifactVersion:
+    Type: String
+  TransferArtifactKey:
+    Type: String
+  TransferArtifactVersion:
+    Type: String
+  LookupArtifactKey:
+    Type: String
+  LookupArtifactVersion:
+    Type: String
+  BridgefuControlBaseUrl:
+    Type: String
+    Description: >-
+      Authenticated Bridgefu control endpoint. The production SIPS posture uses
+      HTTPS; the disposable IP-only SIP proof uses HTTP inside its private VPC.
+    AllowedPattern: '^https?://\S+$'
+  BridgefuRouteId:
+    Type: String
+    Default: support-transfer
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  ContextTtlSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 300
+    MaxValue: 604800
+  LambdaReservedConcurrencyPerFunction:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency for each of the prepare, transfer, and lookup
+      functions. Set 0 to use unreserved account concurrency. A nonzero value N
+      requires an account concurrency quota of at least 3N + 10.
+  DataRetentionMode:
+    Type: String
+    Default: ProductionRetain
+    AllowedValues: [ProductionRetain, TestDelete]
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  ApiThrottleRate:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
+  ApiThrottleBurst:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    MaxValue: 2000
+  TransferSubnetIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated private subnet IDs; leave empty only for a reachable public test control endpoint.
+  TransferSecurityGroupIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated security group IDs paired with TransferSubnetIds.
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  RetainData: !Equals [!Ref DataRetentionMode, ProductionRetain]
+  DeleteData: !Equals [!Ref DataRetentionMode, TestDelete]
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+  UseReservedConcurrency: !Not [!Equals [!Ref LambdaReservedConcurrencyPerFunction, 0]]
+  UseTransferVpc: !And
+    - !Not [!Equals [!Ref TransferSubnetIds, '']]
+    - !Not [!Equals [!Ref TransferSecurityGroupIds, '']]
+
+Resources:
+  ProductionHandoffTable:
+    Type: AWS::DynamoDB::Table
+    Condition: RetainData
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'bridgefu-${DeploymentId}-handoffs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: correlation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: correlation_id
+          KeyType: HASH
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  TestHandoffTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeleteData
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub 'bridgefu-${DeploymentId}-handoffs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: correlation_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: correlation_id
+          KeyType: HASH
+      DeletionProtectionEnabled: false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  CorrelationKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-correlation-key'
+      Description: Recipe-only HMAC key for opaque correlation identifiers.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  VapiWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-vapi-webhook'
+      Description: Vapi-to-recipe webhook bearer credential.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  BridgefuApiBearerSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-api-bearer'
+      Description: Handoff Lambda-to-Bridgefu private control bearer credential.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrepareLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/bridgefu-${DeploymentId}-prepare'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  TransferLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/bridgefu-${DeploymentId}-transfer'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  LookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/bridgefu-${DeploymentId}-lookup'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/bridgefu-${DeploymentId}-handoff'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrepareRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-prepare'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExactHandoffWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem]
+                Resource: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${PrepareLogGroup.Arn}:*'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  TransferRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-transfer'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExactHandoffReserve
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret, !Ref BridgefuApiBearerSecret]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${TransferLogGroup.Arn}:*'
+              - !If
+                - UseTransferVpc
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                    - ec2:AssignPrivateIpAddresses
+                    - ec2:UnassignPrivateIpAddresses
+                  Resource: '*'
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  LookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-lookup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExactHandoffRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${LookupLogGroup.Arn}:*'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrepareFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PrepareLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-prepare'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 10
+      ReservedConcurrentExecutions: !If
+        - UseReservedConcurrency
+        - !Ref LambdaReservedConcurrencyPerFunction
+        - !Ref AWS::NoValue
+      Role: !GetAtt PrepareRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref PrepareArtifactKey
+        S3ObjectVersion: !Ref PrepareArtifactVersion
+      Environment:
+        Variables:
+          HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
+          CORRELATION_KEY_SECRET_ARN: !Ref CorrelationKeySecret
+          VAPI_WEBHOOK_SECRET_ARN: !Ref VapiWebhookSecret
+          DEPLOYMENT_ID: !Ref DeploymentId
+          CONTEXT_TTL_SECONDS: !Ref ContextTtlSeconds
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  TransferFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TransferLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-transfer'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 10
+      ReservedConcurrentExecutions: !If
+        - UseReservedConcurrency
+        - !Ref LambdaReservedConcurrencyPerFunction
+        - !Ref AWS::NoValue
+      Role: !GetAtt TransferRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref TransferArtifactKey
+        S3ObjectVersion: !Ref TransferArtifactVersion
+      Environment:
+        Variables:
+          HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
+          CORRELATION_KEY_SECRET_ARN: !Ref CorrelationKeySecret
+          VAPI_WEBHOOK_SECRET_ARN: !Ref VapiWebhookSecret
+          BRIDGEFU_API_BEARER_SECRET_ARN: !Ref BridgefuApiBearerSecret
+          BRIDGEFU_CONTROL_BASE_URL: !Ref BridgefuControlBaseUrl
+          BRIDGEFU_ROUTE_ID: !Ref BridgefuRouteId
+          DEPLOYMENT_ID: !Ref DeploymentId
+          SIP_SECURITY_SCHEME: !If [SecureSip, sips, sip]
+      VpcConfig: !If
+        - UseTransferVpc
+        - SecurityGroupIds: !Split [',', !Ref TransferSecurityGroupIds]
+          SubnetIds: !Split [',', !Ref TransferSubnetIds]
+        - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  LookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LookupLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-lookup'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 8
+      ReservedConcurrentExecutions: !If
+        - UseReservedConcurrency
+        - !Ref LambdaReservedConcurrencyPerFunction
+        - !Ref AWS::NoValue
+      Role: !GetAtt LookupRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LookupArtifactKey
+        S3ObjectVersion: !Ref LookupArtifactVersion
+      Environment:
+        Variables:
+          HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  HandoffApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-handoff'
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: false
+      Tags:
+        Project: !Ref ProjectTag
+        ManagedBy: !Ref ManagedByTag
+        BridgefuExecutionId: !Ref ExecutionIdTag
+        BridgefuRecipe: vapi-amazon-connect-screen-pop@1
+
+  PrepareIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HandoffApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PrepareFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  TransferIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HandoffApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TransferFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  PrepareRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HandoffApi
+      RouteKey: POST /v1/prepare-handoff
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${PrepareIntegration}'
+
+  TransferRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HandoffApi
+      RouteKey: POST /v1/transfer-destination
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${TransferIntegration}'
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HandoffApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        ThrottlingRateLimit: !Ref ApiThrottleRate
+        ThrottlingBurstLimit: !Ref ApiThrottleBurst
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength"}
+      Tags:
+        Project: !Ref ProjectTag
+        ManagedBy: !Ref ManagedByTag
+        BridgefuExecutionId: !Ref ExecutionIdTag
+
+  PrepareInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PrepareFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HandoffApi}/*/POST/v1/prepare-handoff'
+
+  TransferInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TransferFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HandoffApi}/*/POST/v1/transfer-destination'
+
+Outputs:
+  HandoffTableName:
+    Value: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
+  HandoffTableArn:
+    Value: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
+  PrepareFunctionArn:
+    Value: !GetAtt PrepareFunction.Arn
+  PrepareFunctionName:
+    Value: !Ref PrepareFunction
+  TransferFunctionArn:
+    Value: !GetAtt TransferFunction.Arn
+  TransferFunctionName:
+    Value: !Ref TransferFunction
+  LookupFunctionArn:
+    Value: !GetAtt LookupFunction.Arn
+  LookupFunctionName:
+    Value: !Ref LookupFunction
+  ApiId:
+    Value: !Ref HandoffApi
+  ApiBaseUrl:
+    Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  PrepareUrl:
+    Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/prepare-handoff'
+  TransferUrl:
+    Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/transfer-destination'
+  CorrelationKeySecretArn:
+    Value: !Ref CorrelationKeySecret
+  VapiWebhookSecretArn:
+    Value: !Ref VapiWebhookSecret
+  BridgefuApiBearerSecretArn:
+    Value: !Ref BridgefuApiBearerSecret
+  PrepareLogGroupName:
+    Value: !Ref PrepareLogGroup
+  TransferLogGroupName:
+    Value: !Ref TransferLogGroup
+  LookupLogGroupName:
+    Value: !Ref LookupLogGroup
+  ApiAccessLogGroupName:
+    Value: !Ref ApiAccessLogGroup

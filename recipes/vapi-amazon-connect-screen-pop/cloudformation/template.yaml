@@ -1,0 +1,742 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu recipe for Vapi SIP transfer to an existing Amazon Connect instance.
+  Starter supports either production SIPS/SRTP with public DNS or a
+  nonproduction direct-IP SIP/RTP proof. The bounded multi-AZ High Availability
+  path remains available for existing production descriptors.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Profiles: [starter-production, high-availability-preview]
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Recipe identity and immutable release}
+        Parameters:
+          - DeploymentId
+          - RuntimeProfile
+          - NestedTemplateBaseUrl
+          - ArtifactBucket
+          - PrepareArtifactKey
+          - PrepareArtifactVersion
+          - TransferArtifactKey
+          - TransferArtifactVersion
+          - LookupArtifactKey
+          - LookupArtifactVersion
+          - ProvisionerArtifactKey
+          - ProvisionerArtifactVersion
+          - RuntimeArtifactKey
+          - RuntimeArtifactVersion
+          - RuntimeArtifactSha256
+          - SiteArtifactKey
+          - SiteArtifactVersion
+          - SiteArtifactSha256
+          - BridgefuImageUri
+          - BridgefuRegistryType
+          - BridgefuImageRepositoryArn
+      - Label: {default: Amazon Connect and Vapi}
+        Parameters:
+          - ConnectInstanceArn
+          - TargetContactFlowArn
+          - VapiApiKeySecretArn
+          - VapiModel
+          - VapiVoiceId
+          - RetainVapiResourcesOnDelete
+      - Label: {default: Optional nonproduction browser test page}
+        Parameters:
+          - EnableDemoSite
+          - VapiPublicKey
+      - Label: {default: Public voice edge}
+        Parameters:
+          - PublicHostedZoneId
+          - SipHostname
+          - SipSecurity
+          - VapiSignalingCidr1
+          - VapiSignalingCidr2
+          - VapiSignalingCidr3
+          - VapiSignalingCidr4
+          - MediaSourceCidr
+      - Label: {default: Network}
+        Parameters:
+          - NetworkMode
+          - VpcCidr
+          - ExistingVpcId
+          - ExistingVpcCidr
+          - ExistingPublicSubnet1Id
+          - ExistingPublicSubnet1AvailabilityZone
+          - ExistingPublicSubnet2Id
+          - ExistingPrivateSubnet1Id
+          - ExistingPrivateSubnet2Id
+      - Label: {default: 'Capacity, retention, and alerts'}
+        Parameters:
+          - InstanceType
+          - GatewayInstanceType
+          - WorkerInstanceType
+          - MaxConcurrentCalls
+          - MaxConcurrentCallsPerWorker
+          - RootVolumeGiB
+          - DataVolumeGiB
+          - EbsKmsKeyArn
+          - DataKmsKeyArn
+          - PrivateTlsSecretArn
+          - DatabaseInstanceClass
+          - DatabaseAllocatedStorageGiB
+          - DatabaseMaxStorageGiB
+          - RedisNodeType
+          - ContextTtlSeconds
+          - LambdaReservedConcurrencyPerFunction
+          - DataRetentionMode
+          - LogRetentionDays
+          - AlarmEmail
+    ParameterLabels:
+      ConnectInstanceArn: {default: Existing Amazon Connect instance ARN}
+      TargetContactFlowArn: {default: Existing customer-owned target flow ARN}
+      VapiApiKeySecretArn: {default: Vapi private key secret ARN}
+      SipHostname: {default: Public SIPS hostname (unused for direct-IP SIP)}
+      DataRetentionMode: {default: Retain production data or delete test data}
+      LambdaReservedConcurrencyPerFunction: {default: Reserved concurrency per recipe Lambda}
+
+Parameters:
+  DeploymentId:
+    Type: String
+    Default: bridgefu
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  RuntimeProfile:
+    Type: String
+    Default: Starter
+    AllowedValues: [Starter, HighAvailability]
+    Description: Starter is one hardened host; HighAvailability is the bounded two-AZ ECS profile.
+  NestedTemplateBaseUrl:
+    Type: String
+    Description: Immutable HTTPS prefix for the release CloudFormation directory; no trailing slash.
+    AllowedPattern: '^https://\S+[^/\s]$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  PrepareArtifactKey:
+    Type: String
+  PrepareArtifactVersion:
+    Type: String
+  TransferArtifactKey:
+    Type: String
+  TransferArtifactVersion:
+    Type: String
+  LookupArtifactKey:
+    Type: String
+  LookupArtifactVersion:
+    Type: String
+  ProvisionerArtifactKey:
+    Type: String
+  ProvisionerArtifactVersion:
+    Type: String
+  RuntimeArtifactKey:
+    Type: String
+  RuntimeArtifactVersion:
+    Type: String
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  SiteArtifactKey:
+    Type: String
+    Default: unused
+    MinLength: 1
+    MaxLength: 1024
+  SiteArtifactVersion:
+    Type: String
+    Default: unused
+    MinLength: 1
+    MaxLength: 1024
+  SiteArtifactSha256:
+    Type: String
+    Default: '0000000000000000000000000000000000000000000000000000000000000000'
+    AllowedPattern: '^[0-9a-f]{64}$'
+  BridgefuImageUri:
+    Type: String
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuRegistryType:
+    Type: String
+    Default: PrivateEcr
+    AllowedValues: [PrivateEcr, Anonymous]
+  BridgefuImageRepositoryArn:
+    Type: String
+    Default: arn:aws:ecr:us-east-1:000000000000:repository/unused
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  TargetContactFlowArn:
+    Type: String
+    Description: Customer-owned flow; Bridgefu references it but never updates or deletes it.
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  VapiApiKeySecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  VapiModel:
+    Type: String
+    Default: gpt-4.1-mini
+    AllowedPattern: '^[A-Za-z0-9._:/-]{1,128}$'
+  VapiVoiceId:
+    Type: String
+    Default: Elliot
+    AllowedPattern: '^[A-Za-z0-9._:/-]{1,128}$'
+  RetainVapiResourcesOnDelete:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  EnableDemoSite:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Creates a CloudFront browser page for authorized synthetic test calls.
+      Keep false for ordinary production deployment.
+  VapiPublicKey:
+    Type: String
+    Default: disabled-test-public-key
+    MinLength: 8
+    MaxLength: 256
+    AllowedPattern: '^[A-Za-z0-9._~:/+=-]+$'
+    Description: Browser-safe Vapi public key, required only when EnableDemoSite is true.
+  PublicHostedZoneId:
+    Type: String
+    Default: none
+    AllowedPattern: '^(none|[A-Z0-9]+)$'
+  SipHostname:
+    Type: String
+    Default: unused.bridgefu.invalid
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+    Description: >-
+      Public DNS name for SIPS/SRTP. Leave the default placeholder when
+      PublicHostedZoneId is none and the Starter profile uses direct-IP SIP/RTP.
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidr1:
+    Type: String
+    Default: 44.229.228.186/32
+  VapiSignalingCidr2:
+    Type: String
+    Default: 44.238.177.138/32
+  VapiSignalingCidr3:
+    Type: String
+    Default: ''
+  VapiSignalingCidr4:
+    Type: String
+    Default: ''
+  MediaSourceCidr:
+    Type: String
+    Default: 0.0.0.0/0
+  NetworkMode:
+    Type: String
+    Default: NewVpc
+    AllowedValues: [NewVpc, ExistingVpc]
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  ExistingVpcId:
+    Type: String
+    Default: vpc-00000000000000000
+  ExistingVpcCidr:
+    Type: String
+    Default: 10.255.255.255/32
+  ExistingPublicSubnet1Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPublicSubnet1AvailabilityZone:
+    Type: String
+    Default: unused
+  ExistingPublicSubnet2Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPrivateSubnet1Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPrivateSubnet2Id:
+    Type: String
+    Default: subnet-00000000000000000
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues: [t4g.medium, t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  GatewayInstanceType:
+    Type: String
+    Default: c7g.large
+    AllowedValues: [t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  WorkerInstanceType:
+    Type: String
+    Default: c7g.large
+    AllowedValues: [t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  MaxConcurrentCalls:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+  MaxConcurrentCallsPerWorker:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+  RootVolumeGiB:
+    Type: Number
+    Default: 16
+    MinValue: 12
+    MaxValue: 100
+  DataVolumeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 1024
+  EbsKmsKeyArn:
+    Type: String
+    Default: ''
+  DataKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional customer-managed KMS key for HA PostgreSQL, Redis, and runtime secrets.
+  PrivateTlsSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:us-east-1:000000000000:secret:unused
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+    Description: >-
+      Required for HighAvailability. Exact JSON bundle containing the private CA
+      and gateway/worker mTLS certificates and keys.
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues: [db.t4g.medium, db.t4g.large, db.r7g.large, db.r7g.xlarge]
+  DatabaseAllocatedStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 1000
+  DatabaseMaxStorageGiB:
+    Type: Number
+    Default: 200
+    MinValue: 50
+    MaxValue: 4096
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.small
+    AllowedValues: [cache.t4g.small, cache.t4g.medium, cache.r7g.large, cache.r7g.xlarge]
+  ContextTtlSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 300
+    MaxValue: 604800
+  LambdaReservedConcurrencyPerFunction:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency for every recipe Lambda function. Set 0 to use
+      unreserved account concurrency. A nonzero value N requires quota for four
+      recipe Lambdas plus 10 unreserved executions, or five recipe Lambdas when
+      the optional demo site is enabled.
+  DataRetentionMode:
+    Type: String
+    Default: ProductionRetain
+    AllowedValues: [ProductionRetain, TestDelete]
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  AlarmEmail:
+    Type: String
+    Default: ''
+
+Rules:
+  PrivateEcrRequiresRepositoryArn:
+    RuleCondition: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BridgefuImageRepositoryArn, arn:aws:ecr:us-east-1:000000000000:repository/unused]]
+        AssertDescription: PrivateEcr requires the exact ECR repository ARN.
+  TestDeploymentsMustDeleteVapiResources:
+    RuleCondition: !Equals [!Ref DataRetentionMode, TestDelete]
+    Assertions:
+      - Assert: !Equals [!Ref RetainVapiResourcesOnDelete, 'false']
+        AssertDescription: TestDelete deployments must remove recipe-owned Vapi resources.
+  DemoSiteRequiresExactArtifactAndPublicKey:
+    RuleCondition: !Equals [!Ref EnableDemoSite, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SiteArtifactKey, unused]]
+        AssertDescription: EnableDemoSite requires the immutable site artifact key.
+      - Assert: !Not [!Equals [!Ref SiteArtifactVersion, unused]]
+        AssertDescription: EnableDemoSite requires the immutable site artifact version.
+      - Assert: !Not [!Equals [!Ref SiteArtifactSha256, '0000000000000000000000000000000000000000000000000000000000000000']]
+        AssertDescription: EnableDemoSite requires the reviewed site artifact checksum.
+      - Assert: !Not [!Equals [!Ref VapiPublicKey, disabled-test-public-key]]
+        AssertDescription: EnableDemoSite requires the browser-safe Vapi public key.
+  HighAvailabilityRequiresPrivateTls:
+    RuleCondition: !Equals [!Ref RuntimeProfile, HighAvailability]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PrivateTlsSecretArn, arn:aws:secretsmanager:us-east-1:000000000000:secret:unused]]
+        AssertDescription: HighAvailability requires the private mTLS bundle secret ARN.
+  SecureSipRequiresPublicDns:
+    RuleCondition: !Equals [!Ref SipSecurity, sips_srtp]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicHostedZoneId, none]]
+        AssertDescription: SIPS/SRTP requires a public Route 53 hosted zone and hostname.
+  ClearSipIsTestOnly:
+    RuleCondition: !Equals [!Ref SipSecurity, sip_rtp]
+    Assertions:
+      - Assert: !Equals [!Ref DataRetentionMode, TestDelete]
+        AssertDescription: Direct-IP SIP/RTP is restricted to deletable nonproduction deployments.
+  NoDnsIsStarterSipProofOnly:
+    RuleCondition: !Equals [!Ref PublicHostedZoneId, none]
+    Assertions:
+      - Assert: !Equals [!Ref RuntimeProfile, Starter]
+        AssertDescription: The no-DNS proof posture is available only for Starter.
+      - Assert: !Equals [!Ref SipSecurity, sip_rtp]
+        AssertDescription: The no-DNS proof posture uses SIP/RTP only.
+
+Conditions:
+  CreateDemoSite: !Equals [!Ref EnableDemoSite, 'true']
+  StarterProfile: !Equals [!Ref RuntimeProfile, Starter]
+  HighAvailabilityProfile: !Equals [!Ref RuntimeProfile, HighAvailability]
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+
+Resources:
+  Network:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/network.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        NetworkMode: !Ref NetworkMode
+        VpcCidr: !Ref VpcCidr
+        ExistingVpcId: !Ref ExistingVpcId
+        ExistingVpcCidr: !Ref ExistingVpcCidr
+        ExistingPublicSubnet1Id: !Ref ExistingPublicSubnet1Id
+        ExistingPublicSubnet1AvailabilityZone: !Ref ExistingPublicSubnet1AvailabilityZone
+        ExistingPublicSubnet2Id: !Ref ExistingPublicSubnet2Id
+        ExistingPrivateSubnet1Id: !Ref ExistingPrivateSubnet1Id
+        ExistingPrivateSubnet2Id: !Ref ExistingPrivateSubnet2Id
+        CreateNatGateways: !If [HighAvailabilityProfile, 'true', 'false']
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  HandoffService:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/handoff-service.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ArtifactBucket: !Ref ArtifactBucket
+        PrepareArtifactKey: !Ref PrepareArtifactKey
+        PrepareArtifactVersion: !Ref PrepareArtifactVersion
+        TransferArtifactKey: !Ref TransferArtifactKey
+        TransferArtifactVersion: !Ref TransferArtifactVersion
+        LookupArtifactKey: !Ref LookupArtifactKey
+        LookupArtifactVersion: !Ref LookupArtifactVersion
+        BridgefuControlBaseUrl: !If
+          - SecureSip
+          - !Sub 'https://control.${SipHostname}'
+          - !Sub 'http://control.${DeploymentId}.bridgefu.internal:443'
+        BridgefuRouteId: support
+        SipSecurity: !Ref SipSecurity
+        ContextTtlSeconds: !Ref ContextTtlSeconds
+        LambdaReservedConcurrencyPerFunction: !Ref LambdaReservedConcurrencyPerFunction
+        DataRetentionMode: !Ref DataRetentionMode
+        LogRetentionDays: !Ref LogRetentionDays
+        TransferSubnetIds: !GetAtt Network.Outputs.PrivateSubnetIds
+        TransferSecurityGroupIds: !GetAtt Network.Outputs.TransferFunctionSecurityGroupId
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  ConnectIntegration:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/connect.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        TargetContactFlowArn: !Ref TargetContactFlowArn
+        LookupFunctionArn: !GetAtt HandoffService.Outputs.LookupFunctionArn
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  StarterRuntime:
+    Type: AWS::CloudFormation::Stack
+    Condition: StarterProfile
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/runtime-starter.yaml'
+      TimeoutInMinutes: 45
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcId: !GetAtt Network.Outputs.VpcId
+        VpcCidr: !GetAtt Network.Outputs.VpcCidr
+        PublicSubnet1Id: !GetAtt Network.Outputs.PublicSubnet1Id
+        PublicSubnet1AvailabilityZone: !GetAtt Network.Outputs.PublicSubnet1AvailabilityZone
+        TransferFunctionSecurityGroupId: !GetAtt Network.Outputs.TransferFunctionSecurityGroupId
+        PublicHostedZoneId: !Ref PublicHostedZoneId
+        SipHostname: !Ref SipHostname
+        ControlHostname: !If
+          - SecureSip
+          - !Sub 'control.${SipHostname}'
+          - !Sub 'control.${DeploymentId}.bridgefu.internal'
+        SipSecurity: !Ref SipSecurity
+        VapiSignalingCidr1: !Ref VapiSignalingCidr1
+        VapiSignalingCidr2: !Ref VapiSignalingCidr2
+        VapiSignalingCidr3: !Ref VapiSignalingCidr3
+        VapiSignalingCidr4: !Ref VapiSignalingCidr4
+        MediaSourceCidr: !Ref MediaSourceCidr
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        ConnectEntryFlowArn: !GetAtt ConnectIntegration.Outputs.WrapperFlowArn
+        ConnectEntryFlowId: !GetAtt ConnectIntegration.Outputs.WrapperFlowId
+        BridgefuApiBearerSecretArn: !GetAtt HandoffService.Outputs.BridgefuApiBearerSecretArn
+        BridgefuImageUri: !Ref BridgefuImageUri
+        BridgefuRegistryType: !Ref BridgefuRegistryType
+        BridgefuImageRepositoryArn: !Ref BridgefuImageRepositoryArn
+        ArtifactBucket: !Ref ArtifactBucket
+        RuntimeArtifactKey: !Ref RuntimeArtifactKey
+        RuntimeArtifactVersion: !Ref RuntimeArtifactVersion
+        RuntimeArtifactSha256: !Ref RuntimeArtifactSha256
+        InstanceType: !Ref InstanceType
+        RootVolumeGiB: !Ref RootVolumeGiB
+        DataVolumeGiB: !Ref DataVolumeGiB
+        EbsKmsKeyArn: !Ref EbsKmsKeyArn
+        DataRetentionMode: !Ref DataRetentionMode
+        MaxConcurrentCalls: !Ref MaxConcurrentCalls
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  HighAvailabilityRuntime:
+    Type: AWS::CloudFormation::Stack
+    Condition: HighAvailabilityProfile
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/runtime-ha.yaml'
+      TimeoutInMinutes: 120
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        NestedTemplateBaseUrl: !Ref NestedTemplateBaseUrl
+        VpcId: !GetAtt Network.Outputs.VpcId
+        VpcCidr: !GetAtt Network.Outputs.VpcCidr
+        PublicSubnet1Id: !GetAtt Network.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt Network.Outputs.PublicSubnet2Id
+        PrivateSubnet1Id: !GetAtt Network.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt Network.Outputs.PrivateSubnet2Id
+        TransferFunctionSecurityGroupId: !GetAtt Network.Outputs.TransferFunctionSecurityGroupId
+        PublicHostedZoneId: !Ref PublicHostedZoneId
+        SipHostname: !Ref SipHostname
+        ControlHostname: !Sub 'control.${SipHostname}'
+        WorkerHostname: !Sub 'worker.${SipHostname}'
+        UctpHostname: !Sub 'uctp.${SipHostname}'
+        SipSecurity: !Ref SipSecurity
+        VapiSignalingCidr1: !Ref VapiSignalingCidr1
+        VapiSignalingCidr2: !Ref VapiSignalingCidr2
+        VapiSignalingCidr3: !Ref VapiSignalingCidr3
+        VapiSignalingCidr4: !Ref VapiSignalingCidr4
+        MediaSourceCidr: !Ref MediaSourceCidr
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        ConnectEntryFlowArn: !GetAtt ConnectIntegration.Outputs.WrapperFlowArn
+        ConnectEntryFlowId: !GetAtt ConnectIntegration.Outputs.WrapperFlowId
+        BridgefuApiBearerSecretArn: !GetAtt HandoffService.Outputs.BridgefuApiBearerSecretArn
+        PrivateTlsSecretArn: !Ref PrivateTlsSecretArn
+        BridgefuImageUri: !Ref BridgefuImageUri
+        BridgefuRegistryType: !Ref BridgefuRegistryType
+        BridgefuImageRepositoryArn: !Ref BridgefuImageRepositoryArn
+        ArtifactBucket: !Ref ArtifactBucket
+        RuntimeArtifactKey: !Ref RuntimeArtifactKey
+        RuntimeArtifactVersion: !Ref RuntimeArtifactVersion
+        RuntimeArtifactSha256: !Ref RuntimeArtifactSha256
+        GatewayInstanceType: !Ref GatewayInstanceType
+        WorkerInstanceType: !Ref WorkerInstanceType
+        RootVolumeGiB: !Ref RootVolumeGiB
+        EbsKmsKeyArn: !Ref EbsKmsKeyArn
+        DataKmsKeyArn: !Ref DataKmsKeyArn
+        DatabaseInstanceClass: !Ref DatabaseInstanceClass
+        DatabaseAllocatedStorageGiB: !Ref DatabaseAllocatedStorageGiB
+        DatabaseMaxStorageGiB: !Ref DatabaseMaxStorageGiB
+        RedisNodeType: !Ref RedisNodeType
+        MaxConcurrentCallsPerGateway: !Ref MaxConcurrentCalls
+        MaxConcurrentCallsPerWorker: !Ref MaxConcurrentCallsPerWorker
+        DataRetentionMode: !Ref DataRetentionMode
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  VapiResources:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/vapi.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ArtifactBucket: !Ref ArtifactBucket
+        ProvisionerArtifactKey: !Ref ProvisionerArtifactKey
+        ProvisionerArtifactVersion: !Ref ProvisionerArtifactVersion
+        VapiApiKeySecretArn: !Ref VapiApiKeySecretArn
+        VapiWebhookSecretArn: !GetAtt HandoffService.Outputs.VapiWebhookSecretArn
+        PrepareUrl: !GetAtt HandoffService.Outputs.PrepareUrl
+        TransferUrl: !GetAtt HandoffService.Outputs.TransferUrl
+        VapiModel: !Ref VapiModel
+        VapiVoiceId: !Ref VapiVoiceId
+        RetainVapiResourcesOnDelete: !Ref RetainVapiResourcesOnDelete
+        LambdaReservedConcurrencyPerFunction: !Ref LambdaReservedConcurrencyPerFunction
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  DemoSite:
+    Type: AWS::CloudFormation::Stack
+    Condition: CreateDemoSite
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/demo-site.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ArtifactBucket: !Ref ArtifactBucket
+        SiteArtifactKey: !Ref SiteArtifactKey
+        SiteArtifactVersion: !Ref SiteArtifactVersion
+        SiteArtifactSha256: !Ref SiteArtifactSha256
+        VapiPublicKey: !Ref VapiPublicKey
+        VapiAssistantId: !GetAtt VapiResources.Outputs.AssistantId
+        ReleaseRevision: !Ref RuntimeArtifactSha256
+        LambdaReservedConcurrencyPerFunction: !Ref LambdaReservedConcurrencyPerFunction
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  StarterObservability:
+    Type: AWS::CloudFormation::Stack
+    Condition: StarterProfile
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/observability.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ApiId: !GetAtt HandoffService.Outputs.ApiId
+        HandoffTableName: !GetAtt HandoffService.Outputs.HandoffTableName
+        PrepareFunctionName: !GetAtt HandoffService.Outputs.PrepareFunctionName
+        TransferFunctionName: !GetAtt HandoffService.Outputs.TransferFunctionName
+        LookupFunctionName: !GetAtt HandoffService.Outputs.LookupFunctionName
+        ProvisionerFunctionName: !GetAtt VapiResources.Outputs.ProvisionerFunctionName
+        PrepareLogGroupName: !GetAtt HandoffService.Outputs.PrepareLogGroupName
+        TransferLogGroupName: !GetAtt HandoffService.Outputs.TransferLogGroupName
+        LookupLogGroupName: !GetAtt HandoffService.Outputs.LookupLogGroupName
+        RuntimeInstanceId: !GetAtt StarterRuntime.Outputs.InstanceId
+        RuntimeLogGroupName: !GetAtt StarterRuntime.Outputs.RuntimeLogGroupName
+        SipSecurity: !Ref SipSecurity
+        MaxConcurrentCalls: !Ref MaxConcurrentCalls
+        AlarmEmail: !Ref AlarmEmail
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  HighAvailabilityObservability:
+    Type: AWS::CloudFormation::Stack
+    Condition: HighAvailabilityProfile
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/observability-ha.yaml'
+      TimeoutInMinutes: 20
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ApiId: !GetAtt HandoffService.Outputs.ApiId
+        HandoffTableName: !GetAtt HandoffService.Outputs.HandoffTableName
+        PrepareFunctionName: !GetAtt HandoffService.Outputs.PrepareFunctionName
+        TransferFunctionName: !GetAtt HandoffService.Outputs.TransferFunctionName
+        LookupFunctionName: !GetAtt HandoffService.Outputs.LookupFunctionName
+        ProvisionerFunctionName: !GetAtt VapiResources.Outputs.ProvisionerFunctionName
+        RuntimeClusterName: !GetAtt HighAvailabilityRuntime.Outputs.ClusterName
+        DatabaseIdentifier: !GetAtt HighAvailabilityRuntime.Outputs.DatabaseIdentifier
+        RedisReplicationGroupId: !GetAtt HighAvailabilityRuntime.Outputs.RedisReplicationGroupId
+        MaxConcurrentCallsPerSlot: !Ref MaxConcurrentCalls
+        AlarmEmail: !Ref AlarmEmail
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+Outputs:
+  Recipe:
+    Value: vapi-amazon-connect-screen-pop@1
+  SupportTier:
+    Value: !If [StarterProfile, supported, preview]
+  BridgefuImage:
+    Value: !Ref BridgefuImageUri
+  RuntimeProfile:
+    Value: !Ref RuntimeProfile
+  SipUri:
+    Value: !If [StarterProfile, !GetAtt StarterRuntime.Outputs.SipUri, !GetAtt HighAvailabilityRuntime.Outputs.SipUri]
+  VapiAssistantId:
+    Value: !GetAtt VapiResources.Outputs.AssistantId
+  VapiPrepareToolId:
+    Value: !GetAtt VapiResources.Outputs.PrepareToolId
+  DemoSiteUrl:
+    Condition: CreateDemoSite
+    Value: !GetAtt DemoSite.Outputs.TestSiteUrl
+  ConnectWrapperFlowArn:
+    Value: !GetAtt ConnectIntegration.Outputs.WrapperFlowArn
+  ConnectAgentGuideFlowArn:
+    Value: !GetAtt ConnectIntegration.Outputs.AgentGuideFlowArn
+  HandoffTableName:
+    Value: !GetAtt HandoffService.Outputs.HandoffTableName
+  RuntimeInstanceId:
+    Condition: StarterProfile
+    Value: !GetAtt StarterRuntime.Outputs.InstanceId
+  RuntimeClusterName:
+    Condition: HighAvailabilityProfile
+    Value: !GetAtt HighAvailabilityRuntime.Outputs.ClusterName
+  SsmStartSessionCommand:
+    Condition: StarterProfile
+    Value: !GetAtt StarterRuntime.Outputs.SsmStartSessionCommand
+  SsmInventoryCommand:
+    Condition: HighAvailabilityProfile
+    Value: !GetAtt HighAvailabilityRuntime.Outputs.SsmInventoryCommand
+  DashboardUrl:
+    Value: !If [StarterProfile, !GetAtt StarterObservability.Outputs.DashboardUrl, !GetAtt HighAvailabilityObservability.Outputs.DashboardUrl]
+  AlarmTopicArn:
+    Value: !If [StarterProfile, !GetAtt StarterObservability.Outputs.AlarmTopicArn, !GetAtt HighAvailabilityObservability.Outputs.AlarmTopicArn]
+  AgentPermissionRequired:
+    Value: !GetAtt ConnectIntegration.Outputs.AgentPermissionRequired

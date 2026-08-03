@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS-native dashboard and actionable alarms for the Bridgefu HA recipe profile.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: observability-ha
+
+Parameters:
+  DeploymentId: {Type: String}
+  ApiId: {Type: String}
+  HandoffTableName: {Type: String}
+  PrepareFunctionName: {Type: String}
+  TransferFunctionName: {Type: String}
+  LookupFunctionName: {Type: String}
+  ProvisionerFunctionName: {Type: String}
+  RuntimeClusterName: {Type: String}
+  DatabaseIdentifier: {Type: String}
+  RedisReplicationGroupId: {Type: String}
+  MaxConcurrentCallsPerSlot: {Type: Number, Default: 100}
+  AlarmEmail: {Type: String, Default: ''}
+  ProjectTag: {Type: String, Default: bridgefu-recipe}
+  ManagedByTag: {Type: String, Default: bridgefu-cloudformation}
+  ExecutionIdTag: {Type: String, Default: production}
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bridgefu-${DeploymentId}-ha-alarms'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties: {TopicArn: !Ref AlarmTopic, Protocol: email, Endpoint: !Ref AlarmEmail}
+
+  ApiServerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-api-5xx'
+      AlarmDescription: Handoff API failures; see runbooks/handoff-context.md.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions: [{Name: ApiId, Value: !Ref ApiId}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  PrepareErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-prepare-errors'
+      AlarmDescription: Prepare handoff Lambda errors; see runbooks/handoff-context.md.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref PrepareFunctionName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  TransferErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-transfer-errors'
+      AlarmDescription: Transfer destination Lambda errors; see runbooks/handoff-context.md.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref TransferFunctionName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  LookupErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-lookup-errors'
+      AlarmDescription: Connect lookup Lambda errors; the call remains fail-open.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref LookupFunctionName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ContextTableThrottles:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-context-throttles'
+      AlarmDescription: DynamoDB context throttling; see runbooks/handoff-context.md.
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions: [{Name: TableName, Value: !Ref HandoffTableName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DatabaseCpuHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-database-cpu-high'
+      AlarmDescription: PostgreSQL CPU is sustained high; see runbooks/ha-capacity.md.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref DatabaseIdentifier}]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 10
+      DatapointsToAlarm: 8
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DatabaseFreeStorageLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-database-storage-low'
+      AlarmDescription: PostgreSQL free storage is below 10 GiB; see runbooks/ha-capacity.md.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref DatabaseIdentifier}]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 10737418240
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  RedisEngineCpuHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-redis-engine-cpu-high'
+      AlarmDescription: Redis engine CPU is sustained high; see runbooks/ha-capacity.md.
+      Namespace: AWS/ElastiCache
+      MetricName: EngineCPUUtilization
+      Dimensions: [{Name: ReplicationGroupId, Value: !Ref RedisReplicationGroupId}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 10
+      DatapointsToAlarm: 8
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  RedisEvictions:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-redis-evictions'
+      AlarmDescription: Redis evicted coordination data; see runbooks/ha-capacity.md.
+      Namespace: AWS/ElastiCache
+      MetricName: Evictions
+      Dimensions: [{Name: ReplicationGroupId, Value: !Ref RedisReplicationGroupId}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  GatewayAReadiness:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-gateway-a-not-ready'
+      AlarmDescription: Gateway A readiness is absent; see runbooks/ha-failover.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_process_ready
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: gateway}, {Name: slot, Value: gateway-a}]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  GatewayBReadiness:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-gateway-b-not-ready'
+      AlarmDescription: Gateway B readiness is absent; see runbooks/ha-failover.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_process_ready
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: gateway}, {Name: slot, Value: gateway-b}]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerAReadiness:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-worker-a-not-ready'
+      AlarmDescription: Worker A readiness is absent; see runbooks/ha-failover.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_process_ready
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: worker}, {Name: slot, Value: worker-a}]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerBReadiness:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-worker-b-not-ready'
+      AlarmDescription: Worker B readiness is absent; see runbooks/ha-failover.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_process_ready
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: worker}, {Name: slot, Value: worker-b}]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  GatewayACapacity:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-gateway-a-capacity'
+      AlarmDescription: Gateway A reached its configured call ceiling; see runbooks/ha-capacity.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_gateway_native_active_routes
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: gateway}, {Name: slot, Value: gateway-a}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref MaxConcurrentCallsPerSlot
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  GatewayBCapacity:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-gateway-b-capacity'
+      AlarmDescription: Gateway B reached its configured call ceiling; see runbooks/ha-capacity.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_gateway_native_active_routes
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: gateway}, {Name: slot, Value: gateway-b}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref MaxConcurrentCallsPerSlot
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerACapacity:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-worker-a-capacity'
+      AlarmDescription: Worker A reached its configured call ceiling; see runbooks/ha-capacity.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_private_egress_active_routes
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: worker}, {Name: slot, Value: worker-a}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref MaxConcurrentCallsPerSlot
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerBCapacity:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-worker-b-capacity'
+      AlarmDescription: Worker B reached its configured call ceiling; see runbooks/ha-capacity.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_private_egress_active_routes
+      Dimensions: [{Name: deployment, Value: !Ref DeploymentId}, {Name: role, Value: worker}, {Name: slot, Value: worker-b}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref MaxConcurrentCallsPerSlot
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  CleanupBacklog:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-ha-cleanup-backlog'
+      AlarmDescription: Durable Amazon Connect cleanup authority remains pending; see runbooks/cleanup-backlog.md before scale-in, restart, or replacement.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_amazon_durable_cleanups_pending
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'bridgefu-${DeploymentId}-ha'
+      DashboardBody: !Sub |
+        {
+          "start":"-PT6H","periodOverride":"inherit","widgets":[
+            {"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"# Bridgefu ${DeploymentId} — High Availability\nRunbooks: recipe package `runbooks/ha-failover.md` and `runbooks/ha-capacity.md`. No customer fields or correlation IDs are emitted here."}},
+            {"type":"metric","x":0,"y":2,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Runtime readiness by bounded slot","view":"timeSeries","stat":"Minimum","period":60,"metrics":[["Bridgefu/Runtime","bridgefu_process_ready","deployment","${DeploymentId}","role","gateway","slot","gateway-a"],["...","gateway-b"],[".",".",".",".","role","worker","slot","worker-a"],["...","worker-b"]]}},
+            {"type":"metric","x":12,"y":2,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Active calls and cleanup","view":"timeSeries","stat":"Maximum","period":60,"metrics":[[{"expression":"SEARCH('{Bridgefu/Runtime,deployment,role,slot} MetricName=\"bridgefu_gateway_native_active_routes\" deployment=\"${DeploymentId}\"','Maximum',60)","id":"gateway_routes"}],[{"expression":"SEARCH('{Bridgefu/Runtime,deployment,role,slot} MetricName=\"bridgefu_private_egress_active_routes\" deployment=\"${DeploymentId}\"','Maximum',60)","id":"worker_routes"}],[{"expression":"SEARCH('{Bridgefu/Runtime,deployment,role,slot} MetricName=\"bridgefu_amazon_durable_cleanups_pending\" deployment=\"${DeploymentId}\"','Maximum',60)","id":"cleanup"}]]}},
+            {"type":"metric","x":0,"y":8,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"PostgreSQL","view":"timeSeries","period":60,"metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${DatabaseIdentifier}"],[".","DatabaseConnections",".","."],[".","FreeStorageSpace",".",".",{"yAxis":"right"}]]}},
+            {"type":"metric","x":12,"y":8,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Redis","view":"timeSeries","period":60,"metrics":[["AWS/ElastiCache","EngineCPUUtilization","ReplicationGroupId","${RedisReplicationGroupId}"],[".","CurrConnections",".","."],[".","Evictions",".","."]]}},
+            {"type":"metric","x":0,"y":14,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"ECS service CPU and memory","view":"timeSeries","stat":"Average","period":60,"metrics":[["AWS/ECS","CPUUtilization","ClusterName","${RuntimeClusterName}","ServiceName","gateway-a"],[".","MemoryUtilization",".",".",".","."],[".","CPUUtilization",".",".",".","worker-a"],[".","MemoryUtilization",".",".",".","."]]}},
+            {"type":"metric","x":12,"y":14,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Handoff API, Lambda, and DynamoDB errors","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","5xx","ApiId","${ApiId}"],["AWS/Lambda","Errors","FunctionName","${PrepareFunctionName}"],["...","${TransferFunctionName}"],["...","${LookupFunctionName}"],["...","${ProvisionerFunctionName}"],["AWS/DynamoDB","ThrottledRequests","TableName","${HandoffTableName}"]]}}
+          ]
+        }
+
+Outputs:
+  DashboardName: {Value: !Ref Dashboard}
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}'
+  AlarmTopicArn: {Value: !Ref AlarmTopic}

@@ -1,0 +1,52 @@
+config_version: 1
+
+aws:
+  region: __AWS_REGION__
+
+edge:
+  public_host: __SIP_HOSTNAME__
+  media_public_addr: __PUBLIC_IP__:0
+__SIP_EDGE_CONFIG__
+
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  rate_limit:
+    enabled: true
+    control_requests_per_second: 20
+    control_burst: 40
+    diagnostics_requests_per_second: 5
+    diagnostics_burst: 10
+    webhook_requests_per_second: 5
+    webhook_burst: 10
+    max_tracked_identities: 1024
+    identity_idle_ttl_secs: 300
+
+recipes:
+  support:
+    use: builtin:vapi-amazon-connect-screen-pop@1
+    with:
+      vapi_signaling_cidrs:
+__VAPI_SIGNALING_CIDRS__
+      connect_instance_arn: __CONNECT_INSTANCE_ARN__
+      connect_entry_contact_flow_id: __CONNECT_ENTRY_FLOW_ID__
+      sip_security: __SIP_SECURITY__
+
+persistence:
+  backend: sqlite
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  deployment_id: __DEPLOYMENT_ID__
+
+observability:
+  log_level: info
+  log_format: json
+  http_bind: 127.0.0.1:9090
+
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: __MAX_CONCURRENT_CALLS__
+  setup_timeout_secs: 15
+  media_idle_timeout_secs: 120
+  drain_timeout_secs: 60

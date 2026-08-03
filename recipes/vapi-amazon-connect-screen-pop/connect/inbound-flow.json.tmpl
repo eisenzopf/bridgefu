@@ -1,0 +1,112 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "lookup-context",
+  "Actions": [
+    {
+      "Identifier": "lookup-context",
+      "Type": "InvokeLambdaFunction",
+      "Parameters": {
+        "LambdaFunctionARN": "__LOOKUP_LAMBDA_ARN__",
+        "InvocationTimeLimitSeconds": "8",
+        "LambdaInvocationAttributes": {
+          "correlation_id": "$.Attributes.correlation_id"
+        }
+      },
+      "Transitions": {
+        "NextAction": "copy-context",
+        "Errors": [
+          {
+            "NextAction": "context-unavailable",
+            "ErrorType": "NoMatchingError"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "copy-context",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "context_available": "$.External.context_available",
+          "customer_name": "$.External.customer_name",
+          "issue_summary": "$.External.issue_summary",
+          "intent": "$.External.intent",
+          "verification_status": "$.External.verification_status",
+          "vapi_call_reference": "$.External.vapi_call_reference"
+        }
+      },
+      "Transitions": {
+        "NextAction": "set-agent-guide",
+        "Errors": [
+          {
+            "NextAction": "context-unavailable",
+            "ErrorType": "NoMatchingError"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "context-unavailable",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "context_available": "false",
+          "customer_name": "Context unavailable",
+          "issue_summary": "Please ask the caller for a brief summary.",
+          "intent": "unknown",
+          "verification_status": "unknown",
+          "vapi_call_reference": "unavailable"
+        }
+      },
+      "Transitions": {
+        "NextAction": "set-agent-guide",
+        "Errors": [
+          {
+            "NextAction": "transfer-to-customer-flow",
+            "ErrorType": "NoMatchingError"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "set-agent-guide",
+      "Type": "UpdateContactEventHooks",
+      "Parameters": {
+        "EventHooks": {
+          "DefaultAgentUI": "__AGENT_GUIDE_FLOW_ARN__"
+        }
+      },
+      "Transitions": {
+        "NextAction": "transfer-to-customer-flow",
+        "Errors": [
+          {
+            "NextAction": "transfer-to-customer-flow",
+            "ErrorType": "NoMatchingError"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "transfer-to-customer-flow",
+      "Type": "TransferToFlow",
+      "Parameters": {
+        "ContactFlowId": "__TARGET_CONTACT_FLOW_ARN__"
+      },
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [
+          {
+            "NextAction": "disconnect",
+            "ErrorType": "NoMatchingError"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "disconnect",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "type": "function",
+  "function": {
+    "name": "prepare_handoff",
+    "description": "Store the caller's bounded support context immediately before transferring to a human agent.",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "customer_name",
+        "issue_summary",
+        "intent",
+        "verification_status"
+      ],
+      "properties": {
+        "customer_name": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Caller name for display to the receiving agent."
+        },
+        "issue_summary": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Concise summary of why the caller needs an agent."
+        },
+        "intent": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Short support intent label."
+        },
+        "verification_status": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Display-only statement of any verification already completed."
+        }
+      }
+    }
+  },
+  "server": {
+    "url": "__PREPARE_URL__",
+    "credentialId": "__WEBHOOK_CREDENTIAL_ID__",
+    "timeoutSeconds": 10
+  },
+  "async": false
+}

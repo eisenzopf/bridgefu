@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Persistent, governed nonproduction Amazon Connect foundation for recurring
+  Bridgefu qualification. Deploy once in a dedicated nonproduction account,
+  enable root-stack termination protection, and point the normal recipe
+  template at its outputs. This stack never creates Bridgefu runtime resources.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: persistent-nonproduction-connect-foundation
+    ProductionDefault: false
+
+Parameters:
+  FoundationAcknowledgement:
+    Type: String
+    Default: NOT_ACKNOWLEDGED
+    AllowedValues: [NOT_ACKNOWLEDGED, CREATE_PERSISTENT_NONPRODUCTION_CONNECT]
+  DeploymentId:
+    Type: String
+    Default: bridgefu-nonprod
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  NestedTemplateBaseUrl:
+    Type: String
+    AllowedPattern: '^https://[^[:space:]]+/cloudformation/nested$'
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+
+Rules:
+  ExplicitPersistentFoundationAcknowledgement:
+    Assertions:
+      - Assert: !Equals
+          - !Ref FoundationAcknowledgement
+          - CREATE_PERSISTENT_NONPRODUCTION_CONNECT
+        AssertDescription: >-
+          Creating a persistent Connect foundation requires the exact
+          CREATE_PERSISTENT_NONPRODUCTION_CONNECT acknowledgement.
+
+Resources:
+  ConnectFoundation:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/demo-connect.yaml'
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+        - {Key: BridgefuEnvironment, Value: nonproduction}
+
+Outputs:
+  ConnectInstanceArn:
+    Value: !GetAtt ConnectFoundation.Outputs.ConnectInstanceArn
+  ConnectInstanceId:
+    Value: !GetAtt ConnectFoundation.Outputs.ConnectInstanceId
+  TargetContactFlowArn:
+    Value: !GetAtt ConnectFoundation.Outputs.TargetContactFlowArn
+  ConnectLoginUrl:
+    Value: !GetAtt ConnectFoundation.Outputs.ConnectLoginUrl
+  AgentCredentialSecretArn:
+    Value: !GetAtt ConnectFoundation.Outputs.AgentCredentialSecretArn

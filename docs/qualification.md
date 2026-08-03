@@ -542,7 +542,7 @@ cannot satisfy this qualification.
 
 The published-graph rerun on 2026-07-31 uses only the exact checksummed rvoip
 0.3.5 packages in `Cargo.lock`, Playwright 1.61.1, and its Bridgefu-local
-Chromium installation. No StandardCharter browser installation or Cargo path,
+Chromium installation. No reference tenant browser installation or Cargo path,
 Git, or patch override is used.
 
 | Destination | Exact built-SDK Chromium evidence |
@@ -555,7 +555,7 @@ Git, or patch override is used.
 Supporting current published-graph evidence passes as follows:
 `cargo test --locked --all-targets`, including Bridgefu library 341/341,
 binary 128/128, `call_execution_supervisor` 41/41, generic SIP 6/6,
-`private_forwarding` 7/7, and StandardCharter 82/82. Strict
+`private_forwarding` 7/7, and reference tenant 82/82. Strict
 all-target/all-feature Clippy passes with warnings denied. The TypeScript SDK
 passes 20/20 tests and its typecheck. The generic-WSS test continuously drains
 the real destination media receiver and independently asserts the DTMF event

@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Ephemeral, outbound-only CodeBuild runner for the disposable Bridgefu recipe
+  qualification. The fixed NAT EIP is allocated by the reviewed bootstrap stack.
+
+Parameters:
+  DeploymentId:
+    Type: String
+    AllowedPattern: '^bft-[a-z0-9-]{4,20}$'
+  ArtifactBucket:
+    Type: String
+  QualificationArtifactKey:
+    Type: String
+  QualificationArtifactVersion:
+    Type: String
+  QualificationArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  RunnerRoleArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:iam::[0-9]{12}:role/bridgefu-bft-[a-z0-9-]+-runner$'
+  SourceEipAllocationId:
+    Type: String
+    AllowedPattern: '^eipalloc-[0-9a-f]+$'
+  SourceEipPublicIp:
+    Type: String
+    AllowedPattern: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  RunnerAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Exact Availability Zone selected and capacity-checked by the guarded controller.
+  LogRetentionDays:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 3, 5, 7, 14]
+
+Resources:
+  RunnerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.90.0.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-runner'}
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref RunnerVpc
+      InternetGatewayId: !Ref RunnerInternetGateway
+
+  RunnerPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref RunnerVpc
+      CidrBlock: 10.90.0.0/26
+      AvailabilityZone: !Ref RunnerAvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-runner-public'}
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref RunnerVpc
+      CidrBlock: 10.90.0.64/26
+      AvailabilityZone: !Ref RunnerAvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-runner-private'}
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RunnerVpc
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: RunnerGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RunnerPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref RunnerInternetGateway
+
+  RunnerPublicRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RunnerPublicSubnet
+      RouteTableId: !Ref RunnerPublicRouteTable
+
+  RunnerNatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: RunnerGatewayAttachment
+    Properties:
+      AllocationId: !Ref SourceEipAllocationId
+      SubnetId: !Ref RunnerPublicSubnet
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RunnerVpc
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RunnerPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref RunnerNatGateway
+
+  RunnerPrivateRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RunnerPrivateSubnet
+      RouteTableId: !Ref RunnerPrivateRouteTable
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only Bridgefu qualification runner
+      VpcId: !Ref RunnerVpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Required AWS, Vapi, SIP, RTP, WebRTC, DNS, and package endpoints
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  RunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/qualification-runner'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+
+  QualificationProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-qualification'
+      Description: !Sub 'Disposable Bridgefu recipe qualification for ${DeploymentId}'
+      ServiceRole: !Ref RunnerRoleArn
+      TimeoutInMinutes: 180
+      QueuedTimeoutInMinutes: 15
+      ConcurrentBuildLimit: 1
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+                nodejs: 22
+              commands:
+                - set -euo pipefail
+                - aws s3api get-object --bucket '${ArtifactBucket}' --key '${QualificationArtifactKey}' --version-id '${QualificationArtifactVersion}' /tmp/qualification-source.zip
+                - echo '${QualificationArtifactSha256}  /tmp/qualification-source.zip' | sha256sum --check --strict
+                - mkdir -p /opt/bridgefu && cd /opt/bridgefu && unzip -q /tmp/qualification-source.zip
+                - python3 -m pip install --disable-pip-version-check --no-cache-dir -r recipes/vapi-amazon-connect-screen-pop/qualification/requirements-runner.txt
+                - cd /opt/bridgefu/sdk/typescript && npm ci --ignore-scripts
+                - PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install --with-deps chromium
+                - test -x /opt/bridgefu/target/release/examples/recipe_sip_source
+                - test -x /opt/bridgefu/target/release/examples/recipe_sip_negative
+                - /opt/bridgefu/target/release/examples/recipe_sip_source --version
+                - /opt/bridgefu/target/release/examples/recipe_sip_negative --version
+            pre_build:
+              commands:
+                - test -n "${!BRIDGEFU_RUNNER_INPUT_BUCKET}" && test -n "${!BRIDGEFU_RUNNER_INPUT_KEY}" && test -n "${!BRIDGEFU_RUNNER_INPUT_VERSION}"
+                - aws s3api get-object --bucket "${!BRIDGEFU_RUNNER_INPUT_BUCKET}" --key "${!BRIDGEFU_RUNNER_INPUT_KEY}" --version-id "${!BRIDGEFU_RUNNER_INPUT_VERSION}" /opt/bridgefu/runner-input.private.json
+                - chmod 0600 /opt/bridgefu/runner-input.private.json
+            build:
+              commands:
+                - cd /opt/bridgefu
+                - python3 scripts/run-aws-packaged-qualification.py --input runner-input.private.json
+      Artifacts: {Type: NO_ARTIFACTS}
+      Cache: {Type: NO_CACHE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+      VpcConfig:
+        VpcId: !Ref RunnerVpc
+        Subnets: [!Ref RunnerPrivateSubnet]
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref RunnerLogGroup
+          StreamName: qualification
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+        - {Key: BridgefuEnvironment, Value: demo}
+
+Outputs:
+  ProjectName:
+    Value: !Ref QualificationProject
+  RunnerPublicIp:
+    Value: !Ref SourceEipPublicIp
+  RunnerSourceCidr:
+    Value: !Sub '${SourceEipPublicIp}/32'
+  RunnerLogGroupName:
+    Value: !Ref RunnerLogGroup

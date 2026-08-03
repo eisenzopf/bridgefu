@@ -186,6 +186,29 @@ impl ApiState {
         .await
     }
 
+    /// Constructs the local all-in-one control plane without the historical
+    /// `ConnectScreenPopServer`. Recipe-only processes use the same durable
+    /// call runtime, attachment authority, and API surface while the generic
+    /// SIP/WebRTC runtime owns every media adapter.
+    pub async fn from_recipe_config(
+        config: &Config,
+        metrics: PrometheusHandle,
+        tenants: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let attachment_principals = Arc::new(config.attachment_principal_resolver(&tenants)?);
+        Self::from_config_inner(
+            config,
+            None,
+            metrics,
+            tenants,
+            None,
+            attachment_principals,
+            ApiCallRuntimeKind::LocalWorker,
+            None,
+        )
+        .await
+    }
+
     /// Constructs the public API for a role-separated gateway. This opens the
     /// shared PostgreSQL/Redis control plane but never registers a worker or
     /// constructs an rvoip media runtime.
@@ -2823,6 +2846,7 @@ api:
           type: sip
           config:
             uri: "sips:private-agent@callcenter.example.test:5061;transport=tls"
+            initial_context: required
     foreign-support:
       tenant_id: tenant-b
       ingress: [sip]
@@ -4081,6 +4105,19 @@ persistence:
             response_json(disallowed).await["error"]["code"],
             "context_metadata_not_allowed"
         );
+        let missing_context = post_json(
+            &app,
+            "/v1/routes/sip-support/calls",
+            Some("diagnostics-secret"),
+            &["route-missing-context"],
+            json!({"ingress": "webrtc"}),
+        )
+        .await;
+        assert_eq!(missing_context.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(missing_context).await["error"]["code"],
+            "context_required"
+        );
 
         let call_id = created["call_id"]
             .as_str()
@@ -4150,7 +4187,13 @@ persistence:
             "/v1/routes/sip-support/calls",
             Some("diagnostics-secret"),
             &["route-webrtc-1"],
-            json!({"ingress": "webrtc"}),
+            json!({
+                "ingress": "webrtc",
+                "context": {
+                    "correlation_id": "managed-widget-webrtc-1",
+                    "metadata": {"customer_name": "Ada"}
+                }
+            }),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -5340,6 +5383,7 @@ persistence:
 
         let context_policy = ContextPolicy {
             allow_headers: BTreeMap::from([("X-Bridgefu-Event".into(), "broadcast_event".into())]),
+            ..ContextPolicy::default()
         };
         let event_policy =
             SanitizedContextEventPolicy::new("broadcast_event", 8, 8, 8, &context_policy).unwrap();

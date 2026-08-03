@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/vapi-source-observation-v1.schema.json",
+  "title": "Bridgefu controlled Vapi browser source observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_revision_sha256",
+    "site_bundle_sha256",
+    "browser_sdk_version",
+    "execution_id",
+    "scenario_id",
+    "hangup_origin",
+    "correlation_fingerprint",
+    "source_call_fingerprint",
+    "observed_at",
+    "vapi",
+    "media",
+    "hangup",
+    "redacted"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-vapi-web-playwright@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "site_bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "browser_sdk_version": {"const": "2.5.2"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "scenario_id": {"const": "vapi-web-transfer"},
+    "hangup_origin": {"enum": ["source", "agent"]},
+    "correlation_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "source_call_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "vapi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["web_call_started", "transfer_trigger_sent", "call_end_observed"],
+      "properties": {
+        "web_call_started": {"const": true},
+        "transfer_trigger_sent": {"const": true},
+        "call_end_observed": {"const": true}
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "security",
+        "source_marker_sent_at_ms",
+        "agent_marker_observed_at_ms",
+        "source_to_agent_marker_frames_sent",
+        "agent_to_source_marker_frames",
+        "dtmf_source_to_agent_sent",
+        "dtmf_agent_to_source_observed"
+      ],
+      "properties": {
+        "codec": {"const": "negotiated"},
+        "security": {"const": "srtp"},
+        "source_marker_sent_at_ms": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 32,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "agent_marker_observed_at_ms": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 16,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "source_to_agent_marker_frames_sent": {"type": "integer", "minimum": 5},
+        "agent_to_source_marker_frames": {"type": "integer", "minimum": 3},
+        "dtmf_source_to_agent_sent": {"const": true},
+        "dtmf_agent_to_source_observed": {"const": true}
+      }
+    },
+    "hangup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "local_end_completed",
+        "remote_end_observed",
+        "cleanup_observed"
+      ],
+      "properties": {
+        "origin": {"enum": ["source", "agent"]},
+        "local_end_completed": {"type": "boolean"},
+        "remote_end_observed": {"type": "boolean"},
+        "cleanup_observed": {"const": true}
+      }
+    },
+    "redacted": {"const": true}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"hangup_origin": {"const": "source"}}},
+      "then": {
+        "properties": {
+          "hangup": {
+            "properties": {
+              "origin": {"const": "source"},
+              "local_end_completed": {"const": true},
+              "remote_end_observed": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"hangup_origin": {"const": "agent"}}},
+      "then": {
+        "properties": {
+          "hangup": {
+            "properties": {
+              "origin": {"const": "agent"},
+              "local_end_completed": {"const": false},
+              "remote_end_observed": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

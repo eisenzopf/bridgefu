@@ -1,0 +1,86 @@
+{
+  "agent": {
+    "region": "__AWS_REGION__",
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "namespace": "Bridgefu/Runtime",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "aggregation_dimensions": [["InstanceId"]],
+    "metrics_collected": {
+      "cpu": {
+        "measurement": ["cpu_usage_idle", "cpu_usage_iowait"],
+        "totalcpu": true,
+        "metrics_collection_interval": 60
+      },
+      "disk": {
+        "measurement": ["used_percent", "inodes_free"],
+        "resources": ["/", "/var/lib/bridgefu"],
+        "drop_device": true,
+        "metrics_collection_interval": 60
+      },
+      "mem": {
+        "measurement": ["mem_used_percent"],
+        "metrics_collection_interval": 60
+      },
+      "netstat": {
+        "measurement": ["tcp_established", "tcp_time_wait"],
+        "metrics_collection_interval": 60
+      }
+    }
+  },
+  "logs": {
+    "force_flush_interval": 5,
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/lib/docker/containers/*/*-json.log",
+            "log_group_name": "__RUNTIME_LOG_GROUP__",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": -1
+          }
+        ]
+      }
+    },
+    "metrics_collected": {
+      "prometheus": {
+        "cluster_name": "__DEPLOYMENT_ID__",
+        "log_group_name": "__PROMETHEUS_LOG_GROUP__",
+        "prometheus_config_path": "/opt/aws/amazon-cloudwatch-agent/var/bridgefu-prometheus.yaml",
+        "emf_processor": {
+          "metric_declaration_dedup": true,
+          "metric_namespace": "Bridgefu/Runtime",
+          "metric_unit": {
+            "bridgefu_process_ready": "Count",
+            "bridgefu_gateway_native_active_routes": "Count",
+            "bridgefu_contacts_started_total": "Count",
+            "bridgefu_failures_total": "Count",
+            "bridgefu_auth_failures_total": "Count",
+            "bridgefu_amazon_durable_cleanups_pending": "Count",
+            "bridgefu_amazon_cleanup_reconcile_failures_total": "Count"
+          },
+          "metric_declaration": [
+            {
+              "source_labels": ["job"],
+              "label_matcher": "^bridgefu$",
+              "dimensions": [["deployment"]],
+              "metric_selectors": [
+                "^bridgefu_process_ready$",
+                "^bridgefu_gateway_native_active_routes$",
+                "^bridgefu_contacts_started_total$",
+                "^bridgefu_failures_total$",
+                "^bridgefu_auth_failures_total$",
+                "^bridgefu_amazon_durable_cleanups_pending$",
+                "^bridgefu_amazon_cleanup_reconcile_failures_total$"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

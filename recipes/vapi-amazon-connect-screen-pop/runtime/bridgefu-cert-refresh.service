@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh Bridgefu ACM certificate without interrupting active calls
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/bridgefu/runtime.conf
+ExecStart=/usr/local/sbin/bridgefu-cert-refresh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/bridgefu/tls /etc/haproxy /run/bridgefu

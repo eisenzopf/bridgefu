@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu HA edge: two bounded media gateway slots, public SIP signaling,
+  private control and worker forwarding load balancers, DNS, and TLS identity.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: runtime-ha-edge
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  TransferFunctionSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  PublicHostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  SipHostname:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  ControlHostname:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  WorkerHostname:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  UctpHostname:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidr1:
+    Type: String
+  VapiSignalingCidr2:
+    Type: String
+  VapiSignalingCidr3:
+    Type: String
+    Default: ''
+  VapiSignalingCidr4:
+    Type: String
+    Default: ''
+  MediaSourceCidr:
+    Type: String
+    Default: 0.0.0.0/0
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+  ClearSip: !Equals [!Ref SipSecurity, sip_rtp]
+  HasCidr3: !Not [!Equals [!Ref VapiSignalingCidr3, '']]
+  HasCidr4: !Not [!Equals [!Ref VapiSignalingCidr4, '']]
+  SecureSipCidr3: !And [!Condition SecureSip, !Condition HasCidr3]
+  SecureSipCidr4: !And [!Condition SecureSip, !Condition HasCidr4]
+  ClearSipCidr3: !And [!Condition ClearSip, !Condition HasCidr3]
+  ClearSipCidr4: !And [!Condition ClearSip, !Condition HasCidr4]
+
+Resources:
+  GatewayEipA:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuSlot, Value: gateway-a}
+
+  GatewayEipB:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuSlot, Value: gateway-b}
+
+  PublicNlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Exact Vapi signaling ingress to the Bridgefu public NLB
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-public-nlb'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bridgefu HA gateways; media is direct and control is private
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 16384
+          ToPort: 32767
+          CidrIp: !Ref MediaSourceCidr
+          Description: Dialog-bound RTP or SRTP media
+        - IpProtocol: tcp
+          FromPort: 5060
+          ToPort: 5061
+          SourceSecurityGroupId: !Ref PublicNlbSecurityGroup
+          Description: SIP signaling from public NLB only
+        - IpProtocol: udp
+          FromPort: 5060
+          ToPort: 5060
+          SourceSecurityGroupId: !Ref PublicNlbSecurityGroup
+          Description: Compatibility SIP UDP from public NLB only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs, ECR, and signaling dependencies
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: Media, DNS, time, and private QUIC responses
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: VPC DNS fallback
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: TLS PostgreSQL in private subnets
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !Ref VpcCidr
+          Description: TLS Redis in private subnets
+        - IpProtocol: udp
+          FromPort: 9443
+          ToPort: 9444
+          CidrIp: !Ref VpcCidr
+          Description: Private worker forwarding NLB
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bridgefu HA workers; no public ingress
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs, ECR, and Amazon Connect signaling
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: Amazon Connect WebRTC media, DNS, and time
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: VPC DNS fallback
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: TLS PostgreSQL in private subnets
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !Ref VpcCidr
+          Description: TLS Redis in private subnets
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-worker'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  ControlNlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private transfer Lambda access to Bridgefu control
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TransferFunctionSecurityGroupId
+          Description: Authenticated reservation traffic only
+      SecurityGroupEgress: []
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-control-nlb'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerNlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private mTLS forwarding from gateways to workers
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 9443
+          ToPort: 9444
+          SourceSecurityGroupId: !Ref GatewaySecurityGroup
+          Description: Exact bounded worker slots
+      SecurityGroupEgress: []
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-worker-nlb'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayControlIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9080
+      ToPort: 9080
+      SourceSecurityGroupId: !Ref ControlNlbSecurityGroup
+      Description: Private TLS control from internal NLB
+
+  PublicNlbSipTcpEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt PublicNlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5061
+      DestinationSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: SIP signaling to gateway slots
+
+  PublicNlbSipUdpEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt PublicNlbSecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      DestinationSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: Compatibility SIP UDP to gateway slots
+
+  PublicNlbHealthEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt PublicNlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      DestinationSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: Readiness checks to gateway slots
+
+  ControlNlbApiEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt ControlNlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9080
+      ToPort: 9080
+      DestinationSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: Private TLS API to gateway slots
+
+  ControlNlbHealthEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt ControlNlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      DestinationSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: Readiness checks to gateway slots
+
+  WorkerNlbForwardingEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt WorkerNlbSecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 9443
+      ToPort: 9443
+      DestinationSecurityGroupId: !Ref WorkerSecurityGroup
+      Description: Private mTLS forwarding to worker slots
+
+  WorkerNlbHealthEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt WorkerNlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      DestinationSecurityGroupId: !Ref WorkerSecurityGroup
+      Description: Readiness checks to worker slots
+
+  GatewayPublicHealthIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref PublicNlbSecurityGroup
+      Description: Public NLB private health checks
+
+  GatewayControlHealthIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref ControlNlbSecurityGroup
+      Description: Control NLB private health checks
+
+  WorkerForwardingIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt WorkerSecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 9443
+      ToPort: 9443
+      SourceSecurityGroupId: !Ref WorkerNlbSecurityGroup
+      Description: Private mTLS forwarding NLB
+
+  WorkerHealthIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt WorkerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref WorkerNlbSecurityGroup
+      Description: Worker NLB private health checks
+
+  SecureSipIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref VapiSignalingCidr1}
+  SecureSipIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref VapiSignalingCidr2}
+  SecureSipIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSipCidr3
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref VapiSignalingCidr3}
+  SecureSipIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSipCidr4
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref VapiSignalingCidr4}
+  ClearSipTcpIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr1}
+  ClearSipUdpIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: udp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr1}
+  ClearSipTcpIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr2}
+  ClearSipUdpIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: udp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr2}
+  ClearSipTcpIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr3
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr3}
+  ClearSipUdpIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr3
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: udp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr3}
+  ClearSipTcpIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr4
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr4}
+  ClearSipUdpIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr4
+    Properties: {GroupId: !Ref PublicNlbSecurityGroup, IpProtocol: udp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref VapiSignalingCidr4}
+
+  GatewayUctpIngressAFromB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 4433
+      ToPort: 4433
+      CidrIp: !Sub '${GatewayEipB.PublicIp}/32'
+      Description: Cluster broadcast from gateway B
+
+  GatewayUctpIngressBFromA:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 4433
+      ToPort: 4433
+      CidrIp: !Sub '${GatewayEipA.PublicIp}/32'
+      Description: Cluster broadcast from gateway A
+
+  PublicCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref SipHostname
+      SubjectAlternativeNames:
+        - !Ref ControlHostname
+        - !Ref WorkerHostname
+        - !Ref UctpHostname
+      ValidationMethod: DNS
+      CertificateExport: ENABLED
+      DomainValidationOptions:
+        - {DomainName: !Ref SipHostname, HostedZoneId: !Ref PublicHostedZoneId}
+        - {DomainName: !Ref ControlHostname, HostedZoneId: !Ref PublicHostedZoneId}
+        - {DomainName: !Ref WorkerHostname, HostedZoneId: !Ref PublicHostedZoneId}
+        - {DomainName: !Ref UctpHostname, HostedZoneId: !Ref PublicHostedZoneId}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  CertificatePassphraseSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-ha-certificate-passphrase'
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PublicSignalingLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: [!Ref PublicSubnet1Id, !Ref PublicSubnet2Id]
+      SecurityGroups: [!Ref PublicNlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: load_balancing.cross_zone.enabled, Value: 'false'}
+        - {Key: deletion_protection.enabled, Value: 'false'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PublicSignalingTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: !If [SecureSip, 5061, 5060]
+      Protocol: !If [SecureSip, TCP, TCP_UDP]
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9090'
+      HealthCheckPath: /readyz
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '120'}
+        - {Key: deregistration_delay.connection_termination.enabled, Value: 'false'}
+        - {Key: preserve_client_ip.enabled, Value: 'true'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  SecureSipListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: SecureSip
+    Properties:
+      LoadBalancerArn: !Ref PublicSignalingLoadBalancer
+      Port: 5061
+      Protocol: TCP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref PublicSignalingTargetGroup}]
+
+  ClearSipListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ClearSip
+    Properties:
+      LoadBalancerArn: !Ref PublicSignalingLoadBalancer
+      Port: 5060
+      Protocol: TCP_UDP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref PublicSignalingTargetGroup}]
+
+  ControlLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets: [!Ref PrivateSubnet1Id, !Ref PrivateSubnet2Id]
+      SecurityGroups: [!Ref ControlNlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: load_balancing.cross_zone.enabled, Value: 'true'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ControlTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 9080
+      Protocol: TCP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9090'
+      HealthCheckPath: /readyz
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '120'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ControlListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ControlLoadBalancer
+      Port: 443
+      Protocol: TCP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref ControlTargetGroup}]
+
+  WorkerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets: [!Ref PrivateSubnet1Id, !Ref PrivateSubnet2Id]
+      SecurityGroups: [!Ref WorkerNlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: load_balancing.cross_zone.enabled, Value: 'true'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerATargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 9443
+      Protocol: UDP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9090'
+      HealthCheckPath: /readyz
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '120'}
+      Tags:
+        - {Key: BridgefuSlot, Value: worker-a}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 9443
+      Protocol: UDP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9090'
+      HealthCheckPath: /readyz
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '120'}
+      Tags:
+        - {Key: BridgefuSlot, Value: worker-b}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerAListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WorkerLoadBalancer
+      Port: 9443
+      Protocol: UDP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref WorkerATargetGroup}]
+
+  WorkerBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WorkerLoadBalancer
+      Port: 9444
+      Protocol: UDP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref WorkerBTargetGroup}]
+
+  SipDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref SipHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt PublicSignalingLoadBalancer.DNSName
+        HostedZoneId: !GetAtt PublicSignalingLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  UctpDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref UctpHostname
+      Type: A
+      TTL: '30'
+      ResourceRecords: [!GetAtt GatewayEipA.PublicIp, !GetAtt GatewayEipB.PublicIp]
+
+  ControlPrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref ControlHostname
+      VPCs: [{VPCId: !Ref VpcId, VPCRegion: !Ref AWS::Region}]
+      HostedZoneConfig: {Comment: !Sub 'Bridgefu ${DeploymentId} private control'}
+      HostedZoneTags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ControlDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ControlPrivateHostedZone
+      Name: !Ref ControlHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ControlLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ControlLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  WorkerPrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref WorkerHostname
+      VPCs: [{VPCId: !Ref VpcId, VPCRegion: !Ref AWS::Region}]
+      HostedZoneConfig: {Comment: !Sub 'Bridgefu ${DeploymentId} private workers'}
+      HostedZoneTags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref WorkerPrivateHostedZone
+      Name: !Ref WorkerHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WorkerLoadBalancer.DNSName
+        HostedZoneId: !GetAtt WorkerLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+Outputs:
+  GatewaySecurityGroupId: {Value: !Ref GatewaySecurityGroup}
+  WorkerSecurityGroupId: {Value: !Ref WorkerSecurityGroup}
+  GatewayEipAAllocationId: {Value: !GetAtt GatewayEipA.AllocationId}
+  GatewayEipAPublicIp: {Value: !GetAtt GatewayEipA.PublicIp}
+  GatewayEipBAllocationId: {Value: !GetAtt GatewayEipB.AllocationId}
+  GatewayEipBPublicIp: {Value: !GetAtt GatewayEipB.PublicIp}
+  PublicSignalingTargetGroupArn: {Value: !Ref PublicSignalingTargetGroup}
+  ControlTargetGroupArn: {Value: !Ref ControlTargetGroup}
+  WorkerATargetGroupArn: {Value: !Ref WorkerATargetGroup}
+  WorkerBTargetGroupArn: {Value: !Ref WorkerBTargetGroup}
+  PublicSignalingDnsName: {Value: !GetAtt PublicSignalingLoadBalancer.DNSName}
+  PublicCertificateArn: {Value: !Ref PublicCertificate}
+  CertificatePassphraseSecretArn: {Value: !Ref CertificatePassphraseSecret}
+  SipHostname: {Value: !Ref SipHostname}
+  ControlBaseUrl: {Value: !Sub 'https://${ControlHostname}'}
+  WorkerHostname: {Value: !Ref WorkerHostname}
+  UctpHostname: {Value: !Ref UctpHostname}
+  SipUri:
+    Value: !If
+      - SecureSip
+      - !Sub 'sips:{one-use-token}@${SipHostname}:5061;transport=tls'
+      - !Sub 'sip:{one-use-token}@${SipHostname}:5060'

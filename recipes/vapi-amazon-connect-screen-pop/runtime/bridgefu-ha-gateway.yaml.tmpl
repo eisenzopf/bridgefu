@@ -1,0 +1,89 @@
+config_version: 1
+
+aws:
+  region: __AWS_REGION__
+
+edge:
+  public_host: __SIP_HOSTNAME__
+  media_public_addr: __PUBLIC_IP__:0
+__SIP_EDGE_CONFIG__
+
+api:
+  enabled: true
+  http_bind: 0.0.0.0:9080
+  tls:
+    certificate_chain: /etc/bridgefu/tls/fullchain.pem
+    private_key: /etc/bridgefu/tls/private-key.pem
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  rate_limit:
+    enabled: true
+    control_requests_per_second: 40
+    control_burst: 80
+    diagnostics_requests_per_second: 10
+    diagnostics_burst: 20
+    webhook_requests_per_second: 10
+    webhook_burst: 20
+    max_tracked_identities: 4096
+    identity_idle_ttl_secs: 300
+
+recipes:
+  support:
+    use: builtin:vapi-amazon-connect-screen-pop@1
+    with:
+      vapi_signaling_cidrs:
+__VAPI_SIGNALING_CIDRS__
+      connect_instance_arn: __CONNECT_INSTANCE_ARN__
+      connect_entry_contact_flow_id: __CONNECT_ENTRY_FLOW_ID__
+      sip_security: __SIP_SECURITY__
+
+persistence:
+  backend: postgres
+  database_url: env:BRIDGEFU_DATABASE_URL
+  deployment_id: __DEPLOYMENT_ID__
+  worker_capabilities: [amazon_connect]
+  redis_url: env:BRIDGEFU_REDIS_URL
+  redis_clustered: true
+
+broadcast:
+  public_endpoint: uctp+quic://__UCTP_HOSTNAME__:4433
+  token_secret: env:BRIDGEFU_BROADCAST_TOKEN_SECRET
+
+private_forwarding:
+  enabled: true
+  token_signing_secret: env:BRIDGEFU_PRIVATE_FORWARDING_SECRET
+  gateway:
+    gateway_id: __GATEWAY_ID__
+    bind: 0.0.0.0:0
+    tls:
+      certificate_chain: [/etc/bridgefu/private/gateway.crt]
+      private_key: /etc/bridgefu/private/gateway.key
+      peer_ca_certificates: [/etc/bridgefu/private/ca.crt]
+    public_uctp:
+      bind: 0.0.0.0:4433
+      tls:
+        certificate_chain: [/etc/bridgefu/tls/fullchain.pem]
+        private_key: /etc/bridgefu/tls/private-key.pem
+      max_concurrent_connections: __PUBLIC_UCTP_CAPACITY__
+    workers:
+__WORKER_TARGETS__
+  limits:
+    max_active_routes: __FORWARDING_CAPACITY__
+    max_peer_connections: 16
+    max_routes_per_peer: __MAX_CONCURRENT_CALLS__
+    media_queue_capacity: 32
+    reliable_queue_capacity: 128
+    inbound_queue_capacity: 128
+
+observability:
+  log_level: info
+  log_format: json
+  http_bind: 0.0.0.0:9090
+
+runtime:
+  mode: gateway
+  max_concurrent_calls: __MAX_CONCURRENT_CALLS__
+  setup_timeout_secs: 15
+  media_idle_timeout_secs: 120
+  drain_timeout_secs: 120

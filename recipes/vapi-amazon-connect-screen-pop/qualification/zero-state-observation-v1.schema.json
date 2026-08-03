@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/zero-state-observation-v1.schema.json",
+  "title": "Bridgefu protected final zero-state observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "producer", "producer_revision_sha256", "execution_id", "recipe", "observed_at", "observation_window_seconds", "sources", "active_calls", "active_contacts", "active_routes", "cleanup_backlog", "redacted", "customer_data_retained"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-qualification-controller@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "recipe": {"const": "vapi-amazon-connect-screen-pop@1"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "observation_window_seconds": {"type": "integer", "minimum": 60, "maximum": 1800},
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bridgefu_metrics", "connect_contact_query", "runtime_readiness"],
+      "properties": {
+        "bridgefu_metrics": {"const": true},
+        "connect_contact_query": {"const": true},
+        "runtime_readiness": {"const": true}
+      }
+    },
+    "active_calls": {"const": 0},
+    "active_contacts": {"const": 0},
+    "active_routes": {"const": 0},
+    "cleanup_backlog": {"const": 0},
+    "redacted": {"const": true},
+    "customer_data_retained": {"const": false}
+  }
+}

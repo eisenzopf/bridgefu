@@ -77,6 +77,63 @@ if [ "$base_args" -ne 2 ]; then
   echo "release Dockerfile must pin both base manifest digests" >&2
   exit 1
 fi
+test -f deploy/Dockerfile.qualification
+test -f tools/recipe-qualification/Cargo.toml
+python3 - <<'PY'
+import re
+import tomllib
+from pathlib import Path
+
+dockerfile = Path("deploy/Dockerfile.qualification").read_text()
+pin = re.compile(
+    r"^ARG (QUALIFICATION_BUILDER(?:_AMD64|_ARM64)?_IMAGE)="
+    r"([a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64})$"
+)
+matches = [match.groups() for line in dockerfile.splitlines() if (match := pin.fullmatch(line))]
+expected = {
+    "QUALIFICATION_BUILDER_IMAGE",
+    "QUALIFICATION_BUILDER_AMD64_IMAGE",
+    "QUALIFICATION_BUILDER_ARM64_IMAGE",
+}
+if len(matches) != 3 or {name for name, _ in matches} != expected:
+    raise SystemExit("qualification Dockerfile must uniquely pin its builder index and children")
+images = [image for _, image in matches]
+if len({image.rsplit("@sha256:", 1)[0] for image in images}) != 1:
+    raise SystemExit("qualification builder image pins do not share one repository")
+if len({image.rsplit("@sha256:", 1)[1] for image in images}) != 3:
+    raise SystemExit("qualification builder image pins must have distinct digests")
+required = (
+    "FROM ${QUALIFICATION_BUILDER_IMAGE} AS qualification-builder",
+    "ARG QUALIFICATION_DEBIAN_SNAPSHOT=20260202T000000Z",
+    "ARG QUALIFICATION_RUST_TOOLCHAIN=1.95.0",
+    "ARG QUALIFICATION_TARGET=x86_64-unknown-linux-gnu.2.31",
+    "ENV LIBOPUS_NO_PKG=1",
+    "--package bridgefu-recipe-qualification",
+    'cargo +"${QUALIFICATION_RUST_TOOLCHAIN}" zigbuild --locked --release',
+    "x86_64-linux-gnu-strip",
+    "x86_64-linux-gnu-readelf -d /out/qualification/recipe_sip_source",
+    "x86_64-linux-gnu-readelf -d /out/qualification/recipe_sip_negative",
+    "Shared library: [libopus.so",
+    "FROM scratch AS qualification-binaries",
+)
+if any(value not in dockerfile for value in required) or "--platform" in dockerfile:
+    raise SystemExit("qualification Dockerfile lost its native cross-build contract")
+
+workspace = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]
+if workspace.get("default-members") != ["."] or "tools/recipe-qualification" not in workspace["members"]:
+    raise SystemExit("qualification package changed the default Cargo package boundary")
+qualification = tomllib.loads(Path("tools/recipe-qualification/Cargo.toml").read_text())
+opus = qualification["dependencies"].get("audiopus_sys")
+if (
+    qualification["package"].get("name") != "bridgefu-recipe-qualification"
+    or not isinstance(opus, dict)
+    or opus.get("version") != "=0.2.2"
+    or opus.get("features") != ["static"]
+    or qualification["dependencies"]["rvoip-sip"].get("version") != "=0.3.5"
+    or qualification["dependencies"]["rvoip-sip"].get("default-features") is not False
+):
+    raise SystemExit("qualification Cargo package lost its isolated dependency contract")
+PY
 snapshot_args=$(grep -Ec '^ARG BUILDER_DEBIAN_SNAPSHOT=[0-9]{8}T[0-9]{6}Z$' "$dockerfile")
 if [ "$snapshot_args" -ne 1 ]; then
   echo "release Dockerfile must pin the Debian builder package snapshot" >&2
@@ -105,6 +162,16 @@ fi
 
 grep -Eq '^COPY \. /src/bridgefu$' "$dockerfile"
 grep -Eq 'cargo build --locked --release' "$dockerfile"
+grep -Fq '&& rm -rf target /usr/local/cargo/registry /usr/local/cargo/git' \
+  "$dockerfile"
+grep -Fxq 'recipes/*/cloudformation/*' .dockerignore
+grep -Fxq \
+  '!recipes/vapi-amazon-connect-screen-pop/cloudformation/production-stack-policy.json' \
+  .dockerignore
+if grep -Fxq 'recipes/*/cloudformation/' .dockerignore; then
+  echo "release Docker context excludes a compile-time recipe asset" >&2
+  exit 1
+fi
 grep -Fq 'COPY --from=builder --chown=65532:65532 /out/bridgefu /usr/local/bin/bridgefu' \
   "$dockerfile"
 grep -Eq '^USER 65532:65532$' "$dockerfile"
@@ -361,7 +428,7 @@ while IFS= read -r image; do
 done < <(docker compose --profile cluster --profile generic config --images)
 
 # Compose must preserve the runtime hardening contract for every Bridgefu role.
-for profile in standardcharter generic telnyx uctp moqt cluster; do
+for profile in reference-tenant generic telnyx uctp moqt cluster; do
   rendered=$(docker compose --profile "$profile" config)
   if ! grep -q 'read_only: true' <<<"$rendered"; then
     echo "profile $profile lost read-only root filesystem" >&2

@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 30s
+  scrape_timeout: 5s
+
+scrape_configs:
+  - job_name: bridgefu
+    sample_limit: 5000
+    static_configs:
+      - targets: [127.0.0.1:9090]
+        labels:
+          application: bridgefu
+          deployment: __DEPLOYMENT_ID__
+          role: __ROLE__
+          slot: __SLOT__

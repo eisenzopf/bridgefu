@@ -1,0 +1,25 @@
+schema_version: 2
+provider: aws_cloudformation
+recipe: builtin:vapi-amazon-connect-screen-pop@1
+deployment_id: bft-production
+environment: production
+expected_account_id: '123456789012'
+region: us-west-2
+stack_name: bridgefu-bft-production
+cloudformation_service_role_arn: arn:aws:iam::123456789012:role/bridgefu-bft-production-cloudformation
+release_manifest_url: https://release.example.invalid/bridgefu/RELEASE/manifest.json
+release_manifest_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+stack_policy_file: cloudformation/production-stack-policy.json
+termination_protection: true
+rollback_alarm_arns:
+  - arn:aws:cloudwatch:us-west-2:123456789012:alarm:bridgefu-production-rollback
+
+# Replace this content-addressed example URL with template_url from the signed
+# Bridgefu recipe release manifest. Never point production at a mutable branch.
+profiles:
+  starter:
+    template_url: https://release.example.invalid/bridgefu/RELEASE/recipe/cloudformation/template.yaml
+    parameters_file: parameters-starter.json
+  high_availability:
+    template_url: https://release.example.invalid/bridgefu/RELEASE/recipe/cloudformation/template.yaml
+    parameters_file: parameters-ha.json

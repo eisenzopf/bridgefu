@@ -830,6 +830,7 @@ async fn run_browser_qualification() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,

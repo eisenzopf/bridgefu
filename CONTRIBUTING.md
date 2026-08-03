@@ -7,7 +7,7 @@ and operational integration.
 
 Before proposing a change:
 
-1. Preserve the frozen StandardCharter Vapi → Amazon Connect behavior.
+1. Preserve the frozen reference tenant Vapi → Amazon Connect behavior.
 2. Keep tenant and call ownership explicit at every signaling, media, and data
    boundary. Never add an untyped SIP-header or credential escape path.
 3. Add deterministic negative tests for lifecycle and authorization failures,

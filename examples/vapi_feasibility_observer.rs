@@ -2,7 +2,7 @@
 //!
 //! This is qualification infrastructure, not a Bridgefu administration API.
 //! It composes rvoip's SIP/TLS/SRTP/media implementation with a deliberately
-//! small, authenticated HTTP surface consumed by StandardCharter's owner-gated
+//! small, authenticated HTTP surface consumed by ReferenceTenant's owner-gated
 //! Chromium harness. Run `--validate-config` before binding any socket.
 
 use anyhow::{bail, Context};
@@ -42,8 +42,8 @@ use url::Url;
 const QUERY_PATH: &str = "/v1/observations/query";
 const CONTROL_PATH: &str = "/v1/observations/control";
 const VAPI_EVENTS_PATH: &str = "/v1/observations/vapi-events";
-const OBSERVATION_SCHEMA: &str = "standardcharter.vapi-webcall-sip-observation.v1";
-const READINESS_SCHEMA: &str = "standardcharter.vapi-webcall-sip-fixture-readiness.v1";
+const OBSERVATION_SCHEMA: &str = "reference-tenant.vapi-webcall-sip-observation.v1";
+const READINESS_SCHEMA: &str = "reference-tenant.vapi-webcall-sip-fixture-readiness.v1";
 const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
 const MAX_CALLBACK_TYPES: usize = 16;
 const MAX_HEADER_NAMES: usize = 32;

@@ -24,6 +24,7 @@ use bridgefu::call_service::{
     NamedRouteBinding, NamedRouteCallContext, ReplaceLegInput, RequestedLeg, SipEndpointConfig,
     SipInitialContextMode, TransferCallInput, WebRtcEndpointConfig,
 };
+use bridgefu::recipes::SipAdmissionMode;
 
 use crate::config::{NamedRouteCfg, NamedRouteIngress, ProfileAudioCodec, ResolvedRouteIceServer};
 
@@ -326,6 +327,16 @@ pub(super) async fn create_route_call(
             "named route does not support the requested ingress",
         ));
     }
+    if input.ingress == RouteIngressInput::Sip
+        && route
+            .recipe_sip_admission
+            .as_ref()
+            .is_some_and(|admission| admission.mode == SipAdmissionMode::StableUri)
+    {
+        return Err(ApiError::capability(
+            "this recipe uses its configured stable SIP URI instead of a managed attachment",
+        ));
+    }
     require_local_route_execution(&state, input.ingress, &route.destination.endpoint).await?;
     if let (Some(context), Some(allowlist)) = (
         input.context.as_ref(),
@@ -339,22 +350,42 @@ pub(super) async fn create_route_call(
             ));
         }
     }
+    if route.context_required && input.context.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "context_required",
+            "this route requires bounded server-owned context",
+        ));
+    }
+    if route.required_sip_correlation_header.is_some() && input.context.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "correlation_context_required",
+            "this SIP route requires a server-owned correlation context",
+        ));
+    }
     let key = IdempotencyKey::from_headers(&headers)?;
-    let ingress_profile_kind = match input.ingress {
-        RouteIngressInput::Sip => NamedProfileKind::VapiIngress,
-        RouteIngressInput::Webrtc => NamedProfileKind::WebRtc,
-    };
     let profiles = route
         .profile_bindings
         .iter()
         .filter(|profile| {
             profile.role() == NamedProfileRole::Destination
                 || (profile.role() == NamedProfileRole::Ingress
-                    && profile.kind() == ingress_profile_kind)
+                    && match input.ingress {
+                        RouteIngressInput::Sip => matches!(
+                            profile.kind(),
+                            NamedProfileKind::VapiIngress | NamedProfileKind::SipIngress
+                        ),
+                        RouteIngressInput::Webrtc => profile.kind() == NamedProfileKind::WebRtc,
+                    })
         })
         .cloned()
         .collect();
-    let binding = NamedRouteBinding::new_with_profiles(route_id.clone(), input.context, profiles)?;
+    let mut binding =
+        NamedRouteBinding::new_with_profiles(route_id.clone(), input.context, profiles)?;
+    if let Some(header) = &route.required_sip_correlation_header {
+        binding = binding.with_required_sip_correlation_header(header.clone())?;
+    }
     let create = CreateCallInput {
         tenant_id: None,
         legs: [input.ingress.requested_leg(), route.destination.clone()],

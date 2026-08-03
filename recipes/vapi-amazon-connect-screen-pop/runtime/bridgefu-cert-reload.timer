@@ -1,0 +1,10 @@
+[Unit]
+Description=Activate pending Bridgefu certificates only while idle
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=1m
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

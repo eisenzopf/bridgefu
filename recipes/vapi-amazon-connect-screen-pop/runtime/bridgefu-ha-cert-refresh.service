@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh Bridgefu HA gateway certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bridgefu-ha-cert-refresh
+User=root
+Group=root
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/bridgefu/tls /run/bridgefu
+NoNewPrivileges=yes

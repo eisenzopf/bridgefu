@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/negative-observation-v1.schema.json",
+  "title": "Bridgefu protected negative-case observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_revision_sha256",
+    "execution_id",
+    "recipe",
+    "id",
+    "started_at",
+    "ended_at",
+    "revisions",
+    "outcome",
+    "call_evidence_sha256",
+    "supporting_evidence_sha256",
+    "checks",
+    "zero_state",
+    "passed",
+    "redacted",
+    "customer_data_retained"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-qualification-controller@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "recipe": {"const": "vapi-amazon-connect-screen-pop@1"},
+    "id": {
+      "enum": [
+        "prepare_auth_rejected",
+        "prepare_conflicting_replay_rejected",
+        "malformed_payload_rejected",
+        "missing_correlation_header_rejected",
+        "duplicate_correlation_header_rejected",
+        "expired_attachment_rejected",
+        "attachment_replay_rejected",
+        "source_cancellation_cleanup",
+        "missing_context_fail_open"
+      ]
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "source_tree_sha256", "image"],
+      "properties": {
+        "release_id": {"type": "string", "pattern": "^[0-9a-f]{20}$"},
+        "source_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "outcome": {"enum": ["rejected", "conflict_rejected", "replay_rejected", "cancelled_cleanly", "failed_open"]},
+    "call_evidence_sha256": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "supporting_evidence_sha256": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stimulus_applied", "expected_outcome_observed", "no_duplicate_contact", "agent_workspace_observed"],
+      "properties": {
+        "stimulus_applied": {"const": true},
+        "expected_outcome_observed": {"const": true},
+        "no_duplicate_contact": {"const": true},
+        "agent_workspace_observed": {"type": "boolean"}
+      }
+    },
+    "zero_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_calls", "active_contacts", "active_routes", "cleanup_backlog"],
+      "properties": {
+        "active_calls": {"const": 0},
+        "active_contacts": {"const": 0},
+        "active_routes": {"const": 0},
+        "cleanup_backlog": {"const": 0}
+      }
+    },
+    "passed": {"const": true},
+    "redacted": {"const": true},
+    "customer_data_retained": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"id": {"const": "missing_context_fail_open"}}},
+      "then": {
+        "properties": {
+          "outcome": {"const": "failed_open"},
+          "checks": {"properties": {"agent_workspace_observed": {"const": true}}}
+        }
+      }
+    }
+  ]
+}

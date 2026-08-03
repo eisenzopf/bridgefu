@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/bridgefu/runtime.conf
+marker=/run/bridgefu/certificate-reload-pending
+[[ "$BRIDGEFU_ROLE" == gateway && -f "$marker" ]] || exit 0
+metrics="$(curl --silent --show-error --fail --max-time 3 http://127.0.0.1:9090/metrics)" || {
+  echo "Certificate activation deferred because Bridgefu metrics are unavailable" >&2
+  exit 0
+}
+active="$(awk '
+  /^bridgefu_gateway_native_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+  /^bridgefu_private_forwarding_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+  END {if (seen) print sum; else exit 1}
+' <<<"$metrics")" || {
+  echo "Certificate activation deferred because active-route evidence is absent" >&2
+  exit 0
+}
+if ! awk -v active="$active" 'BEGIN {exit !(active == 0)}'; then
+  echo "Certificate activation deferred; active_routes=$active"
+  exit 0
+fi
+
+token="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)"
+instance_id="$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)"
+container_instance="$(aws ecs list-container-instances \
+  --region "$AWS_REGION" \
+  --cluster "$BRIDGEFU_ECS_CLUSTER" \
+  --filter "ec2InstanceId == $instance_id" \
+  --query 'containerInstanceArns[0]' \
+  --output text)"
+if [[ -z "$container_instance" || "$container_instance" == None ]]; then
+  echo "Certificate activation deferred because the ECS container instance is unavailable" >&2
+  exit 0
+fi
+mapfile -t tasks < <(aws ecs list-tasks \
+  --region "$AWS_REGION" \
+  --cluster "$BRIDGEFU_ECS_CLUSTER" \
+  --container-instance "$container_instance" \
+  --desired-status RUNNING \
+  --query 'taskArns[]' \
+  --output text | tr '\t' '\n')
+if [[ ${#tasks[@]} -ne 1 || -z "${tasks[0]}" ]]; then
+  echo "Certificate activation deferred because one exact gateway task was not found" >&2
+  exit 0
+fi
+aws ecs stop-task \
+  --region "$AWS_REGION" \
+  --cluster "$BRIDGEFU_ECS_CLUSTER" \
+  --task "${tasks[0]}" \
+  --reason bridgefu-idle-certificate-activation >/dev/null
+for _ in $(seq 1 90); do
+  if curl --silent --fail --max-time 2 http://127.0.0.1:9090/readyz >/dev/null; then
+    rm -f "$marker"
+    echo "Refreshed Bridgefu HA certificate activated while the gateway was idle"
+    exit 0
+  fi
+  sleep 2
+done
+echo "Replacement Bridgefu gateway did not become ready after certificate activation" >&2
+exit 1

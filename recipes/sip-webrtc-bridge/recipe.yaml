@@ -1,0 +1,50 @@
+api_version: bridgefu.dev/recipe/v1
+kind: bridge_recipe
+
+metadata:
+  name: sip-webrtc-bridge
+  version: 1
+  title: SIP application to interactive WebRTC
+  support: preview
+  description: >-
+    Accepts a managed SIP/RTP or SIPS/SRTP attachment and originates one fixed,
+    credential-protected interactive WebRTC WSS destination.
+
+inputs:
+  sip_signaling_cidrs:
+    type: cidr_list
+    required: true
+    description: Verified SIP signaling networks admitted by the recipe.
+  sip_security:
+    type: enum
+    values: [sips_srtp, sip_rtp]
+    default: sips_srtp
+    description: SIPS/SRTP is the production default; SIP/RTP is compatibility-only.
+  webrtc_signaling_uri:
+    type: string
+    required: true
+    description: Fixed credential-free outbound WSS endpoint; callers never select it.
+  webrtc_bearer_token:
+    type: secret_ref
+    description: Optional env, absolute file, or Secrets Manager reference for outbound WSS.
+
+spec:
+  bridges:
+    support:
+      source:
+        type: sip
+        security: {$input: sip_security}
+        admission:
+          mode: managed_attachment
+          trusted_cidrs: {$input: sip_signaling_cidrs}
+        codecs: [pcmu, pcma, opus]
+      destination:
+        type: webrtc
+        signaling_uri: {$input: webrtc_signaling_uri}
+        bearer_token_ref: {$input: webrtc_bearer_token}
+        codecs: [opus, pcmu, pcma]
+        data_channels: true
+
+assets:
+  documentation: README.md
+  values_example: values.example.yaml

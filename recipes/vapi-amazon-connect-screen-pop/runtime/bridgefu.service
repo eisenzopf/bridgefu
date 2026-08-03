@@ -1,0 +1,46 @@
+[Unit]
+Description=Bridgefu recipe media gateway
+Documentation=https://github.com/eisenzopf/bridgefu
+After=docker.service network-online.target haproxy.service
+Requires=docker.service haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bridgefu/runtime.conf
+ExecStartPre=/usr/local/sbin/bridgefu-load-secrets
+ExecStartPre=/usr/local/sbin/bridgefu-pull-image
+ExecStartPre=/usr/bin/test -r /etc/bridgefu/bridgefu.yaml
+ExecStartPre=-/usr/bin/docker rm -f bridgefu
+ExecStart=/usr/bin/docker run --rm --name bridgefu \
+    --network host \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+    --user 65532:65532 \
+    --group-add 65532 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --stop-timeout 60 \
+    --env-file /run/bridgefu/runtime.env \
+    --mount type=bind,src=/etc/bridgefu/bridgefu.yaml,dst=/etc/bridgefu/bridgefu.yaml,readonly \
+    --mount type=bind,src=/etc/bridgefu/tls,dst=/etc/bridgefu/tls,readonly \
+    --mount type=bind,src=/var/lib/bridgefu,dst=/var/lib/bridgefu \
+    --log-driver json-file \
+    --log-opt max-size=20m \
+    --log-opt max-file=5 \
+    ${BRIDGEFU_IMAGE_URI} --config /etc/bridgefu/bridgefu.yaml
+ExecStop=/usr/bin/docker stop --time 60 bridgefu
+
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=180
+TimeoutStopSec=75
+KillMode=process
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/bridgefu /var/lib/docker /var/lib/bridgefu
+
+[Install]
+WantedBy=multi-user.target

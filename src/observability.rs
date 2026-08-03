@@ -400,8 +400,9 @@ mod tests {
         ("bridgefu_auth_failures_total", &["surface"]),
         ("bridgefu_call_operations_total", &["operation", "result"]),
         ("bridgefu_attachment_admission_total", &["result"]),
+        ("bridgefu_recipe_sip_admission_total", &["result"]),
         (
-            "bridgefu_standardcharter_canary_admission_total",
+            "bridgefu_reference_tenant_canary_admission_total",
             &["result"],
         ),
         ("bridgefu_transfer_status_total", &["transport", "result"]),

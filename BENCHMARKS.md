@@ -46,6 +46,6 @@ report before asserting so a failed run is retained. The release profile must
 run on the intended Linux qualification host; shortening a duration or lowering
 a subscriber count changes the run to smoke evidence.
 
-Provider, StandardCharter, cloud, and chaos evidence are deliberately separate
+Provider, reference tenant, cloud, and chaos evidence are deliberately separate
 from these throughput measurements. A media benchmark cannot turn a skipped
 credentialed workflow into a pass.

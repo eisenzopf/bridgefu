@@ -1,0 +1,50 @@
+api_version: bridgefu.dev/recipe/v1
+kind: bridge_recipe
+
+metadata:
+  name: webrtc-amazon-connect-bridge
+  version: 1
+  title: Browser WebRTC to Amazon Connect
+  support: preview
+  description: >-
+    Accepts a one-use browser WebRTC attachment and starts a fixed Amazon
+    Connect WebRTC contact with a bounded context-attribute allowlist.
+
+inputs:
+  webrtc_signaling_uri:
+    type: string
+    required: true
+    description: Public credential-free WSS attachment endpoint served by Bridgefu.
+  connect_instance_arn:
+    type: aws_arn
+    required: true
+    description: ARN of the customer's existing Amazon Connect instance.
+  connect_contact_flow_id:
+    type: aws_connect_resource_id
+    required: true
+    description: Existing customer-owned entry flow used by StartWebRTCContact.
+
+spec:
+  bridges:
+    support:
+      source:
+        type: webrtc
+        signaling_uri: {$input: webrtc_signaling_uri}
+        codecs: [opus, pcmu, pcma]
+        data_channels: true
+      destination:
+        type: amazon_connect
+        media: webrtc
+        instance_arn: {$input: connect_instance_arn}
+        contact_flow_id: {$input: connect_contact_flow_id}
+        context_metadata_keys:
+          - correlation_id
+          - customer_name
+          - issue_summary
+          - intent
+          - verification_status
+          - vapi_call_reference
+
+assets:
+  documentation: README.md
+  values_example: values.example.yaml

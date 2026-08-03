@@ -1,6 +1,100 @@
 # bridgefu
 
-## Start here
+Bridgefu is a recipe-first application for connecting one support
+signaling/media transport to another. The normal administrator experience is:
+choose a recipe, supply a small set of environment-owned inputs, review the
+deployment change set, run its verification, and operate it from the provided
+dashboard and runbooks.
+
+The flagship recipe is
+[`vapi-amazon-connect-screen-pop@1`](recipes/vapi-amazon-connect-screen-pop/README.md):
+Vapi transfers over SIP/RTP or SIPS/SRTP, Bridgefu starts Amazon Connect WebRTC
+media, and an AWS-native correlation/Lambda/DynamoDB path displays already
+collected context to the agent. Its normal deployment uses the customer's
+existing Connect instance and target flow; the recipe owns only its wrapper
+flow and never modifies the supplied target.
+
+See the [recipe catalog and exact support tiers](docs/recipes.md) before making
+a production claim. The flagship package currently declares Starter and HA
+`preview`. Starter is implemented as a controlled production-pilot candidate,
+but promotion requires a new immutable release to pass the retained live audio,
+DTMF, Agent Workspace, negative-case, recovery, teardown, and one-hour soak
+gates twice in the governed nonproduction account. An unqualified working
+branch is not a support claim. The directional
+[`sip-webrtc-bridge@1`](recipes/sip-webrtc-bridge/README.md) and
+[`webrtc-sip-bridge@1`](recipes/webrtc-sip-bridge/README.md) packages, plus the
+direct [`webrtc-amazon-connect-bridge@1`](recipes/webrtc-amazon-connect-bridge/README.md)
+website-to-Connect path, are also embedded at `preview`: their strict
+configuration and runtime projection are implemented, while exact live
+interoperability and soak gates remain open.
+Genesys WebRTC is roadmap. Advanced Telnyx, WHIP/WHEP, UCTP, MOQT, and other
+generic WSS capabilities remain available at their explicitly documented
+development or preview tiers.
+
+| Promoted recipe direction | Clear media | Secure media | Current tier |
+|---|---|---|---|
+| SIP to Amazon Connect WebRTC | SIP/RTP | SIPS/SRTP | Preview (Starter pilot and HA) |
+| SIP to interactive WebRTC | SIP/RTP | SIPS/SRTP | Preview |
+| Interactive WebRTC to SIP | SIP/RTP | SIPS/SRTP | Preview |
+| Interactive WebRTC to Amazon Connect WebRTC | — | DTLS-SRTP on both WebRTC legs | Preview |
+
+These tiers are evidence claims, not merely feature flags. The flagship package
+includes AWS-native DynamoDB/Lambda screen-pop context, an existing-Connect
+production template, a separate first-instance/full-demo template, and an
+optional CloudFront browser qualification page.
+
+Recipe authors should start with the
+[data-only recipe authoring guide](docs/recipe-authoring.md). Kubernetes is not
+part of the production topology: Starter uses a hardened EC2 host, while the
+HA profile uses call-aware AWS gateway/worker orchestration.
+
+## Recipe quickstart
+
+The simplest first deployment is the flagship recipe against an existing
+Amazon Connect instance and customer-owned target contact flow. It does not
+create, replace, or edit that instance or target flow.
+
+```bash
+bridgefu recipe available
+bridgefu recipe show builtin:vapi-amazon-connect-screen-pop@1
+bridgefu recipe init builtin:vapi-amazon-connect-screen-pop@1 \
+  --output bridgefu-vapi-connect
+cd bridgefu-vapi-connect
+```
+
+Fill in the four non-secret values in `values.yaml`, then validate the exact
+recipe projection:
+
+```bash
+bridgefu recipe validate builtin:vapi-amazon-connect-screen-pop@1 \
+  --values values.yaml
+```
+
+For AWS deployment, copy the immutable template, object versions, and image
+digest from the signed Bridgefu release manifest into `deployment.yaml` and
+`parameters-starter.json`. Add your Vapi API-key secret ARN, Connect instance
+ARN, customer target-flow ARN, Route 53 zone, and SIP hostname. Deployment is
+review-only until preflight verifies the exact account, non-root identity,
+signed release, Connect target, DNS, quotas, service role, audit baseline,
+budget, and rollback alarms:
+
+```bash
+bridgefu recipe preflight deployment.yaml --profile starter
+bridgefu recipe deploy deployment.yaml --profile starter \
+  --change-set-name bridgefu-production-r1
+bridgefu recipe deploy deployment.yaml --profile starter \
+  --execute --change-set-name bridgefu-production-r1 \
+  --confirm bridgefu-bft-production
+bridgefu recipe doctor deployment.yaml --profile starter
+```
+
+Use the [complete flagship guide](recipes/vapi-amazon-connect-screen-pop/README.md)
+for prerequisites, the Amazon Connect agent-permission step, verification,
+monitoring, costs, rollback, and teardown. A separate, explicitly acknowledged
+demo template can create a first/disposable Connect instance; it is never the
+normal customer deployment path.
+
+## Platform and contributor reference
 
 This working tree contains both the preserved Vapi-to-Amazon gateway and the
 Bridgefu 0.9.0 customer preview of the larger 1.0 call-control platform. Use
@@ -62,8 +156,8 @@ documented in [durable repository backends](docs/repository-backends.md).
 The currently executable role-separated public edge and its deliberately
 fail-closed surface boundary are documented in
 [split gateway UCTP ingress](docs/gateway-uctp-ingress.md).
-The protected StandardCharter staging procedure is documented in the
-[non-production smoke, drain, and rollback runbook](docs/standardcharter-smoke-runbook.md).
+The protected reference tenant staging procedure is documented in the
+[non-production smoke, drain, and rollback runbook](docs/reference-tenant-smoke-runbook.md).
 
 MOQT draft-19 qualification is recorded in the
 [independent interop report](docs/moq-independent-interop.md),
@@ -101,7 +195,7 @@ as the one-hour release gate.
   protected release-candidate workflow assembles one OCI index and verifies
   its platform manifests, SBOMs, provenance statements, and vulnerability
   policy without granting registry publication authority.
-- Compose profiles cover StandardCharter, generic SIP↔WebRTC, Telnyx, UCTP,
+- Compose profiles cover reference tenant, generic SIP↔WebRTC, Telnyx, UCTP,
   MOQT, PostgreSQL/Redis, and Coturn. The executable process roles are
   `all-in-one`, `gateway`, `worker`, and `moq-relay`; see
   [deployment details](deploy/README.md) for the exact supported edge surfaces.
@@ -110,7 +204,7 @@ as the one-hour release gate.
   validated but deliberately require an owner-authorized disposable account
   or project before `apply` and smoke evidence can be called complete.
 - `deploy.sh` and the systemd unit remain as an isolated legacy
-  StandardCharter deployment path. They are not the reference clustered
+  reference tenant deployment path. They are not the reference clustered
   topology.
 
 ---
@@ -129,7 +223,7 @@ For an owner-authorized cloud deployment:
 - The AWS CLI v2 or Google Cloud CLI, authenticated to the disposable target.
 - Provider credentials supplied only through the documented secret references.
 
-The StandardCharter profile additionally requires an Amazon Connect instance
+The reference tenant profile additionally requires an Amazon Connect instance
 with the screen-pop contact flow described below.
 
 ---
@@ -207,10 +301,10 @@ provisioned first; `validate` resolves secrets and performs the full runtime
 preflight.
 
 The non-secret
-[StandardCharter managed-route fixture](config/fixtures/standardcharter-managed-routes.yaml)
+[reference tenant managed-route fixture](config/fixtures/reference-tenant-managed-routes.yaml)
 defines the paired `amazon-connect`, `generic-sip`, `telnyx`, and `generic-wss`
 routes, both approved ingress modes, and only `env:` credential references. Its
-[StandardCharter environment half](config/fixtures/standardcharter-managed-routes.env)
+[reference tenant environment half](config/fixtures/reference-tenant-managed-routes.env)
 keeps legacy rollback explicitly scoped to the default Amazon route. The schema
 check validates both files and their shared route catalog in CI.
 
@@ -249,10 +343,10 @@ placement share the original setup budget; Bridgefu commits no call or worker
 capacity after that budget or the two-minute attachment window is exhausted.
 Missing API authentication makes every protected route fail closed with `503`;
 missing call-control key material makes the call routes fail with `503`. The
-existing StandardCharter listener and public health/metrics endpoints continue
-to start normally. A separate durable `sip:<tenant>` StandardCharter canary is
+existing reference tenant listener and public health/metrics endpoints continue
+to start normally. A separate durable `sip:<tenant>` reference tenant canary is
 available only through the explicitly enabled
-`generic_bridge.standardcharter_canary` policy; it requires the exact trusted
+`generic_bridge.reference_tenant_canary` policy; it requires the exact trusted
 principal, tenant, scopes, and one mapped `X-Correlation-Id`, then consumes the
 same single-use attachment proof as every other inbound leg. Legacy Amazon-call broadcasts and screen-pop diagnostics
 remain available in an unambiguous single-tenant runtime. In a multi-tenant
@@ -267,9 +361,9 @@ curl -H "Authorization: Bearer $BRIDGEFU_API_TOKEN" \
 
 ---
 
-## Legacy StandardCharter single-EC2 deployment
+## Legacy reference tenant single-EC2 deployment
 
-The commands below preserve the original StandardCharter proof-of-concept
+The commands below preserve the original reference tenant proof-of-concept
 path. They do not deploy the Bridgefu 1.0 gateway/worker/MOQT-relay topology.
 For the reference container profiles and the statically validated AWS ECS and
 GCP GKE roots, start with [deployment details](deploy/README.md) and
@@ -390,7 +484,7 @@ in place:
 | `package X requires rustc 1.9x` | The AWS SDK crates float their MSRV above rvoip's declared 1.88. `deploy/Dockerfile` pins the builder to `rust:1.95`; bump it if a future `cargo update` raises the floor again. |
 | First build very slow | Expected — the full rvoip dependency graph compiles once. Redeploys reuse cached layers. |
 | `IMDS request timed out (not on EC2?)` | You're running off-EC2, or IMDSv2 is blocked. Set literal IPs for `advertised_ip` / `media_public_ip` instead of `auto`. |
-| Expected `X-` context is absent | Do not enable raw-header or attribute-value logging. Use synthetic values in the protected non-production workflow, inspect redacted context/admission counters and traces, and run the hermetic StandardCharter contract test to isolate mapping from carrier delivery. |
+| Expected `X-` context is absent | Do not enable raw-header or attribute-value logging. Use synthetic values in the protected non-production workflow, inspect redacted context/admission counters and traces, and run the hermetic reference tenant contract test to isolate mapping from carrier delivery. |
 | `AccessDenied` on StartWebRTCContact | Region mismatch (config vs Connect instance) or the contact flow isn't WebRTC-enabled; confirm `instance_id`/`contact_flow_id`. |
 | No audio / one-way audio | RTP may be blocked — confirm `sip_cidrs` allows carrier signaling, `rtp_cidr` and UDP 16384–32767 match the media policy, and the EIP is advertised in SDP. |
 
@@ -419,7 +513,7 @@ Dockerfile                reproducible multi-stage non-root image
 compose.yaml              local all-in-one deployment
 deploy/bridgefu.service   systemd unit (docker run --network host, Restart=always)
 deploy.sh                 sync -> build-on-instance -> restart -> healthcheck
-terraform/                legacy StandardCharter single-EC2 root
+terraform/                legacy reference tenant single-EC2 root
 deploy/terraform/aws/     reference ECS/EC2 gateway, worker, relay, RDS, Redis
 deploy/terraform/gcp/     reference GKE gateway, worker, relay, SQL, Redis
 ```

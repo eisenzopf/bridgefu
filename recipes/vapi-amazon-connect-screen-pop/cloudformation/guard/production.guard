@@ -1,0 +1,133 @@
+# Bridgefu recipe CloudFormation security and operability invariants.
+
+let instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
+let volumes = Resources.*[ Type == 'AWS::EC2::Volume' ]
+let tables = Resources.*[ Type == 'AWS::DynamoDB::Table' ]
+let databases = Resources.*[ Type == 'AWS::RDS::DBInstance' ]
+let redis_groups = Resources.*[ Type == 'AWS::ElastiCache::ReplicationGroup' ]
+let task_definitions = Resources.*[ Type == 'AWS::ECS::TaskDefinition' ]
+let log_groups = Resources.*[ Type == 'AWS::Logs::LogGroup' ]
+let security_groups = Resources.*[ Type == 'AWS::EC2::SecurityGroup' ]
+let ingress_rules = %security_groups.Properties.SecurityGroupIngress[*]
+let https_ingress_rules = %ingress_rules[ FromPort == 443 ]
+let standalone_ingress_rules = Resources.*[ Type == 'AWS::EC2::SecurityGroupIngress' ].Properties
+let lambda_urls = Resources.*[ Type == 'AWS::Lambda::Url' ]
+let image_parameter = Parameters.BridgefuImageUri
+let sip_security_parameter = Parameters.SipSecurity
+
+rule no_lambda_function_urls {
+    %lambda_urls empty
+}
+
+rule ec2_requires_imdsv2_and_no_ssh_key when %instances !empty {
+    %instances.Properties.MetadataOptions.HttpTokens == 'required'
+    %instances.Properties.MetadataOptions.HttpEndpoint == 'enabled'
+    %instances.Properties.MetadataOptions.HttpPutResponseHopLimit == 1
+    %instances.Properties.KeyName !exists
+}
+
+rule ec2_root_volumes_are_encrypted when %instances !empty {
+    %instances.Properties.BlockDeviceMappings[*].Ebs.Encrypted == true
+    %instances.Properties.BlockDeviceMappings[*].Ebs.DeleteOnTermination == true
+}
+
+rule launch_templates_require_imdsv2_and_encrypted_root when %launch_templates !empty {
+    %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+    %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
+    %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 2
+    %launch_templates.Properties.LaunchTemplateData.KeyName !exists
+    %launch_templates.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+    %launch_templates.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.DeleteOnTermination == true
+}
+
+rule data_volumes_are_encrypted when %volumes !empty {
+    %volumes.Properties.Encrypted == true
+}
+
+rule dynamodb_is_encrypted_recoverable_and_expiring when %tables !empty {
+    %tables.Properties.SSESpecification.SSEEnabled == true
+    %tables.Properties.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled == true
+    %tables.Properties.TimeToLiveSpecification.Enabled == true
+    %tables.Properties.TimeToLiveSpecification.AttributeName == 'expires_at'
+}
+
+rule ha_databases_are_private_encrypted_and_multi_az when %databases !empty {
+    %databases.Properties.StorageEncrypted == true
+    %databases.Properties.PubliclyAccessible == false
+    %databases.Properties.MultiAZ == true
+    %databases.Properties.ManageMasterUserPassword == true
+}
+
+rule ha_redis_is_encrypted_and_multi_az when %redis_groups !empty {
+    %redis_groups.Properties.AtRestEncryptionEnabled == true
+    %redis_groups.Properties.TransitEncryptionEnabled == true
+    %redis_groups.Properties.AutomaticFailoverEnabled == true
+    %redis_groups.Properties.MultiAZEnabled == true
+}
+
+rule ecs_tasks_are_non_privileged_read_only when %task_definitions !empty {
+    %task_definitions.Properties.NetworkMode == 'host'
+    %task_definitions.Properties.ContainerDefinitions[*].ReadonlyRootFilesystem == true
+    %task_definitions.Properties.ContainerDefinitions[*].Privileged == false
+    %task_definitions.Properties.ContainerDefinitions[*].LinuxParameters.Capabilities.Drop[*] == 'ALL'
+}
+
+rule log_groups_have_retention when %log_groups !empty {
+    %log_groups.Properties.RetentionInDays exists
+}
+
+rule security_groups_do_not_expose_admin_ports when %ingress_rules !empty {
+    %ingress_rules {
+        FromPort != 22
+        ToPort != 22
+        FromPort != 8080
+        ToPort != 8080
+        when FromPort == 9090 {
+            SourceSecurityGroupId exists
+            CidrIp !exists
+            CidrIpv6 !exists
+        }
+        when ToPort == 9090 {
+            SourceSecurityGroupId exists
+            CidrIp !exists
+            CidrIpv6 !exists
+        }
+    }
+}
+
+rule standalone_ingress_does_not_expose_admin_ports when %standalone_ingress_rules !empty {
+    %standalone_ingress_rules {
+        FromPort != 22
+        ToPort != 22
+        FromPort != 8080
+        ToPort != 8080
+        when FromPort == 9090 {
+            SourceSecurityGroupId exists
+            CidrIp !exists
+            CidrIpv6 !exists
+        }
+        when ToPort == 9090 {
+            SourceSecurityGroupId exists
+            CidrIp !exists
+            CidrIpv6 !exists
+        }
+    }
+}
+
+rule public_https_is_not_a_control_ingress when %https_ingress_rules !empty {
+    %https_ingress_rules {
+        SourceSecurityGroupId exists
+        CidrIp !exists
+        CidrIpv6 !exists
+    }
+}
+
+rule image_parameter_requires_digest when %image_parameter !empty {
+    %image_parameter.AllowedPattern == '^[^\s@]+@sha256:[0-9a-f]{64}$'
+}
+
+rule clear_sip_is_explicit when %sip_security_parameter !empty {
+    %sip_security_parameter.Default == 'sips_srtp'
+    %sip_security_parameter.AllowedValues == ['sips_srtp', 'sip_rtp']
+}

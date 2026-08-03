@@ -68,7 +68,6 @@ enum DependencyResolution {
 #[serde(rename_all = "snake_case")]
 enum TargetKind {
     Library,
-    Binary,
     Integration,
 }
 
@@ -244,8 +243,8 @@ const SCENARIOS: &[ScenarioSpec] = &[
         scope: ScenarioScope::LocalDeterministic,
         workspace: Workspace::Bridgefu,
         package: None,
-        target_kind: TargetKind::Binary,
-        target: Some("bridgefu"),
+        target_kind: TargetKind::Library,
+        target: None,
         features: None,
         test: "providers::tests::telnyx_exhausted_errors_have_safe_retry_classification",
         ignored: false,
@@ -259,8 +258,8 @@ const SCENARIOS: &[ScenarioSpec] = &[
         scope: ScenarioScope::LocalDeterministic,
         workspace: Workspace::Bridgefu,
         package: None,
-        target_kind: TargetKind::Binary,
-        target: Some("bridgefu"),
+        target_kind: TargetKind::Library,
+        target: None,
         features: None,
         test: "providers::tests::telnyx_circuit_breaker_opens_rejects_and_recovers_with_one_probe",
         ignored: false,
@@ -542,9 +541,6 @@ fn run_scenario(
     match spec.target_kind {
         TargetKind::Library => {
             command.arg("--lib");
-        }
-        TargetKind::Binary => {
-            command.args(["--bin", spec.target.expect("binary target")]);
         }
         TargetKind::Integration => {
             command.args(["--test", spec.target.expect("integration target")]);
@@ -898,12 +894,11 @@ fn validate_scenarios(scenarios: &[ScenarioSpec]) -> Result<(), &'static str> {
         if scenario.test.is_empty() || scenario.timeout_seconds == 0 {
             return Err("scenario test and timeout are required");
         }
-        if matches!(
-            scenario.target_kind,
-            TargetKind::Binary | TargetKind::Integration
-        ) && scenario.target.is_none()
-        {
-            return Err("binary and integration scenario targets are required");
+        if scenario.target_kind == TargetKind::Integration && scenario.target.is_none() {
+            return Err("integration scenario targets are required");
+        }
+        if scenario.target_kind == TargetKind::Library && scenario.target.is_some() {
+            return Err("library scenarios cannot name an integration target");
         }
         if scenario.scope == ScenarioScope::LocalDeterministic
             && !scenario.required_environment.is_empty()
@@ -934,6 +929,18 @@ fn parses_exact_test_counts_without_retaining_diagnostics() {
         parse_test_summary(b"running 0 tests", b""),
         ParsedTestSummary::default()
     );
+}
+
+#[test]
+fn telnyx_chaos_scenarios_select_the_library_target() {
+    for id in ["telnyx_retry_exhaustion", "telnyx_circuit_recovery"] {
+        let scenario = SCENARIOS
+            .iter()
+            .find(|scenario| scenario.id == id)
+            .expect("Telnyx chaos scenario remains in the catalog");
+        assert_eq!(scenario.target_kind, TargetKind::Library);
+        assert_eq!(scenario.target, None);
+    }
 }
 
 #[test]

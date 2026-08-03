@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu HA shared state: Multi-AZ PostgreSQL, TLS Valkey (Redis protocol), generated runtime
+  credentials, encrypted backups, and role-scoped network access.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: runtime-ha-data
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  GatewaySecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  WorkerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues: [db.t4g.medium, db.t4g.large, db.r7g.large, db.r7g.xlarge]
+  DatabaseAllocatedStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 1000
+  DatabaseMaxStorageGiB:
+    Type: Number
+    Default: 200
+    MinValue: 50
+    MaxValue: 4096
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.small
+    AllowedValues: [cache.t4g.small, cache.t4g.medium, cache.r7g.large, cache.r7g.xlarge]
+  DataRetentionMode:
+    Type: String
+    Default: ProductionRetain
+    AllowedValues: [ProductionRetain, TestDelete]
+  DataKmsKeyArn:
+    Type: String
+    Default: ''
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  RetainData: !Equals [!Ref DataRetentionMode, ProductionRetain]
+  DeleteData: !Equals [!Ref DataRetentionMode, TestDelete]
+  HasDataKmsKey: !Not [!Equals [!Ref DataKmsKeyArn, '']]
+
+Resources:
+  DataSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL and Valkey only from Bridgefu HA roles
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref GatewaySecurityGroupId
+          Description: PostgreSQL from gateways
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WorkerSecurityGroupId
+          Description: PostgreSQL from workers
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref GatewaySecurityGroupId
+          Description: TLS Redis from gateways
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WorkerSecurityGroupId
+          Description: TLS Redis from workers
+      SecurityGroupEgress: []
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-data'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Bridgefu ${DeploymentId} HA database subnets'
+      SubnetIds: [!Ref PrivateSubnet1Id, !Ref PrivateSubnet2Id]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Bridgefu PostgreSQL 17 TLS-only settings
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: '1'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ProductionDatabase:
+    Type: AWS::RDS::DBInstance
+    Condition: RetainData
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub 'bridgefu-${DeploymentId}'
+      Engine: postgres
+      EngineVersion: '17.6'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: !Ref DatabaseAllocatedStorageGiB
+      MaxAllocatedStorage: !Ref DatabaseMaxStorageGiB
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      DBName: bridgefu
+      MasterUsername: bridgefu
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      VPCSecurityGroups: [!Ref DataSecurityGroup]
+      MultiAZ: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 14
+      PreferredBackupWindow: 05:00-06:00
+      PreferredMaintenanceWindow: sun:07:00-sun:08:00
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PerformanceInsightsKMSKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      EnableIAMDatabaseAuthentication: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  TestDatabase:
+    Type: AWS::RDS::DBInstance
+    Condition: DeleteData
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub 'bridgefu-${DeploymentId}'
+      Engine: postgres
+      EngineVersion: '17.6'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: !Ref DatabaseAllocatedStorageGiB
+      MaxAllocatedStorage: !Ref DatabaseMaxStorageGiB
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      DBName: bridgefu
+      MasterUsername: bridgefu
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      VPCSecurityGroups: [!Ref DataSecurityGroup]
+      MultiAZ: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: false
+      DeletionProtection: false
+      EnablePerformanceInsights: false
+      EnableIAMDatabaseAuthentication: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub 'Bridgefu ${DeploymentId} HA Redis subnets'
+      SubnetIds: [!Ref PrivateSubnet1Id, !Ref PrivateSubnet2Id]
+
+  RedisPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-redis-password'
+      Description: Password for the Bridgefu-only TLS Redis user.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  DisabledDefaultRedisUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: valkey
+      UserId: !Sub '${DeploymentId}-default'
+      UserName: default
+      AccessString: 'off ~* -@all'
+      AuthenticationMode: {Type: no-password-required}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  BridgefuRedisUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: valkey
+      UserId: !Sub '${DeploymentId}-bridgefu'
+      UserName: bridgefu
+      AccessString: 'on ~* +@all'
+      AuthenticationMode:
+        Type: password
+        Passwords:
+          - !Sub '{{resolve:secretsmanager:${RedisPasswordSecret}:SecretString}}'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  RedisUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      Engine: valkey
+      UserGroupId: !Sub '${DeploymentId}-bridgefu'
+      UserIds: [!Ref DisabledDefaultRedisUser, !Ref BridgefuRedisUser]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  RedisSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/redis/slow'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  RedisEngineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/redis/engine'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ProductionRedis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: RetainData
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      ReplicationGroupId: !Sub 'bridgefu-${DeploymentId}'
+      ReplicationGroupDescription: Bridgefu TLS coordination
+      Engine: valkey
+      EngineVersion: '7.2'
+      CacheNodeType: !Ref RedisNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref DataSecurityGroup]
+      Port: 6379
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      UserGroupIds: [!Ref RedisUserGroup]
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: 03:00-04:00
+      PreferredMaintenanceWindow: sun:04:00-sun:05:00
+      AutoMinorVersionUpgrade: true
+      LogDeliveryConfigurations:
+        - DestinationDetails: {CloudWatchLogsDetails: {LogGroup: !Ref RedisSlowLogGroup}}
+          DestinationType: cloudwatch-logs
+          LogFormat: json
+          LogType: slow-log
+        - DestinationDetails: {CloudWatchLogsDetails: {LogGroup: !Ref RedisEngineLogGroup}}
+          DestinationType: cloudwatch-logs
+          LogFormat: json
+          LogType: engine-log
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  TestRedis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: DeleteData
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ReplicationGroupId: !Sub 'bridgefu-${DeploymentId}'
+      ReplicationGroupDescription: Bridgefu TLS coordination test
+      Engine: valkey
+      EngineVersion: '7.2'
+      CacheNodeType: !Ref RedisNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref DataSecurityGroup]
+      Port: 6379
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      UserGroupIds: [!Ref RedisUserGroup]
+      SnapshotRetentionLimit: 0
+      AutoMinorVersionUpgrade: true
+      LogDeliveryConfigurations:
+        - DestinationDetails: {CloudWatchLogsDetails: {LogGroup: !Ref RedisSlowLogGroup}}
+          DestinationType: cloudwatch-logs
+          LogFormat: json
+          LogType: slow-log
+        - DestinationDetails: {CloudWatchLogsDetails: {LogGroup: !Ref RedisEngineLogGroup}}
+          DestinationType: cloudwatch-logs
+          LogFormat: json
+          LogType: engine-log
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  ControlHmacSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-control-hmac'
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrivateForwardingSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-private-forwarding'
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  BroadcastSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-broadcast'
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      KmsKeyId: !If [HasDataKmsKey, !Ref DataKmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+Outputs:
+  DatabaseIdentifier:
+    Value: !If [RetainData, !Ref ProductionDatabase, !Ref TestDatabase]
+  DatabaseEndpoint:
+    Value: !If [RetainData, !GetAtt ProductionDatabase.Endpoint.Address, !GetAtt TestDatabase.Endpoint.Address]
+  DatabaseSecretArn:
+    Value: !If [RetainData, !GetAtt ProductionDatabase.MasterUserSecret.SecretArn, !GetAtt TestDatabase.MasterUserSecret.SecretArn]
+  RedisReplicationGroupId:
+    Value: !If [RetainData, !Ref ProductionRedis, !Ref TestRedis]
+  RedisEndpoint:
+    Value: !If [RetainData, !GetAtt ProductionRedis.PrimaryEndPoint.Address, !GetAtt TestRedis.PrimaryEndPoint.Address]
+  RedisPasswordSecretArn:
+    Value: !Ref RedisPasswordSecret
+  ControlHmacSecretArn:
+    Value: !Ref ControlHmacSecret
+  PrivateForwardingSecretArn:
+    Value: !Ref PrivateForwardingSecret
+  BroadcastSecretArn:
+    Value: !Ref BroadcastSecret
+  DataSecurityGroupId:
+    Value: !Ref DataSecurityGroup

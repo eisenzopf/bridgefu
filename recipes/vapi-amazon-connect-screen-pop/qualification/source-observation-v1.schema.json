@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/source-observation-v1.schema.json",
+  "title": "Bridgefu controlled SIP source observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_revision_sha256",
+    "execution_id",
+    "scenario_id",
+    "hangup_origin",
+    "correlation_fingerprint",
+    "source_call_fingerprint",
+    "observed_at",
+    "signaling",
+    "media",
+    "hangup",
+    "redacted"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-recipe-sip-source@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "scenario_id": {
+      "enum": [
+        "sip-rtp-pcmu",
+        "sip-rtp-pcma",
+        "sips-srtp-pcmu",
+        "sips-srtp-pcma"
+      ]
+    },
+    "hangup_origin": {"enum": ["source", "agent"]},
+    "correlation_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "source_call_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "signaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "transport",
+        "invite_sent",
+        "wire_header_name",
+        "wire_header_count",
+        "answered",
+        "attachment_replay_rejected"
+      ],
+      "properties": {
+        "scheme": {"enum": ["sip", "sips"]},
+        "transport": {"enum": ["udp", "tls"]},
+        "invite_sent": {"const": true},
+        "wire_header_name": {"const": "x-correlation-id"},
+        "wire_header_count": {"const": 1},
+        "answered": {"const": true},
+        "attachment_replay_rejected": {"const": true}
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "security",
+        "source_marker_sent_at_ms",
+        "agent_marker_observed_at_ms",
+        "source_to_agent_marker_frames_sent",
+        "agent_to_source_marker_frames",
+        "dtmf_source_to_agent_sent",
+        "dtmf_agent_to_source_observed"
+      ],
+      "properties": {
+        "codec": {"enum": ["pcmu", "pcma"]},
+        "security": {"enum": ["rtp", "srtp"]},
+        "source_marker_sent_at_ms": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 32,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "agent_marker_observed_at_ms": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 16,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "source_to_agent_marker_frames_sent": {"type": "integer", "minimum": 5},
+        "agent_to_source_marker_frames": {"type": "integer", "minimum": 3},
+        "dtmf_source_to_agent_sent": {"const": true},
+        "dtmf_agent_to_source_observed": {"const": true}
+      }
+    },
+    "hangup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "local_bye_completed",
+        "remote_bye_observed",
+        "cleanup_observed"
+      ],
+      "properties": {
+        "origin": {"enum": ["source", "agent"]},
+        "local_bye_completed": {"type": "boolean"},
+        "remote_bye_observed": {"type": "boolean"},
+        "cleanup_observed": {"const": true}
+      }
+    },
+    "redacted": {"const": true}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scenario_id": {"pattern": "^sip-rtp-"}}},
+      "then": {
+        "properties": {
+          "signaling": {
+            "properties": {"scheme": {"const": "sip"}, "transport": {"const": "udp"}}
+          },
+          "media": {"properties": {"security": {"const": "rtp"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scenario_id": {"pattern": "^sips-srtp-"}}},
+      "then": {
+        "properties": {
+          "signaling": {
+            "properties": {"scheme": {"const": "sips"}, "transport": {"const": "tls"}}
+          },
+          "media": {"properties": {"security": {"const": "srtp"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scenario_id": {"pattern": "-pcmu$"}}},
+      "then": {"properties": {"media": {"properties": {"codec": {"const": "pcmu"}}}}}
+    },
+    {
+      "if": {"properties": {"scenario_id": {"pattern": "-pcma$"}}},
+      "then": {"properties": {"media": {"properties": {"codec": {"const": "pcma"}}}}}
+    },
+    {
+      "if": {"properties": {"hangup_origin": {"const": "source"}}},
+      "then": {
+        "properties": {
+          "hangup": {
+            "properties": {
+              "origin": {"const": "source"},
+              "local_bye_completed": {"const": true},
+              "remote_bye_observed": {"const": false}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"hangup_origin": {"const": "agent"}}},
+      "then": {
+        "properties": {
+          "hangup": {
+            "properties": {
+              "origin": {"const": "agent"},
+              "local_bye_completed": {"const": false},
+              "remote_bye_observed": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

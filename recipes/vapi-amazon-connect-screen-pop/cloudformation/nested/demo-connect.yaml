@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL NONPRODUCTION Bridgefu demo Amazon Connect instance, queue, routing
+  profile, agent, and target flow. Use only for qualification or an explicitly
+  approved first Connect environment; normal recipe deployments use an existing
+  customer-owned instance and flow.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: disposable-demo-connect
+    ProductionDefault: false
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: demo
+
+Resources:
+  DemoConnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/connect/${DeploymentId}-connect'
+      RetentionInDays: 7
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoInstance:
+    Type: AWS::Connect::Instance
+    DependsOn: DemoConnectLogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      IdentityManagementType: CONNECT_MANAGED
+      InstanceAlias: !Sub '${DeploymentId}-connect'
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: false
+        ContactflowLogs: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+        - {Key: BridgefuEnvironment, Value: demo}
+
+  DemoHours:
+    Type: AWS::Connect::HoursOfOperation
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      Name: !Sub 'bridgefu-${DeploymentId}-always-open'
+      Description: Nonproduction 24x7 hours for the Bridgefu demo queue.
+      TimeZone: UTC
+      Config:
+        - {Day: SUNDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: MONDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: TUESDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: WEDNESDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: THURSDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: FRIDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+        - {Day: SATURDAY, StartTime: {Hours: 0, Minutes: 0}, EndTime: {Hours: 23, Minutes: 59}}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoQueue:
+    Type: AWS::Connect::Queue
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      HoursOfOperationArn: !GetAtt DemoHours.HoursOfOperationArn
+      Name: !Sub 'bridgefu-${DeploymentId}-support'
+      Description: Nonproduction queue for the complete Bridgefu handoff demo.
+      MaxContacts: 10
+      Status: ENABLED
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoTargetFlow:
+    Type: AWS::Connect::ContactFlow
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      Name: !Sub 'bridgefu-${DeploymentId}-demo-target'
+      Description: >-
+        Recipe demo target flow. The production wrapper transfers here after
+        context lookup, and this flow sends the contact to the demo queue.
+      Type: CONTACT_FLOW
+      State: ACTIVE
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "set-demo-queue",
+          "Actions": [
+            {
+              "Identifier": "set-demo-queue",
+              "Type": "UpdateContactTargetQueue",
+              "Parameters": {"QueueId": "${DemoQueue.QueueArn}"},
+              "Transitions": {
+                "NextAction": "transfer-to-demo-queue",
+                "Errors": [{"NextAction": "disconnect", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "transfer-to-demo-queue",
+              "Type": "TransferContactToQueue",
+              "Parameters": {},
+              "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                  {"NextAction": "disconnect", "ErrorType": "QueueAtCapacity"},
+                  {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
+                ]
+              }
+            },
+            {
+              "Identifier": "disconnect",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoRoutingProfile:
+    Type: AWS::Connect::RoutingProfile
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      Name: !Sub 'bridgefu-${DeploymentId}-agent-routing'
+      Description: Nonproduction voice routing profile for the Bridgefu demo agent.
+      DefaultOutboundQueueArn: !GetAtt DemoQueue.QueueArn
+      MediaConcurrencies:
+        - Channel: VOICE
+          Concurrency: 1
+      QueueConfigs:
+        - Delay: 0
+          Priority: 1
+          QueueReference:
+            Channel: VOICE
+            QueueArn: !GetAtt DemoQueue.QueueArn
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoAgentSecurityProfile:
+    Type: AWS::Connect::SecurityProfile
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      SecurityProfileName: !Sub 'bridgefu-${DeploymentId}-demo-agent'
+      Description: Least-privilege nonproduction agent access plus recipe screen-pop views.
+      Permissions:
+        - BasicAgentAccess
+        - CustomViews.Access
+        - Views.View
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoAgentCredential:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-demo-agent-credential'
+      Description: Generated credential for the disposable Bridgefu Amazon Connect demo agent.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"bridgefu-demo-agent"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+        IncludeSpace: false
+        RequireEachIncludedType: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  DemoAgent:
+    Type: AWS::Connect::User
+    Properties:
+      InstanceArn: !GetAtt DemoInstance.Arn
+      Username: bridgefu-demo-agent
+      Password: !Sub '{{resolve:secretsmanager:${DemoAgentCredential}:SecretString:password}}'
+      IdentityInfo:
+        FirstName: Bridgefu
+        LastName: Demo Agent
+      PhoneConfig:
+        PhoneType: SOFT_PHONE
+        AutoAccept: false
+        AfterContactWorkTimeLimit: 1
+      RoutingProfileArn: !GetAtt DemoRoutingProfile.RoutingProfileArn
+      SecurityProfileArns:
+        - !GetAtt DemoAgentSecurityProfile.SecurityProfileArn
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+Outputs:
+  ConnectInstanceArn:
+    Value: !GetAtt DemoInstance.Arn
+  ConnectInstanceId:
+    Value: !GetAtt DemoInstance.Id
+  TargetContactFlowArn:
+    Value: !GetAtt DemoTargetFlow.ContactFlowArn
+  DemoQueueArn:
+    Value: !GetAtt DemoQueue.QueueArn
+  AgentUsername:
+    Value: bridgefu-demo-agent
+  AgentCredentialSecretArn:
+    Description: ARN only; the generated password value is never a stack output.
+    Value: !Ref DemoAgentCredential
+  ConnectLoginUrl:
+    Value: !Sub 'https://${DeploymentId}-connect.my.connect.aws/agent-app-v2/'

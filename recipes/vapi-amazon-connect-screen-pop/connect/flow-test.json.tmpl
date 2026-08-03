@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "bridgefu-context-lookup-contract",
+  "entry_flow_arn": "__WRAPPER_FLOW_ARN__",
+  "synthetic_attributes": {
+    "correlation_id": "__SYNTHETIC_CORRELATION_ID__"
+  },
+  "assertions": [
+    "lookup-context invoked exactly once",
+    "context values copied to user-defined attributes",
+    "DefaultAgentUI event hook points to the recipe guide",
+    "control transfers to the supplied customer flow",
+    "lookup failure still transfers to the supplied customer flow"
+  ]
+}

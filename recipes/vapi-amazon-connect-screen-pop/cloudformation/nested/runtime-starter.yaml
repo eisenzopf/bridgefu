@@ -1,0 +1,865 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu Starter runtime: one SSM-managed EC2 media gateway with a direct EIP,
+  optional exportable ACM certificate automation for SIPS/SRTP, encrypted
+  durable storage, private control, backups, and CloudWatch collection. The
+  nonproduction SIP/RTP path creates no public DNS record or ACM certificate.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: runtime-starter
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet1AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  TransferFunctionSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  PublicHostedZoneId:
+    Type: String
+    Default: none
+    AllowedPattern: '^(none|[A-Z0-9]+)$'
+  SipHostname:
+    Type: String
+    Default: unused.bridgefu.invalid
+  ControlHostname:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidr1:
+    Type: String
+    Default: 44.229.228.186/32
+  VapiSignalingCidr2:
+    Type: String
+    Default: 44.238.177.138/32
+  VapiSignalingCidr3:
+    Type: String
+    Default: ''
+  VapiSignalingCidr4:
+    Type: String
+    Default: ''
+  MediaSourceCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >-
+      Vapi media addresses are dynamic. Exposure is bounded to the RTP/SRTP
+      range and Bridgefu's dialog-bound symmetric-RTP checks.
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  ConnectEntryFlowArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  ConnectEntryFlowId:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+  BridgefuApiBearerSecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  BridgefuImageUri:
+    Type: String
+    Description: Immutable reviewed image reference including @sha256 digest.
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuRegistryType:
+    Type: String
+    Default: PrivateEcr
+    AllowedValues: [PrivateEcr, Anonymous]
+  BridgefuImageRepositoryArn:
+    Type: String
+    Default: arn:aws:ecr:us-east-1:000000000000:repository/unused
+    Description: Required only for PrivateEcr; scope excludes push and delete actions.
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  RuntimeArtifactKey:
+    Type: String
+    MinLength: 1
+  RuntimeArtifactVersion:
+    Type: String
+    MinLength: 1
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues: [t4g.medium, t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  RootVolumeGiB:
+    Type: Number
+    Default: 16
+    MinValue: 12
+    MaxValue: 100
+  DataVolumeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 1024
+  EbsKmsKeyArn:
+    Type: String
+    Default: ''
+  DataRetentionMode:
+    Type: String
+    Default: ProductionRetain
+    AllowedValues: [ProductionRetain, TestDelete]
+  MaxConcurrentCalls:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Rules:
+  PrivateEcrRequiresRepositoryArn:
+    RuleCondition: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BridgefuImageRepositoryArn, arn:aws:ecr:us-east-1:000000000000:repository/unused]]
+        AssertDescription: PrivateEcr requires the exact ECR repository ARN used by the immutable image.
+  SecureSipRequiresPublicDns:
+    RuleCondition: !Equals [!Ref SipSecurity, sips_srtp]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicHostedZoneId, none]]
+        AssertDescription: SIPS/SRTP requires a public Route 53 hosted zone and hostname.
+  ClearSipIsTestOnly:
+    RuleCondition: !Equals [!Ref SipSecurity, sip_rtp]
+    Assertions:
+      - Assert: !Equals [!Ref DataRetentionMode, TestDelete]
+        AssertDescription: Direct-IP SIP/RTP is restricted to deletable nonproduction data.
+
+Conditions:
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+  ClearSip: !Equals [!Ref SipSecurity, sip_rtp]
+  HasPublicDns: !Not [!Equals [!Ref PublicHostedZoneId, none]]
+  HasCidr3: !Not [!Equals [!Ref VapiSignalingCidr3, '']]
+  HasCidr4: !Not [!Equals [!Ref VapiSignalingCidr4, '']]
+  SecureSipCidr3: !And [!Condition SecureSip, !Condition HasCidr3]
+  SecureSipCidr4: !And [!Condition SecureSip, !Condition HasCidr4]
+  ClearSipCidr3: !And [!Condition ClearSip, !Condition HasCidr3]
+  ClearSipCidr4: !And [!Condition ClearSip, !Condition HasCidr4]
+  PrivateEcr: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+  HasEbsKmsKey: !Not [!Equals [!Ref EbsKmsKeyArn, '']]
+  RetainData: !Equals [!Ref DataRetentionMode, ProductionRetain]
+  DeleteData: !Equals [!Ref DataRetentionMode, TestDelete]
+
+Resources:
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bridgefu SIPS/SIP, bounded RTP/SRTP, and private control
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 16384
+          ToPort: 32767
+          CidrIp: !Ref MediaSourceCidr
+          Description: Dialog-bound RTP or SRTP media
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TransferFunctionSecurityGroupId
+          Description: Private TLS call reservation from transfer Lambda
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs, ECR, and Amazon Connect signaling
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: Amazon Connect WebRTC media and DNS/time responses
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: VPC DNS fallback
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  SecureSipIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5061
+      ToPort: 5061
+      CidrIp: !Ref VapiSignalingCidr1
+      Description: Vapi SIPS signaling 1
+
+  SecureSipIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5061
+      ToPort: 5061
+      CidrIp: !Ref VapiSignalingCidr2
+      Description: Vapi SIPS signaling 2
+
+  SecureSipIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSipCidr3
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5061
+      ToPort: 5061
+      CidrIp: !Ref VapiSignalingCidr3
+      Description: Optional Vapi SIPS signaling 3
+
+  SecureSipIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SecureSipCidr4
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5061
+      ToPort: 5061
+      CidrIp: !Ref VapiSignalingCidr4
+      Description: Optional Vapi SIPS signaling 4
+
+  ClearSipTcpIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr1
+      Description: Compatibility SIP TCP 1
+
+  ClearSipUdpIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr1
+      Description: Compatibility SIP UDP 1
+
+  ClearSipTcpIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr2
+      Description: Compatibility SIP TCP 2
+
+  ClearSipUdpIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSip
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr2
+      Description: Compatibility SIP UDP 2
+
+  ClearSipTcpIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr3
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr3
+      Description: Optional compatibility SIP TCP 3
+
+  ClearSipUdpIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr3
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr3
+      Description: Optional compatibility SIP UDP 3
+
+  ClearSipTcpIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr4
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr4
+      Description: Optional compatibility SIP TCP 4
+
+  ClearSipUdpIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ClearSipCidr4
+    Properties:
+      GroupId: !GetAtt GatewaySecurityGroup.GroupId
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref VapiSignalingCidr4
+      Description: Optional compatibility SIP UDP 4
+
+  PublicCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: SecureSip
+    Properties:
+      DomainName: !Ref SipHostname
+      SubjectAlternativeNames: [!Ref ControlHostname]
+      ValidationMethod: DNS
+      CertificateExport: ENABLED
+      DomainValidationOptions:
+        - DomainName: !Ref SipHostname
+          HostedZoneId: !Ref PublicHostedZoneId
+        - DomainName: !Ref ControlHostname
+          HostedZoneId: !Ref PublicHostedZoneId
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  CertificatePassphraseSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: SecureSip
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-certificate-passphrase'
+      Description: ACM export passphrase used only by the Starter gateway role.
+      GenerateSecretString:
+        ExcludeCharacters: '#$%'
+        ExcludePunctuation: true
+        PasswordLength: 64
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  BridgefuControlHmacSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-control-hmac'
+      Description: Bridgefu durable call-control HMAC key.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/runtime'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrometheusLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/prometheus'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-gateway'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ExactBridgefuRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartOnlyRecipeConnectFlow
+                Effect: Allow
+                Action: connect:StartWebRTCContact
+                Resource: !Ref ConnectEntryFlowArn
+              - Sid: StopOnlyContactsInRecipeInstance
+                Effect: Allow
+                Action: connect:StopContact
+                Resource: !Sub '${ConnectInstanceArn}/contact/*'
+              - Sid: ReadOnlyRuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BridgefuApiBearerSecretArn
+                  - !Ref BridgefuControlHmacSecret
+                  - !If [SecureSip, !Ref CertificatePassphraseSecret, !Ref AWS::NoValue]
+              - !If
+                - SecureSip
+                - Sid: ExportOnlyRecipeCertificate
+                  Effect: Allow
+                  Action: acm:ExportCertificate
+                  Resource: !Ref PublicCertificate
+                - !Ref AWS::NoValue
+              - Sid: ReadImmutableBootstrap
+                Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RuntimeArtifactKey}'
+              - Sid: SignalOnlyThisRuntimeStack
+                Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+              - Sid: PublishBoundedMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: [Bridgefu/Runtime, CWAgent]
+              - Sid: WriteOnlyRecipeLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:DescribeLogStreams, logs:PutLogEvents]
+                Resource:
+                  - !Sub '${RuntimeLogGroup.Arn}:*'
+                  - !Sub '${PrometheusLogGroup.Arn}:*'
+              - !If
+                - PrivateEcr
+                - Sid: PullOnlyReviewedImage
+                  Effect: Allow
+                  Action:
+                    - ecr:BatchCheckLayerAvailability
+                    - ecr:GetDownloadUrlForLayer
+                    - ecr:BatchGetImage
+                  Resource: !Ref BridgefuImageRepositoryArn
+                - !Ref AWS::NoValue
+              - !If
+                - PrivateEcr
+                - Sid: AuthenticatePrivateEcr
+                  Effect: Allow
+                  Action: ecr:GetAuthorizationToken
+                  Resource: '*'
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  GatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'bridgefu-${DeploymentId}-gateway'
+      Roles: [!Ref GatewayRole]
+
+  GatewayEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  ProductionDataVolume:
+    Type: AWS::EC2::Volume
+    Condition: RetainData
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref PublicSubnet1AvailabilityZone
+      Encrypted: true
+      KmsKeyId: !If [HasEbsKmsKey, !Ref EbsKmsKeyArn, !Ref AWS::NoValue]
+      Size: !Ref DataVolumeGiB
+      VolumeType: gp3
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-data'}
+        - {Key: BridgefuBackup, Value: !Ref DeploymentId}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  TestDataVolume:
+    Type: AWS::EC2::Volume
+    Condition: DeleteData
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AvailabilityZone: !Ref PublicSubnet1AvailabilityZone
+      Encrypted: true
+      KmsKeyId: !If [HasEbsKmsKey, !Ref EbsKmsKeyArn, !Ref AWS::NoValue]
+      Size: !Ref DataVolumeGiB
+      VolumeType: gp3
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-data-test'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: !Sub 'Bridgefu ${DeploymentId} Starter primary interface'
+      SubnetId: !Ref PublicSubnet1Id
+      GroupSet: [!Ref GatewaySecurityGroup]
+      SourceDestCheck: true
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}' }
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  GatewayEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt GatewayEip.AllocationId
+      NetworkInterfaceId: !Ref GatewayNetworkInterface
+
+  GatewayInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: GatewayEipAssociation
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT30M
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          NetworkInterfaceId: !Ref GatewayNetworkInterface
+      IamInstanceProfile: !Ref GatewayInstanceProfile
+      Monitoring: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !If [HasEbsKmsKey, !Ref EbsKmsKeyArn, !Ref AWS::NoValue]
+            VolumeSize: !Ref RootVolumeGiB
+            VolumeType: gp3
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !If
+            - RetainData
+            - !Ref ProductionDataVolume
+            - !Ref TestDataVolume
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              umask 077
+              signal_id="$(cat /sys/devices/virtual/dmi/id/board_asset 2>/dev/null || printf 'bridgefu-starter')"
+              if [[ ! "$signal_id" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+                signal_id=bridgefu-starter
+              fi
+              bootstrap_status_file=/run/bridgefu/bootstrap-step
+              install -d -o root -g root -m 0755 /run/bridgefu
+              printf '%s\n' package-install > "$bootstrap_status_file"
+              signal_stack() {
+                aws cloudformation signal-resource \
+                  --region '${AWS::Region}' \
+                  --stack-name '${AWS::StackName}' \
+                  --logical-resource-id GatewayInstance \
+                  --unique-id "$signal_id" \
+                  --status "$1" \
+                  --no-cli-pager
+              }
+              signal_failure() {
+                status=$?
+                bootstrap_step=unknown
+                if [[ -r "$bootstrap_status_file" ]]; then
+                  read -r bootstrap_step < "$bootstrap_status_file" || true
+                fi
+                if [[ ! "$bootstrap_step" =~ ^[a-z0-9-]{1,64}$ ]]; then
+                  bootstrap_step=unknown
+                fi
+                printf 'Bridgefu bootstrap failed during %s; inspect SSM and console output\n' \
+                  "$bootstrap_step" >&2
+                signal_stack FAILURE || true
+                exit "$status"
+              }
+              trap signal_failure ERR
+              dnf install -y docker haproxy iproute-tc jq openssl unzip xfsprogs amazon-cloudwatch-agent
+              printf '%s\n' runtime-directories > "$bootstrap_status_file"
+              install -d -o root -g root -m 0755 /opt/bridgefu/bootstrap /etc/bridgefu
+              printf '%s\n' artifact-download > "$bootstrap_status_file"
+              aws s3api get-object \
+                --region '${AWS::Region}' \
+                --bucket '${ArtifactBucket}' \
+                --key '${RuntimeArtifactKey}' \
+                --version-id '${RuntimeArtifactVersion}' \
+                /opt/bridgefu/starter-runtime.zip >/dev/null
+              printf '%s\n' artifact-verify > "$bootstrap_status_file"
+              printf '%s  %s\n' '${RuntimeArtifactSha256}' /opt/bridgefu/starter-runtime.zip \
+                | sha256sum -c -
+              printf '%s\n' artifact-extract > "$bootstrap_status_file"
+              unzip -q /opt/bridgefu/starter-runtime.zip -d /opt/bridgefu/bootstrap
+              chmod 0755 /opt/bridgefu/bootstrap/bootstrap.sh
+              printf '%s\n' runtime-config > "$bootstrap_status_file"
+              cat > /etc/bridgefu/runtime.conf <<'BRIDGEFU_RUNTIME'
+              BRIDGEFU_DEPLOYMENT_ID='${DeploymentId}'
+              AWS_REGION='${AWS::Region}'
+              BRIDGEFU_SIP_HOSTNAME='${PublicHost}'
+              BRIDGEFU_CONTROL_HOSTNAME='${ControlHostname}'
+              BRIDGEFU_PUBLIC_IP='${PublicIp}'
+              BRIDGEFU_SIP_SECURITY='${SipSecurity}'
+              BRIDGEFU_MAX_CONCURRENT_CALLS='${MaxConcurrentCalls}'
+              VAPI_SIGNALING_CIDRS='${VapiCidrs}'
+              CONNECT_INSTANCE_ARN='${ConnectInstanceArn}'
+              CONNECT_ENTRY_FLOW_ID='${ConnectEntryFlowId}'
+              BRIDGEFU_IMAGE_URI='${BridgefuImageUri}'
+              BRIDGEFU_REGISTRY_TYPE='${BridgefuRegistryType}'
+              BRIDGEFU_API_BEARER_SECRET_ARN='${BridgefuApiBearerSecretArn}'
+              BRIDGEFU_CONTROL_HMAC_SECRET_ARN='${ControlHmacSecretArn}'
+              CERTIFICATE_ARN='${CertificateArn}'
+              CERTIFICATE_PASSPHRASE_SECRET_ARN='${CertificatePassphraseArn}'
+              BRIDGEFU_RUNTIME_LOG_GROUP='${RuntimeLogGroupName}'
+              BRIDGEFU_PROMETHEUS_LOG_GROUP='${PrometheusLogGroupName}'
+              BRIDGEFU_BUNDLE_DIR='/opt/bridgefu/bootstrap'
+              BRIDGEFU_RUNTIME
+              chmod 0600 /etc/bridgefu/runtime.conf
+              export BRIDGEFU_BOOTSTRAP_STATUS_FILE="$bootstrap_status_file"
+              printf '%s\n' runtime-bootstrap > "$bootstrap_status_file"
+              /opt/bridgefu/bootstrap/bootstrap.sh
+              printf '%s\n' readiness-signal > "$bootstrap_status_file"
+              signal_stack SUCCESS
+              trap - ERR
+            - PublicIp: !GetAtt GatewayEip.PublicIp
+              PublicHost: !If [SecureSip, !Ref SipHostname, !GetAtt GatewayEip.PublicIp]
+              VapiCidrs: !Join
+                - ','
+                - - !Ref VapiSignalingCidr1
+                  - !Ref VapiSignalingCidr2
+                  - !If [HasCidr3, !Ref VapiSignalingCidr3, !Ref AWS::NoValue]
+                  - !If [HasCidr4, !Ref VapiSignalingCidr4, !Ref AWS::NoValue]
+              ControlHmacSecretArn: !Ref BridgefuControlHmacSecret
+              CertificateArn: !If [SecureSip, !Ref PublicCertificate, none]
+              CertificatePassphraseArn: !If [SecureSip, !Ref CertificatePassphraseSecret, none]
+              RuntimeLogGroupName: !Ref RuntimeLogGroup
+              PrometheusLogGroupName: !Ref PrometheusLogGroup
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  SipDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasPublicDns
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref SipHostname
+      Type: A
+      TTL: '60'
+      ResourceRecords: [!GetAtt GatewayEip.PublicIp]
+
+  ControlPrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref ControlHostname
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref AWS::Region
+      HostedZoneConfig:
+        Comment: !Sub 'Bridgefu ${DeploymentId} private control endpoint'
+      HostedZoneTags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ControlDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ControlPrivateHostedZone
+      Name: !Ref ControlHostname
+      Type: A
+      TTL: '30'
+      ResourceRecords: [!GetAtt GatewayInstance.PrivateIp]
+
+  ProductionBackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: RetainData
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Sub 'bridgefu-${DeploymentId}'
+      BackupVaultTags:
+        Project: !Ref ProjectTag
+        ManagedBy: !Ref ManagedByTag
+        BridgefuExecutionId: !Ref ExecutionIdTag
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Condition: RetainData
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-backup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: backup.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  ProductionBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: RetainData
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub 'bridgefu-${DeploymentId}-daily'
+        BackupPlanRule:
+          - RuleName: DailyEncryptedDataVolume
+            TargetBackupVault: !Ref ProductionBackupVault
+            ScheduleExpression: cron(0 5 ? * * *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: 35
+      BackupPlanTags:
+        Project: !Ref ProjectTag
+        ManagedBy: !Ref ManagedByTag
+        BridgefuExecutionId: !Ref ExecutionIdTag
+
+  ProductionBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: RetainData
+    Properties:
+      BackupPlanId: !Ref ProductionBackupPlan
+      BackupSelection:
+        SelectionName: !Sub 'bridgefu-${DeploymentId}-data-volume'
+        IamRoleArn: !GetAtt BackupRole.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: aws:ResourceTag/BridgefuBackup
+            ConditionValue: !Ref DeploymentId
+
+  AutomaticRecoveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-ec2-recover'
+      AlarmDescription: EC2 system recovery for Starter; see runbooks/starter-recovery.md before manual replacement.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions:
+        - {Name: InstanceId, Value: !Ref GatewayInstance}
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover'
+
+Outputs:
+  InstanceId:
+    Value: !Ref GatewayInstance
+  InstancePrivateIp:
+    Value: !GetAtt GatewayInstance.PrivateIp
+  PublicIp:
+    Value: !GetAtt GatewayEip.PublicIp
+  SipHostname:
+    Value: !If [SecureSip, !Ref SipHostname, !GetAtt GatewayEip.PublicIp]
+  SipUri:
+    Value: !If
+      - SecureSip
+      - !Sub 'sips:{one-use-token}@${SipHostname}:5061;transport=tls'
+      - !Sub
+        - 'sip:{one-use-token}@${PublicIp}:5060'
+        - PublicIp: !GetAtt GatewayEip.PublicIp
+  ControlBaseUrl:
+    Value: !If
+      - SecureSip
+      - !Sub 'https://${ControlHostname}'
+      - !Sub 'http://${ControlHostname}:443'
+  GatewaySecurityGroupId:
+    Value: !Ref GatewaySecurityGroup
+  CertificateArn:
+    Value: !If [SecureSip, !Ref PublicCertificate, none]
+  BridgefuControlHmacSecretArn:
+    Value: !Ref BridgefuControlHmacSecret
+  DataVolumeId:
+    Value: !If [RetainData, !Ref ProductionDataVolume, !Ref TestDataVolume]
+  RuntimeLogGroupName:
+    Value: !Ref RuntimeLogGroup
+  PrometheusLogGroupName:
+    Value: !Ref PrometheusLogGroup
+  ReadinessEvidence:
+    Value: ready
+  SsmStartSessionCommand:
+    Value: !Sub 'aws ssm start-session --target ${GatewayInstance} --region ${AWS::Region}'

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/bridgefu/runtime.conf
+marker=/run/bridgefu/certificate-reload-pending
+[[ -f "$marker" ]] || exit 0
+if ! systemctl is-active --quiet bridgefu.service; then
+  rm -f "$marker"
+  exit 0
+fi
+
+metrics="$(curl --silent --show-error --fail --max-time 3 http://127.0.0.1:9090/metrics)" || {
+  echo "Certificate activation deferred because Bridgefu metrics are unavailable" >&2
+  exit 0
+}
+active="$(awk '
+  /^bridgefu_gateway_native_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+  /^bridgefu_private_egress_active_routes([{ ]|$)/ {sum += $NF; seen = 1}
+  /^bridgefu_amazon_durable_cleanups_pending([{ ]|$)/ {sum += $NF; seen = 1}
+  END {if (seen) print sum; else exit 1}
+' <<<"$metrics")" || {
+  echo "Certificate activation deferred because active-route evidence is absent" >&2
+  exit 0
+}
+
+if awk -v active="$active" 'BEGIN {exit !(active == 0)}'; then
+  systemctl restart bridgefu.service
+  for _ in $(seq 1 60); do
+    if curl --silent --fail --max-time 2 http://127.0.0.1:9090/readyz >/dev/null; then
+      rm -f "$marker"
+      echo "Refreshed Bridgefu certificate activated while no calls were active"
+      exit 0
+    fi
+    sleep 2
+  done
+  echo "Bridgefu did not become ready after certificate activation" >&2
+  exit 1
+fi
+
+echo "Certificate activation deferred; active_routes_or_cleanup=$active"

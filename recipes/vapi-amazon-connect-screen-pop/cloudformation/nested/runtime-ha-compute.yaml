@@ -1,0 +1,931 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu HA ECS-on-EC2 compute: two fixed gateway slots and two fixed worker
+  slots with immutable tasks, automatic slot replacement, and graceful ECS drain.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: runtime-ha-compute
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  PublicSubnet1Id: {Type: AWS::EC2::Subnet::Id}
+  PublicSubnet2Id: {Type: AWS::EC2::Subnet::Id}
+  PrivateSubnet1Id: {Type: AWS::EC2::Subnet::Id}
+  PrivateSubnet2Id: {Type: AWS::EC2::Subnet::Id}
+  GatewaySecurityGroupId: {Type: AWS::EC2::SecurityGroup::Id}
+  WorkerSecurityGroupId: {Type: AWS::EC2::SecurityGroup::Id}
+  GatewayEipAAllocationId: {Type: String}
+  GatewayEipAPublicIp: {Type: String}
+  GatewayEipBAllocationId: {Type: String}
+  GatewayEipBPublicIp: {Type: String}
+  PublicSignalingTargetGroupArn: {Type: String}
+  ControlTargetGroupArn: {Type: String}
+  WorkerATargetGroupArn: {Type: String}
+  WorkerBTargetGroupArn: {Type: String}
+  SipHostname: {Type: String}
+  ControlHostname: {Type: String}
+  WorkerHostname: {Type: String}
+  UctpHostname: {Type: String}
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidrs:
+    Type: String
+    MinLength: 9
+    MaxLength: 1024
+    AllowedPattern: '^[0-9a-fA-F:./,]+$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  ConnectEntryFlowArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  ConnectEntryFlowId:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9-]{1,128}$'
+  BridgefuApiBearerSecretArn: {Type: String}
+  BridgefuControlHmacSecretArn: {Type: String}
+  PrivateForwardingSecretArn: {Type: String}
+  BroadcastSecretArn: {Type: String}
+  DatabaseSecretArn: {Type: String}
+  RedisPasswordSecretArn: {Type: String}
+  RedisEndpoint: {Type: String}
+  PrivateTlsSecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  PublicCertificateArn: {Type: String}
+  CertificatePassphraseSecretArn: {Type: String}
+  BridgefuImageUri:
+    Type: String
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuRegistryType:
+    Type: String
+    AllowedValues: [PrivateEcr, Anonymous]
+  BridgefuImageRepositoryArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  ArtifactBucket: {Type: String}
+  RuntimeArtifactKey: {Type: String}
+  RuntimeArtifactVersion: {Type: String}
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  GatewayInstanceType:
+    Type: String
+    Default: c7g.large
+    AllowedValues: [t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  WorkerInstanceType:
+    Type: String
+    Default: c7g.large
+    AllowedValues: [t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
+  RootVolumeGiB:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 200
+  EbsKmsKeyArn:
+    Type: String
+    Default: ''
+  RuntimeSecretsKmsKeyArn:
+    Type: String
+    Default: ''
+  MaxConcurrentCallsPerGateway:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+  MaxConcurrentCallsPerWorker:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  ProjectTag: {Type: String, Default: bridgefu-recipe}
+  ManagedByTag: {Type: String, Default: bridgefu-cloudformation}
+  ExecutionIdTag: {Type: String, Default: production}
+
+Rules:
+  PrivateEcrRequiresRepositoryArn:
+    RuleCondition: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BridgefuImageRepositoryArn, arn:aws:ecr:us-east-1:000000000000:repository/unused]]
+        AssertDescription: PrivateEcr requires the exact immutable image repository ARN.
+
+Conditions:
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+  PrivateEcr: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+  HasEbsKmsKey: !Not [!Equals [!Ref EbsKmsKeyArn, '']]
+  HasRuntimeSecretsKmsKey: !Not [!Equals [!Ref RuntimeSecretsKmsKeyArn, '']]
+
+Resources:
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/ha/runtime'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  LifecycleLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/bridgefu/${DeploymentId}/ha/lifecycle'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'bridgefu-${DeploymentId}'
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+      Configuration:
+        ExecuteCommandConfiguration: {Logging: DEFAULT}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-task-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: ExactImageAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteRuntimeLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${RuntimeLogGroup.Arn}:*'
+              - !If
+                - PrivateEcr
+                - Sid: PullReviewedImage
+                  Effect: Allow
+                  Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                  Resource: !Ref BridgefuImageRepositoryArn
+                - !Ref AWS::NoValue
+              - !If
+                - PrivateEcr
+                - Sid: AuthenticateEcr
+                  Effect: Allow
+                  Action: ecr:GetAuthorizationToken
+                  Resource: '*'
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-gateway-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-worker-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: ExactAmazonConnectFlow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartOnlyRecipeConnectFlow
+                Effect: Allow
+                Action: connect:StartWebRTCContact
+                Resource: !Ref ConnectEntryFlowArn
+              - Sid: StopOnlyRecipeInstanceContacts
+                Effect: Allow
+                Action: connect:StopContact
+                Resource: !Sub '${ConnectInstanceArn}/contact/*'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-gateway-host'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Policies:
+        - PolicyName: ExactGatewayBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadImmutableRuntimeBundle
+                Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RuntimeArtifactKey}'
+              - Sid: ReadExactRuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BridgefuApiBearerSecretArn
+                  - !Ref BridgefuControlHmacSecretArn
+                  - !Ref PrivateForwardingSecretArn
+                  - !Ref BroadcastSecretArn
+                  - !Ref DatabaseSecretArn
+                  - !Ref RedisPasswordSecretArn
+                  - !Ref PrivateTlsSecretArn
+                  - !Ref CertificatePassphraseSecretArn
+              - Sid: ExportRecipeCertificate
+                Effect: Allow
+                Action: acm:ExportCertificate
+                Resource: !Ref PublicCertificateArn
+              - Sid: ReconcileBoundedMediaAddress
+                Effect: Allow
+                Action: [ec2:AssociateAddress, ec2:DescribeAddresses, ec2:DescribeTags]
+                Resource: '*'
+              - Sid: ActivateIdleCertificate
+                Effect: Allow
+                Action: [ecs:ListContainerInstances, ecs:ListTasks, ecs:StopTask]
+                Resource: '*'
+              - Sid: ProtectActiveCallsFromScaleIn
+                Effect: Allow
+                Action: [autoscaling:DescribeAutoScalingInstances, autoscaling:SetInstanceProtection]
+                Resource: '*'
+              - Sid: PublishRuntimeMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals: {cloudwatch:namespace: [Bridgefu/Runtime, CWAgent]}
+              - !If
+                - HasRuntimeSecretsKmsKey
+                - Sid: DecryptRuntimeSecrets
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref RuntimeSecretsKmsKeyArn
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-worker-host'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Policies:
+        - PolicyName: ExactWorkerBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadImmutableRuntimeBundle
+                Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RuntimeArtifactKey}'
+              - Sid: ReadExactRuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BridgefuApiBearerSecretArn
+                  - !Ref BridgefuControlHmacSecretArn
+                  - !Ref PrivateForwardingSecretArn
+                  - !Ref BroadcastSecretArn
+                  - !Ref DatabaseSecretArn
+                  - !Ref RedisPasswordSecretArn
+                  - !Ref PrivateTlsSecretArn
+              - Sid: ReadOwnSlotTag
+                Effect: Allow
+                Action: ec2:DescribeTags
+                Resource: '*'
+              - Sid: ProtectActiveCallsFromScaleIn
+                Effect: Allow
+                Action: [autoscaling:DescribeAutoScalingInstances, autoscaling:SetInstanceProtection]
+                Resource: '*'
+              - Sid: PublishHostMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals: {cloudwatch:namespace: [Bridgefu/Runtime, CWAgent]}
+              - !If
+                - HasRuntimeSecretsKmsKey
+                - Sid: DecryptRuntimeSecrets
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref RuntimeSecretsKmsKeyArn
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref GatewayHostRole]}
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref WorkerHostRole]}
+
+  GatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'bridgefu-${DeploymentId}-ha-gateway'
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref GatewayInstanceType
+        IamInstanceProfile: {Arn: !GetAtt GatewayInstanceProfile.Arn}
+        SecurityGroupIds: [!Ref GatewaySecurityGroupId]
+        Monitoring: {Enabled: true}
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              KmsKeyId: !If [HasEbsKmsKey, !Ref EbsKmsKeyArn, !Ref AWS::NoValue]
+              VolumeSize: !Ref RootVolumeGiB
+              VolumeType: gp3
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - {Key: Project, Value: !Ref ProjectTag}
+              - {Key: ManagedBy, Value: !Ref ManagedByTag}
+              - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              umask 077
+              dnf install -y unzip
+              token=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+              instance_id=$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)
+              tag_value() { aws ec2 describe-tags --region '${AWS::Region}' --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=$1" --query 'Tags[0].Value' --output text; }
+              slot=None
+              for attempt in $(seq 1 60); do slot=$(tag_value BridgefuSlot); [[ "$slot" != None ]] && break; sleep 2; done
+              [[ "$slot" == gateway-a || "$slot" == gateway-b ]]
+              allocation_id=$(tag_value BridgefuEipAllocationId)
+              public_ip=$(tag_value BridgefuPublicIp)
+              aws ec2 associate-address --region '${AWS::Region}' --instance-id "$instance_id" --allocation-id "$allocation_id" --allow-reassociation >/dev/null
+              install -d -o root -g root -m 0755 /opt/bridgefu/bootstrap /etc/bridgefu
+              aws s3api get-object --region '${AWS::Region}' --bucket '${ArtifactBucket}' --key '${RuntimeArtifactKey}' --version-id '${RuntimeArtifactVersion}' /opt/bridgefu/runtime.zip >/dev/null
+              printf '%s  %s\n' '${RuntimeArtifactSha256}' /opt/bridgefu/runtime.zip | sha256sum -c -
+              unzip -q /opt/bridgefu/runtime.zip -d /opt/bridgefu/bootstrap
+              cat > /etc/bridgefu/runtime.conf <<BRIDGEFU_RUNTIME
+              BRIDGEFU_ROLE='gateway'
+              BRIDGEFU_SLOT='$slot'
+              BRIDGEFU_GATEWAY_ID='$slot'
+              BRIDGEFU_DEPLOYMENT_ID='${DeploymentId}'
+              BRIDGEFU_ECS_CLUSTER='${Cluster}'
+              AWS_REGION='${AWS::Region}'
+              BRIDGEFU_SIP_HOSTNAME='${SipHostname}'
+              BRIDGEFU_CONTROL_HOSTNAME='${ControlHostname}'
+              BRIDGEFU_WORKER_HOSTNAME='${WorkerHostname}'
+              BRIDGEFU_UCTP_HOSTNAME='${UctpHostname}'
+              BRIDGEFU_PUBLIC_IP='$public_ip'
+              BRIDGEFU_SIP_SECURITY='${SipSecurity}'
+              BRIDGEFU_MAX_CONCURRENT_CALLS='${MaxConcurrentCallsPerGateway}'
+              VAPI_SIGNALING_CIDRS='${VapiSignalingCidrs}'
+              CONNECT_INSTANCE_ARN='${ConnectInstanceArn}'
+              CONNECT_ENTRY_FLOW_ID='${ConnectEntryFlowId}'
+              BRIDGEFU_WORKER_TARGETS_JSON='[{"worker_id":"11111111-1111-4111-8111-111111111111","endpoint":"${WorkerHostname}:9443","server_name":"${WorkerHostname}"},{"worker_id":"22222222-2222-4222-8222-222222222222","endpoint":"${WorkerHostname}:9444","server_name":"${WorkerHostname}"}]'
+              BRIDGEFU_API_BEARER_SECRET_ARN='${BridgefuApiBearerSecretArn}'
+              BRIDGEFU_CONTROL_HMAC_SECRET_ARN='${BridgefuControlHmacSecretArn}'
+              BRIDGEFU_PRIVATE_FORWARDING_SECRET_ARN='${PrivateForwardingSecretArn}'
+              BRIDGEFU_BROADCAST_SECRET_ARN='${BroadcastSecretArn}'
+              BRIDGEFU_DATABASE_SECRET_ARN='${DatabaseSecretArn}'
+              BRIDGEFU_REDIS_PASSWORD_SECRET_ARN='${RedisPasswordSecretArn}'
+              BRIDGEFU_REDIS_ENDPOINT='${RedisEndpoint}'
+              BRIDGEFU_PRIVATE_TLS_SECRET_ARN='${PrivateTlsSecretArn}'
+              CERTIFICATE_ARN='${PublicCertificateArn}'
+              CERTIFICATE_PASSPHRASE_SECRET_ARN='${CertificatePassphraseSecretArn}'
+              BRIDGEFU_BUNDLE_DIR='/opt/bridgefu/bootstrap'
+              BRIDGEFU_RUNTIME
+              chmod 0600 /etc/bridgefu/runtime.conf
+              chmod 0755 /opt/bridgefu/bootstrap/ha-host-bootstrap.sh
+              /opt/bridgefu/bootstrap/ha-host-bootstrap.sh
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'bridgefu-${DeploymentId}-ha-worker'
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref WorkerInstanceType
+        IamInstanceProfile: {Arn: !GetAtt WorkerInstanceProfile.Arn}
+        SecurityGroupIds: [!Ref WorkerSecurityGroupId]
+        Monitoring: {Enabled: true}
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              KmsKeyId: !If [HasEbsKmsKey, !Ref EbsKmsKeyArn, !Ref AWS::NoValue]
+              VolumeSize: !Ref RootVolumeGiB
+              VolumeType: gp3
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - {Key: Project, Value: !Ref ProjectTag}
+              - {Key: ManagedBy, Value: !Ref ManagedByTag}
+              - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              umask 077
+              dnf install -y unzip
+              token=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+              instance_id=$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)
+              tag_value() { aws ec2 describe-tags --region '${AWS::Region}' --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=$1" --query 'Tags[0].Value' --output text; }
+              slot=None
+              for attempt in $(seq 1 60); do slot=$(tag_value BridgefuSlot); [[ "$slot" != None ]] && break; sleep 2; done
+              case "$slot" in worker-a) worker_id=11111111-1111-4111-8111-111111111111 ;; worker-b) worker_id=22222222-2222-4222-8222-222222222222 ;; *) exit 1 ;; esac
+              install -d -o root -g root -m 0755 /opt/bridgefu/bootstrap /etc/bridgefu
+              aws s3api get-object --region '${AWS::Region}' --bucket '${ArtifactBucket}' --key '${RuntimeArtifactKey}' --version-id '${RuntimeArtifactVersion}' /opt/bridgefu/runtime.zip >/dev/null
+              printf '%s  %s\n' '${RuntimeArtifactSha256}' /opt/bridgefu/runtime.zip | sha256sum -c -
+              unzip -q /opt/bridgefu/runtime.zip -d /opt/bridgefu/bootstrap
+              cat > /etc/bridgefu/runtime.conf <<BRIDGEFU_RUNTIME
+              BRIDGEFU_ROLE='worker'
+              BRIDGEFU_SLOT='$slot'
+              BRIDGEFU_WORKER_ID='$worker_id'
+              BRIDGEFU_DEPLOYMENT_ID='${DeploymentId}'
+              BRIDGEFU_ECS_CLUSTER='${Cluster}'
+              AWS_REGION='${AWS::Region}'
+              BRIDGEFU_SIP_HOSTNAME='${SipHostname}'
+              BRIDGEFU_CONTROL_HOSTNAME='${ControlHostname}'
+              BRIDGEFU_WORKER_HOSTNAME='${WorkerHostname}'
+              BRIDGEFU_UCTP_HOSTNAME='${UctpHostname}'
+              BRIDGEFU_PUBLIC_IP='127.0.0.1'
+              BRIDGEFU_SIP_SECURITY='${SipSecurity}'
+              BRIDGEFU_MAX_CONCURRENT_CALLS='${MaxConcurrentCallsPerWorker}'
+              VAPI_SIGNALING_CIDRS='${VapiSignalingCidrs}'
+              CONNECT_INSTANCE_ARN='${ConnectInstanceArn}'
+              CONNECT_ENTRY_FLOW_ID='${ConnectEntryFlowId}'
+              BRIDGEFU_API_BEARER_SECRET_ARN='${BridgefuApiBearerSecretArn}'
+              BRIDGEFU_CONTROL_HMAC_SECRET_ARN='${BridgefuControlHmacSecretArn}'
+              BRIDGEFU_PRIVATE_FORWARDING_SECRET_ARN='${PrivateForwardingSecretArn}'
+              BRIDGEFU_BROADCAST_SECRET_ARN='${BroadcastSecretArn}'
+              BRIDGEFU_DATABASE_SECRET_ARN='${DatabaseSecretArn}'
+              BRIDGEFU_REDIS_PASSWORD_SECRET_ARN='${RedisPasswordSecretArn}'
+              BRIDGEFU_REDIS_ENDPOINT='${RedisEndpoint}'
+              BRIDGEFU_PRIVATE_TLS_SECRET_ARN='${PrivateTlsSecretArn}'
+              BRIDGEFU_BUNDLE_DIR='/opt/bridgefu/bootstrap'
+              BRIDGEFU_RUNTIME
+              chmod 0600 /etc/bridgefu/runtime.conf
+              chmod 0755 /opt/bridgefu/bootstrap/ha-host-bootstrap.sh
+              /opt/bridgefu/bootstrap/ha-host-bootstrap.sh
+
+  GatewayAsgA:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'bridgefu-${DeploymentId}-gateway-a'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref PublicSubnet1Id]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LaunchTemplate: {LaunchTemplateId: !Ref GatewayLaunchTemplate, Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber}
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway-a', PropagateAtLaunch: true}
+        - {Key: BridgefuSlot, Value: gateway-a, PropagateAtLaunch: true}
+        - {Key: BridgefuEipAllocationId, Value: !Ref GatewayEipAAllocationId, PropagateAtLaunch: true}
+        - {Key: BridgefuPublicIp, Value: !Ref GatewayEipAPublicIp, PropagateAtLaunch: true}
+        - {Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag, PropagateAtLaunch: true}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag, PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MaxBatchSize: 1, MinInstancesInService: 0, PauseTime: PT0S}
+
+  GatewayAsgB:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'bridgefu-${DeploymentId}-gateway-b'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref PublicSubnet2Id]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LaunchTemplate: {LaunchTemplateId: !Ref GatewayLaunchTemplate, Version: !GetAtt GatewayLaunchTemplate.LatestVersionNumber}
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-gateway-b', PropagateAtLaunch: true}
+        - {Key: BridgefuSlot, Value: gateway-b, PropagateAtLaunch: true}
+        - {Key: BridgefuEipAllocationId, Value: !Ref GatewayEipBAllocationId, PropagateAtLaunch: true}
+        - {Key: BridgefuPublicIp, Value: !Ref GatewayEipBPublicIp, PropagateAtLaunch: true}
+        - {Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag, PropagateAtLaunch: true}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag, PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MaxBatchSize: 1, MinInstancesInService: 0, PauseTime: PT0S}
+
+  WorkerAsgA:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'bridgefu-${DeploymentId}-worker-a'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref PrivateSubnet1Id]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LaunchTemplate: {LaunchTemplateId: !Ref WorkerLaunchTemplate, Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber}
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-worker-a', PropagateAtLaunch: true}
+        - {Key: BridgefuSlot, Value: worker-a, PropagateAtLaunch: true}
+        - {Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag, PropagateAtLaunch: true}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag, PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MaxBatchSize: 1, MinInstancesInService: 0, PauseTime: PT0S}
+
+  WorkerAsgB:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'bridgefu-${DeploymentId}-worker-b'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref PrivateSubnet2Id]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LaunchTemplate: {LaunchTemplateId: !Ref WorkerLaunchTemplate, Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber}
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-worker-b', PropagateAtLaunch: true}
+        - {Key: BridgefuSlot, Value: worker-b, PropagateAtLaunch: true}
+        - {Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag, PropagateAtLaunch: true}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag, PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MaxBatchSize: 1, MinInstancesInService: 0, PauseTime: PT0S}
+
+  GatewayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'bridgefu-${DeploymentId}-gateway'
+      RequiresCompatibilities: [EC2]
+      NetworkMode: host
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt GatewayTaskRole.Arn
+      RuntimePlatform: {CpuArchitecture: ARM64, OperatingSystemFamily: LINUX}
+      Volumes:
+        - {Name: config, Host: {SourcePath: /etc/bridgefu}}
+        - {Name: secrets, Host: {SourcePath: /run/bridgefu/secrets}}
+      ContainerDefinitions:
+        - Name: bridgefu
+          Image: !Ref BridgefuImageUri
+          Essential: true
+          User: '65532:65532'
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          LinuxParameters:
+            Capabilities: {Drop: [ALL]}
+            InitProcessEnabled: true
+          StopTimeout: 120
+          Command: [--config, /etc/bridgefu/bridgefu.yaml]
+          Environment:
+            - {Name: AWS_REGION, Value: !Ref AWS::Region}
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+            - {Name: BRIDGEFU_API_BEARER_TOKEN_FILE, Value: /run/bridgefu/secrets/api-bearer}
+            - {Name: BRIDGEFU_CONTROL_HMAC_KEY_FILE, Value: /run/bridgefu/secrets/control-hmac}
+            - {Name: BRIDGEFU_PRIVATE_FORWARDING_SECRET_FILE, Value: /run/bridgefu/secrets/private-forwarding}
+            - {Name: BRIDGEFU_BROADCAST_TOKEN_SECRET_FILE, Value: /run/bridgefu/secrets/broadcast-token}
+            - {Name: BRIDGEFU_DATABASE_URL_FILE, Value: /run/bridgefu/secrets/database-url}
+            - {Name: BRIDGEFU_REDIS_URL_FILE, Value: /run/bridgefu/secrets/redis-url}
+          MountPoints:
+            - {SourceVolume: config, ContainerPath: /etc/bridgefu, ReadOnly: true}
+            - {SourceVolume: secrets, ContainerPath: /run/bridgefu/secrets, ReadOnly: true}
+          PortMappings:
+            - {ContainerPort: 5060, HostPort: 5060, Protocol: tcp}
+            - {ContainerPort: 5060, HostPort: 5060, Protocol: udp}
+            - {ContainerPort: 5061, HostPort: 5061, Protocol: tcp}
+            - {ContainerPort: 9080, HostPort: 9080, Protocol: tcp}
+            - {ContainerPort: 9090, HostPort: 9090, Protocol: tcp}
+            - {ContainerPort: 4433, HostPort: 4433, Protocol: udp}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'bridgefu-${DeploymentId}-worker'
+      RequiresCompatibilities: [EC2]
+      NetworkMode: host
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      RuntimePlatform: {CpuArchitecture: ARM64, OperatingSystemFamily: LINUX}
+      Volumes:
+        - {Name: config, Host: {SourcePath: /etc/bridgefu}}
+        - {Name: secrets, Host: {SourcePath: /run/bridgefu/secrets}}
+      ContainerDefinitions:
+        - Name: bridgefu
+          Image: !Ref BridgefuImageUri
+          Essential: true
+          User: '65532:65532'
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          LinuxParameters:
+            Capabilities: {Drop: [ALL]}
+            InitProcessEnabled: true
+          StopTimeout: 120
+          Command: [--config, /etc/bridgefu/bridgefu.yaml]
+          Environment:
+            - {Name: AWS_REGION, Value: !Ref AWS::Region}
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+            - {Name: BRIDGEFU_API_BEARER_TOKEN_FILE, Value: /run/bridgefu/secrets/api-bearer}
+            - {Name: BRIDGEFU_CONTROL_HMAC_KEY_FILE, Value: /run/bridgefu/secrets/control-hmac}
+            - {Name: BRIDGEFU_PRIVATE_FORWARDING_SECRET_FILE, Value: /run/bridgefu/secrets/private-forwarding}
+            - {Name: BRIDGEFU_BROADCAST_TOKEN_SECRET_FILE, Value: /run/bridgefu/secrets/broadcast-token}
+            - {Name: BRIDGEFU_DATABASE_URL_FILE, Value: /run/bridgefu/secrets/database-url}
+            - {Name: BRIDGEFU_REDIS_URL_FILE, Value: /run/bridgefu/secrets/redis-url}
+          MountPoints:
+            - {SourceVolume: config, ContainerPath: /etc/bridgefu, ReadOnly: true}
+            - {SourceVolume: secrets, ContainerPath: /run/bridgefu/secrets, ReadOnly: true}
+          PortMappings:
+            - {ContainerPort: 9443, HostPort: 9443, Protocol: udp}
+            - {ContainerPort: 9090, HostPort: 9090, Protocol: tcp}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  GatewayServiceA:
+    Type: AWS::ECS::Service
+    DependsOn: GatewayAsgA
+    Properties:
+      ServiceName: gateway-a
+      Cluster: !Ref Cluster
+      LaunchType: EC2
+      DesiredCount: 1
+      TaskDefinition: !Ref GatewayTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      HealthCheckGracePeriodSeconds: 300
+      PlacementConstraints: [{Type: memberOf, Expression: 'attribute:bridgefu.slot == gateway-a'}]
+      LoadBalancers:
+        - {ContainerName: bridgefu, ContainerPort: !If [SecureSip, 5061, 5060], TargetGroupArn: !Ref PublicSignalingTargetGroupArn}
+        - {ContainerName: bridgefu, ContainerPort: 9080, TargetGroupArn: !Ref ControlTargetGroupArn}
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuSlot, Value: gateway-a}
+
+  GatewayServiceB:
+    Type: AWS::ECS::Service
+    DependsOn: GatewayAsgB
+    Properties:
+      ServiceName: gateway-b
+      Cluster: !Ref Cluster
+      LaunchType: EC2
+      DesiredCount: 1
+      TaskDefinition: !Ref GatewayTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      HealthCheckGracePeriodSeconds: 300
+      PlacementConstraints: [{Type: memberOf, Expression: 'attribute:bridgefu.slot == gateway-b'}]
+      LoadBalancers:
+        - {ContainerName: bridgefu, ContainerPort: !If [SecureSip, 5061, 5060], TargetGroupArn: !Ref PublicSignalingTargetGroupArn}
+        - {ContainerName: bridgefu, ContainerPort: 9080, TargetGroupArn: !Ref ControlTargetGroupArn}
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuSlot, Value: gateway-b}
+
+  WorkerServiceA:
+    Type: AWS::ECS::Service
+    DependsOn: WorkerAsgA
+    Properties:
+      ServiceName: worker-a
+      Cluster: !Ref Cluster
+      LaunchType: EC2
+      DesiredCount: 1
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      HealthCheckGracePeriodSeconds: 300
+      PlacementConstraints: [{Type: memberOf, Expression: 'attribute:bridgefu.slot == worker-a'}]
+      LoadBalancers: [{ContainerName: bridgefu, ContainerPort: 9443, TargetGroupArn: !Ref WorkerATargetGroupArn}]
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuSlot, Value: worker-a}
+
+  WorkerServiceB:
+    Type: AWS::ECS::Service
+    DependsOn: WorkerAsgB
+    Properties:
+      ServiceName: worker-b
+      Cluster: !Ref Cluster
+      LaunchType: EC2
+      DesiredCount: 1
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      HealthCheckGracePeriodSeconds: 300
+      PlacementConstraints: [{Type: memberOf, Expression: 'attribute:bridgefu.slot == worker-b'}]
+      LoadBalancers: [{ContainerName: bridgefu, ContainerPort: 9443, TargetGroupArn: !Ref WorkerBTargetGroupArn}]
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuSlot, Value: worker-b}
+
+  LifecycleTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bridgefu-${DeploymentId}-ha-lifecycle'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  LifecyclePublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-lifecycle-publish'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: autoscaling.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: PublishExactLifecycleTopic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: sns:Publish, Resource: !Ref LifecycleTopic}]
+
+  LifecycleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-ha-lifecycle'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: DrainExactCluster
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ecs:ListContainerInstances, ecs:UpdateContainerInstancesState, ecs:ListTasks, ecs:StopTask, ecs:DescribeTasks]
+                Resource: '*'
+              - Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: '*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${LifecycleLogGroup.Arn}:*'
+
+  LifecycleFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LifecycleLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-ha-drain'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt LifecycleFunctionRole.Arn
+      Timeout: 180
+      MemorySize: 128
+      Environment: {Variables: {CLUSTER: !Ref Cluster}}
+      Code:
+        ZipFile: |
+          import boto3,json,os,time
+          ecs=boto3.client('ecs'); autoscaling=boto3.client('autoscaling')
+          def handler(event,context):
+              message=json.loads(event['Records'][0]['Sns']['Message'])
+              if message.get('LifecycleTransition')!='autoscaling:EC2_INSTANCE_TERMINATING': return
+              instance=message['EC2InstanceId']; cluster=os.environ['CLUSTER']
+              found=ecs.list_container_instances(cluster=cluster,filter=f'ec2InstanceId == {instance}')['containerInstanceArns']
+              if found:
+                  container=found[0]
+                  ecs.update_container_instances_state(cluster=cluster,containerInstances=[container],status='DRAINING')
+                  tasks=ecs.list_tasks(cluster=cluster,containerInstance=container,desiredStatus='RUNNING')['taskArns']
+                  for task in tasks: ecs.stop_task(cluster=cluster,task=task,reason='Bridgefu HA lifecycle drain')
+                  deadline=time.time()+130
+                  while tasks and time.time()<deadline:
+                      time.sleep(5)
+                      tasks=ecs.list_tasks(cluster=cluster,containerInstance=container,desiredStatus='RUNNING')['taskArns']
+              autoscaling.complete_lifecycle_action(LifecycleHookName=message['LifecycleHookName'],AutoScalingGroupName=message['AutoScalingGroupName'],LifecycleActionToken=message['LifecycleActionToken'],LifecycleActionResult='CONTINUE')
+
+  LifecycleSubscription:
+    Type: AWS::SNS::Subscription
+    Properties: {TopicArn: !Ref LifecycleTopic, Protocol: lambda, Endpoint: !GetAtt LifecycleFunction.Arn}
+
+  LifecycleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LifecycleFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LifecycleTopic
+
+  GatewayAHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: {AutoScalingGroupName: !Ref GatewayAsgA, LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING', HeartbeatTimeout: 300, DefaultResult: CONTINUE, NotificationTargetARN: !Ref LifecycleTopic, RoleARN: !GetAtt LifecyclePublishRole.Arn}
+  GatewayBHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: {AutoScalingGroupName: !Ref GatewayAsgB, LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING', HeartbeatTimeout: 300, DefaultResult: CONTINUE, NotificationTargetARN: !Ref LifecycleTopic, RoleARN: !GetAtt LifecyclePublishRole.Arn}
+  WorkerAHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: {AutoScalingGroupName: !Ref WorkerAsgA, LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING', HeartbeatTimeout: 300, DefaultResult: CONTINUE, NotificationTargetARN: !Ref LifecycleTopic, RoleARN: !GetAtt LifecyclePublishRole.Arn}
+  WorkerBHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: {AutoScalingGroupName: !Ref WorkerAsgB, LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING', HeartbeatTimeout: 300, DefaultResult: CONTINUE, NotificationTargetARN: !Ref LifecycleTopic, RoleARN: !GetAtt LifecyclePublishRole.Arn}
+
+Outputs:
+  ClusterName: {Value: !Ref Cluster}
+  GatewayServiceAName: {Value: !GetAtt GatewayServiceA.Name}
+  GatewayServiceBName: {Value: !GetAtt GatewayServiceB.Name}
+  WorkerServiceAName: {Value: !GetAtt WorkerServiceA.Name}
+  WorkerServiceBName: {Value: !GetAtt WorkerServiceB.Name}
+  GatewayAsgAName: {Value: !Ref GatewayAsgA}
+  GatewayAsgBName: {Value: !Ref GatewayAsgB}
+  WorkerAsgAName: {Value: !Ref WorkerAsgA}
+  WorkerAsgBName: {Value: !Ref WorkerAsgB}
+  RuntimeLogGroupName: {Value: !Ref RuntimeLogGroup}
+  ReadinessEvidence: {Value: 'four ECS services stabilized across two Availability Zones'}
+  SsmInventoryCommand:
+    Value: !Sub >-
+      aws ec2 describe-instances --region ${AWS::Region} --filters
+      Name=tag:BridgefuExecutionId,Values=${ExecutionIdTag} Name=instance-state-name,Values=running

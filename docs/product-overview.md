@@ -62,7 +62,7 @@ Bridgefu currently offers two forms of this workflow.
 
 ### Preserved fixed SIP listener
 
-The original StandardCharter-compatible gateway remains the default
+The original reference-tenant-compatible gateway remains the default
 all-in-one path. Its SIP listener uses `sip.port`, which defaults to port 5060.
 
 For each inbound `INVITE`, it:
@@ -485,7 +485,7 @@ active, production-complete browser-to-Vapi-to-Amazon topology:
 The `vapi-direct-assistant` example is commented in
 [`config/bridgefu.example.yaml`](../config/bridgefu.example.yaml), while the
 active Amazon route is demonstrated in
-[`config/fixtures/standardcharter-managed-routes.yaml`](../config/fixtures/standardcharter-managed-routes.yaml).
+[`config/fixtures/reference-tenant-managed-routes.yaml`](../config/fixtures/reference-tenant-managed-routes.yaml).
 They should be read as complementary examples, not as a single ready-to-deploy
 configuration.
 

@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu High Availability runtime profile. Composes bounded multi-AZ edge,
+  shared PostgreSQL/Redis state, and ECS-on-EC2 gateway/worker services.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: runtime-ha
+    SupportTier: preview
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  NestedTemplateBaseUrl: {Type: String}
+  VpcId: {Type: AWS::EC2::VPC::Id}
+  VpcCidr: {Type: String}
+  PublicSubnet1Id: {Type: AWS::EC2::Subnet::Id}
+  PublicSubnet2Id: {Type: AWS::EC2::Subnet::Id}
+  PrivateSubnet1Id: {Type: AWS::EC2::Subnet::Id}
+  PrivateSubnet2Id: {Type: AWS::EC2::Subnet::Id}
+  TransferFunctionSecurityGroupId: {Type: AWS::EC2::SecurityGroup::Id}
+  PublicHostedZoneId: {Type: AWS::Route53::HostedZone::Id}
+  SipHostname: {Type: String}
+  ControlHostname: {Type: String}
+  WorkerHostname: {Type: String}
+  UctpHostname: {Type: String}
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidr1: {Type: String}
+  VapiSignalingCidr2: {Type: String}
+  VapiSignalingCidr3: {Type: String, Default: ''}
+  VapiSignalingCidr4: {Type: String, Default: ''}
+  MediaSourceCidr: {Type: String, Default: 0.0.0.0/0}
+  ConnectInstanceArn: {Type: String}
+  ConnectEntryFlowArn: {Type: String}
+  ConnectEntryFlowId: {Type: String}
+  BridgefuApiBearerSecretArn: {Type: String}
+  PrivateTlsSecretArn: {Type: String}
+  BridgefuImageUri:
+    Type: String
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuRegistryType:
+    Type: String
+    AllowedValues: [PrivateEcr, Anonymous]
+  BridgefuImageRepositoryArn: {Type: String}
+  ArtifactBucket: {Type: String}
+  RuntimeArtifactKey: {Type: String}
+  RuntimeArtifactVersion: {Type: String}
+  RuntimeArtifactSha256: {Type: String}
+  GatewayInstanceType:
+    Type: String
+    Default: c7g.large
+  WorkerInstanceType:
+    Type: String
+    Default: c7g.large
+  RootVolumeGiB:
+    Type: Number
+    Default: 30
+  EbsKmsKeyArn: {Type: String, Default: ''}
+  DataKmsKeyArn: {Type: String, Default: ''}
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+  DatabaseAllocatedStorageGiB:
+    Type: Number
+    Default: 50
+  DatabaseMaxStorageGiB:
+    Type: Number
+    Default: 200
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.small
+  MaxConcurrentCallsPerGateway:
+    Type: Number
+    Default: 100
+  MaxConcurrentCallsPerWorker:
+    Type: Number
+    Default: 100
+  DataRetentionMode:
+    Type: String
+    Default: ProductionRetain
+    AllowedValues: [ProductionRetain, TestDelete]
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  ProjectTag: {Type: String, Default: bridgefu-recipe}
+  ManagedByTag: {Type: String, Default: bridgefu-cloudformation}
+  ExecutionIdTag: {Type: String, Default: production}
+
+Conditions:
+  HasCidr3: !Not [!Equals [!Ref VapiSignalingCidr3, '']]
+  HasCidr4: !Not [!Equals [!Ref VapiSignalingCidr4, '']]
+
+Resources:
+  Edge:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/runtime-ha-edge.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcId: !Ref VpcId
+        VpcCidr: !Ref VpcCidr
+        PublicSubnet1Id: !Ref PublicSubnet1Id
+        PublicSubnet2Id: !Ref PublicSubnet2Id
+        PrivateSubnet1Id: !Ref PrivateSubnet1Id
+        PrivateSubnet2Id: !Ref PrivateSubnet2Id
+        TransferFunctionSecurityGroupId: !Ref TransferFunctionSecurityGroupId
+        PublicHostedZoneId: !Ref PublicHostedZoneId
+        SipHostname: !Ref SipHostname
+        ControlHostname: !Ref ControlHostname
+        WorkerHostname: !Ref WorkerHostname
+        UctpHostname: !Ref UctpHostname
+        SipSecurity: !Ref SipSecurity
+        VapiSignalingCidr1: !Ref VapiSignalingCidr1
+        VapiSignalingCidr2: !Ref VapiSignalingCidr2
+        VapiSignalingCidr3: !Ref VapiSignalingCidr3
+        VapiSignalingCidr4: !Ref VapiSignalingCidr4
+        MediaSourceCidr: !Ref MediaSourceCidr
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+        ExecutionIdTag: !Ref ExecutionIdTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  Data:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/runtime-ha-data.yaml'
+      TimeoutInMinutes: 60
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcId: !Ref VpcId
+        PrivateSubnet1Id: !Ref PrivateSubnet1Id
+        PrivateSubnet2Id: !Ref PrivateSubnet2Id
+        GatewaySecurityGroupId: !GetAtt Edge.Outputs.GatewaySecurityGroupId
+        WorkerSecurityGroupId: !GetAtt Edge.Outputs.WorkerSecurityGroupId
+        DatabaseInstanceClass: !Ref DatabaseInstanceClass
+        DatabaseAllocatedStorageGiB: !Ref DatabaseAllocatedStorageGiB
+        DatabaseMaxStorageGiB: !Ref DatabaseMaxStorageGiB
+        RedisNodeType: !Ref RedisNodeType
+        DataRetentionMode: !Ref DataRetentionMode
+        DataKmsKeyArn: !Ref DataKmsKeyArn
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+        ExecutionIdTag: !Ref ExecutionIdTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  Compute:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/runtime-ha-compute.yaml'
+      TimeoutInMinutes: 75
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        PublicSubnet1Id: !Ref PublicSubnet1Id
+        PublicSubnet2Id: !Ref PublicSubnet2Id
+        PrivateSubnet1Id: !Ref PrivateSubnet1Id
+        PrivateSubnet2Id: !Ref PrivateSubnet2Id
+        GatewaySecurityGroupId: !GetAtt Edge.Outputs.GatewaySecurityGroupId
+        WorkerSecurityGroupId: !GetAtt Edge.Outputs.WorkerSecurityGroupId
+        GatewayEipAAllocationId: !GetAtt Edge.Outputs.GatewayEipAAllocationId
+        GatewayEipAPublicIp: !GetAtt Edge.Outputs.GatewayEipAPublicIp
+        GatewayEipBAllocationId: !GetAtt Edge.Outputs.GatewayEipBAllocationId
+        GatewayEipBPublicIp: !GetAtt Edge.Outputs.GatewayEipBPublicIp
+        PublicSignalingTargetGroupArn: !GetAtt Edge.Outputs.PublicSignalingTargetGroupArn
+        ControlTargetGroupArn: !GetAtt Edge.Outputs.ControlTargetGroupArn
+        WorkerATargetGroupArn: !GetAtt Edge.Outputs.WorkerATargetGroupArn
+        WorkerBTargetGroupArn: !GetAtt Edge.Outputs.WorkerBTargetGroupArn
+        SipHostname: !Ref SipHostname
+        ControlHostname: !Ref ControlHostname
+        WorkerHostname: !Ref WorkerHostname
+        UctpHostname: !Ref UctpHostname
+        SipSecurity: !Ref SipSecurity
+        VapiSignalingCidrs: !Join
+          - ','
+          - - !Ref VapiSignalingCidr1
+            - !Ref VapiSignalingCidr2
+            - !If [HasCidr3, !Ref VapiSignalingCidr3, !Ref AWS::NoValue]
+            - !If [HasCidr4, !Ref VapiSignalingCidr4, !Ref AWS::NoValue]
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        ConnectEntryFlowArn: !Ref ConnectEntryFlowArn
+        ConnectEntryFlowId: !Ref ConnectEntryFlowId
+        BridgefuApiBearerSecretArn: !Ref BridgefuApiBearerSecretArn
+        BridgefuControlHmacSecretArn: !GetAtt Data.Outputs.ControlHmacSecretArn
+        PrivateForwardingSecretArn: !GetAtt Data.Outputs.PrivateForwardingSecretArn
+        BroadcastSecretArn: !GetAtt Data.Outputs.BroadcastSecretArn
+        DatabaseSecretArn: !GetAtt Data.Outputs.DatabaseSecretArn
+        RedisPasswordSecretArn: !GetAtt Data.Outputs.RedisPasswordSecretArn
+        RedisEndpoint: !GetAtt Data.Outputs.RedisEndpoint
+        PrivateTlsSecretArn: !Ref PrivateTlsSecretArn
+        PublicCertificateArn: !GetAtt Edge.Outputs.PublicCertificateArn
+        CertificatePassphraseSecretArn: !GetAtt Edge.Outputs.CertificatePassphraseSecretArn
+        BridgefuImageUri: !Ref BridgefuImageUri
+        BridgefuRegistryType: !Ref BridgefuRegistryType
+        BridgefuImageRepositoryArn: !Ref BridgefuImageRepositoryArn
+        ArtifactBucket: !Ref ArtifactBucket
+        RuntimeArtifactKey: !Ref RuntimeArtifactKey
+        RuntimeArtifactVersion: !Ref RuntimeArtifactVersion
+        RuntimeArtifactSha256: !Ref RuntimeArtifactSha256
+        GatewayInstanceType: !Ref GatewayInstanceType
+        WorkerInstanceType: !Ref WorkerInstanceType
+        RootVolumeGiB: !Ref RootVolumeGiB
+        EbsKmsKeyArn: !Ref EbsKmsKeyArn
+        RuntimeSecretsKmsKeyArn: !Ref DataKmsKeyArn
+        MaxConcurrentCallsPerGateway: !Ref MaxConcurrentCallsPerGateway
+        MaxConcurrentCallsPerWorker: !Ref MaxConcurrentCallsPerWorker
+        LogRetentionDays: !Ref LogRetentionDays
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+        ExecutionIdTag: !Ref ExecutionIdTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+Outputs:
+  ClusterName: {Value: !GetAtt Compute.Outputs.ClusterName}
+  SipUri: {Value: !GetAtt Edge.Outputs.SipUri}
+  ControlBaseUrl: {Value: !GetAtt Edge.Outputs.ControlBaseUrl}
+  RuntimeLogGroupName: {Value: !GetAtt Compute.Outputs.RuntimeLogGroupName}
+  PublicCertificateArn: {Value: !GetAtt Edge.Outputs.PublicCertificateArn}
+  PublicSignalingDnsName: {Value: !GetAtt Edge.Outputs.PublicSignalingDnsName}
+  GatewayEipAPublicIp: {Value: !GetAtt Edge.Outputs.GatewayEipAPublicIp}
+  GatewayEipBPublicIp: {Value: !GetAtt Edge.Outputs.GatewayEipBPublicIp}
+  PublicSignalingTargetGroupArn: {Value: !GetAtt Edge.Outputs.PublicSignalingTargetGroupArn}
+  ControlTargetGroupArn: {Value: !GetAtt Edge.Outputs.ControlTargetGroupArn}
+  WorkerATargetGroupArn: {Value: !GetAtt Edge.Outputs.WorkerATargetGroupArn}
+  WorkerBTargetGroupArn: {Value: !GetAtt Edge.Outputs.WorkerBTargetGroupArn}
+  GatewayAsgAName: {Value: !GetAtt Compute.Outputs.GatewayAsgAName}
+  GatewayAsgBName: {Value: !GetAtt Compute.Outputs.GatewayAsgBName}
+  WorkerAsgAName: {Value: !GetAtt Compute.Outputs.WorkerAsgAName}
+  WorkerAsgBName: {Value: !GetAtt Compute.Outputs.WorkerAsgBName}
+  DatabaseIdentifier: {Value: !GetAtt Data.Outputs.DatabaseIdentifier}
+  RedisReplicationGroupId: {Value: !GetAtt Data.Outputs.RedisReplicationGroupId}
+  SsmInventoryCommand: {Value: !GetAtt Compute.Outputs.SsmInventoryCommand}
+  ReadinessEvidence: {Value: !GetAtt Compute.Outputs.ReadinessEvidence}

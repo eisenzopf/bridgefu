@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Two-AZ network foundation for Bridgefu Starter and High Availability. New
+  VPC is the default; existing VPC mode consumes customer-supplied subnets.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: network
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  NetworkMode:
+    Type: String
+    Default: NewVpc
+    AllowedValues: [NewVpc, ExistingVpc]
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.).+$'
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.42.0.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.42.1.0/24
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.42.10.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.42.11.0/24
+  ExistingVpcId:
+    Type: String
+    Default: vpc-00000000000000000
+  ExistingVpcCidr:
+    Type: String
+    Default: 10.255.255.255/32
+    Description: Required in ExistingVpc mode for endpoint and security-group scoping.
+  ExistingPublicSubnet1Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPublicSubnet1AvailabilityZone:
+    Type: String
+    Default: unused
+  ExistingPublicSubnet2Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPrivateSubnet1Id:
+    Type: String
+    Default: subnet-00000000000000000
+  ExistingPrivateSubnet2Id:
+    Type: String
+    Default: subnet-00000000000000000
+  CreateNatGateways:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Creates one NAT gateway per AZ for HA workers. ExistingVpc mode requires
+      customer-managed private-subnet egress and ignores this setting.
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Rules:
+  ExistingNetworkInputs:
+    RuleCondition: !Equals [!Ref NetworkMode, ExistingVpc]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref ExistingVpcId, vpc-00000000000000000]]
+          - !Not [!Equals [!Ref ExistingVpcCidr, 10.255.255.255/32]]
+          - !Not [!Equals [!Ref ExistingPublicSubnet1Id, subnet-00000000000000000]]
+          - !Not [!Equals [!Ref ExistingPublicSubnet1AvailabilityZone, unused]]
+          - !Not [!Equals [!Ref ExistingPublicSubnet2Id, subnet-00000000000000000]]
+          - !Not [!Equals [!Ref ExistingPrivateSubnet1Id, subnet-00000000000000000]]
+          - !Not [!Equals [!Ref ExistingPrivateSubnet2Id, subnet-00000000000000000]]
+        AssertDescription: ExistingVpc mode requires one VPC CIDR and two public plus two private subnet IDs.
+
+Conditions:
+  CreateNetwork: !Equals [!Ref NetworkMode, NewVpc]
+  CreateNat: !And
+    - !Condition CreateNetwork
+    - !Equals [!Ref CreateNatGateways, 'true']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-public-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-public-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-private-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-private-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-public'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties: {SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable}
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties: {SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable}
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-private-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-private-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties: {SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable1}
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties: {SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable2}
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    Condition: CreateNat
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-nat-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    Condition: CreateNat
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-nat-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNat
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      ConnectivityType: public
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-nat-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNat
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      ConnectivityType: public
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-nat-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Condition: CreateNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Condition: CreateNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateNetwork
+    Properties:
+      GroupDescription: Bridgefu private AWS service endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from recipe resources
+      SecurityGroupEgress: []
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-endpoints'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      RouteTableIds: [!Ref PrivateRouteTable1, !Ref PrivateRouteTable2]
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: [!Ref PrivateRouteTable1, !Ref PrivateRouteTable2]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  TransferFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS-only egress for the Bridgefu transfer-destination Lambda
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Private control endpoint and AWS HTTPS services
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !If [CreateNetwork, !Ref VpcCidr, !Ref ExistingVpcCidr]
+          Description: VPC DNS
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !If [CreateNetwork, !Ref VpcCidr, !Ref ExistingVpcCidr]
+          Description: VPC DNS fallback
+      Tags:
+        - {Key: Name, Value: !Sub 'bridgefu-${DeploymentId}-transfer'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
+Outputs:
+  VpcId:
+    Value: !If [CreateNetwork, !Ref Vpc, !Ref ExistingVpcId]
+  VpcCidr:
+    Value: !If [CreateNetwork, !Ref VpcCidr, !Ref ExistingVpcCidr]
+  PublicSubnet1Id:
+    Value: !If [CreateNetwork, !Ref PublicSubnet1, !Ref ExistingPublicSubnet1Id]
+  PublicSubnet2Id:
+    Value: !If [CreateNetwork, !Ref PublicSubnet2, !Ref ExistingPublicSubnet2Id]
+  PublicSubnet1AvailabilityZone:
+    Value: !If
+      - CreateNetwork
+      - !GetAtt PublicSubnet1.AvailabilityZone
+      - !Ref ExistingPublicSubnet1AvailabilityZone
+  PublicSubnetIds:
+    Value: !If
+      - CreateNetwork
+      - !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+      - !Join [',', [!Ref ExistingPublicSubnet1Id, !Ref ExistingPublicSubnet2Id]]
+  PrivateSubnet1Id:
+    Value: !If [CreateNetwork, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+  PrivateSubnet2Id:
+    Value: !If [CreateNetwork, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+  PrivateSubnetIds:
+    Value: !If
+      - CreateNetwork
+      - !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+      - !Join [',', [!Ref ExistingPrivateSubnet1Id, !Ref ExistingPrivateSubnet2Id]]
+  CreatesServiceEndpoints:
+    Value: !If [CreateNetwork, 'true', 'false']
+  CreatesNatGateways:
+    Value: !If [CreateNat, 'true', 'false']
+  TransferFunctionSecurityGroupId:
+    Value: !Ref TransferFunctionSecurityGroup

@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Optional nonproduction CloudFront test page for the Bridgefu Vapi to Amazon
+  Connect recipe. The page contains public Vapi configuration only.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: demo-site
+    ProductionUse: false
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  SiteArtifactKey:
+    Type: String
+    MinLength: 1
+    MaxLength: 1024
+  SiteArtifactVersion:
+    Type: String
+    MinLength: 1
+    MaxLength: 1024
+  SiteArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  VapiPublicKey:
+    Type: String
+    MinLength: 8
+    MaxLength: 256
+    AllowedPattern: '^[A-Za-z0-9._~:/+=-]+$'
+    Description: >-
+      Browser-safe Vapi public key. No private Vapi or Bridgefu credential is
+      accepted by this stack.
+  VapiAssistantId:
+    Type: String
+    MinLength: 8
+    MaxLength: 256
+    AllowedPattern: '^[A-Za-z0-9._:-]+$'
+  ReleaseRevision:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9._:-]+$'
+  LambdaReservedConcurrencyPerFunction:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency for the demo-site publisher. Set 0 to use unreserved
+      account concurrency.
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  UseReservedConcurrency: !Not [!Equals [!Ref LambdaReservedConcurrencyPerFunction, 0]]
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'bfu-${AWS::AccountId}-${AWS::Region}-${DeploymentId}-site'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+            BlockedEncryptionTypes: {EncryptionType: [SSE-C]}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  PublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/bridgefu-${DeploymentId}-demo-site-publisher'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-demo-site-publisher'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExactDemoSiteObjects
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${SiteArtifactKey}'
+                Condition:
+                  StringEquals:
+                    s3:VersionId: !Ref SiteArtifactVersion
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt SiteBucket.Arn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${SiteBucket.Arn}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${PublisherLogGroup.Arn}:*'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  PublisherFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PublisherLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-demo-site-publisher'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 120
+      ReservedConcurrentExecutions: !If
+        - UseReservedConcurrency
+        - !Ref LambdaReservedConcurrencyPerFunction
+        - !Ref AWS::NoValue
+      Role: !GetAtt PublisherRole.Arn
+      Code:
+        ZipFile: |
+          import hashlib, io, json, urllib.request, zipfile
+          import boto3
+          s3 = boto3.client("s3")
+          EXPECTED = {"index.html", "style.css", "app.js", "app.js.LEGAL.txt", "third-party-licenses.json"}
+          TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".txt": "text/plain; charset=utf-8"}
+          def respond(event, context, status, reason, data=None):
+              body = json.dumps({"Status": status, "Reason": reason[:512], "PhysicalResourceId": event.get("PhysicalResourceId", "bridgefu-demo-site"), "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"], "NoEcho": True, "Data": data or {}}).encode()
+              request = urllib.request.Request(event["ResponseURL"], data=body, method="PUT", headers={"content-type": "", "content-length": str(len(body))})
+              with urllib.request.urlopen(request, timeout=10): pass
+          def clear(bucket):
+              token = None
+              while True:
+                  args = {"Bucket": bucket, "MaxKeys": 1000}
+                  if token: args["ContinuationToken"] = token
+                  page = s3.list_objects_v2(**args)
+                  objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
+                  if objects: s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+                  if not page.get("IsTruncated"): return
+                  token = page["NextContinuationToken"]
+          def handler(event, context):
+              props = event["ResourceProperties"]
+              bucket = props["DestinationBucket"]
+              try:
+                  if event["RequestType"] == "Delete":
+                      clear(bucket)
+                      respond(event, context, "SUCCESS", "deleted")
+                      return
+                  obj = s3.get_object(Bucket=props["ArtifactBucket"], Key=props["ArtifactKey"], VersionId=props["ArtifactVersion"])
+                  raw = obj["Body"].read(6 * 1024 * 1024)
+                  if len(raw) > 5 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != props["ArtifactSha256"]: raise ValueError("site artifact integrity check failed")
+                  with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                      names = set(archive.namelist())
+                      if names != EXPECTED: raise ValueError("site artifact file contract changed")
+                      for name in sorted(names):
+                          value = archive.read(name)
+                          if len(value) > 2 * 1024 * 1024: raise ValueError("site file is oversized")
+                          suffix = "." + name.rsplit(".", 1)[-1]
+                          s3.put_object(Bucket=bucket, Key=name, Body=value, ContentType=TYPES[suffix], CacheControl="no-store", ServerSideEncryption="AES256")
+                  config = json.dumps({"schema_version": 1, "recipe": "vapi-amazon-connect-screen-pop@1", "vapi_public_key": props["VapiPublicKey"], "vapi_assistant_id": props["VapiAssistantId"], "release_revision": props["ReleaseRevision"]}, separators=(",", ":")).encode()
+                  s3.put_object(Bucket=bucket, Key="config.json", Body=config, ContentType=TYPES[".json"], CacheControl="no-store", ServerSideEncryption="AES256")
+                  respond(event, context, "SUCCESS", "published", {"ObjectCount": 6})
+              except Exception as error:
+                  print(json.dumps({"event": "demo_site_publish_failed", "error_type": type(error).__name__}))
+                  respond(event, context, "FAILED", "demo site publication failed")
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  PublishedSite:
+    Type: Custom::BridgefuDemoSite
+    Properties:
+      ServiceToken: !GetAtt PublisherFunction.Arn
+      DestinationBucket: !Ref SiteBucket
+      ArtifactBucket: !Ref ArtifactBucket
+      ArtifactKey: !Ref SiteArtifactKey
+      ArtifactVersion: !Ref SiteArtifactVersion
+      ArtifactSha256: !Ref SiteArtifactSha256
+      VapiPublicKey: !Ref VapiPublicKey
+      VapiAssistantId: !Ref VapiAssistantId
+      ReleaseRevision: !Ref ReleaseRevision
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'bridgefu-${DeploymentId}-demo-site'
+        Description: !Sub 'Private S3 origin for Bridgefu ${DeploymentId} recipe test page'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  NoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub 'bridgefu-${DeploymentId}-demo-no-cache'
+        Comment: Nonproduction recipe test assets and configuration are never cached.
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig: {CookieBehavior: none}
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig: {HeaderBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub 'bridgefu-${DeploymentId}-demo-security'
+        Comment: Browser isolation for the optional Vapi recipe test page.
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: >-
+              default-src 'self'; base-uri 'self'; frame-ancestors 'none';
+              object-src 'none'; script-src 'self' 'unsafe-eval' blob:;
+              style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:;
+              worker-src 'self' blob:; connect-src 'self' https://api.vapi.ai
+              https://*.vapi.ai wss://*.vapi.ai https://*.daily.co
+              wss://*.daily.co https://*.pluot.blue wss://*.pluot.blue
+            Override: true
+          ContentTypeOptions: {Override: true}
+          FrameOptions: {FrameOption: DENY, Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+            Preload: true
+          XSSProtection: {ModeBlock: true, Override: true, Protection: true}
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: PublishedSite
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Bridgefu ${DeploymentId} nonproduction recipe test page'
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: !Ref NoCachePolicy
+          Compress: true
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt SiteBucket.RegionalDomainName
+            Id: site
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        PriceClass: PriceClass_100
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+Outputs:
+  TestSiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  DistributionId:
+    Value: !Ref Distribution
+  SiteBucketName:
+    Value: !Ref SiteBucket

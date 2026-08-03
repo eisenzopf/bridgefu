@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL NONPRODUCTION full Bridgefu demo. Creates a new Amazon Connect
+  instance and then deploys the vapi-amazon-connect-screen-pop Starter recipe.
+  Normal customer deployments must use template.yaml with an existing instance.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Profile: full-demo-new-connect
+    ProductionDefault: false
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Required nonproduction acknowledgement}
+        Parameters: [DemoAcknowledgement]
+      - Label: {default: Recipe identity and immutable release}
+        Parameters:
+          - DeploymentId
+          - NestedTemplateBaseUrl
+          - ArtifactBucket
+          - PrepareArtifactKey
+          - PrepareArtifactVersion
+          - TransferArtifactKey
+          - TransferArtifactVersion
+          - LookupArtifactKey
+          - LookupArtifactVersion
+          - ProvisionerArtifactKey
+          - ProvisionerArtifactVersion
+          - RuntimeArtifactKey
+          - RuntimeArtifactVersion
+          - RuntimeArtifactSha256
+          - SiteArtifactKey
+          - SiteArtifactVersion
+          - SiteArtifactSha256
+          - BridgefuImageUri
+          - BridgefuRegistryType
+          - BridgefuImageRepositoryArn
+      - Label: {default: Vapi and public voice edge}
+        Parameters:
+          - VapiApiKeySecretArn
+          - VapiModel
+          - VapiVoiceId
+          - EnableDemoSite
+          - VapiPublicKey
+          - PublicHostedZoneId
+          - SipHostname
+          - SipSecurity
+          - VapiSignalingCidr1
+          - VapiSignalingCidr2
+          - VapiSignalingCidr3
+          - MediaSourceCidr
+      - Label: {default: Bounded demo capacity and alerts}
+        Parameters:
+          - InstanceType
+          - MaxConcurrentCalls
+          - RootVolumeGiB
+          - DataVolumeGiB
+          - ContextTtlSeconds
+          - LambdaReservedConcurrencyPerFunction
+          - LogRetentionDays
+          - AlarmEmail
+    ParameterLabels:
+      DemoAcknowledgement: {default: Confirm this is a disposable/nonproduction Connect environment}
+
+Parameters:
+  DemoAcknowledgement:
+    Type: String
+    Default: NOT_ACKNOWLEDGED
+    AllowedValues: [NOT_ACKNOWLEDGED, CREATE_NONPRODUCTION_CONNECT]
+    Description: >-
+      Select CREATE_NONPRODUCTION_CONNECT only after reviewing Amazon Connect
+      quotas, charges, identity, telephony, recording, and deletion implications.
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+    Description: >-
+      Unique lowercase ID. The new Connect alias will be this value followed by
+      -connect and must not already exist.
+  NestedTemplateBaseUrl:
+    Type: String
+    Description: Immutable HTTPS prefix for the release CloudFormation directory; no trailing slash.
+    AllowedPattern: '^https://\S+[^/\s]$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  PrepareArtifactKey:
+    Type: String
+  PrepareArtifactVersion:
+    Type: String
+  TransferArtifactKey:
+    Type: String
+  TransferArtifactVersion:
+    Type: String
+  LookupArtifactKey:
+    Type: String
+  LookupArtifactVersion:
+    Type: String
+  ProvisionerArtifactKey:
+    Type: String
+  ProvisionerArtifactVersion:
+    Type: String
+  RuntimeArtifactKey:
+    Type: String
+  RuntimeArtifactVersion:
+    Type: String
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  SiteArtifactKey:
+    Type: String
+    Default: unused
+  SiteArtifactVersion:
+    Type: String
+    Default: unused
+  SiteArtifactSha256:
+    Type: String
+    Default: '0000000000000000000000000000000000000000000000000000000000000000'
+    AllowedPattern: '^[0-9a-f]{64}$'
+  BridgefuImageUri:
+    Type: String
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuRegistryType:
+    Type: String
+    Default: PrivateEcr
+    AllowedValues: [PrivateEcr, Anonymous]
+  BridgefuImageRepositoryArn:
+    Type: String
+    Default: arn:aws:ecr:us-east-1:000000000000:repository/unused
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  VapiApiKeySecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  VapiModel:
+    Type: String
+    Default: gpt-4.1-mini
+    AllowedPattern: '^[A-Za-z0-9._:/-]{1,128}$'
+  VapiVoiceId:
+    Type: String
+    Default: Elliot
+    AllowedPattern: '^[A-Za-z0-9._:/-]{1,128}$'
+  EnableDemoSite:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  VapiPublicKey:
+    Type: String
+    Default: disabled-test-public-key
+    MinLength: 8
+    MaxLength: 256
+    AllowedPattern: '^[A-Za-z0-9._~:/+=-]+$'
+  PublicHostedZoneId:
+    Type: String
+    Default: none
+    AllowedPattern: '^(none|[A-Z0-9]+)$'
+  SipHostname:
+    Type: String
+    Default: unused.bridgefu.invalid
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  VapiSignalingCidr1:
+    Type: String
+    Default: 44.229.228.186/32
+  VapiSignalingCidr2:
+    Type: String
+    Default: 44.238.177.138/32
+  VapiSignalingCidr3:
+    Type: String
+    Description: Fixed /32 NAT address of the packaged qualification runner.
+  MediaSourceCidr:
+    Type: String
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues: [t4g.medium, t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large, m7g.xlarge]
+  MaxConcurrentCalls:
+    Type: Number
+    Default: 25
+    MinValue: 1
+    MaxValue: 100
+  RootVolumeGiB:
+    Type: Number
+    Default: 12
+    MinValue: 12
+    MaxValue: 100
+  DataVolumeGiB:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 1024
+  ContextTtlSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 86400
+  LambdaReservedConcurrencyPerFunction:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency for every recipe Lambda function. The disposable
+      proof defaults to 0 so it works in accounts whose initial Lambda
+      concurrency quota is 10.
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+  AlarmEmail:
+    Type: String
+    Default: ''
+
+Rules:
+  ExplicitDemoAcknowledgement:
+    Assertions:
+      - Assert: !Equals [!Ref DemoAcknowledgement, CREATE_NONPRODUCTION_CONNECT]
+        AssertDescription: >-
+          Full demo deployment is disabled until CREATE_NONPRODUCTION_CONNECT is
+          explicitly selected. Use template.yaml for an existing Connect instance.
+  PrivateEcrRequiresRepositoryArn:
+    RuleCondition: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BridgefuImageRepositoryArn, arn:aws:ecr:us-east-1:000000000000:repository/unused]]
+        AssertDescription: PrivateEcr requires the exact ECR repository ARN.
+  SecureSipRequiresPublicDns:
+    RuleCondition: !Equals [!Ref SipSecurity, sips_srtp]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicHostedZoneId, none]]
+        AssertDescription: SIPS/SRTP requires a public Route 53 hosted zone and hostname.
+
+Conditions:
+  CreateDemoSite: !Equals [!Ref EnableDemoSite, 'true']
+
+Resources:
+  DemoConnect:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/demo-connect.yaml'
+      TimeoutInMinutes: 45
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        ProjectTag: bridgefu-recipe
+        ManagedByTag: bridgefu-cloudformation
+        ExecutionIdTag: !Ref DeploymentId
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+        - {Key: BridgefuEnvironment, Value: demo}
+
+  RecipeApplication:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/template.yaml'
+      TimeoutInMinutes: 90
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        RuntimeProfile: Starter
+        NestedTemplateBaseUrl: !Ref NestedTemplateBaseUrl
+        ArtifactBucket: !Ref ArtifactBucket
+        PrepareArtifactKey: !Ref PrepareArtifactKey
+        PrepareArtifactVersion: !Ref PrepareArtifactVersion
+        TransferArtifactKey: !Ref TransferArtifactKey
+        TransferArtifactVersion: !Ref TransferArtifactVersion
+        LookupArtifactKey: !Ref LookupArtifactKey
+        LookupArtifactVersion: !Ref LookupArtifactVersion
+        ProvisionerArtifactKey: !Ref ProvisionerArtifactKey
+        ProvisionerArtifactVersion: !Ref ProvisionerArtifactVersion
+        RuntimeArtifactKey: !Ref RuntimeArtifactKey
+        RuntimeArtifactVersion: !Ref RuntimeArtifactVersion
+        RuntimeArtifactSha256: !Ref RuntimeArtifactSha256
+        SiteArtifactKey: !Ref SiteArtifactKey
+        SiteArtifactVersion: !Ref SiteArtifactVersion
+        SiteArtifactSha256: !Ref SiteArtifactSha256
+        BridgefuImageUri: !Ref BridgefuImageUri
+        BridgefuRegistryType: !Ref BridgefuRegistryType
+        BridgefuImageRepositoryArn: !Ref BridgefuImageRepositoryArn
+        ConnectInstanceArn: !GetAtt DemoConnect.Outputs.ConnectInstanceArn
+        TargetContactFlowArn: !GetAtt DemoConnect.Outputs.TargetContactFlowArn
+        VapiApiKeySecretArn: !Ref VapiApiKeySecretArn
+        VapiModel: !Ref VapiModel
+        VapiVoiceId: !Ref VapiVoiceId
+        EnableDemoSite: !Ref EnableDemoSite
+        VapiPublicKey: !Ref VapiPublicKey
+        RetainVapiResourcesOnDelete: 'false'
+        PublicHostedZoneId: !Ref PublicHostedZoneId
+        SipHostname: !Ref SipHostname
+        SipSecurity: !Ref SipSecurity
+        VapiSignalingCidr1: !Ref VapiSignalingCidr1
+        VapiSignalingCidr2: !Ref VapiSignalingCidr2
+        VapiSignalingCidr3: !Ref VapiSignalingCidr3
+        MediaSourceCidr: !Ref MediaSourceCidr
+        NetworkMode: NewVpc
+        InstanceType: !Ref InstanceType
+        MaxConcurrentCalls: !Ref MaxConcurrentCalls
+        RootVolumeGiB: !Ref RootVolumeGiB
+        DataVolumeGiB: !Ref DataVolumeGiB
+        ContextTtlSeconds: !Ref ContextTtlSeconds
+        LambdaReservedConcurrencyPerFunction: !Ref LambdaReservedConcurrencyPerFunction
+        DataRetentionMode: TestDelete
+        LogRetentionDays: !Ref LogRetentionDays
+        AlarmEmail: !Ref AlarmEmail
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-cloudformation}
+        - {Key: BridgefuExecutionId, Value: !Ref DeploymentId}
+        - {Key: BridgefuEnvironment, Value: demo}
+
+Outputs:
+  Recipe:
+    Value: vapi-amazon-connect-screen-pop@1
+  SupportTier:
+    Value: supported
+  ConnectInstanceArn:
+    Value: !GetAtt DemoConnect.Outputs.ConnectInstanceArn
+  ConnectLoginUrl:
+    Value: !GetAtt DemoConnect.Outputs.ConnectLoginUrl
+  AgentUsername:
+    Value: !GetAtt DemoConnect.Outputs.AgentUsername
+  AgentCredentialSecretArn:
+    Description: ARN only; retrieve the generated password through an authorized Secrets Manager session.
+    Value: !GetAtt DemoConnect.Outputs.AgentCredentialSecretArn
+  SipUri:
+    Value: !GetAtt RecipeApplication.Outputs.SipUri
+  VapiAssistantId:
+    Value: !GetAtt RecipeApplication.Outputs.VapiAssistantId
+  DemoSiteUrl:
+    Condition: CreateDemoSite
+    Value: !GetAtt RecipeApplication.Outputs.DemoSiteUrl
+  ConnectWrapperFlowArn:
+    Value: !GetAtt RecipeApplication.Outputs.ConnectWrapperFlowArn
+  DashboardUrl:
+    Value: !GetAtt RecipeApplication.Outputs.DashboardUrl
+  SsmStartSessionCommand:
+    Value: !GetAtt RecipeApplication.Outputs.SsmStartSessionCommand
+  DestructionWarning:
+    Value: >-
+      Delete this root stack only after removing manually added Connect resources;
+      stack deletion intentionally deletes the demo Connect instance and recipe data.

@@ -642,6 +642,7 @@ async fn run_direct_browser_amazon_case(terminal: TerminalSide) {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -1410,6 +1411,7 @@ mod direct_assistant_handoff {
                     ("X-Correlation-Id".into(), "correlation_id".into()),
                     ("X-Account-Tier".into(), "account_tier".into()),
                 ]),
+                ..ContextPolicy::default()
             }),
             None,
             None,

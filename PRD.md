@@ -82,8 +82,8 @@ instance role — never from this file.
 ```yaml
 aws:
   region: us-west-2
-  instance_id: 83a72e61-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  contact_flow_id: 2a3b3059-xxxx-xxxx-xxxx-xxxxxxxxxxxx   # agent/screen-pop flow
+  instance_id: 11111111-1111-1111-1111-111111111111
+  contact_flow_id: 22222222-2222-2222-2222-222222222222   # agent/screen-pop flow
 
 sip:
   bind_ip: 0.0.0.0

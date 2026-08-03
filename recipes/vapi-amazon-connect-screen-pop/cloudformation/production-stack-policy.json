@@ -1,0 +1,26 @@
+{
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "Update:*",
+      "Principal": "*",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "Update:Replace",
+        "Update:Delete"
+      ],
+      "Principal": "*",
+      "Resource": [
+        "LogicalResourceId/Network",
+        "LogicalResourceId/HandoffService",
+        "LogicalResourceId/ConnectIntegration",
+        "LogicalResourceId/StarterRuntime",
+        "LogicalResourceId/HighAvailabilityRuntime",
+        "LogicalResourceId/VapiResources"
+      ]
+    }
+  ]
+}

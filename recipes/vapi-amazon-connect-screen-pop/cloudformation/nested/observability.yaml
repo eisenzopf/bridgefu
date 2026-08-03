@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS-native dashboard, bounded log metrics, and actionable alarms for the
+  Bridgefu Vapi to Amazon Connect screen-pop recipe.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: observability
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ApiId:
+    Type: String
+    MinLength: 1
+  HandoffTableName:
+    Type: String
+    MinLength: 3
+  PrepareFunctionName:
+    Type: String
+  TransferFunctionName:
+    Type: String
+  LookupFunctionName:
+    Type: String
+  ProvisionerFunctionName:
+    Type: String
+  PrepareLogGroupName:
+    Type: String
+  TransferLogGroupName:
+    Type: String
+  LookupLogGroupName:
+    Type: String
+  RuntimeInstanceId:
+    Type: String
+  RuntimeLogGroupName:
+    Type: String
+  SipSecurity:
+    Type: String
+    Default: sips_srtp
+    AllowedValues: [sips_srtp, sip_rtp]
+  MaxConcurrentCalls:
+    Type: Number
+    MinValue: 1
+    MaxValue: 1000
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address. AWS requires the recipient to confirm the subscription.
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+  SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
+
+Resources:
+  RecipeAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bridgefu-${DeploymentId}-alarms'
+      DisplayName: Bridgefu recipe alarms
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref RecipeAlarmTopic
+
+  PrepareFailureMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref PrepareLogGroupName
+      FilterPattern: '{ $.event = "prepare_handoff" && $.result != "created" && $.result != "replayed" }'
+      MetricTransformations:
+        - MetricNamespace: Bridgefu/Recipe
+          MetricName: !Sub 'PrepareFailures-${DeploymentId}'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  TransferFailureMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TransferLogGroupName
+      FilterPattern: '{ $.event = "transfer_destination" && $.result != "reserved" }'
+      MetricTransformations:
+        - MetricNamespace: Bridgefu/Recipe
+          MetricName: !Sub 'TransferFailures-${DeploymentId}'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  ContextUnavailableMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LookupLogGroupName
+      FilterPattern: '{ $.event = "connect_lookup" && $.result != "available" }'
+      MetricTransformations:
+        - MetricNamespace: Bridgefu/Recipe
+          MetricName: !Sub 'ContextUnavailable-${DeploymentId}'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  RuntimeErrorMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RuntimeLogGroupName
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricNamespace: Bridgefu/Recipe
+          MetricName: !Sub 'RuntimeErrors-${DeploymentId}'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  PrepareErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-prepare-errors'
+      AlarmDescription: >-
+        Prepare Lambda errors. See runbooks/handoff-context.md; begin with the
+        function logs and Errors/Duration metrics.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref PrepareFunctionName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  TransferErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-transfer-errors'
+      AlarmDescription: >-
+        Transfer Lambda errors. See runbooks/handoff-context.md; check the
+        Bridgefu readiness endpoint before retrying.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref TransferFunctionName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  LookupErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-lookup-errors'
+      AlarmDescription: >-
+        Connect lookup errors; see runbooks/amazon-connect.md. Calls fail open,
+        but agent context may be unavailable.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref LookupFunctionName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  ProvisionerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-vapi-provisioner-errors'
+      AlarmDescription: >-
+        Vapi custom-resource errors. See runbooks/vapi-provisioning.md; inspect
+        bounded result logs and never print events or Vapi response bodies.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ProvisionerFunctionName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  TransferThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-transfer-throttles'
+      AlarmDescription: Transfer requests are throttled; see runbooks/capacity.md for concurrency and abuse checks.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref TransferFunctionName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-api-5xx'
+      AlarmDescription: Handoff API server errors; see runbooks/handoff-context.md for route and Lambda checks.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - {Name: ApiId, Value: !Ref ApiId}
+        - {Name: Stage, Value: '$default'}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  DynamoThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-dynamodb-throttles'
+      AlarmDescription: Handoff table requests are throttled; see runbooks/handoff-context.md and runbooks/capacity.md.
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - {Name: TableName, Value: !Ref HandoffTableName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  TransferContractFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-transfer-contract-failures'
+      AlarmDescription: Transfer contract failure; see runbooks/handoff-context.md for validation, replay, and reservation checks.
+      Namespace: Bridgefu/Recipe
+      MetricName: !Sub 'TransferFailures-${DeploymentId}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  ContextUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-context-unavailable'
+      AlarmDescription: Screen-pop context unavailable; voice fails open. See runbooks/handoff-context.md and runbooks/amazon-connect.md.
+      Namespace: Bridgefu/Recipe
+      MetricName: !Sub 'ContextUnavailable-${DeploymentId}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  RuntimeReadinessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-runtime-not-ready'
+      AlarmDescription: Bridgefu is not ready; see runbooks/deployment-readiness.md and begin with SSM status.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_process_ready
+      Dimensions:
+        - {Name: deployment, Value: !Ref DeploymentId}
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  RuntimeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-runtime-errors'
+      AlarmDescription: Bridgefu emitted an error event; see runbooks/deployment-readiness.md and runbooks/cleanup-backlog.md.
+      Namespace: Bridgefu/Recipe
+      MetricName: !Sub 'RuntimeErrors-${DeploymentId}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  CleanupBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-cleanup-backlog'
+      AlarmDescription: Amazon Connect cleanup authority remains pending; see runbooks/cleanup-backlog.md before restarting or replacing the host.
+      Namespace: Bridgefu/Runtime
+      MetricName: bridgefu_amazon_durable_cleanups_pending
+      Dimensions:
+        - {Name: deployment, Value: !Ref DeploymentId}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  CertificateExpiryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: SecureSip
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-certificate-expiry'
+      AlarmDescription: SIPS certificate is missing or below 21 days; see runbooks/dns-certificate.md.
+      Namespace: Bridgefu/Runtime
+      MetricName: CertificateDaysToExpiry
+      Dimensions:
+        - {Name: deployment, Value: !Ref DeploymentId}
+      Statistic: Minimum
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 21
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  RuntimeCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${DeploymentId}-cpu-capacity'
+      AlarmDescription: Starter CPU exceeded 80 percent for 15 minutes; see runbooks/capacity.md.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - {Name: InstanceId, Value: !Ref RuntimeInstanceId}
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RecipeAlarmTopic]
+      OKActions: [!Ref RecipeAlarmTopic]
+
+  RecipeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'bridgefu-${DeploymentId}'
+      DashboardBody: !Sub |
+        {
+          "start": "-PT6H",
+          "periodOverride": "inherit",
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {"markdown": "# Bridgefu ${DeploymentId}\nRecipe `vapi-amazon-connect-screen-pop@1` — Starter capacity: ${MaxConcurrentCalls} calls. Use alarm descriptions to open the matching runbook."}
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "Handoff requests and failures", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiId", "${ApiId}", "Stage", "$default"],
+                  [".", "4xx", ".", ".", ".", "."],
+                  [".", "5xx", ".", ".", ".", "."],
+                  ["Bridgefu/Recipe", "PrepareFailures-${DeploymentId}"],
+                  [".", "TransferFailures-${DeploymentId}"],
+                  [".", "ContextUnavailable-${DeploymentId}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "Lambda errors and throttles", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PrepareFunctionName}"],
+                  [".", ".", ".", "${TransferFunctionName}"],
+                  [".", ".", ".", "${LookupFunctionName}"],
+                  [".", ".", ".", "${ProvisionerFunctionName}"],
+                  [".", "Throttles", ".", "${TransferFunctionName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "Setup latency", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiId", "${ApiId}", "Stage", "$default", {"stat": "p95"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${PrepareFunctionName}", {"stat": "p95"}],
+                  [".", ".", ".", "${TransferFunctionName}", {"stat": "p95"}],
+                  [".", ".", ".", "${LookupFunctionName}", {"stat": "p95"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "DynamoDB dependency", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/DynamoDB", "ThrottledRequests", "TableName", "${HandoffTableName}"],
+                  [".", "SystemErrors", ".", "."],
+                  [".", "SuccessfulRequestLatency", "Operation", "GetItem", "TableName", "${HandoffTableName}", {"stat": "Average", "yAxis": "right"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "Bridgefu readiness, calls, and cleanup", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  ["Bridgefu/Runtime", "bridgefu_process_ready", "deployment", "${DeploymentId}", {"stat": "Minimum"}],
+                  [".", "bridgefu_gateway_native_active_routes", ".", ".", {"stat": "Maximum"}],
+                  [".", "bridgefu_amazon_durable_cleanups_pending", ".", ".", {"stat": "Maximum"}],
+                  ["Bridgefu/Recipe", "RuntimeErrors-${DeploymentId}", {"stat": "Sum"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "region": "${AWS::Region}", "title": "Host and certificate capacity", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RuntimeInstanceId}", {"stat": "Average"}],
+                  [".", "StatusCheckFailed", ".", ".", {"stat": "Maximum"}],
+                  ["Bridgefu/Runtime", "CertificateDaysToExpiry", "deployment", "${DeploymentId}", {"stat": "Minimum", "yAxis": "right"}]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Value: !Ref RecipeDashboard
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${RecipeDashboard}'
+  AlarmTopicArn:
+    Value: !Ref RecipeAlarmTopic

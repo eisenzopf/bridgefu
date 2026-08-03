@@ -16,6 +16,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: bridgefu
+      - name: Enforce neutral repository naming
+        working-directory: bridgefu
+        run: |
+          bash scripts/check-neutral-naming.sh --self-test
+          bash scripts/check-neutral-naming.sh
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.15.6
@@ -24,17 +29,99 @@ jobs:
         working-directory: bridgefu
         run: |
           python3 -m pip install --disable-pip-version-check \
-            'jsonschema==4.25.1' 'PyYAML==6.0.2'
+            'jsonschema==4.25.1' 'PyYAML==6.0.2' 'cfn-lint==1.53.3'
           python3 scripts/check-config-schema.py
+      - name: Validate canonical recipe application and CloudFormation
+        working-directory: bridgefu
+        run: |
+          python3 -m unittest discover \
+            -s recipes/vapi-amazon-connect-screen-pop/tests/unit -v
+          python3 scripts/check-recipe-docs.py
+          cfn-lint \
+            recipes/vapi-amazon-connect-screen-pop/cloudformation/*.yaml \
+            recipes/vapi-amazon-connect-screen-pop/cloudformation/nested/*.yaml
+          curl --fail --location --silent --show-error \
+            https://github.com/aws-cloudformation/cloudformation-guard/releases/download/3.2.0/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz \
+            --output target/cfn-guard.tar.gz
+          echo '9f8c4d9f15f7dd54a37ea70a5237ba00aba682fb1e6521a744d12259961dfc13  target/cfn-guard.tar.gz' \
+            | sha256sum --check
+          tar --extract --gzip --file target/cfn-guard.tar.gz --directory target
+          for template in \
+            recipes/vapi-amazon-connect-screen-pop/cloudformation/*.yaml \
+            recipes/vapi-amazon-connect-screen-pop/cloudformation/nested/*.yaml; do
+            target/cfn-guard-v3-x86_64-ubuntu-latest/cfn-guard validate \
+              --data "$template" \
+              --rules recipes/vapi-amazon-connect-screen-pop/cloudformation/guard/production.guard \
+              --show-summary fail
+          done
+          python3 scripts/build-recipe-lambdas.py \
+            --output target/recipe-lambdas-first
+          python3 scripts/build-recipe-lambdas.py \
+            --output target/recipe-lambdas-second
+          diff -r target/recipe-lambdas-first target/recipe-lambdas-second
+          python3 scripts/build-recipe-runtime.py \
+            --output target/recipe-runtime-first
+          python3 scripts/build-recipe-runtime.py \
+            --output target/recipe-runtime-second
+          diff -r target/recipe-runtime-first target/recipe-runtime-second
+          python3 scripts/build-recipe-demo-site.py \
+            --output target/recipe-demo-site-first
+          python3 scripts/build-recipe-demo-site.py \
+            --output target/recipe-demo-site-second
+          diff -r target/recipe-demo-site-first target/recipe-demo-site-second
+          python3 scripts/build-recipe-release.py \
+            --image-uri example.invalid/bridgefu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --output target/recipe-release-first
+          python3 scripts/build-recipe-release.py \
+            --image-uri example.invalid/bridgefu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --output target/recipe-release-second
+          diff -r target/recipe-release-first target/recipe-release-second
+          mkdir -p target/recipe-signing-test
+          openssl genpkey -algorithm Ed25519 \
+            -out target/recipe-signing-test/private.pem
+          openssl pkey -in target/recipe-signing-test/private.pem -pubout \
+            -out target/recipe-signing-test/public.pem
+          python3 scripts/build-recipe-release.py \
+            --image-uri example.invalid/bridgefu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --output target/recipe-release-signed \
+            --signing-key target/recipe-signing-test/private.pem \
+            --signing-public-key target/recipe-signing-test/public.pem
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey target/recipe-release-signed/manifest.pub \
+            -in target/recipe-release-signed/manifest.json \
+            -sigfile target/recipe-release-signed/manifest.sig
+          test "$(wc -c < target/recipe-release-signed/manifest.sig | tr -d ' ')" = 64
+          shellcheck -e SC1091,SC2154 \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bootstrap.sh \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-cert-refresh \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-cert-reload \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-ha-cert-refresh \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-ha-cert-reload \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-ha-scale-protection \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-load-secrets \
+            recipes/vapi-amazon-connect-screen-pop/runtime/bridgefu-pull-image \
+            recipes/vapi-amazon-connect-screen-pop/runtime/ha-host-bootstrap.sh
       - name: Validate every Compose scenario
         working-directory: bridgefu
         run: |
-          for profile in standardcharter generic telnyx uctp moqt cluster; do
+          for profile in reference-tenant generic telnyx uctp moqt cluster; do
             docker compose --profile "${profile}" config --quiet
           done
       - name: Terraform formatting
         working-directory: bridgefu
-        run: terraform fmt -check -recursive deploy/terraform
+        run: terraform fmt -check -recursive deploy/terraform recipes/vapi-amazon-connect-screen-pop/terraform
+      - name: Validate and contract-test the flagship AWS Starter Terraform module
+        working-directory: bridgefu/recipes/vapi-amazon-connect-screen-pop/terraform/modules/aws-starter
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+          terraform test -no-color
+      - name: Validate and contract-test the flagship AWS HA Terraform module
+        working-directory: bridgefu/recipes/vapi-amazon-connect-screen-pop/terraform/modules/aws-ha
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+          terraform test -no-color
       - name: Validate AWS Terraform without applying
         working-directory: bridgefu/deploy/terraform/aws
         run: |
@@ -86,8 +173,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: bridgefu
-      - name: StandardCharter protected smoke artifact validation
-        run: bash scripts/check-standardcharter-smoke-artifacts.sh
+      - name: ReferenceTenant protected smoke artifact validation
+        run: bash scripts/check-reference-tenant-smoke-artifacts.sh
         working-directory: bridgefu
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pin
         with:

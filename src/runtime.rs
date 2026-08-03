@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use bridgefu::call_service::{
     CallExecutionSupervisor, CallServiceRuntime, OutboundProfileResolver, ProviderLegExecutor,
 };
-use bridgefu::standardcharter_canary::StandardCharterCanaryPolicy;
+use bridgefu::reference_tenant_canary::ReferenceTenantCanaryPolicy;
 use rvoip_amazon_connect::AmazonConnectAdapter;
 use rvoip_auth_core::BearerValidator;
 use rvoip_core::adapter::ConnectionAdapter;
@@ -30,6 +30,7 @@ use rvoip_webrtc::{WebRtcServer, WebRtcServerBuilder};
 use tokio::sync::Mutex;
 
 use bridgefu::gateway_native_ingress::SipEgressProfileConfig;
+use bridgefu::recipe_admission::RecipeSipAdmissionCatalog;
 
 use crate::config::{GenericBridgeCfg, RuntimeCfg};
 use crate::context::ContextPolicy;
@@ -72,7 +73,8 @@ pub struct GenericBridgeStart<'a> {
     pub webrtc_bearer_validator: Arc<dyn BearerValidator>,
     pub webrtc_session_binding: Arc<dyn WsBearerSessionBinding>,
     pub context_policy: &'a ContextPolicy,
-    pub standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+    pub reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+    pub recipe_sip_admissions: Option<Arc<RecipeSipAdmissionCatalog>>,
     pub provider_executor: Arc<dyn ProviderLegExecutor>,
     pub outbound_profiles: Arc<dyn OutboundProfileResolver>,
     pub amazon_connect: Arc<AmazonConnectAdapter>,
@@ -98,7 +100,8 @@ impl GenericBridgeRuntime {
             webrtc_bearer_validator,
             webrtc_session_binding,
             context_policy,
-            standardcharter_canary,
+            reference_tenant_canary,
+            recipe_sip_admissions,
             provider_executor,
             outbound_profiles,
             amazon_connect,
@@ -140,15 +143,17 @@ impl GenericBridgeRuntime {
         // immediate lifecycle event always has an authoritative consumer.
         let orchestrator = Orchestrator::new(CoreConfig::default());
         let execution =
-            CallExecutionSupervisor::install_with_leg_executors_context_canary_broadcast_and_outbound_profiles(
+            CallExecutionSupervisor::install_with_leg_executors_context_canary_recipe_broadcast_profiles_and_private_egress(
                 Arc::clone(&orchestrator),
                 call_runtime,
                 provider_executor,
                 Some(Arc::clone(&amazon_connect)),
                 Arc::new(context_policy.clone()),
-                standardcharter_canary,
+                reference_tenant_canary,
+                recipe_sip_admissions,
                 None,
                 outbound_profiles,
+                None,
                 admission_capacity,
                 setup_timeout,
             )
@@ -536,6 +541,7 @@ mod tests {
                 ("X-Account-Tier".into(), "account_tier".into()),
                 ("X-Bridgefu-Event".into(), "broadcast_event".into()),
             ]),
+            ..ContextPolicy::default()
         };
         let policy = sip_inbound_context_policy(&context).unwrap();
         assert_eq!(policy.allowed_header_count(), 2);
@@ -545,6 +551,7 @@ mod tests {
     fn invalid_bridgefu_context_policy_never_reaches_sip_listener_startup() {
         let context = ContextPolicy {
             allow_headers: BTreeMap::from([("Authorization".into(), "credential".into())]),
+            ..ContextPolicy::default()
         };
         assert!(sip_inbound_context_policy(&context).is_err());
     }

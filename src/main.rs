@@ -12,6 +12,7 @@ mod imds;
 mod moq_relay_role;
 mod observability;
 mod process_role;
+mod recipe_admin;
 mod runtime;
 mod screen_pop_evidence;
 
@@ -24,6 +25,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bridgefu::context;
+use bridgefu::recipes::{
+    AmazonConnectMedia, CompiledRecipe, RecipeCatalog, RecipeEndpointSpec, RecipeSource,
+    SipAdmissionMode, SipSecurity,
+};
 use clap::{Parser, Subcommand};
 use metrics_exporter_prometheus::PrometheusHandle;
 use rvoip_amazon_connect::ConnectScreenPopServer;
@@ -69,6 +74,11 @@ enum Command {
     Validate,
     /// Print the effective configuration with all secrets redacted.
     PrintEffectiveConfig,
+    /// Inspect and validate immutable Bridgefu Recipe packages.
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
+    },
     /// Probe the local liveness endpoint without loading configuration.
     Healthcheck {
         /// Local operations endpoint to probe.
@@ -80,6 +90,112 @@ enum Command {
         /// Per-operation network timeout in milliseconds.
         #[arg(long, default_value_t = 2_500)]
         timeout_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum RecipeCommand {
+    /// List recipe packages that can be selected on this installation.
+    Available {
+        /// External recipe package directory. Repeat for more than one.
+        #[arg(long = "package", value_name = "DIRECTORY")]
+        packages: Vec<PathBuf>,
+    },
+    /// List embedded recipes and any explicitly supplied external packages.
+    List {
+        /// External recipe package directory. Repeat for more than one.
+        #[arg(long = "package", value_name = "DIRECTORY")]
+        packages: Vec<PathBuf>,
+        /// List configured instances from --config instead of available packages.
+        #[arg(long)]
+        configured: bool,
+    },
+    /// Print one unresolved, credential-free recipe manifest.
+    Show {
+        /// Exact builtin:name@version or external:name@version selector.
+        selector: String,
+        /// External recipe package directory. Repeat for more than one.
+        #[arg(long = "package", value_name = "DIRECTORY")]
+        packages: Vec<PathBuf>,
+    },
+    /// Compile one recipe with a YAML values file and print its fingerprint.
+    Validate {
+        /// Exact builtin:name@version or external:name@version selector.
+        selector: String,
+        /// YAML mapping containing the recipe's typed input values.
+        #[arg(long, value_name = "FILE")]
+        values: PathBuf,
+        /// External recipe package directory. Repeat for more than one.
+        #[arg(long = "package", value_name = "DIRECTORY")]
+        packages: Vec<PathBuf>,
+    },
+    /// Create a safe, editable starter directory without overwriting files.
+    Init {
+        /// Exact builtin:name@version or external:name@version selector.
+        selector: String,
+        /// New directory to create.
+        #[arg(long, value_name = "DIRECTORY")]
+        output: PathBuf,
+        /// External recipe package directory. Repeat for more than one.
+        #[arg(long = "package", value_name = "DIRECTORY")]
+        packages: Vec<PathBuf>,
+    },
+    /// Explain one configured recipe instance with credentials redacted.
+    Explain {
+        /// Instance name under the config's recipes mapping.
+        instance: String,
+    },
+    /// Create and review an AWS CloudFormation change set; execution is opt-in.
+    Deploy {
+        /// Deployment descriptor created from a published recipe release.
+        deployment: PathBuf,
+        /// Starter Production or High Availability infrastructure profile.
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+        /// Execute the reviewed change set after it is printed.
+        #[arg(long)]
+        execute: bool,
+        /// Required with --execute; must exactly equal the stack name.
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Explicit review name; with --execute, reuses that exact available review.
+        #[arg(long)]
+        change_set_name: Option<String>,
+    },
+    /// Verify identity, release, target, quotas, DNS, and account guardrails.
+    Preflight {
+        /// Deployment descriptor created from a published recipe release.
+        deployment: PathBuf,
+        /// Starter Production or High Availability infrastructure profile.
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+    },
+    /// Print redacted CloudFormation deployment status and safe outputs.
+    Status {
+        deployment: PathBuf,
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+    },
+    /// Check stack ownership, resources, required outputs, and active alarms.
+    Doctor {
+        deployment: PathBuf,
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+    },
+    /// Run the nonbillable structural deployment qualification.
+    Test {
+        deployment: PathBuf,
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+    },
+    /// Delete an exactly owned recipe stack after explicit confirmation.
+    Destroy {
+        deployment: PathBuf,
+        #[arg(long, value_enum, default_value_t = recipe_admin::DeploymentProfile::Starter)]
+        profile: recipe_admin::DeploymentProfile,
+        /// Must exactly equal the stack name in the deployment descriptor.
+        #[arg(long)]
+        confirm: String,
     },
 }
 
@@ -96,6 +212,7 @@ fn main() -> Result<()> {
             print!("{}", config::Config::redacted_effective_yaml(&args.config)?);
             Ok(())
         }
+        Command::Recipe { command } => run_recipe_command(command, &args.config),
         // Container liveness must work in a package-free runtime before a
         // config file or deployment secret is mounted. Dispatching before
         // constructing Tokio also keeps each frequent probe to one thread.
@@ -116,6 +233,361 @@ fn main() -> Result<()> {
                 .build()
                 .context("building the Bridgefu Tokio runtime")?;
             runtime.block_on(run(args))
+        }
+    }
+}
+
+fn run_recipe_command(command: RecipeCommand, config_path: &std::path::Path) -> Result<()> {
+    match command {
+        RecipeCommand::Available { packages }
+        | RecipeCommand::List {
+            packages,
+            configured: false,
+        } => {
+            let catalog = RecipeCatalog::with_external_paths(&packages)?;
+            for package in catalog.iter() {
+                let source = match package.source() {
+                    RecipeSource::Builtin => "builtin",
+                    RecipeSource::External(_) => "external",
+                };
+                let manifest = package.manifest();
+                println!(
+                    "{source}:{}@{}\t{}\t{}",
+                    manifest.metadata.name,
+                    manifest.metadata.version,
+                    package.effective_support(),
+                    manifest.metadata.title
+                );
+            }
+            Ok(())
+        }
+        RecipeCommand::List {
+            configured: true, ..
+        } => {
+            let config = config::Config::load(config_path)?;
+            for (instance, recipe) in &config.compiled_recipes {
+                println!(
+                    "{instance}\t{}@{}\t{}\t{}",
+                    recipe.name, recipe.version, recipe.support, recipe.fingerprint
+                );
+            }
+            Ok(())
+        }
+        RecipeCommand::Show { selector, packages } => {
+            let catalog = RecipeCatalog::with_external_paths(&packages)?;
+            let package = catalog.resolve(&selector)?;
+            print!("{}", serde_yaml::to_string(package.manifest())?);
+            Ok(())
+        }
+        RecipeCommand::Validate {
+            selector,
+            values,
+            packages,
+        } => {
+            let catalog = RecipeCatalog::with_external_paths(&packages)?;
+            let package = catalog.resolve(&selector)?;
+            let metadata = std::fs::metadata(&values)
+                .with_context(|| format!("reading recipe values file {}", values.display()))?;
+            anyhow::ensure!(
+                metadata.len() <= 256 * 1024,
+                "recipe values file exceeds the size limit"
+            );
+            let raw = std::fs::read_to_string(&values)
+                .with_context(|| format!("reading recipe values file {}", values.display()))?;
+            let input_values = serde_yaml::from_str(&raw)
+                .with_context(|| format!("parsing recipe values file {}", values.display()))?;
+            let compiled = package.compile(&input_values)?;
+            println!("recipe: {}@{}", compiled.name, compiled.version);
+            println!("support: {}", compiled.support);
+            println!("bridges: {}", compiled.spec.bridges.len());
+            println!("fingerprint: {}", compiled.fingerprint);
+            Ok(())
+        }
+        RecipeCommand::Init {
+            selector,
+            output,
+            packages,
+        } => {
+            let catalog = RecipeCatalog::with_external_paths(&packages)?;
+            let package = catalog.resolve(&selector)?;
+            initialize_recipe_directory(&selector, package.manifest(), &output)?;
+            println!("initialized {} in {}", selector, output.display());
+            println!("next: edit values.yaml, then run bridgefu recipe validate {selector} --values {}/values.yaml", output.display());
+            Ok(())
+        }
+        RecipeCommand::Explain { instance } => {
+            let config = config::Config::load_recipe_view(config_path)?;
+            let recipe = config.compiled_recipes.get(&instance).with_context(|| {
+                format!(
+                    "configured recipe instance {instance:?} was not found in {}",
+                    config_path.display()
+                )
+            })?;
+            print!("{}", explain_compiled_recipe(&instance, recipe));
+            Ok(())
+        }
+        RecipeCommand::Deploy {
+            deployment,
+            profile,
+            execute,
+            confirm,
+            change_set_name,
+        } => recipe_admin::deploy(
+            &deployment,
+            profile,
+            execute,
+            confirm.as_deref(),
+            change_set_name.as_deref(),
+        ),
+        RecipeCommand::Preflight {
+            deployment,
+            profile,
+        } => recipe_admin::preflight(&deployment, profile),
+        RecipeCommand::Status {
+            deployment,
+            profile,
+        } => recipe_admin::status(&deployment, profile),
+        RecipeCommand::Doctor {
+            deployment,
+            profile,
+        } => recipe_admin::doctor(&deployment, profile),
+        RecipeCommand::Test {
+            deployment,
+            profile,
+        } => recipe_admin::test(&deployment, profile),
+        RecipeCommand::Destroy {
+            deployment,
+            profile,
+            confirm,
+        } => recipe_admin::destroy(&deployment, profile, &confirm),
+    }
+}
+
+fn initialize_recipe_directory(
+    selector: &str,
+    manifest: &bridgefu::recipes::RecipeManifest,
+    output: &std::path::Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        !output.exists(),
+        "refusing to overwrite existing recipe directory {}",
+        output.display()
+    );
+    std::fs::create_dir_all(output)
+        .with_context(|| format!("creating recipe directory {}", output.display()))?;
+
+    let canonical = selector == "builtin:vapi-amazon-connect-screen-pop@1";
+    let values = if canonical {
+        include_str!("../recipes/vapi-amazon-connect-screen-pop/values.example.yaml").to_owned()
+    } else {
+        serde_yaml::to_string(&initial_recipe_values(manifest))?
+    };
+    let selection_values: serde_yaml::Value = serde_yaml::from_str(&values)?;
+    std::fs::write(output.join("values.yaml"), &values)
+        .with_context(|| format!("writing {}/values.yaml", output.display()))?;
+
+    let selection = serde_yaml::to_string(&serde_yaml::Value::Mapping(
+        serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("recipes".to_owned()),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
+                serde_yaml::Value::String("support".to_owned()),
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("use".to_owned()),
+                        serde_yaml::Value::String(selector.to_owned()),
+                    ),
+                    (
+                        serde_yaml::Value::String("with".to_owned()),
+                        selection_values,
+                    ),
+                ])),
+            )])),
+        )]),
+    ))?;
+    std::fs::write(output.join("recipe-selection.yaml"), selection)
+        .with_context(|| format!("writing {}/recipe-selection.yaml", output.display()))?;
+
+    let mut inputs = format!(
+        "# {}\n\nSelector: `{selector}`\n\n| Input | Type | Required | Description |\n|---|---|---:|---|\n",
+        manifest.metadata.title
+    );
+    for (name, definition) in &manifest.inputs {
+        let description = definition
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .replace('|', "\\|")
+            .replace('\n', " ");
+        inputs.push_str(&format!(
+            "| `{name}` | `{:?}` | {} | {description} |\n",
+            definition.kind,
+            if definition.required { "yes" } else { "no" }
+        ));
+    }
+    inputs.push_str("\nSecret values belong in env, absolute file, or Secrets Manager references; never write raw credentials here.\n");
+    std::fs::write(output.join("INPUTS.md"), inputs)
+        .with_context(|| format!("writing {}/INPUTS.md", output.display()))?;
+
+    if canonical {
+        std::fs::write(
+            output.join("bridgefu.yaml"),
+            include_str!("../config/recipe-vapi-amazon-connect.example.yaml"),
+        )
+        .with_context(|| format!("writing {}/bridgefu.yaml", output.display()))?;
+        std::fs::write(
+            output.join("deployment.yaml"),
+            include_str!("../recipes/vapi-amazon-connect-screen-pop/deployment.example.yaml"),
+        )
+        .with_context(|| format!("writing {}/deployment.yaml", output.display()))?;
+        std::fs::write(
+            output.join("deployment-nonproduction.yaml"),
+            include_str!(
+                "../recipes/vapi-amazon-connect-screen-pop/deployment.nonproduction.example.yaml"
+            ),
+        )
+        .with_context(|| format!("writing {}/deployment-nonproduction.yaml", output.display()))?;
+        std::fs::write(
+            output.join("parameters-starter.json"),
+            include_str!("../recipes/vapi-amazon-connect-screen-pop/parameters-starter.json"),
+        )
+        .with_context(|| format!("writing {}/parameters-starter.json", output.display()))?;
+        std::fs::write(
+            output.join("parameters-nonproduction-starter.json"),
+            include_str!(
+                "../recipes/vapi-amazon-connect-screen-pop/parameters-nonproduction-starter.json"
+            ),
+        )
+        .with_context(|| {
+            format!(
+                "writing {}/parameters-nonproduction-starter.json",
+                output.display()
+            )
+        })?;
+        std::fs::write(
+            output.join("parameters-ha.json"),
+            include_str!("../recipes/vapi-amazon-connect-screen-pop/parameters-ha.json"),
+        )
+        .with_context(|| format!("writing {}/parameters-ha.json", output.display()))?;
+        let cloudformation = output.join("cloudformation");
+        std::fs::create_dir(&cloudformation)
+            .with_context(|| format!("creating {}/cloudformation", output.display()))?;
+        std::fs::write(
+            cloudformation.join("production-stack-policy.json"),
+            include_str!(
+                "../recipes/vapi-amazon-connect-screen-pop/cloudformation/production-stack-policy.json"
+            ),
+        )
+        .with_context(|| {
+            format!(
+                "writing {}/cloudformation/production-stack-policy.json",
+                output.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn initial_recipe_values(
+    manifest: &bridgefu::recipes::RecipeManifest,
+) -> std::collections::BTreeMap<String, serde_yaml::Value> {
+    manifest
+        .inputs
+        .iter()
+        .filter_map(|(name, definition)| {
+            definition
+                .default
+                .clone()
+                .or_else(|| definition.required.then_some(serde_yaml::Value::Null))
+                .map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+fn explain_compiled_recipe(instance: &str, recipe: &CompiledRecipe) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "instance: {instance}");
+    let _ = writeln!(output, "recipe: {}@{}", recipe.name, recipe.version);
+    let _ = writeln!(output, "support: {}", recipe.support);
+    let _ = writeln!(output, "fingerprint: {}", recipe.fingerprint);
+    for (bridge_id, bridge) in &recipe.spec.bridges {
+        let _ = writeln!(output, "bridge: {bridge_id}");
+        let _ = writeln!(
+            output,
+            "  source: {}",
+            explain_recipe_endpoint(&bridge.source, true)
+        );
+        let _ = writeln!(
+            output,
+            "  destination: {}",
+            explain_recipe_endpoint(&bridge.destination, false)
+        );
+        if let Some(context) = &bridge.context {
+            let correlation = &context.correlation;
+            let _ = writeln!(
+                output,
+                "  context: {} -> Amazon attribute {} ({}, required={})",
+                correlation.from_sip_header,
+                correlation.to_amazon_attribute,
+                correlation.format,
+                correlation.required
+            );
+        } else {
+            let _ = writeln!(output, "  context: none");
+        }
+    }
+    output.push_str("secrets: redacted; recipe fingerprints never contain secret values\n");
+    output
+        .push_str("projection conflicts: none; run bridgefu validate for full runtime preflight\n");
+    output
+}
+
+fn explain_recipe_endpoint(endpoint: &RecipeEndpointSpec, source: bool) -> String {
+    match endpoint {
+        RecipeEndpointSpec::Sip {
+            security,
+            admission,
+            target_uri,
+            ..
+        } => {
+            let posture = match security {
+                SipSecurity::SipsSrtp => "SIPS/SRTP; TCP 5061; UDP 16384-32767",
+                SipSecurity::SipRtp => "SIP/RTP; TCP+UDP 5060; UDP 16384-32767",
+            };
+            if source {
+                let admission =
+                    admission
+                        .as_ref()
+                        .map_or("missing", |admission| match admission.mode {
+                            SipAdmissionMode::ManagedAttachment => "managed one-use attachment",
+                            SipAdmissionMode::StableUri => "stable URI",
+                        });
+                format!("SIP ({posture}); admission={admission}")
+            } else {
+                format!(
+                    "SIP ({posture}); target_uri={}",
+                    if target_uri.is_some() {
+                        "configured (redacted)"
+                    } else {
+                        "missing"
+                    }
+                )
+            }
+        }
+        RecipeEndpointSpec::Webrtc { signaling_uri, .. } => format!(
+            "WebRTC; signaling={}",
+            if signaling_uri.is_some() {
+                "configured (redacted)"
+            } else {
+                "runtime-managed"
+            }
+        ),
+        RecipeEndpointSpec::AmazonConnect { media, .. } => {
+            let media = match media {
+                AmazonConnectMedia::Webrtc => "WebRTC",
+            };
+            format!("Amazon Connect {media}; instance and flow configured (redacted)")
         }
     }
 }
@@ -215,7 +687,7 @@ fn probe_liveness(address: SocketAddr, path: &str, timeout: Duration) -> Result<
     Ok(())
 }
 
-/// Existing StandardCharter-compatible single-process lifecycle. This remains
+/// Existing ReferenceTenant-compatible single-process lifecycle. This remains
 /// the default and deliberately retains the original listener construction,
 /// call-runtime sharing, and shutdown ordering.
 async fn run_all_in_one(
@@ -223,6 +695,9 @@ async fn run_all_in_one(
     config_path: &std::path::Path,
     prom: PrometheusHandle,
 ) -> Result<()> {
+    if !cfg.legacy_vapi_connect_enabled() {
+        return run_recipe_all_in_one(cfg, config_path, prom).await;
+    }
     let tenants = cfg.tenant_names()?;
     tracing::info!(
         config = %config_path.display(),
@@ -325,10 +800,15 @@ async fn run_all_in_one(
             .context("configuring named outbound signaling profiles")?;
         let provider_executor: Arc<dyn bridgefu::call_service::ProviderLegExecutor> =
             Arc::new(api_state.provider_registry());
-        // The legacy StandardCharter server keeps exclusive ownership of its
+        // The legacy ReferenceTenant server keeps exclusive ownership of its
         // adapter event receiver and routes. Generic execution gets a fresh
-        // isolated adapter only when this opt-in runtime is enabled.
-        let generic_amazon_connect = server.adapter().fork_isolated();
+        // adapter whose immutable profile catalog includes every projected
+        // named/recipe Amazon destination; the legacy server exposes only its
+        // default profile and therefore cannot be forked for recipe calls.
+        let generic_amazon_connect = cfg
+            .build_worker_amazon_connect_adapter()
+            .await
+            .context("building generic Amazon Connect profile catalog")?;
         let cleanup_observer: Arc<dyn rvoip_amazon_connect::AmazonConnectCleanupObserver> =
             amazon_cleanup.clone();
         generic_amazon_connect
@@ -336,7 +816,8 @@ async fn run_all_in_one(
             .map_err(|error| {
                 anyhow::anyhow!("installing generic Amazon cleanup journal: {error}")
             })?;
-        let standardcharter_canary = cfg.standardcharter_canary_policy()?;
+        let reference_tenant_canary = cfg.reference_tenant_canary_policy()?;
+        let recipe_sip_admissions = cfg.recipe_sip_admission_catalog()?;
         let signaling_tls = cfg.api.tls.as_ref().map(|tls| runtime::GenericBridgeTls {
             certificate_chain: &tls.certificate_chain,
             private_key: &tls.private_key,
@@ -351,7 +832,8 @@ async fn run_all_in_one(
             webrtc_bearer_validator,
             webrtc_session_binding,
             context_policy: &cfg.context,
-            standardcharter_canary,
+            reference_tenant_canary,
+            recipe_sip_admissions,
             provider_executor,
             outbound_profiles,
             amazon_connect: generic_amazon_connect,
@@ -582,6 +1064,222 @@ async fn run_all_in_one(
     Ok(())
 }
 
+/// Recipe-only single-process lifecycle. The durable call service and generic
+/// rvoip adapters remain identical to expert mode, but no legacy
+/// `ConnectScreenPopServer` or clear ReferenceTenant listener is constructed.
+async fn run_recipe_all_in_one(
+    cfg: &config::Config,
+    config_path: &std::path::Path,
+    prom: PrometheusHandle,
+) -> Result<()> {
+    anyhow::ensure!(
+        !cfg.compiled_recipes.is_empty(),
+        "legacy_vapi_connect is disabled but no compiled recipe is configured"
+    );
+    anyhow::ensure!(
+        cfg.generic_bridge.enabled,
+        "recipe-only all-in-one mode requires the generic bridge runtime"
+    );
+    let tenants = cfg.tenant_names()?;
+    tracing::info!(
+        config = %config_path.display(),
+        region = %cfg.aws.region,
+        tenants = ?tenants,
+        recipe_instances = cfg.compiled_recipes.len(),
+        "starting recipe-only bridgefu"
+    );
+    let http_bind: SocketAddr = cfg.observability.http_bind.parse().with_context(|| {
+        format!(
+            "invalid observability.http_bind: {}",
+            cfg.observability.http_bind
+        )
+    })?;
+    let (owned_task_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut api_state = api::ApiState::from_recipe_config(cfg, prom, tenants.clone()).await?;
+    let call_runtime_owner = api_state.call_runtime();
+    let call_runtime = call_runtime_owner.as_ref().map(Arc::clone).ok_or_else(|| {
+        anyhow::anyhow!("recipe-only runtime requires the authenticated call service")
+    })?;
+    let bearer_validator = api_state.bearer_validator().ok_or_else(|| {
+        anyhow::anyhow!("recipe-only runtime requires the shared API bearer validator")
+    })?;
+    let webrtc_bearer_validator =
+        api_state
+            .webrtc_signaling_bearer_validator()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recipe-only runtime requires the attachment-bound WebRTC bearer validator"
+                )
+            })?;
+    let webrtc_session_binding = api_state.webrtc_session_binding().ok_or_else(|| {
+        anyhow::anyhow!("recipe-only runtime requires WebRTC attachment binding authority")
+    })?;
+    let sip_tenant = cfg
+        .api
+        .static_tenant
+        .as_deref()
+        .or_else(|| (tenants.len() == 1).then(|| tenants[0].as_str()))
+        .ok_or_else(|| anyhow::anyhow!("recipe-only runtime requires one SIP listener tenant"))?;
+    let sip_listener_auth = cfg
+        .sip_listener_auth_policy(sip_tenant, bearer_validator, "sip:connect")
+        .context("configuring recipe SIP listener authentication")?;
+    let generic_sip_bind = cfg
+        .generic_bridge
+        .sip_bind
+        .parse::<SocketAddr>()
+        .context("parsing generic_bridge.sip_bind")?;
+    let sip_stack = cfg
+        .generic_sip_stack_config("bridgefu-recipe", generic_sip_bind)
+        .context("configuring recipe SIP/SRTP networking")?;
+    let sip_egress_profiles = cfg
+        .sip_egress_profile_configs("bridgefu-recipe", generic_sip_bind)
+        .context("configuring recipe SIP egress profiles")?;
+    let outbound_profiles = cfg
+        .outbound_profile_resolver()
+        .context("configuring recipe outbound profiles")?;
+    let provider_executor: Arc<dyn bridgefu::call_service::ProviderLegExecutor> =
+        Arc::new(api_state.provider_registry());
+    let amazon_connect = cfg
+        .build_worker_amazon_connect_adapter()
+        .await
+        .context("building recipe Amazon Connect adapter")?;
+    let amazon_cleanup =
+        bridgefu::amazon_cleanup::AmazonCleanupJournal::connect(cfg.call_repository_backend()?)
+            .await
+            .context("opening durable Amazon cleanup journal")?;
+    let cleanup_observer: Arc<dyn rvoip_amazon_connect::AmazonConnectCleanupObserver> =
+        amazon_cleanup.clone();
+    amazon_connect
+        .install_cleanup_observer(cleanup_observer)
+        .map_err(|error| anyhow::anyhow!("installing Amazon cleanup journal: {error}"))?;
+    let cleanup_reconcile = amazon_cleanup
+        .reconcile(&amazon_connect)
+        .await
+        .context("reconciling retained Amazon cleanup authority")?;
+    metrics::gauge!("bridgefu_amazon_durable_cleanups_pending")
+        .set(cleanup_reconcile.remaining as f64);
+    let signaling_tls = cfg.api.tls.as_ref().map(|tls| runtime::GenericBridgeTls {
+        certificate_chain: &tls.certificate_chain,
+        private_key: &tls.private_key,
+    });
+    let recipe_sip_admissions = cfg.recipe_sip_admission_catalog()?;
+    let generic_runtime = runtime::GenericBridgeRuntime::start(runtime::GenericBridgeStart {
+        config: &cfg.generic_bridge,
+        runtime: &cfg.runtime,
+        call_runtime,
+        sip_stack,
+        sip_egress_profiles,
+        sip_listener_auth,
+        webrtc_bearer_validator,
+        webrtc_session_binding,
+        context_policy: &cfg.context,
+        reference_tenant_canary: None,
+        recipe_sip_admissions,
+        provider_executor,
+        outbound_profiles,
+        amazon_connect: Arc::clone(&amazon_connect),
+        signaling_tls,
+    })
+    .await?;
+    if let Err(error) = api_state
+        .set_generic_runtime(Arc::clone(&generic_runtime))
+        .await
+    {
+        generic_runtime
+            .shutdown(Duration::from_secs(cfg.runtime.drain_timeout_secs.max(1)))
+            .await;
+        return Err(error).context("publishing recipe worker capabilities");
+    }
+
+    let public_uctp_listener = match &cfg.broadcast.uctp_listener {
+        Some(listener_config) => Some(
+            bridgefu::broadcast::PublicUctpBroadcastListener::bind(
+                generic_runtime.orchestrator(),
+                api_state.broadcast_token_service(),
+                listener_config.runtime()?,
+            )
+            .await
+            .context("starting authenticated public UCTP broadcast listener")?,
+        ),
+        None => None,
+    };
+    let mut cleanup_reconciler = amazon_cleanup.spawn_reconciler(
+        Arc::clone(&amazon_connect),
+        owned_task_shutdown_tx.subscribe(),
+        Duration::from_secs(30),
+    );
+    let (http_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let api_shutdown_owner = api_state.clone();
+    let app = api::router(api_state);
+    let mut http = tokio::spawn(api::serve(
+        http_bind,
+        app,
+        wait_for_shutdown(http_shutdown_tx.subscribe()),
+    ));
+
+    tokio::select! {
+        result = &mut http => {
+            match result {
+                Ok(Ok(())) => tracing::warn!("recipe HTTP server stopped before shutdown"),
+                Ok(Err(error)) => tracing::error!(%error, "recipe HTTP server failed"),
+                Err(error) => tracing::error!(%error, "recipe HTTP task failed"),
+            }
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; draining recipe runtime");
+        }
+    }
+
+    let shutdown_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(cfg.runtime.drain_timeout_secs);
+    let _ = http_shutdown_tx.send(true);
+    if let Some(listener) = &public_uctp_listener {
+        listener.begin_drain();
+    }
+    let closed_broadcasts = api_shutdown_owner.shutdown_local_broadcasts().await;
+    tracing::info!(closed_broadcasts, "local broadcasts drained");
+    if let Some(listener) = public_uctp_listener {
+        if tokio::time::timeout(shutdown_budget(shutdown_deadline), listener.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("public UCTP listener exceeded the shutdown deadline");
+        }
+    }
+    generic_runtime
+        .shutdown(shutdown_budget(shutdown_deadline))
+        .await;
+    let _ = owned_task_shutdown_tx.send(true);
+    if tokio::time::timeout(
+        shutdown_budget(shutdown_deadline).min(Duration::from_secs(3)),
+        &mut cleanup_reconciler,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("Amazon cleanup reconciler did not stop; aborting task");
+        cleanup_reconciler.abort();
+        let _ = cleanup_reconciler.await;
+    }
+    if !http.is_finished()
+        && tokio::time::timeout(
+            shutdown_budget(shutdown_deadline).min(Duration::from_secs(3)),
+            &mut http,
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!("HTTP API did not drain; aborting task");
+        http.abort();
+        let _ = http.await;
+    }
+    drop(api_shutdown_owner);
+    drop(amazon_connect);
+    shutdown_call_runtime(call_runtime_owner, shutdown_deadline).await?;
+    tracing::info!("recipe-only bridgefu stopped");
+    Ok(())
+}
+
 async fn shutdown_call_runtime(
     runtime: Option<Arc<bridgefu::call_service::CallServiceRuntime>>,
     deadline: tokio::time::Instant,
@@ -681,12 +1379,19 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut connection, _) = listener.accept().unwrap();
             connection
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut request_line = String::new();
-            BufReader::new(&mut connection)
-                .read_line(&mut request_line)
-                .unwrap();
+            let mut reader = BufReader::new(&mut connection);
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" || header.is_empty() {
+                    break;
+                }
+            }
+            drop(reader);
             write!(
                 connection,
                 "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -700,15 +1405,18 @@ mod tests {
     #[test]
     fn native_healthcheck_accepts_a_live_endpoint() {
         let (address, server) = spawn_liveness_endpoint("200 OK");
-        probe_liveness(address, "/livez", Duration::from_secs(2)).unwrap();
+        probe_liveness(address, "/livez", Duration::from_secs(10)).unwrap();
         assert_eq!(server.join().unwrap(), "GET /livez HTTP/1.1\r\n");
     }
 
     #[test]
     fn native_healthcheck_rejects_an_unhealthy_endpoint() {
         let (address, server) = spawn_liveness_endpoint("503 Service Unavailable");
-        let error = probe_liveness(address, "/livez", Duration::from_secs(2)).unwrap_err();
-        assert!(error.to_string().contains("returned HTTP 503"));
+        let error = probe_liveness(address, "/livez", Duration::from_secs(10)).unwrap_err();
+        assert!(
+            error.to_string().contains("returned HTTP 503"),
+            "unexpected healthcheck error: {error:#}"
+        );
         assert_eq!(server.join().unwrap(), "GET /livez HTTP/1.1\r\n");
     }
 
@@ -737,6 +1445,141 @@ mod tests {
         assert_eq!(address, "127.0.0.1:9090".parse::<SocketAddr>().unwrap());
         assert_eq!(path, "/livez");
         assert_eq!(timeout_ms, 2_500);
+    }
+
+    #[test]
+    fn recipe_cli_exposes_safe_administrator_commands() {
+        let available = Args::try_parse_from(["bridgefu", "recipe", "available"]).unwrap();
+        assert!(matches!(
+            available.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Available { .. }
+            })
+        ));
+
+        let init = Args::try_parse_from([
+            "bridgefu",
+            "recipe",
+            "init",
+            "builtin:vapi-amazon-connect-screen-pop@1",
+            "--output",
+            "starter",
+        ])
+        .unwrap();
+        assert!(matches!(
+            init.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Init { .. }
+            })
+        ));
+
+        let explain = Args::try_parse_from([
+            "bridgefu",
+            "--config",
+            "bridgefu.yaml",
+            "recipe",
+            "explain",
+            "support",
+        ])
+        .unwrap();
+        assert_eq!(explain.config, PathBuf::from("bridgefu.yaml"));
+        assert!(matches!(
+            explain.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Explain { .. }
+            })
+        ));
+
+        let deploy = Args::try_parse_from([
+            "bridgefu",
+            "recipe",
+            "deploy",
+            "deployment.yaml",
+            "--profile",
+            "starter",
+        ])
+        .unwrap();
+        assert!(matches!(
+            deploy.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Deploy { execute: false, .. }
+            })
+        ));
+
+        let preflight = Args::try_parse_from([
+            "bridgefu",
+            "recipe",
+            "preflight",
+            "deployment.yaml",
+            "--profile",
+            "starter",
+        ])
+        .unwrap();
+        assert!(matches!(
+            preflight.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Preflight { .. }
+            })
+        ));
+
+        let destroy = Args::try_parse_from([
+            "bridgefu",
+            "recipe",
+            "destroy",
+            "deployment.yaml",
+            "--confirm",
+            "bridgefu",
+        ])
+        .unwrap();
+        assert!(matches!(
+            destroy.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::Destroy { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn recipe_explanation_is_useful_and_redacts_configured_targets() {
+        let catalog = RecipeCatalog::builtin().unwrap();
+        let package = catalog
+            .resolve("builtin:vapi-amazon-connect-screen-pop@1")
+            .unwrap();
+        let values = serde_yaml::from_str(include_str!(
+            "../recipes/vapi-amazon-connect-screen-pop/values.example.yaml"
+        ))
+        .unwrap();
+        let compiled = package.compile(&values).unwrap();
+        let explanation = explain_compiled_recipe("support", &compiled);
+        assert!(explanation.contains("SIPS/SRTP; TCP 5061"));
+        assert!(explanation.contains("managed one-use attachment"));
+        assert!(explanation.contains("X-Correlation-Id -> Amazon attribute correlation_id"));
+        assert!(explanation.contains("configured (redacted)"));
+        assert!(!explanation.contains("123456789012"));
+        assert!(!explanation.contains("11111111-1111"));
+    }
+
+    #[test]
+    fn generic_recipe_initial_values_use_defaults_and_visible_nulls() {
+        let catalog = RecipeCatalog::builtin().unwrap();
+        let package = catalog
+            .resolve("builtin:vapi-amazon-connect-screen-pop@1")
+            .unwrap();
+        let values = initial_recipe_values(package.manifest());
+        assert_eq!(
+            values
+                .get("sip_security")
+                .and_then(serde_yaml::Value::as_str),
+            Some("sips_srtp")
+        );
+        assert!(matches!(
+            values.get("connect_instance_arn"),
+            Some(serde_yaml::Value::Null)
+        ));
+        assert!(matches!(
+            values.get("vapi_signaling_cidrs"),
+            Some(serde_yaml::Value::Null)
+        ));
     }
 
     #[tokio::test]

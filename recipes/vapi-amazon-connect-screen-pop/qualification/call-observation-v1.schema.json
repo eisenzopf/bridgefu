@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/call-observation-v1.schema.json",
+  "title": "Bridgefu protected per-call qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "recipe",
+    "execution_id",
+    "scenario_id",
+    "network",
+    "hangup_origin",
+    "started_at",
+    "ended_at",
+    "revisions",
+    "correlation_fingerprint",
+    "checks",
+    "timings",
+    "observations",
+    "passed",
+    "redacted",
+    "customer_data_retained"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "recipe": {"const": "vapi-amazon-connect-screen-pop@1"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "scenario_id": {
+      "enum": [
+        "sip-rtp-pcmu",
+        "sip-rtp-pcma",
+        "sips-srtp-pcmu",
+        "sips-srtp-pcma",
+        "vapi-web-transfer"
+      ]
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "controller",
+        "controller_revision_sha256",
+        "settings",
+        "target_count",
+        "verified_clean_before",
+        "impairment_applied",
+        "verified_during_call",
+        "removed_after_call"
+      ],
+      "properties": {
+        "profile": {"enum": ["baseline", "moderate-wan"]},
+        "controller": {"const": "bridgefu-aws-tc-netem-controller@1"},
+        "controller_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "settings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["delay_ms", "jitter_ms", "loss_percent", "reorder_percent"],
+          "properties": {
+            "delay_ms": {"type": "number", "minimum": 0, "maximum": 1000},
+            "jitter_ms": {"type": "number", "minimum": 0, "maximum": 500},
+            "loss_percent": {"type": "number", "minimum": 0, "maximum": 20},
+            "reorder_percent": {"type": "number", "minimum": 0, "maximum": 20}
+          }
+        },
+        "target_count": {"type": "integer", "minimum": 1, "maximum": 16},
+        "verified_clean_before": {"const": true},
+        "impairment_applied": {"type": "boolean"},
+        "verified_during_call": {"const": true},
+        "removed_after_call": {"const": true}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"profile": {"const": "baseline"}}},
+          "then": {"properties": {"impairment_applied": {"const": false}}},
+          "else": {"properties": {"impairment_applied": {"const": true}}}
+        }
+      ]
+    },
+    "hangup_origin": {"enum": ["source", "agent"]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "source_tree_sha256", "image"],
+      "properties": {
+        "release_id": {"type": "string", "pattern": "^[0-9a-f]{20}$"},
+        "source_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "correlation_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actual_transfer_header",
+        "context_persisted",
+        "amazon_attribute_mapped",
+        "connect_contact_started_once",
+        "connect_lookup_available",
+        "media_connected",
+        "agent_screen_visible",
+        "audio_source_to_agent_non_silent",
+        "audio_agent_to_source_non_silent",
+        "dtmf_source_to_agent",
+        "dtmf_agent_to_source",
+        "originating_hangup_cleanup",
+        "cleanup_zero_state"
+      ],
+      "properties": {
+        "actual_transfer_header": {"const": true},
+        "context_persisted": {"const": true},
+        "amazon_attribute_mapped": {"const": true},
+        "connect_contact_started_once": {"const": true},
+        "connect_lookup_available": {"const": true},
+        "media_connected": {"const": true},
+        "agent_screen_visible": {"const": true},
+        "audio_source_to_agent_non_silent": {"const": true},
+        "audio_agent_to_source_non_silent": {"const": true},
+        "dtmf_source_to_agent": {"const": true},
+        "dtmf_agent_to_source": {"const": true},
+        "originating_hangup_cleanup": {"const": true},
+        "cleanup_zero_state": {"const": true}
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["setup_latency_ms", "source_to_agent_latency_ms_p95", "agent_to_source_latency_ms_p95"],
+      "properties": {
+        "setup_latency_ms": {"type": "number", "minimum": 0, "maximum": 30000},
+        "source_to_agent_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 5000},
+        "agent_to_source_latency_ms_p95": {"type": "number", "minimum": 0, "maximum": 5000}
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime_lifecycle_stages", "lookup_result", "source_producer", "source_producer_revision_sha256", "source_site_bundle_sha256", "vapi_call_contract_verified", "attachment_replay_rejected", "participant_producer", "participant_producer_revision_sha256", "screenshot_sha256"],
+      "properties": {
+        "runtime_lifecycle_stages": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "enum": [
+              "sip_invite_received",
+              "attributes_mapped",
+              "contact_started",
+              "media_connected",
+              "teardown_started",
+              "terminated"
+            ]
+          }
+        },
+        "lookup_result": {"const": "available"},
+        "source_producer": {"enum": ["bridgefu-recipe-sip-source@1", "bridgefu-vapi-web-playwright@1"]},
+        "source_producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_site_bundle_sha256": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          ]
+        },
+        "vapi_call_contract_verified": {"type": "boolean"},
+        "attachment_replay_rejected": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "boolean"}
+          ]
+        },
+        "participant_producer": {"const": "bridgefu-agent-workspace-playwright@1"},
+        "participant_producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "screenshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "passed": {"const": true},
+    "redacted": {"const": true},
+    "customer_data_retained": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scenario_id": {"const": "vapi-web-transfer"}}},
+      "then": {
+        "properties": {
+          "observations": {
+            "properties": {
+              "source_producer": {"const": "bridgefu-vapi-web-playwright@1"},
+              "source_site_bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "vapi_call_contract_verified": {"const": true},
+              "attachment_replay_rejected": {"type": "null"}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "observations": {
+            "properties": {
+              "source_producer": {"const": "bridgefu-recipe-sip-source@1"},
+              "source_site_bundle_sha256": {"type": "null"},
+              "vapi_call_contract_verified": {"const": false},
+              "attachment_replay_rejected": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

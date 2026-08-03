@@ -1,0 +1,14 @@
+[Unit]
+Description=Activate refreshed Bridgefu HA gateway certificate when idle
+After=ecs.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bridgefu-ha-cert-reload
+User=root
+Group=root
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/bridgefu
+NoNewPrivileges=yes

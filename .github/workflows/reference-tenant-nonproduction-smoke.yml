@@ -1,0 +1,162 @@
+name: ReferenceTenant non-production smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Offline validation is the default; every other operation uses the protected non-production environment."
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - smoke
+          - rollback-plan
+          - rollback
+      confirm_nonproduction:
+        description: "Confirm that every configured target belongs only to ReferenceTenant non-production."
+        required: true
+        type: boolean
+        default: false
+      owner_authorization:
+        description: "Exact owner authorization phrase documented in the runbook; validation does not require one."
+        required: false
+        type: string
+        default: NOT-AUTHORIZED
+      approval_reference:
+        description: "Non-secret owner review/change reference (3-80 safe characters)."
+        required: false
+        type: string
+        default: validation-only
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reference-tenant-nonproduction-smoke
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: ${{ inputs.operation == 'validate' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate workflow, smoke, and rollback artifacts offline
+        run: bash scripts/check-reference-tenant-smoke-artifacts.sh
+
+  protected-operation:
+    if: ${{ inputs.operation != 'validate' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: reference-tenant-nonproduction
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce explicit owner and non-production confirmation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CONFIRM_NONPRODUCTION: ${{ inputs.confirm_nonproduction }}
+          OWNER_AUTHORIZATION: ${{ inputs.owner_authorization }}
+          APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+        run: |
+          set -euo pipefail
+          [[ "${CONFIRM_NONPRODUCTION}" == "true" ]]
+          [[ "${APPROVAL_REFERENCE}" =~ ^[A-Za-z0-9._:/-]{3,80}$ ]]
+          case "${OPERATION}" in
+            smoke)
+              [[ "${OWNER_AUTHORIZATION}" == "OWNER-AUTHORIZED-NONPROD-SMOKE" ]]
+              ;;
+            rollback-plan|rollback)
+              [[ "${OWNER_AUTHORIZATION}" == "OWNER-AUTHORIZED-NONPROD-ROLLBACK" ]]
+              ;;
+            *)
+              exit 2
+              ;;
+          esac
+
+      - name: Preflight the secret-backed smoke configuration without network calls
+        if: ${{ inputs.operation == 'smoke' }}
+        env:
+          BRIDGEFU_SMOKE_ENVIRONMENT: reference-tenant-nonproduction
+          BRIDGEFU_SMOKE_APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+          AWS_EXPECTED_ACCOUNT_ID: ${{ secrets.REFERENCE_TENANT_SMOKE_AWS_ACCOUNT_ID }}
+          BRIDGEFU_DIAGNOSTICS_BASE_URL: ${{ secrets.REFERENCE_TENANT_SMOKE_BRIDGEFU_URL }}
+          BRIDGEFU_DIAGNOSTICS_TOKEN: ${{ secrets.REFERENCE_TENANT_SMOKE_DIAGNOSTICS_TOKEN }}
+          VAPI_API_TOKEN: ${{ secrets.REFERENCE_TENANT_SMOKE_VAPI_TOKEN }}
+          VAPI_CALL_PAYLOAD_JSON: ${{ secrets.REFERENCE_TENANT_SMOKE_VAPI_CALL_PAYLOAD_JSON }}
+        run: bash scripts/run-reference-tenant-smoke.sh preflight
+
+      - name: Configure the allowlisted non-production AWS identity
+        if: ${{ inputs.operation == 'smoke' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.REFERENCE_TENANT_SMOKE_AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.REFERENCE_TENANT_SMOKE_AWS_REGION }}
+
+      - name: Run the owner-authorized Vapi to Connect smoke
+        if: ${{ inputs.operation == 'smoke' }}
+        env:
+          BRIDGEFU_SMOKE_ENVIRONMENT: reference-tenant-nonproduction
+          BRIDGEFU_SMOKE_CONFIRM_NONPRODUCTION: ${{ inputs.confirm_nonproduction }}
+          BRIDGEFU_SMOKE_OWNER_AUTHORIZATION: ${{ inputs.owner_authorization }}
+          BRIDGEFU_SMOKE_APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+          BRIDGEFU_SMOKE_REPORT_PATH: ${{ runner.temp }}/reference-tenant-smoke-report.json
+          AWS_EXPECTED_ACCOUNT_ID: ${{ secrets.REFERENCE_TENANT_SMOKE_AWS_ACCOUNT_ID }}
+          BRIDGEFU_DIAGNOSTICS_BASE_URL: ${{ secrets.REFERENCE_TENANT_SMOKE_BRIDGEFU_URL }}
+          BRIDGEFU_DIAGNOSTICS_TOKEN: ${{ secrets.REFERENCE_TENANT_SMOKE_DIAGNOSTICS_TOKEN }}
+          VAPI_API_TOKEN: ${{ secrets.REFERENCE_TENANT_SMOKE_VAPI_TOKEN }}
+          VAPI_CALL_PAYLOAD_JSON: ${{ secrets.REFERENCE_TENANT_SMOKE_VAPI_CALL_PAYLOAD_JSON }}
+        run: bash scripts/run-reference-tenant-smoke.sh execute
+
+      - name: Upload only redacted screen-pop evidence
+        if: ${{ always() && inputs.operation == 'smoke' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-tenant-nonproduction-smoke-${{ github.run_id }}
+          path: ${{ runner.temp }}/reference-tenant-smoke-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Prepare pinned SSH trust for an authorized rollback
+        if: ${{ inputs.operation == 'rollback' }}
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.REFERENCE_TENANT_ROLLBACK_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.REFERENCE_TENANT_ROLLBACK_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${RUNNER_TEMP}/reference-tenant-rollback-key"
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > "${RUNNER_TEMP}/reference-tenant-known-hosts"
+
+      - name: Check or execute the explicit drain and rollback runbook
+        if: ${{ inputs.operation == 'rollback-plan' || inputs.operation == 'rollback' }}
+        env:
+          BRIDGEFU_ROLLBACK_ENVIRONMENT: reference-tenant-nonproduction
+          BRIDGEFU_ROLLBACK_CONFIRM_NONPRODUCTION: ${{ inputs.confirm_nonproduction }}
+          BRIDGEFU_ROLLBACK_OWNER_AUTHORIZATION: ${{ inputs.owner_authorization }}
+          BRIDGEFU_ROLLBACK_APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+          BRIDGEFU_ROLLBACK_SSH_TARGET: ${{ secrets.REFERENCE_TENANT_ROLLBACK_SSH_TARGET }}
+          BRIDGEFU_ROLLBACK_SSH_KEY_PATH: ${{ runner.temp }}/reference-tenant-rollback-key
+          BRIDGEFU_ROLLBACK_SSH_KNOWN_HOSTS_PATH: ${{ runner.temp }}/reference-tenant-known-hosts
+          BRIDGEFU_ROLLBACK_IMAGE: ${{ secrets.REFERENCE_TENANT_ROLLBACK_IMAGE }}
+          BRIDGEFU_ROLLBACK_DRAIN_SECONDS: "30"
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          if [[ "${OPERATION}" == "rollback" ]]; then
+            bash scripts/reference-tenant-drain-rollback.sh execute
+          else
+            bash scripts/reference-tenant-drain-rollback.sh plan
+          fi
+
+      - name: Remove temporary SSH material
+        if: ${{ always() }}
+        run: |
+          rm -f "${RUNNER_TEMP}/reference-tenant-rollback-key"
+          rm -f "${RUNNER_TEMP}/reference-tenant-known-hosts"

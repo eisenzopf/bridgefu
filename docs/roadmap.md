@@ -8,10 +8,10 @@ Documentation, Terraform, or API scaffolding alone does not complete a gate.
 
 - Bridgefu starting revision: `5ed676c3f51d1b3af5bdabe504032b26a59225e0`
 - rvoip starting revision: `239efa5649dcf330f90ed63a84c1b082a8f4916b`
-- StandardCharter starting revision: `0143eac46d737ac532405371224d1a4f8c676ffb`
+- Reference tenant starting revision: `0143eac46d737ac532405371224d1a4f8c676ffb`
 - Bridgefu branch: `codex/bridgefu-1.0`
 - rvoip branch: `codex/bridgefu-1.0-rvoip`
-- Production StandardCharter deployment and public artifact publication are not
+- Production reference-tenant deployment and public artifact publication are not
   authorized by this roadmap.
 - Reproducible defects in the published rvoip dependency are reported in
   `eisenzopf/rvoip` with Bridgefu evidence for the rvoip maintainer to repair.
@@ -23,7 +23,7 @@ Baseline evidence recorded on 2026-07-10:
 - Bridgefu: `cargo test` — 13 passed.
 - rvoip: auth-core 35, core 25, UCTP 8, QUIC 1, and MOQT 1 unit tests passed.
 - rvoip WebRTC: WHIP, WS, and rustls feature compilation passed.
-- StandardCharter core: 31 tests passed; web: 3 tests passed.
+- Reference tenant core: 31 tests passed; web: 3 tests passed.
 
 Dependency checkpoint recorded on 2026-07-26:
 
@@ -62,7 +62,7 @@ Registry integration checkpoint recorded on 2026-07-29:
   fallback for older adapters.
 - The real SIP cancellation reference passes the one-second destination-CANCEL
   bound. The complete generic SIP suite passes 6/6, the call execution
-  supervisor passes 40/40, the StandardCharter contract passes 82/82, and the
+  supervisor passes 40/40, the reference tenant contract passes 82/82, and the
   non-browser Amazon qualification passes 2/2 against the registry-only graph.
 - rvoip `0.3.4` used the disclosed owner-approved carry-forward release mode;
   its full beta, external interoperability matrix, and long soaks were not
@@ -100,7 +100,7 @@ Overlay provenance:
   `5fc5886b563e4bd3cb908881d36a2baabcbe267a40a4546497638c016d28ccc4`.
 - The original rvoip worktree was preserved on `main` at
   `f2f29d0e110bc9b3d6f83aa5e8f131398a2dce0a`. Proxy work uses the clean
-  isolated worktree `/Users/jonathan/Developer/rvoip-sip-proxy-conformance`
+  isolated worktree `<RVOIP_WORKTREE>/rvoip-sip-proxy-conformance`
   on `codex/sip-proxy-conformance`; its exact manifest and evolving evidence
   are recorded in `crates/sip/sip-proxy/docs/CONFORMANCE_STATUS.md`.
 
@@ -143,13 +143,13 @@ to coordinate its two call legs.
 | BP-5 — ACK, Timer C, and routing | In progress | Focused tests now distinguish transaction-owned non-2xx ACK from stateless 2xx ACK. Per-branch Timer C, actual-transport Via stamping, Route/SIPS/RFC 3263, bounded state, UDP/TCP/TLS packet evidence, and cleanup remain open. |
 | BP-6 — independent conformance | Active | Mock and real UDP/TCP/TLS loopback coverage is in progress. On the current stable development source, a bounded Kamailio/rvoip-first UDP row and a bounded OpenSIPS/peer-first UDP row each pass all 10 counted core-and-cleanup scenarios with real external traversal, packet-bound Via evidence, unchanged proxy binaries, and clean process/port convergence. Earlier diagnostic runs exposed and led to corrections for SIPp CANCEL branch/duplicate-response modeling, an INVITE-487 Via fixture error, provisional-response timing, body-length evidence, and shell fail-open/stale-artifact risks. These short dirty-source rows deliberately omit the 130-second retention assertion and advanced scenarios, so they are development evidence rather than release evidence. The `0.3.2` release gate requires pinned real Kamailio and OpenSIPS peers in both adjacency orders (`UAC → rvoip → peer → UAS` and `UAC → peer → rvoip → UAS`), SIPp/raw-wire scenario traffic, verified TLS identities, packet captures proving both Via hops, a full protocol-retention drain, and machine-readable zero-retained-state evidence. Each peer must independently exercise the full required scenario inventory across its six rows; one peer cannot substitute for the other, and an in-process Rust test may supplement but cannot satisfy external interoperability coverage. The harness follows the existing Asterisk/FreeSWITCH lifecycle and provenance pattern while remaining self-contained in rvoip. A skipped peer, topology, required transport, scenario, capture, or cleanup assertion is a release failure. |
 | BP-7 — beta qualification | Pending | Full beta report, three canonical 2,000-CPS passes, PBX audio/teardown, 30-minute monolithic soak, and one-hour split soak pass. |
-| BP-8 — registry integration | Historical 0.3.4 checkpoint complete; superseded by 0.3.5 | At the 2026-07-29 checkpoint, rvoip 0.3.4 was published and Bridgefu's exact registry-only 0.3.4 graph passed its all-target compile/test matrix plus SIP cancellation, generic SIP, call-actor, StandardCharter, and hermetic Amazon suites. The 2026-07-31 checkpoint above makes exact registry-only 0.3.5 the current release graph. Owner-gated TURN/public-NAT, live-provider, split/cloud, and long-run evidence remain later product-release gates rather than registry-integration claims. |
+| BP-8 — registry integration | Historical 0.3.4 checkpoint complete; superseded by 0.3.5 | At the 2026-07-29 checkpoint, rvoip 0.3.4 was published and Bridgefu's exact registry-only 0.3.4 graph passed its all-target compile/test matrix plus SIP cancellation, generic SIP, call-actor, reference tenant, and hermetic Amazon suites. The 2026-07-31 checkpoint above makes exact registry-only 0.3.5 the current release graph. Owner-gated TURN/public-NAT, live-provider, split/cloud, and long-run evidence remain later product-release gates rather than registry-integration claims. |
 
 ## Vapi Widget to Call Center full-duplex release gap
 
 This section is the canonical product-level release overlay approved on
 2026-07-14. It takes precedence over any older statement below that calls a
-component, localhost adapter path, or legacy StandardCharter fixture locally
+component, localhost adapter path, or legacy reference tenant fixture locally
 complete. Those results remain useful implementation evidence, but they do not
 make a Vapi website-widget topology supported.
 
@@ -201,14 +201,14 @@ with its listed executable evidence.
 
 | Gap gate | Status | Required evidence |
 |---|---|---|
-| VF-0 — roadmap and Vapi feasibility | In progress — owner-gated harness implemented; live evidence absent | StandardCharter now has a manual-only, dry-run-by-default Chromium harness for both Vapi transfer mechanisms, a controlled SIP echo, and a generated Bridgefu SIPS attachment. Offline contract/redaction tests are executable, but they are not qualification evidence and no live browser run has occurred. Closure still requires owner-authorized, externally credentialed evidence for full-duplex audio, DTMF, allowlisted header names, both hangup directions, callbacks, final reason, and cleanup. Automation may only flag a vendor-blocked candidate after all four echo attempts explicitly report capability unsupported; only owner review may mark Vapi-managed ingress `vendor-blocked`, and direct ingress remains release-capable. |
+| VF-0 — roadmap and Vapi feasibility | In progress — owner-gated harness implemented; live evidence absent | The reference tenant now has a manual-only, dry-run-by-default Chromium harness for both Vapi transfer mechanisms, a controlled SIP echo, and a generated Bridgefu SIPS attachment. Offline contract/redaction tests are executable, but they are not qualification evidence and no live browser run has occurred. Closure still requires owner-authorized, externally credentialed evidence for full-duplex audio, DTMF, allowlisted header names, both hangup directions, callbacks, final reason, and cleanup. Automation may only flag a vendor-blocked candidate after all four echo attempts explicitly report capability unsupported; only owner review may mark Vapi-managed ingress `vendor-blocked`, and direct ingress remains release-capable. |
 | VF-1 — rvoip edge foundations | In progress — local split initial, replacement, terminal, and drain paths are green; outbound browser DTMF is upstream-blocked | Staged inbound SIP answer, listener policy exposure, outbound SIPS/SRTP and authentication profiles, and WSS/HTTPS/ICE/TURN/DataMessage lifecycle pass their focused suites. Authenticated `offer-ready` provides two-phase WSS admission: it requires a leased `rvoip.webrtc.v1` route and a non-anonymous, unexpired principal; stages SDP and DataChannels before core publication; emits neither media nor `Connected` before exact request-bound acceptance; preserves legacy `offer`; and performs owner-bound rejection, timeout, disconnect, and expired-principal cleanup. Its focused suite passes 11/11. The private UCTP seam has versioned, bounded `prepare`, `activate`, `abort`, `end`, DTMF, DataMessage, response, and lifecycle envelopes; exact worker fence plus tenant/call/source-leg/source-generation/target-generation checks; command expiry/digest replay rejection; source cleanup; worker/gateway client dispatch; one-use generation-bound destination-stream admission; and distinct authenticated UCTP Session/Connection/MediaStream ownership. Gateway and worker roles install the SIP/WSS proxy lifecycle, Redis-backed state/replay, durable initial and replacement bindings, DTMF/DataMessage forwarding, terminal lifecycle journaling with exact durable ACKs, and awaited End/Abort cleanup during drain. Process-level Redis restart and non-loopback real-peer qualification remain open. The coordinated WebRTC/RTC implementation is supplied by the locked rvoip 0.3.5 crates.io graph. Three exact Chromium destinations pass; generic WSS exposes rvoip #54 after the DTMF event reaches Bridgefu's core boundary. Reproducible dependency defects are reported to `eisenzopf/rvoip`; Bridgefu carries no local rvoip patch. |
 | VF-2 — secure routes and attachment lifecycle | In progress — local API, repository, and split-adapter ownership evidence is green | Named route/profile APIs, complete redacted one-use SIP and WebRTC attachment descriptors, `attach_then_dial`, durable 24-hour idempotency, atomic token consumption, tenant isolation, fail-closed split capability selection, and generation-bound split destination ownership pass focused suites. Closure still requires the final all-target regression and deployed topology evidence. |
 | VF-3 — generic SIP reference destination | In progress — secure SIP, true early media, all-in-one, cancellation, and local split execution are hermetically green; live qualification remains | `tests/generic_sip_reference.rs` composes the durable named-route actor with real rvoip source, Bridgefu B2BUA, and destination peers. All six exact local tests pass for authenticated SIPS/SRTP, non-silent destination-to-source media during 183 while both legs remain signaling, final-answer promotion onto the same source graph, full-duplex media, RFC 4733, proxy and origin Digest challenges, rejection, source CANCEL propagation within one second, and cleanup. The call-supervisor race suite additionally proves that source termination while the final answer is in flight commits the same exact-generation durable transition and immediately retires a connected peer. `tests/qualification_generic_wss.rs` separately covers authenticated browser WSS/TLS to named SIPS/TLS+SRTP with media, context translation, DTMF, hangup, and cleanup. The split topology test adds real authenticated WHIP ingress over loopback, private mTLS UCTP, staged SIP/WSS adapter fixtures, failed-generation compensation, successful replacement, and exact terminal/drain cleanup. Non-loopback/live standards-PBX and built-SDK split qualification remain open; this does not prove stock Vapi browser transfer. |
-| VF-4 — Vapi-managed ingress | In progress — local Vapi-like edges and StandardCharter control integration are green; VF-0/live evidence remains | `tests/qualification_generic_wss.rs` proves that a trusted-CIDR-authenticated, one-use named-route SIPS attachment with mandatory SRTP reaches configured WSS and generic-SIP destinations with the advertised media, context, DTMF, terminal, and cleanup behavior. StandardCharter locally creates only allowlisted managed route calls, preserves the Amazon default and rollback flag, and keeps URI/call/tenant/credential authority off the model. This is hermetic Vapi-like SIP and local control evidence, not proof that stock Vapi `webCall` can transfer. Closure still requires VF-0, owner-authorized canary evidence, and every claimed destination. |
-| VF-5 — direct browser ingress and handoff | In progress — SDK, server-owned mapping, assistant configuration, durable lifecycle, all-in-one handoffs, local split replacement, and three published-graph Chromium destinations are green | The reusable TypeScript client, StandardCharter widget integration, signed server-owned session mapping, dedicated Vapi SIP assistant/tool configuration, generation-fenced make-before-break replacement, monotonic authenticated handoff status, success compensation, timeout/cancellation, replay, glare, and no-spoof/no-mix tests are implemented. Exact built-SDK Chromium handoffs to generic SIP, Amazon Connect, and Telnyx pass against published rvoip 0.3.5. Generic WSS reaches Bridgefu's core but is blocked by rvoip #54 on outbound RFC 4733. Real-adapter suites cover application/media-ready promotion, rejection compensation, no-mix holds, stable browser binding, exact profile revisions, terminal variants, and cleanup. The local split topology proves one failed replacement generation followed by a successful generation without cross-connect or leaked prior media, but remains an adapter-fixture/WHIP test rather than a built-SDK Chromium split matrix. Closure still requires the upstream fix/rerun, TURN-only and public-NAT evidence, built-SDK split execution, process-restart recovery, and deployed canary qualification. |
+| VF-4 — Vapi-managed ingress | In progress — local Vapi-like edges and reference-tenant control integration are green; VF-0/live evidence remains | `tests/qualification_generic_wss.rs` proves that a trusted-CIDR-authenticated, one-use named-route SIPS attachment with mandatory SRTP reaches configured WSS and generic-SIP destinations with the advertised media, context, DTMF, terminal, and cleanup behavior. The reference tenant locally creates only allowlisted managed route calls, preserves the Amazon default and rollback flag, and keeps URI/call/tenant/credential authority off the model. This is hermetic Vapi-like SIP and local control evidence, not proof that stock Vapi `webCall` can transfer. Closure still requires VF-0, owner-authorized canary evidence, and every claimed destination. |
+| VF-5 — direct browser ingress and handoff | In progress — SDK, server-owned mapping, assistant configuration, durable lifecycle, all-in-one handoffs, local split replacement, and three published-graph Chromium destinations are green | The reusable TypeScript client, reference tenant widget integration, signed server-owned session mapping, dedicated Vapi SIP assistant/tool configuration, generation-fenced make-before-break replacement, monotonic authenticated handoff status, success compensation, timeout/cancellation, replay, glare, and no-spoof/no-mix tests are implemented. Exact built-SDK Chromium handoffs to generic SIP, Amazon Connect, and Telnyx pass against published rvoip 0.3.5. Generic WSS reaches Bridgefu's core but is blocked by rvoip #54 on outbound RFC 4733. Real-adapter suites cover application/media-ready promotion, rejection compensation, no-mix holds, stable browser binding, exact profile revisions, terminal variants, and cleanup. The local split topology proves one failed replacement generation followed by a successful generation without cross-connect or leaked prior media, but remains an adapter-fixture/WHIP test rather than a built-SDK Chromium split matrix. Closure still requires the upstream fix/rerun, TURN-only and public-NAT evidence, built-SDK split execution, process-restart recovery, and deployed canary qualification. |
 | VF-6 — destination qualification | In progress — all-in-one paths and three published-graph exact built-SDK destinations are green; generic WSS is upstream-blocked | The published rvoip 0.3.5 Chromium rerun qualifies direct-browser → Vapi-like SIPS/SRTP assistant → generic SIP, Amazon Connect, and Telnyx. Generic WSS has a strict failing result recorded in rvoip #54. Real-adapter suites cover full-duplex media, DTMF, signed readiness, compensation, both terminal variants, and exact cleanup; Amazon remains initial-context-only. The local split test qualifies SIP/WSS adapter-fixture routing and replacement, not split Amazon/Telnyx, stock Vapi transfer, real TURN traversal, live provider/PBX behavior, or cloud infrastructure. |
-| VF-7 — clustered and release qualification | In progress — local split execution, route-catalog fencing, runtime smoke, and native image are green; deployed qualification remains | Split workers advertise only concrete configured capabilities. The canonical SHA-256 route/capability fingerprint includes provider, Amazon, generic destination/profile, codec, and effective capability policy; ordering is stable, configuration changes alter the digest, workers advertise it, assignments retain it, gateways reject mismatched/legacy workers and fresh dispatch or attachment consumption after catalog change, and reconnect refresh is tested. A worker cannot advance to a changed catalog while either an active assignment or a released terminal assignment with unfinished recovery work still requires the previous catalog. Gateway and worker roles install the authenticated private egress command service, Redis-backed epoch/replay state, SIP/WSS staged adapters, separate target-generation media admission, durable initial/replacement supervision, DTMF/DataMessage carriage, progress/terminal reconciliation, exact lifecycle ACKs, source-loss fallback, and awaited drain cleanup. The nine-check runtime smoke and hardened native Linux ARM image pass. Closure still requires a real process-role Redis restart test, non-loopback gateway/worker peer qualification, the protected multi-architecture OCI candidate, AWS/GCP smoke, one-hour load, latency/memory, deployed chaos, and provider/StandardCharter evidence. |
+| VF-7 — clustered and release qualification | In progress — local split execution, route-catalog fencing, runtime smoke, and native image are green; deployed qualification remains | Split workers advertise only concrete configured capabilities. The canonical SHA-256 route/capability fingerprint includes provider, Amazon, generic destination/profile, codec, and effective capability policy; ordering is stable, configuration changes alter the digest, workers advertise it, assignments retain it, gateways reject mismatched/legacy workers and fresh dispatch or attachment consumption after catalog change, and reconnect refresh is tested. A worker cannot advance to a changed catalog while either an active assignment or a released terminal assignment with unfinished recovery work still requires the previous catalog. Gateway and worker roles install the authenticated private egress command service, Redis-backed epoch/replay state, SIP/WSS staged adapters, separate target-generation media admission, durable initial/replacement supervision, DTMF/DataMessage carriage, progress/terminal reconciliation, exact lifecycle ACKs, source-loss fallback, and awaited drain cleanup. The nine-check runtime smoke and hardened native Linux ARM image pass. Closure still requires a real process-role Redis restart test, non-loopback gateway/worker peer qualification, the protected multi-architecture OCI candidate, AWS/GCP smoke, one-hour load, latency/memory, deployed chaos, and provider/reference tenant evidence. |
 
 VF-2 named-Vapi attachment-identity evidence recorded on 2026-07-15: route
 creation remains authorized by the control-API principal, while a named SIP
@@ -498,7 +498,7 @@ Current post-change Bridgefu regression evidence recorded on 2026-07-15:
 The generic-WSS file passes all four nonignored tests and its exact Chromium
 test passes 1/1; Amazon passes 2/2 plus its exact Chromium 1/1; Telnyx passes
 2/2 plus its exact Chromium 1/1; and the generic-SIP exact Chromium test passes
-1/1. StandardCharter passes 48 core, 11 web, and 16 Python tests, and its
+1/1. The reference tenant passes 48 core, 11 web, and 16 Python tests, and its
 production web build succeeds. These are local library, loopback, and
 local-composite browser results. They do not replace owner-authorized Vapi/AWS
 canaries, a restricted live-provider run, TURN/public-NAT qualification,
@@ -659,7 +659,7 @@ release gates above:
 | 8 | Local Telnyx implementation complete; live qualification pending | Restricted live Telnyx test-account control/media workflow. |
 | 9 | Direct UCTP and local/static MOQT complete; clustered dynamic MOQT pending | Owner review, immutable pin, enablement, and requalification of the private dynamic publisher-policy candidate. |
 | 10 | Local modes/config/observability/Compose preflight/Terraform validation complete | Protected multi-architecture artifact plus disposable AWS/GCP apply-smoke-destroy. |
-| 11 | Finite local qualification complete; release campaign pending | Exact one-hour loads, deployed chaos, protected provider/StandardCharter runs, and coordinated release-candidate revisions. |
+| 11 | Finite local qualification complete; release campaign pending | Exact one-hour loads, deployed chaos, protected provider/reference tenant runs, and coordinated release-candidate revisions. |
 
 An unchecked item below is not implied by a green local smoke. Production
 deployment, public publication, fork push/adoption, cloud apply, and live
@@ -677,7 +677,7 @@ provider calls remain outside automatic authority.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
 
-### Gate 1 — Freeze StandardCharter (`complete`)
+### Gate 1 — Freeze the reference tenant (`complete`)
 
 - [x] Add hermetic Connect and Chime test doubles and golden Vapi SIP fixtures.
 - [x] Assert `X-Correlation-Id` to Amazon `correlation_id` mapping and exact
@@ -691,7 +691,7 @@ Exit: all existing work is accounted for and the baseline is reproducible.
 The Gate 7 Amazon audit reopened this gate at Bridgefu revision `6e30708`.
 Bridgefu revision `eb9932c` and rvoip revisions `84f84fbf`, `869e20d6`, and
 `a18df977` close the hermetic media and lifecycle gap without changing the
-production connector default. `tests/standardcharter_contract.rs` now enters
+production connector default. `tests/reference_tenant_contract.rs` now enters
 through the real localhost SIP listener, completes INVITE/180/200/ACK, sends
 real PCMU RTP through the production MediaGraph to a credential-free fake
 Connect Opus session, loops Opus back to real PCMU RTP, and proves ordered
@@ -701,15 +701,15 @@ reusable rvoip defects: bridge handles must retain transport-owning media
 streams, and decoded audio callbacks must preserve source RTP timestamps.
 
 Focused evidence passes 247 media-core tests, 62 Amazon Connect library tests,
-3 Amazon media-bridge tests, and all 34 locked StandardCharter contract tests.
+3 Amazon media-bridge tests, and all 34 locked reference tenant contract tests.
 Bridgefu revision `84d760e` adds the manual-only workflow, its fixed
-`standardcharter-nonproduction` GitHub environment boundary, exact confirmation
+`reference-tenant-nonproduction` GitHub environment boundary, exact confirmation
 and owner-authorization gates, secret-only targets, offline-default validation,
 redacted lifecycle evidence, and the executable drain/rollback runbook. The CI
 artifact check parses the workflow and scripts, executes synthetic offline
 preflight/plan paths, and proves that production-marked targets, option-looking
 targets, and unauthorized execution are rejected. The locked 34-test
-StandardCharter contract remains green after the artifact change.
+The reference tenant contract remains green after the artifact change.
 
 No AWS, Vapi, SSH, deployment, or rollback operation was executed to close this
 gate. An owner-authorized run of the protected non-production workflow remains
@@ -720,7 +720,7 @@ This gate freezes the legacy Vapi SIP-to-Amazon contract only. It does not
 prove that a stock Vapi browser `webCall` can transfer to SIP; that externally
 credentialed feasibility result remains pending in VF-0.
 
-Exit: current StandardCharter behavior is reproducibly protected without a
+Exit: current reference-tenant behavior is reproducibly protected without a
 production change.
 
 ### Gate 2 — Complete rvoip foundations (`complete`)
@@ -909,7 +909,7 @@ Gate 4 evidence recorded on 2026-07-11:
   registry, and uses generation-scoped cleanup that cannot delete a
   replacement publisher.
 - Bridgefu's locked consumer graph passes 34 tests against the 0.2.0 crates;
-  StandardCharter remains unchanged and passes all 35 core and 3 web tests.
+  the reference tenant remains unchanged and passes all 35 core and 3 web tests.
   CI now runs the all-target Gate 4 matrix and the same strict clippy set.
 - The current rvoip revision packages `rvoip-uctp` 0.2.0 successfully. Dry
   packaging the dependent QUIC/WebTransport crates correctly waits for a
@@ -1078,7 +1078,7 @@ hint for SIP and WebRTC connections.
    - Inject rvoip `AuthenticatedPrincipal` validation into Axum, inherit tenant
      from the principal, require operation scopes, and allow tenant override
      only with `calls:tenant-override`.
-   - Keep `ConnectScreenPopServer` and the existing StandardCharter listener
+   - Keep `ConnectScreenPopServer` and the existing reference tenant listener
      untouched; the new API and effect executor do not call its active-call or
      teardown helpers during this item.
 6. [x] Add memory and Redis worker coordination with fenced leases, capability
@@ -1255,7 +1255,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
   decisions, and ordered effect intents.
 - The domain suite passes 19 transition, stale-generation, serialization,
   invariant, and property-like tests. The complete Bridgefu all-target suite
-  passes 20 binary tests plus 14 StandardCharter contract tests; strict library
+  passes 20 binary tests plus 14 reference tenant contract tests; strict library
   Clippy and warning-free library rustdoc pass.
 - rvoip revision `87b213b33f26ca6f178c899b8b91a18ba30ebedf`
   completed the inbound-context seam and was pushed on
@@ -1295,7 +1295,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
   attachments, wrong-leg provider rollback, callback-before-reference ordering,
   exact lost-response replay, terminal callback recovery, permanent connection
   ID tombstones, and capacity-safe terminal cleanup. The complete locked suite
-  passes 49 library, 20 binary, and 14 StandardCharter tests; strict library
+  passes 49 library, 20 binary, and 14 reference tenant tests; strict library
   Clippy and warning-free library rustdoc pass.
 - Bridgefu revision `5b746cf12bd50c645492d05213167a1c6283950b`
   adds authoritative SQLite and PostgreSQL implementations with one versioned
@@ -1313,7 +1313,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
 - The digest-pinned PostgreSQL 17.5 Docker runner passes all 10 shared schema,
   migration reconnect/checksum, row-delta, rollback/cancellation, 13-row-family
   drift, lifecycle, and two-independent-instance race tests. The main locked
-  suite passes 49 library, 20 binary, 10 repository, and 14 StandardCharter
+  suite passes 49 library, 20 binary, 10 repository, and 14 reference tenant
   tests; strict library/repository Clippy and warning-free rustdoc pass. CI
   provisions PostgreSQL and cannot silently use the local skip path.
 - Bridgefu revision `fb24b7a` upgrades both SQL backends to integrity schema
@@ -1332,7 +1332,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
   idempotency, immutable execution plans, exact original create snapshots and
   attachment-token replay, durable transfer/DTMF/control receipts, bounded
   dependency setup, explicit capability/transition errors, and tenant-scoped
-  legacy API isolation. The frozen StandardCharter runtime is not called or
+  legacy API isolation. The frozen reference tenant runtime is not called or
   replaced by this path.
 - Bridgefu revision `dda3288`
   makes Gate 6 item 5 durable at process startup. A public shared construction
@@ -1352,7 +1352,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
   duplicate, or mismatched evidence fails closed without weakening schema-v3
   service markers, tombstones, or reverse reconciliation evidence.
 - The final locked all-target/all-feature suite passes 178 tests, including 20
-  unchanged StandardCharter contract tests. The digest-pinned disposable
+  unchanged reference tenant contract tests. The digest-pinned disposable
   PostgreSQL runner executes 16 repository, 3 service-repository, and 5 runtime
   tests. Memory, SQLite, and real PostgreSQL cover dependency outage, exhausted
   capacity, restart fencing, retained reservations, and exact replay after an
@@ -1430,7 +1430,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
   start new outbound work. Provider reconciliation remains schema version 5;
   execution authority is the ordered schema-version-6 migration. The isolated
   locked suite passes 114 library, 40 binary, all repository/runtime suites,
-  and 24 unchanged StandardCharter contract tests.
+  and 24 unchanged reference tenant contract tests.
 - Bridgefu revision `09d92fa` adds explicit SQLite and PostgreSQL schema-5 to
   schema-6 fixtures containing a legacy version-1 execution plan, historical
   outbound binding, and service-reconciliation receipt. Upgrade preserves
@@ -1479,7 +1479,7 @@ Gate 6 progress evidence recorded on 2026-07-12:
 - Final Gate 6 qualification passes 280 executable tests: 133 library, 53
   binary, 6 real fake-adapter supervisor integrations, 20 memory-service, 5
   service-repository, 8 runtime, 1 standalone SQL coordination, 21 repository
-  conformance, and 33 unchanged StandardCharter tests. Three credentialed
+  conformance, and 33 unchanged reference tenant tests. Three credentialed
   Redis/PostgreSQL cases remain intentionally environment-gated in the normal
   suite. The digest-pinned disposable PostgreSQL run passes 21 repository, 5
   service-repository, 8 runtime, and 2 coordination tests; the companion
@@ -1492,7 +1492,7 @@ Gate 6 qualification covers interleaved unrelated attachments, repository
 parity, concurrent capacity/idempotency races, callback-before-originate-result,
 outbox crash points, token replay/expiry/isolation, remote teardown, transfer
 glare, restart, authority loss, and bounded drain. The existing
-`ConnectScreenPopServer` remains the default StandardCharter path until Gate 7
+`ConnectScreenPopServer` remains the default reference tenant path until Gate 7
 moves Amazon behind the common engine.
 
 Exit: state/repository tests pass and unrelated concurrent calls cannot
@@ -2263,19 +2263,19 @@ not hide an earlier adapter side effect behind a nominally staged API.
 
    The follow-up local golden closes the durable call-engine, fake-Connect,
    fake-Chime, media, and repository-crash portions of 5h. The
-   `standardcharter_canary_replays_into_generic_engine_bridges_media_and_drains`
+   `reference_tenant_canary_replays_into_generic_engine_bridges_media_and_drains`
    test enters with only the configured `sip:<tenant>` routing hint and Vapi
    headers, replays/consumes the hidden bearer inside normal admission, sends
    the exact two allowlisted Connect attributes, starts one contact, runs a
    bidirectional PCMU↔Opus graph, rejects exact attachment replay, changed
    mapped metadata, and a foreign tenant, then observes one StopContact, one
    media close, zero aborts, zero graph routes, and zero retained Amazon
-   sessions. `standardcharter_canary_sqlite_restart_fails_closed_without_connect_io`
+   sessions. `reference_tenant_canary_sqlite_restart_fails_closed_without_connect_io`
    crashes after durable creation but before attachment, advances the worker
    fence on SQLite restart, fails both old legs with `worker_restarted`, and
    rejects correlation replay with zero Start/Stop/media routes. The focused
    commands pass 2/2 integration tests and the original 3/3 policy tests; the
-   unchanged real-SIP frozen `standardcharter_contract` suite now passes 72/72.
+   unchanged real-SIP frozen `reference_tenant_contract` suite now passes 72/72.
 
    This run exposed a production rvoip integration defect rather than masking
    it in the fixture: the outbound-only Amazon adapter advertised
@@ -2300,7 +2300,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
    produces exactly one StopContact and media close, zero aborts, zero active
    graph bridges, zero Amazon sessions or pending cleanup, and zero retained
    SIP/orchestrator lifecycle tasks after drain. The exact test
-   `authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_exactly`
+   `authenticated_reference_tenant_canary_crosses_real_sip_rtp_and_drains_exactly`
    passes 1/1. This does not run Vapi, AWS, or authorize a production switch.
 6. [x] Add an initial-context readiness barrier. Durable
    `bridgefu.context.v1` metadata must be validated and available before an
@@ -2422,7 +2422,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
    metric and byte-exact private RTCP conformance are tested separately.
    Deployed NAT/TURN remains the owner-gated item 9 qualification and does not
    keep the local call-engine implementation open.
-8. [x] Preserve the frozen StandardCharter path while adding a protected
+8. [x] Preserve the frozen reference tenant path while adding a protected
    canary compatibility route for its trusted Vapi contract: `sip:<tenant>`
    plus `X-Correlation-Id`, without a public attachment token. The canary may
    auto-create or attach only after source authentication, explicit tenant
@@ -2485,7 +2485,7 @@ not hide an earlier adapter side effect behind a nominally staged API.
      Run Bridgefu through representative deployed public-NAT and TURN-only
      topologies, including explicit media-port allocation/forwarding behavior,
      and rerun the RTC, rvoip WebRTC, exact Chromium destination, and
-     StandardCharter regression matrices against the committed lockfile.
+     reference tenant regression matrices against the committed lockfile.
      Reproducible rvoip defects are filed in `eisenzopf/rvoip`; Bridgefu does
      not carry a local dependency patch.
 
@@ -3547,15 +3547,15 @@ Gate 7 progress evidence recorded on 2026-07-12:
   the parent poll chain to unwind. A raw-UDP fast-auto-accept regression runs
   the complete inbound listener path on an explicitly configured 2 MiB Tokio
   worker stack and passes with `RUST_MIN_STACK` absent. Both hermetic
-  StandardCharter teardown directions now use the same explicit 2 MiB runtime;
+  reference tenant teardown directions now use the same explicit 2 MiB runtime;
   their exact tests pass independently, the full locked
-  `standardcharter_contract` binary passes 59/59 tests, and the focused SIP
+  `reference_tenant_contract` binary passes 59/59 tests, and the focused SIP
   teardown/header/state-table matrix passes 23/23 tests. The raw peer in the
   rvoip regression deliberately excludes the separate UAC response path so the
   evidence measures the corrected inbound boundary directly.
 
 Historical local exit: the generic SIP/WebRTC adapter directions pass the
-listed real localhost media tests and the frozen StandardCharter SIP contract
+listed real localhost media tests and the frozen reference tenant SIP contract
 remains unchanged. This is not evidence for a stock Vapi browser transfer, a
 direct Bridgefu widget, API-level leg replacement, or the complete destination
 matrix. Product release status is governed by VF-0 through VF-7 in addition to
@@ -4025,7 +4025,7 @@ owner-reviewed, pinned, enabled, and requalified.
     Telnyx control/media field, and give the clustered worker a private-role
     configuration that passes its real preflight.
   - [x] Render every Compose profile in CI, then run the Bridgefu binary's
-    strict `validate`/role preflight against the StandardCharter, generic,
+    strict `validate`/role preflight against the reference tenant, generic,
     Telnyx, UCTP, MOQT, clustered-gateway, clustered-worker, and
     clustered-MOQT-relay service environments. This is executable configuration
     validation, not a claim that the checker starts the Compose services. The
@@ -4546,7 +4546,7 @@ rvoip and Bridgefu revisions are release-candidate quality.
   backchannels, and active-call migration are deferred.
 - Twilio and Vonage provider control are deferred beyond Bridgefu 1.0; Telnyx
   is the only external provider-control release gate.
-- StandardCharter compatibility is release-blocking.
+- Reference-tenant compatibility is release-blocking.
 - External provider/cloud evidence requires test credentials supplied through
   secret references; absence of credentials never converts a pending gate into
   a completed one.

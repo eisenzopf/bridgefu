@@ -104,7 +104,7 @@ impl fmt::Debug for AmazonCleanupJournal {
 
 impl AmazonCleanupJournal {
     /// Open the same durable backend selected for call state. SQL setup is
-    /// idempotent so the frozen StandardCharter-only configuration also gains
+    /// idempotent so the frozen ReferenceTenant-only configuration also gains
     /// cleanup durability when the generic call API is disabled.
     pub async fn connect(config: CallRepositoryBackendConfig) -> anyhow::Result<Arc<Self>> {
         let backend = match &config {

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+source /etc/bridgefu/runtime.conf
+[[ "$BRIDGEFU_ROLE" == gateway ]] || exit 0
+work="$(mktemp -d /run/bridgefu-ha-cert.XXXXXX)"
+trap 'rm -rf "$work"' EXIT
+
+aws secretsmanager get-secret-value \
+  --region "$AWS_REGION" \
+  --secret-id "$CERTIFICATE_PASSPHRASE_SECRET_ARN" \
+  --query SecretString \
+  --output text > "$work/passphrase"
+if (( $(wc -c < "$work/passphrase") < 32 )); then
+  echo "ACM export passphrase is invalid" >&2
+  exit 1
+fi
+
+aws acm export-certificate \
+  --region "$AWS_REGION" \
+  --certificate-arn "$CERTIFICATE_ARN" \
+  --passphrase "fileb://$work/passphrase" > "$work/export.json"
+jq -er '.Certificate' "$work/export.json" > "$work/certificate.pem"
+jq -er '.CertificateChain' "$work/export.json" > "$work/chain.pem"
+jq -er '.PrivateKey' "$work/export.json" > "$work/private-encrypted.pem"
+openssl pkey \
+  -in "$work/private-encrypted.pem" \
+  -passin "file:$work/passphrase" \
+  -out "$work/private-key.pem" >/dev/null 2>&1
+cat "$work/certificate.pem" "$work/chain.pem" > "$work/fullchain.pem"
+
+openssl x509 -in "$work/certificate.pem" -noout -checkend 604800 >/dev/null
+for hostname in \
+  "$BRIDGEFU_SIP_HOSTNAME" \
+  "$BRIDGEFU_CONTROL_HOSTNAME" \
+  "$BRIDGEFU_UCTP_HOSTNAME"; do
+  openssl x509 -in "$work/certificate.pem" -noout -checkhost "$hostname" >/dev/null
+done
+cert_key="$(openssl x509 -in "$work/certificate.pem" -pubkey -noout | openssl pkey -pubin -outform der 2>/dev/null | sha256sum | cut -d' ' -f1)"
+private_key="$(openssl pkey -in "$work/private-key.pem" -pubout -outform der 2>/dev/null | sha256sum | cut -d' ' -f1)"
+if [[ "$cert_key" != "$private_key" ]]; then
+  echo "ACM certificate and private key do not match" >&2
+  exit 1
+fi
+
+changed=true
+if [[ -f /etc/bridgefu/tls/fullchain.pem && -f /etc/bridgefu/tls/private-key.pem ]] \
+  && cmp -s "$work/fullchain.pem" /etc/bridgefu/tls/fullchain.pem \
+  && cmp -s "$work/private-key.pem" /etc/bridgefu/tls/private-key.pem; then
+  changed=false
+fi
+if $changed; then
+  install -o root -g bridgefu -m 0640 "$work/fullchain.pem" /etc/bridgefu/tls/fullchain.pem.new
+  install -o root -g bridgefu -m 0640 "$work/private-key.pem" /etc/bridgefu/tls/private-key.pem.new
+  mv -f /etc/bridgefu/tls/fullchain.pem.new /etc/bridgefu/tls/fullchain.pem
+  mv -f /etc/bridgefu/tls/private-key.pem.new /etc/bridgefu/tls/private-key.pem
+  touch /run/bridgefu/certificate-reload-pending
+  /usr/local/sbin/bridgefu-ha-cert-reload || true
+fi
+
+expiry="$(openssl x509 -in "$work/certificate.pem" -noout -enddate | cut -d= -f2-)"
+days="$(( ($(date -d "$expiry" +%s) - $(date +%s)) / 86400 ))"
+aws cloudwatch put-metric-data \
+  --region "$AWS_REGION" \
+  --namespace Bridgefu/Runtime \
+  --metric-data "MetricName=CertificateDaysToExpiry,Dimensions=[{Name=deployment,Value=$BRIDGEFU_DEPLOYMENT_ID},{Name=role,Value=gateway},{Name=slot,Value=$BRIDGEFU_SLOT}],Value=$days,Unit=Count" \
+  >/dev/null 2>&1 || true
+echo "Bridgefu HA certificate refresh completed; changed=$changed days_to_expiry=$days"

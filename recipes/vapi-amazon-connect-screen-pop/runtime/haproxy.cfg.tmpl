@@ -1,0 +1,28 @@
+global
+    log stdout format raw local0
+    user haproxy
+    group haproxy
+    maxconn 256
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 3s
+    timeout client 12s
+    timeout server 12s
+
+frontend bridgefu_private_control
+    bind __CONTROL_BIND__
+    acl exact_reservation path -m str /v1/routes/support/calls
+    acl exact_reservation_method method POST
+    acl health_path path -m str /livez /readyz
+    http-request deny deny_status 404 unless health_path or exact_reservation
+    http-request deny deny_status 405 if exact_reservation !exact_reservation_method
+    default_backend bridgefu_loopback
+
+backend bridgefu_loopback
+    option httpchk GET /readyz
+    http-check expect status 200
+    server bridgefu 127.0.0.1:9090 check inter 5s fall 3 rise 2

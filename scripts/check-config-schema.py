@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 
 import yaml
@@ -14,14 +15,21 @@ from jsonschema import Draft202012Validator
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "config" / "schema.json"
 EXAMPLE_PATH = ROOT / "config" / "bridgefu.example.yaml"
+RECIPE_SCHEMA_PATH = ROOT / "recipes" / "schema" / "recipe-v1.schema.json"
+RECIPE_VALUES_SCHEMA_PATH = ROOT / "recipes" / "schema" / "values-v1.schema.json"
+RECIPE_ROOT = ROOT / "recipes" / "vapi-amazon-connect-screen-pop"
+RECIPE_PACKAGES = sorted(
+    path for path in (ROOT / "recipes").iterdir() if (path / "recipe.yaml").is_file()
+)
+RECIPE_CONFIG_EXAMPLE = ROOT / "config" / "recipe-vapi-amazon-connect.example.yaml"
 COMPATIBILITY_FIXTURES = sorted((ROOT / "config" / "fixtures").glob("config-v*.yaml"))
-STANDARDCHARTER_CONFIG = (
-    ROOT / "config" / "fixtures" / "standardcharter-managed-routes.yaml"
+REFERENCE_TENANT_CONFIG = (
+    ROOT / "config" / "fixtures" / "reference-tenant-managed-routes.yaml"
 )
-STANDARDCHARTER_ENV = (
-    ROOT / "config" / "fixtures" / "standardcharter-managed-routes.env"
+REFERENCE_TENANT_ENV = (
+    ROOT / "config" / "fixtures" / "reference-tenant-managed-routes.env"
 )
-EXPECTED_STANDARDCHARTER_ROUTES = (
+EXPECTED_REFERENCE_TENANT_ROUTES = (
     "amazon-connect",
     "generic-sip",
     "telnyx",
@@ -83,36 +91,36 @@ def assert_env_secret(instance: dict[str, object], *path: object) -> None:
         raise AssertionError(f"paired fixture secret {path!r} must use env:VARIABLE")
 
 
-def validate_standardcharter_pair(
+def validate_reference_tenant_pair(
     validator: Draft202012Validator,
 ) -> None:
-    bridgefu = yaml.safe_load(STANDARDCHARTER_CONFIG.read_text(encoding="utf-8"))
+    bridgefu = yaml.safe_load(REFERENCE_TENANT_CONFIG.read_text(encoding="utf-8"))
     validator.validate(bridgefu)
-    standardcharter = parse_env_fixture(STANDARDCHARTER_ENV)
+    reference_tenant = parse_env_fixture(REFERENCE_TENANT_ENV)
 
     routes = nested(bridgefu, "api", "routes")
     if not isinstance(routes, dict):
         raise AssertionError("paired Bridgefu fixture has no named-route catalog")
-    if tuple(routes) != EXPECTED_STANDARDCHARTER_ROUTES:
+    if tuple(routes) != EXPECTED_REFERENCE_TENANT_ROUTES:
         raise AssertionError(
             "paired Bridgefu fixture route order/IDs do not match the product contract"
         )
     configured_routes = tuple(
         route.strip()
-        for route in standardcharter.get("BRIDGEFU_ROUTE_IDS", "").split(",")
+        for route in reference_tenant.get("BRIDGEFU_ROUTE_IDS", "").split(",")
         if route.strip()
     )
-    if configured_routes != EXPECTED_STANDARDCHARTER_ROUTES:
-        raise AssertionError("paired StandardCharter route IDs do not match Bridgefu")
-    if standardcharter.get("BRIDGEFU_DEFAULT_ROUTE_ID") != "amazon-connect":
+    if configured_routes != EXPECTED_REFERENCE_TENANT_ROUTES:
+        raise AssertionError("paired ReferenceTenant route IDs do not match Bridgefu")
+    if reference_tenant.get("BRIDGEFU_DEFAULT_ROUTE_ID") != "amazon-connect":
         raise AssertionError("paired default route must remain amazon-connect")
-    if standardcharter.get("BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED") != "true":
+    if reference_tenant.get("BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED") != "true":
         raise AssertionError("paired migration fixture must explicitly scope Amazon rollback")
-    if not standardcharter.get("CONNECT_TRANSFER_SIP_URI", "").startswith("sips:"):
+    if not reference_tenant.get("CONNECT_TRANSFER_SIP_URI", "").startswith("sips:"):
         raise AssertionError("paired Amazon rollback fixture must use SIPS")
-    bearer_ref = standardcharter.get("BRIDGEFU_API_BEARER_TOKEN_REF", "")
+    bearer_ref = reference_tenant.get("BRIDGEFU_API_BEARER_TOKEN_REF", "")
     if not bearer_ref.startswith("env:"):
-        raise AssertionError("StandardCharter control bearer must remain a secret reference")
+        raise AssertionError("ReferenceTenant control bearer must remain a secret reference")
 
     expected_destination_types = {
         "amazon-connect": ("amazon_connect", "amazon_connect"),
@@ -149,21 +157,146 @@ def validate_standardcharter_pair(
     ):
         assert_env_secret(bridgefu, *path)
 
-    # A coordinated local checkout additionally catches accidental drift in
-    # StandardCharter's operator-facing example. Isolated Bridgefu CI still
-    # validates the complete canonical pair above.
-    sibling = ROOT.parent / "standardcharter" / "config" / "bridgefu-managed-ingress.env.example"
-    if sibling.is_file():
-        deployed = parse_env_fixture(sibling)
+    # A caller may additionally check a coordinated operator-facing fixture.
+    # Isolated Bridgefu CI validates the complete canonical pair above without
+    # depending on a specifically named sibling checkout.
+    paired_fixture = os.environ.get("BRIDGEFU_PAIRED_OPERATOR_FIXTURE")
+    if paired_fixture:
+        deployed_path = Path(paired_fixture).expanduser()
+        if not deployed_path.is_file():
+            raise AssertionError(
+                "BRIDGEFU_PAIRED_OPERATOR_FIXTURE must name an existing file"
+            )
+        deployed = parse_env_fixture(deployed_path)
         for key in (
             "BRIDGEFU_ROUTE_IDS",
             "BRIDGEFU_DEFAULT_ROUTE_ID",
             "BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED",
         ):
-            if deployed.get(key) != standardcharter.get(key):
+            if deployed.get(key) != reference_tenant.get(key):
                 raise AssertionError(
-                    f"StandardCharter example drifted from paired fixture key {key}"
+                    f"ReferenceTenant example drifted from paired fixture key {key}"
                 )
+
+
+def collect_recipe_input_references(value: object) -> list[str]:
+    references: list[str] = []
+    if isinstance(value, dict):
+        if "$input" in value:
+            if set(value) != {"$input"} or not isinstance(value["$input"], str):
+                raise AssertionError("$input must replace one complete YAML node")
+            references.append(value["$input"])
+        else:
+            for child in value.values():
+                references.extend(collect_recipe_input_references(child))
+    elif isinstance(value, list):
+        for child in value:
+            references.extend(collect_recipe_input_references(child))
+    return references
+
+
+def validate_canonical_recipe() -> None:
+    recipe_schema = json.loads(RECIPE_SCHEMA_PATH.read_text(encoding="utf-8"))
+    values_schema = json.loads(
+        RECIPE_VALUES_SCHEMA_PATH.read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(recipe_schema)
+    Draft202012Validator.check_schema(values_schema)
+    recipe_validator = Draft202012Validator(recipe_schema)
+    values_validator = Draft202012Validator(values_schema)
+
+    for package_root in RECIPE_PACKAGES:
+        package_manifest = yaml.safe_load(
+            (package_root / "recipe.yaml").read_text(encoding="utf-8")
+        )
+        package_values = yaml.safe_load(
+            (package_root / "values.example.yaml").read_text(encoding="utf-8")
+        )
+        recipe_validator.validate(package_manifest)
+        values_validator.validate(package_values)
+        declared_inputs = package_manifest.get("inputs", {})
+        supplied_inputs = set(package_values)
+        unknown_inputs = supplied_inputs - set(declared_inputs)
+        missing_required = {
+            name
+            for name, definition in declared_inputs.items()
+            if definition.get("required", False)
+            and "default" not in definition
+            and name not in supplied_inputs
+        }
+        references = collect_recipe_input_references(package_manifest["spec"])
+        unknown_references = set(references) - set(declared_inputs)
+        unused_inputs = set(declared_inputs) - set(references)
+        if unknown_inputs or missing_required or unknown_references or unused_inputs:
+            raise AssertionError(
+                f"recipe package {package_root.name} input contract drifted: "
+                f"unknown_values={sorted(unknown_inputs)!r} "
+                f"missing_required={sorted(missing_required)!r} "
+                f"unknown_references={sorted(unknown_references)!r} "
+                f"unused={sorted(unused_inputs)!r}"
+            )
+        for asset_path in list(package_manifest.get("assets", {}).values()) + [
+            asset_path
+            for profiles in package_manifest.get("deployments", {}).values()
+            for asset_path in profiles.values()
+        ]:
+            resolved = (package_root / asset_path).resolve()
+            if package_root.resolve() not in resolved.parents or not resolved.is_file():
+                raise AssertionError(
+                    f"recipe asset is missing or escapes {package_root.name}: {asset_path}"
+                )
+
+    manifest_path = RECIPE_ROOT / "recipe.yaml"
+    values_path = RECIPE_ROOT / "values.example.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    values = yaml.safe_load(values_path.read_text(encoding="utf-8"))
+    recipe_validator.validate(manifest)
+    values_validator.validate(values)
+
+    declared = set(manifest.get("inputs", {}))
+    supplied = set(values)
+    if declared != supplied:
+        raise AssertionError(
+            f"canonical recipe example values differ from declared inputs: "
+            f"declared={sorted(declared)!r} supplied={sorted(supplied)!r}"
+        )
+    referenced = collect_recipe_input_references(manifest["spec"])
+    unknown = set(referenced) - declared
+    unused = declared - set(referenced)
+    if unknown or unused:
+        raise AssertionError(
+            f"canonical recipe input references drifted: "
+            f"unknown={sorted(unknown)!r} unused={sorted(unused)!r}"
+        )
+
+    for path in list(manifest.get("assets", {}).values()) + [
+        path
+        for profiles in manifest.get("deployments", {}).values()
+        for path in profiles.values()
+    ]:
+        resolved = (RECIPE_ROOT / path).resolve()
+        if RECIPE_ROOT.resolve() not in resolved.parents or not resolved.is_file():
+            raise AssertionError(f"canonical recipe asset is missing or escapes root: {path}")
+
+    handoff_contract = json.loads(
+        (RECIPE_ROOT / "handoff-contract.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(handoff_contract)
+
+    unknown_top = copy.deepcopy(manifest)
+    unknown_top["executable_plugin"] = "forbidden"
+    assert_rejected(recipe_validator, unknown_top, ())
+
+    unknown_metadata = copy.deepcopy(manifest)
+    unknown_metadata["metadata"]["download_url"] = "https://example.invalid/recipe"
+    assert_rejected(recipe_validator, unknown_metadata, ("metadata",))
+
+    unknown_endpoint = copy.deepcopy(manifest)
+    unknown_endpoint["spec"]["bridges"]["transfer"]["source"][
+        "forward_all_headers"
+    ] = True
+    if not list(recipe_validator.iter_errors(unknown_endpoint)):
+        raise AssertionError("recipe schema accepted an unknown endpoint policy")
 
 
 def main() -> None:
@@ -172,12 +305,14 @@ def main() -> None:
     Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
     validator.validate(example)
+    validator.validate(yaml.safe_load(RECIPE_CONFIG_EXAMPLE.read_text(encoding="utf-8")))
     if not COMPATIBILITY_FIXTURES:
         raise AssertionError("no versioned configuration compatibility fixtures found")
     for fixture_path in COMPATIBILITY_FIXTURES:
         fixture = yaml.safe_load(fixture_path.read_text(encoding="utf-8"))
         validator.validate(fixture)
-    validate_standardcharter_pair(validator)
+    validate_reference_tenant_pair(validator)
+    validate_canonical_recipe()
 
     unknown_top = copy.deepcopy(example)
     unknown_top["unknown_top_level"] = True
@@ -254,8 +389,9 @@ def main() -> None:
     assert_rejected(validator, telnyx, ("providers", "telnyx"))
 
     print(
-        "Bridgefu config schema, compatibility/deployment fixtures, paired "
-        "StandardCharter routes, and strict negative fixtures are valid"
+        "Bridgefu config and recipe schemas, compatibility/deployment fixtures, "
+        "paired ReferenceTenant routes, canonical recipe assets, and strict "
+        "negative fixtures are valid"
     )
 
 

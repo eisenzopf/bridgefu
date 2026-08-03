@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bridgefu workload-account governance baseline: durable multi-region audit,
+  AWS Config recording, external-access analysis, threat detection, production
+  Security Hub, and three-stage monthly cost notifications. Deploy once per
+  nonproduction or production workload account before application preflight.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [nonproduction, production]
+  BudgetAmountUsd:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 1000000
+  BudgetEmail:
+    Type: String
+    MinLength: 3
+    MaxLength: 254
+    AllowedPattern: '^[^@[:space:]]+@[^@[:space:]]+$'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+Resources:
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'bridgefu-audit-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+            BucketKeyEnabled: true
+            BlockedEncryptionTypes: {EncryptionType: [SSE-C]}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: RetainAuditHistory
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 2555}
+            ExpirationInDays: 2555
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-governance}
+        - {Key: Environment, Value: !Ref Environment}
+
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditBucket.Arn
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/bridgefu-${Environment}'
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub '${AuditBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/bridgefu-${Environment}'
+          - Sid: ConfigBucketRead
+            Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action:
+              - s3:GetBucketAcl
+              - s3:ListBucket
+            Resource: !GetAtt AuditBucket.Arn
+            Condition:
+              StringEquals: {AWS:SourceAccount: !Ref 'AWS::AccountId'}
+          - Sid: ConfigWrite
+            Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub '${AuditBucket.Arn}/config/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref 'AWS::AccountId'
+                s3:x-amz-acl: bucket-owner-full-control
+
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditBucketPolicy
+    Properties:
+      TrailName: !Sub 'bridgefu-${Environment}'
+      S3BucketName: !Ref AuditBucket
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-governance}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${Environment}-config-recorder'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWS_ConfigRole'
+      Policies:
+        - PolicyName: WriteOnlyAccountConfigHistory
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VerifyAuditBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt AuditBucket.Arn
+              - Sid: WriteAccountConfigHistory
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${AuditBucket.Arn}/config/AWSLogs/${AWS::AccountId}/Config/*'
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-governance}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn:
+      - AuditBucketPolicy
+      - ConfigRecorder
+    Properties:
+      Name: bridgefu
+      S3BucketName: !Ref AuditBucket
+      S3KeyPrefix: config
+      ConfigSnapshotDeliveryProperties: {DeliveryFrequency: TwentyFour_Hours}
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: bridgefu
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ExternalAccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub 'bridgefu-${Environment}-external-access'
+      Type: ACCOUNT
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-governance}
+        - {Key: Environment, Value: !Ref Environment}
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-governance}
+        - {Key: Environment, Value: !Ref Environment}
+
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: IsProduction
+    Properties:
+      EnableDefaultStandards: true
+      Tags:
+        Project: bridgefu-recipe
+        ManagedBy: bridgefu-account-governance
+        Environment: !Ref Environment
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'bridgefu-${Environment}-monthly'
+        BudgetLimit: {Amount: !Ref BudgetAmountUsd, Unit: USD}
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {Address: !Ref BudgetEmail, SubscriptionType: EMAIL}
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {Address: !Ref BudgetEmail, SubscriptionType: EMAIL}
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - {Address: !Ref BudgetEmail, SubscriptionType: EMAIL}
+
+Outputs:
+  AuditBucketName: {Value: !Ref AuditBucket}
+  AuditTrailArn: {Value: !GetAtt AuditTrail.Arn}
+  AccessAnalyzerArn: {Value: !GetAtt ExternalAccessAnalyzer.Arn}
+  GuardDutyDetectorId: {Value: !Ref GuardDutyDetector}
+  BudgetName: {Value: !Ref MonthlyBudget}

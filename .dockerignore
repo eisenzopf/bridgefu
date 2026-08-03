@@ -3,6 +3,7 @@
 # IS shipped — we want reproducible builds.)
 target/
 .git/
+.gitignore
 .claude/
 .vscode/
 **/node_modules/
@@ -29,3 +30,14 @@ __pycache__/
 *.log
 /etc/
 deploy/*.tar.gz
+
+# Runtime images contain built-in recipe manifests but not CloudFormation or
+# release-controller code. Keep infrastructure-only changes from invalidating
+# the expensive Rust layer while retaining every compile-time recipe asset.
+recipes/*/cloudformation/*
+!recipes/vapi-amazon-connect-screen-pop/cloudformation/production-stack-policy.json
+recipes/*/tests/
+scripts/
+BRIDGEFU-RECIPE-IMPLEMENTATION-*.md
+BRIDGEFU-AWS-*.md
+AWS-ADMIN-*.md

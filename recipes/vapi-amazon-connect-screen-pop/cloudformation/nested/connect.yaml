@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Recipe-owned Amazon Connect wrapper and Agent Workspace guide for an existing
+  customer-owned Connect instance and target flow.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: existing-connect-integration
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  TargetContactFlowArn:
+    Type: String
+    Description: Existing customer-owned target flow. The recipe never updates or deletes it.
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  LookupFunctionArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:lambda:[-a-z0-9]+:[0-9]{12}:function:[A-Za-z0-9-_]+$'
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Resources:
+  ConnectLookupInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LookupFunctionArn
+      Principal: connect.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Ref ConnectInstanceArn
+
+  LookupIntegration:
+    Type: AWS::Connect::IntegrationAssociation
+    DependsOn: ConnectLookupInvokePermission
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !Ref LookupFunctionArn
+
+  AgentGuideFlow:
+    Type: AWS::Connect::ContactFlow
+    Properties:
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: !Sub 'bridgefu-${DeploymentId}-agent-guide'
+      Description: Recipe-owned Agent Workspace screen pop. Safe to remove with this stack.
+      Type: CONTACT_FLOW
+      State: ACTIVE
+      Content: |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "show-context",
+          "Actions": [
+            {
+              "Identifier": "show-context",
+              "Type": "ShowView",
+              "Parameters": {
+                "ViewResource": {"Id": "detail", "Version": "Latest"},
+                "InvocationTimeLimitSeconds": "3600",
+                "ViewData": {
+                  "Heading": "Bridgefu caller context",
+                  "Description": "Information collected before this handoff. Confirm it with the caller when appropriate.",
+                  "Sections": [
+                    {"TemplateString": "<h3>Support request</h3><p><strong>Customer:</strong> $.Attributes.customer_name</p><p><strong>Issue:</strong> $.Attributes.issue_summary</p><p><strong>Intent:</strong> $.Attributes.intent</p><p><strong>Verification:</strong> $.Attributes.verification_status</p>"},
+                    {"TemplateString": "<p><strong>Context available:</strong> $.Attributes.context_available</p><p><strong>Voice AI call reference:</strong> $.Attributes.vapi_call_reference</p>"}
+                  ],
+                  "AttributeBar": [
+                    {"Label": "Customer", "Value": "$.Attributes.customer_name"},
+                    {"Label": "Intent", "Value": "$.Attributes.intent"}
+                  ],
+                  "Actions": [],
+                  "Back": {"Label": "Close"}
+                }
+              },
+              "Transitions": {
+                "NextAction": "end-guide",
+                "Conditions": [
+                  {"NextAction": "end-guide", "Condition": {"Operator": "Equals", "Operands": ["Back"]}}
+                ],
+                "Errors": [
+                  {"NextAction": "end-guide", "ErrorType": "NoMatchingCondition"},
+                  {"NextAction": "end-guide", "ErrorType": "NoMatchingError"},
+                  {"NextAction": "end-guide", "ErrorType": "TimeLimitExceeded"}
+                ]
+              }
+            },
+            {
+              "Identifier": "end-guide",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  WrapperEntryFlow:
+    Type: AWS::Connect::ContactFlow
+    DependsOn: LookupIntegration
+    Properties:
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: !Sub 'bridgefu-${DeploymentId}-entry'
+      Description: >-
+        Recipe-owned lookup and screen-pop wrapper. Transfers to, but never
+        modifies, the customer-owned target flow.
+      Type: CONTACT_FLOW
+      State: ACTIVE
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "lookup-context",
+          "Actions": [
+            {
+              "Identifier": "lookup-context",
+              "Type": "InvokeLambdaFunction",
+              "Parameters": {
+                "LambdaFunctionARN": "${LookupFunctionArn}",
+                "InvocationTimeLimitSeconds": "8",
+                "LambdaInvocationAttributes": {"correlation_id": "$.Attributes.correlation_id"}
+              },
+              "Transitions": {
+                "NextAction": "copy-context",
+                "Errors": [{"NextAction": "context-unavailable", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "copy-context",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {
+                  "context_available": "$.External.context_available",
+                  "customer_name": "$.External.customer_name",
+                  "issue_summary": "$.External.issue_summary",
+                  "intent": "$.External.intent",
+                  "verification_status": "$.External.verification_status",
+                  "vapi_call_reference": "$.External.vapi_call_reference"
+                }
+              },
+              "Transitions": {
+                "NextAction": "set-agent-guide",
+                "Errors": [{"NextAction": "context-unavailable", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "context-unavailable",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {
+                  "context_available": "false",
+                  "customer_name": "Context unavailable",
+                  "issue_summary": "Please ask the caller for a brief summary.",
+                  "intent": "unknown",
+                  "verification_status": "unknown",
+                  "vapi_call_reference": "unavailable"
+                }
+              },
+              "Transitions": {
+                "NextAction": "set-agent-guide",
+                "Errors": [{"NextAction": "transfer-to-customer-flow", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "set-agent-guide",
+              "Type": "UpdateContactEventHooks",
+              "Parameters": {"EventHooks": {"DefaultAgentUI": "${AgentGuideFlow.ContactFlowArn}"}},
+              "Transitions": {
+                "NextAction": "transfer-to-customer-flow",
+                "Errors": [{"NextAction": "transfer-to-customer-flow", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "transfer-to-customer-flow",
+              "Type": "TransferToFlow",
+              "Parameters": {"ContactFlowId": "${TargetContactFlowArn}"},
+              "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [{"NextAction": "disconnect", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "disconnect",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+Outputs:
+  WrapperFlowArn:
+    Value: !GetAtt WrapperEntryFlow.ContactFlowArn
+  WrapperFlowId:
+    Value: !Select [1, !Split ['/contact-flow/', !GetAtt WrapperEntryFlow.ContactFlowArn]]
+  AgentGuideFlowArn:
+    Value: !GetAtt AgentGuideFlow.ContactFlowArn
+  AgentGuideFlowId:
+    Value: !Select [1, !Split ['/contact-flow/', !GetAtt AgentGuideFlow.ContactFlowArn]]
+  CustomerTargetFlowArn:
+    Value: !Ref TargetContactFlowArn
+  AgentPermissionRequired:
+    Value: Agent Applications - Custom views - All

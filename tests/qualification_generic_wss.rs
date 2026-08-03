@@ -1893,6 +1893,7 @@ async fn run_browser_and_vapi_like_sips_to_wss() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -2501,6 +2502,7 @@ async fn run_direct_browser_to_named_generic_sips() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -2826,6 +2828,7 @@ async fn run_direct_browser_vapi_sip_handoff() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -3734,6 +3737,7 @@ async fn run_direct_browser_vapi_sip_to_generic_wss_handoff(mode: DirectWssHando
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,

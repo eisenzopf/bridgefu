@@ -61,7 +61,7 @@ Only one edge profile should be active at a time because each binds the same
 SIP, WebRTC, API, and QUIC ports:
 
 ```sh
-docker compose --profile standardcharter config --quiet
+docker compose --profile reference-tenant config --quiet
 docker compose --profile generic config --quiet
 docker compose --profile telnyx config --quiet
 docker compose --profile uctp config --quiet
@@ -113,7 +113,7 @@ Telnyx additionally requires `TELNYX_API_KEY`, `TELNYX_WEBHOOK_PUBLIC_KEY`,
 `TELNYX_MEDIA_SIP_PASSWORD`. `TELNYX_MEDIA_SIP_USERNAME` defaults to
 `telnyx-media`; realm and transport default to `bridgefu` and `UDP`. The API
 key, webhook key, and media password remain `env:` references in the effective
-Bridgefu configuration. StandardCharter requires a real configuration path in
+Bridgefu configuration. The reference tenant requires a real configuration path in
 `BRIDGEFU_CONFIG` and the normal AWS credential chain. The generic profile
 starts Coturn and requires explicit TURN credentials and an advertised address
 outside loopback.

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/handoff-contract-v1.json",
+  "title": "Bridgefu Vapi to Amazon Connect handoff context v1",
+  "type": "object",
+  "required": [
+    "correlation_id",
+    "customer_name",
+    "issue_summary",
+    "intent",
+    "verification_status",
+    "vapi_call_reference"
+  ],
+  "properties": {
+    "correlation_id": {
+      "type": "string",
+      "minLength": 47,
+      "maxLength": 47,
+      "pattern": "^bf1_[A-Za-z0-9_-]{43}$"
+    },
+    "customer_name": { "type": "string", "maxLength": 256 },
+    "issue_summary": { "type": "string", "maxLength": 1024 },
+    "intent": { "type": "string", "maxLength": 128 },
+    "verification_status": { "type": "string", "maxLength": 128 },
+    "vapi_call_reference": { "type": "string", "maxLength": 256 },
+    "expires_at": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

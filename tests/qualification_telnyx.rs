@@ -1286,6 +1286,7 @@ async fn run_telnyx_qualification() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         8,
         Duration::from_secs(10),
@@ -2101,6 +2102,7 @@ mod direct_assistant_handoff {
                     ("X-Correlation-Id".into(), "correlation_id".into()),
                     ("X-Account-Tier".into(), "account_tier".into()),
                 ]),
+                ..ContextPolicy::default()
             }),
             None,
             None,

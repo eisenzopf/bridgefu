@@ -1,0 +1,90 @@
+schema_version: 1
+recipe: vapi-amazon-connect-screen-pop@1
+support_candidate: supported
+deployment_profiles: [starter, high_availability]
+required_scenarios:
+  - id: sip-rtp-pcmu
+    source: sip
+    security: sip_rtp
+    codec: pcmu
+  - id: sip-rtp-pcma
+    source: sip
+    security: sip_rtp
+    codec: pcma
+  - id: sips-srtp-pcmu
+    source: sip
+    security: sips_srtp
+    codec: pcmu
+  - id: sips-srtp-pcma
+    source: sip
+    security: sips_srtp
+    codec: pcma
+  - id: vapi-web-transfer
+    source: vapi_web
+    security: deployed
+    codec: negotiated
+required_scenario_ids_by_sip_security:
+  sip_rtp: [sip-rtp-pcmu, sip-rtp-pcma, vapi-web-transfer]
+  sips_srtp: [sips-srtp-pcmu, sips-srtp-pcma, vapi-web-transfer]
+required_checks:
+  - actual_transfer_header
+  - context_persisted
+  - amazon_attribute_mapped
+  - connect_contact_started_once
+  - agent_screen_visible
+  - audio_source_to_agent_non_silent
+  - audio_agent_to_source_non_silent
+  - dtmf_source_to_agent
+  - dtmf_agent_to_source
+  - source_hangup_cleanup
+  - agent_hangup_cleanup
+  - replay_rejected
+  - missing_context_fail_open
+  - cleanup_zero_state
+required_checks_by_sip_security:
+  sip_rtp:
+    - actual_transfer_header
+    - context_persisted
+    - amazon_attribute_mapped
+    - connect_contact_started_once
+    - agent_screen_visible
+    - audio_source_to_agent_non_silent
+    - audio_agent_to_source_non_silent
+    - dtmf_source_to_agent
+    - dtmf_agent_to_source
+    - source_hangup_cleanup
+    - agent_hangup_cleanup
+    - replay_rejected
+    - missing_context_fail_open
+    - cleanup_zero_state
+  sips_srtp:
+    - actual_transfer_header
+    - context_persisted
+    - amazon_attribute_mapped
+    - connect_contact_started_once
+    - agent_screen_visible
+    - audio_source_to_agent_non_silent
+    - audio_agent_to_source_non_silent
+    - dtmf_source_to_agent
+    - dtmf_agent_to_source
+    - source_hangup_cleanup
+    - agent_hangup_cleanup
+    - replay_rejected
+    - missing_context_fail_open
+    - cleanup_zero_state
+adverse_network_profiles:
+  - {id: baseline, delay_ms: 0, jitter_ms: 0, loss_percent: 0, reorder_percent: 0}
+  - {id: moderate-wan, delay_ms: 80, jitter_ms: 20, loss_percent: 1, reorder_percent: 0.1}
+required_failure_drills:
+  starter: [process_restart, host_recovery, dependency_timeout]
+  high_availability:
+    - gateway_a_loss
+    - gateway_b_loss
+    - worker_a_loss
+    - worker_b_loss
+    - availability_zone_loss
+    - postgres_failover
+    - redis_failover
+    - rolling_update
+    - rollback
+required_soak_minutes: 60

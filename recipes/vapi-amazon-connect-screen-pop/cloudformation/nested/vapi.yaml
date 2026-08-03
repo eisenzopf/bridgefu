@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Ownership-safe Vapi assistant and tool provisioning for the Bridgefu Vapi to
+  Amazon Connect screen-pop recipe.
+
+Metadata:
+  BridgefuRecipe:
+    Id: vapi-amazon-connect-screen-pop@1
+    Component: vapi-provisioning
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  ProvisionerArtifactKey:
+    Type: String
+    MinLength: 1
+  ProvisionerArtifactVersion:
+    Type: String
+    MinLength: 1
+  VapiApiKeySecretArn:
+    Type: String
+    Description: >-
+      ARN of an existing Secrets Manager secret whose SecretString is the Vapi
+      private API key. The stack never returns or logs the key.
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  VapiWebhookSecretArn:
+    Type: String
+    Description: ARN of the generated recipe webhook bearer secret.
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  PrepareUrl:
+    Type: String
+    AllowedPattern: '^https://\S+$'
+  TransferUrl:
+    Type: String
+    AllowedPattern: '^https://\S+$'
+  VapiModel:
+    Type: String
+    Default: gpt-4.1-mini
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9._:/-]+$'
+  VapiVoiceId:
+    Type: String
+    Default: Elliot
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9._:/-]+$'
+  RetainVapiResourcesOnDelete:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Break-glass option. Keep false for normal ownership-safe stack cleanup and
+      for every automated test deployment.
+  LambdaReservedConcurrencyPerFunction:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+    Description: >-
+      Reserved concurrency for the Vapi provisioner. Set 0 to use unreserved
+      account concurrency.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+  ExecutionIdTag:
+    Type: String
+    Default: production
+
+Conditions:
+  UseReservedConcurrency: !Not [!Equals [!Ref LambdaReservedConcurrencyPerFunction, 0]]
+
+Resources:
+  ProvisionerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/bridgefu-${DeploymentId}-vapi-provisioner'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  ProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'bridgefu-${DeploymentId}-vapi-provisioner'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExactVapiProvisioningSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref VapiApiKeySecretArn
+                  - !Ref VapiWebhookSecretArn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${ProvisionerLogGroup.Arn}:*'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  ProvisionerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProvisionerLogGroup
+    Properties:
+      FunctionName: !Sub 'bridgefu-${DeploymentId}-vapi-provisioner'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      # First-time provisioning can make ten base Vapi requests plus one retry
+      # for each read, while preserving time for the response PUT.
+      Timeout: 240
+      ReservedConcurrentExecutions: !If
+        - UseReservedConcurrency
+        - !Ref LambdaReservedConcurrencyPerFunction
+        - !Ref AWS::NoValue
+      Role: !GetAtt ProvisionerRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ProvisionerArtifactKey
+        S3ObjectVersion: !Ref ProvisionerArtifactVersion
+      Environment:
+        Variables:
+          VAPI_ASSET_ROOT: assets/vapi
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+
+  VapiResources:
+    Type: Custom::BridgefuVapiResources
+    Properties:
+      ServiceToken: !GetAtt ProvisionerFunction.Arn
+      ServiceTimeout: '300'
+      DeploymentId: !Ref DeploymentId
+      VapiApiKeySecretArn: !Ref VapiApiKeySecretArn
+      WebhookSecretArn: !Ref VapiWebhookSecretArn
+      PrepareUrl: !Ref PrepareUrl
+      TransferUrl: !Ref TransferUrl
+      Model: !Ref VapiModel
+      VoiceId: !Ref VapiVoiceId
+      RetainVapiResourcesOnDelete: !Ref RetainVapiResourcesOnDelete
+
+Outputs:
+  AssistantId:
+    Value: !GetAtt VapiResources.AssistantId
+  PrepareToolId:
+    Value: !GetAtt VapiResources.PrepareToolId
+  TransferToolMode:
+    Value: !GetAtt VapiResources.TransferToolMode
+  WebhookCredentialId:
+    Value: !GetAtt VapiResources.WebhookCredentialId
+  ProvisionerFunctionArn:
+    Value: !GetAtt ProvisionerFunction.Arn
+  ProvisionerFunctionName:
+    Value: !Ref ProvisionerFunction
+  ProvisionerLogGroupName:
+    Value: !Ref ProvisionerLogGroup

@@ -1,0 +1,130 @@
+name: Bridgefu recipe CloudFormation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Protected workload environment and AWS account.
+        required: true
+        type: choice
+        options: [nonproduction, production]
+      operation:
+        description: Preflight, create a review, execute it, or run doctor.
+        required: true
+        type: choice
+        default: preflight
+        options: [preflight, review, execute, doctor]
+      profile:
+        description: Bridgefu runtime profile.
+        required: true
+        type: choice
+        default: starter
+        options: [starter, high-availability]
+      descriptor_path:
+        description: Checked-in descriptor under deployments/<environment>/.
+        required: true
+        type: string
+      confirm_stack:
+        description: Exact stack name; required only for execute.
+        required: false
+        type: string
+      change_set_name:
+        description: Exact review name; required for review and execute, and reused unchanged.
+        required: false
+        type: string
+      approval_reference:
+        description: Non-secret change or owner-approval reference.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridgefu-${{ inputs.environment }}-cloudformation
+  cancel-in-progress: false
+
+jobs:
+  administer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: bridgefu-${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate the protected request
+        env:
+          BRIDGEFU_ENVIRONMENT: ${{ inputs.environment }}
+          BRIDGEFU_OPERATION: ${{ inputs.operation }}
+          BRIDGEFU_DESCRIPTOR: ${{ inputs.descriptor_path }}
+          BRIDGEFU_CONFIRM_STACK: ${{ inputs.confirm_stack }}
+          BRIDGEFU_CHANGE_SET_NAME: ${{ inputs.change_set_name }}
+          BRIDGEFU_APPROVAL_REFERENCE: ${{ inputs.approval_reference }}
+        run: |
+          set -euo pipefail
+          [[ "$BRIDGEFU_DESCRIPTOR" =~ ^deployments/${BRIDGEFU_ENVIRONMENT}/[A-Za-z0-9._/-]+\.ya?ml$ ]]
+          [[ "$BRIDGEFU_DESCRIPTOR" != *..* ]]
+          test -f "$BRIDGEFU_DESCRIPTOR"
+          [[ "$BRIDGEFU_APPROVAL_REFERENCE" =~ ^[A-Za-z0-9._:/-]{3,80}$ ]]
+          if [[ "$BRIDGEFU_OPERATION" == execute ]]; then
+            [[ "$BRIDGEFU_CONFIRM_STACK" =~ ^[A-Za-z][A-Za-z0-9-]{0,127}$ ]]
+          else
+            test -z "$BRIDGEFU_CONFIRM_STACK"
+          fi
+          if [[ "$BRIDGEFU_OPERATION" == review || "$BRIDGEFU_OPERATION" == execute ]]; then
+            [[ "$BRIDGEFU_CHANGE_SET_NAME" =~ ^[A-Za-z][A-Za-z0-9-]{0,127}$ ]]
+          else
+            test -z "$BRIDGEFU_CHANGE_SET_NAME"
+          fi
+
+      - name: Assume the exact environment deployer
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.BRIDGEFU_AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: bridgefu-${{ inputs.environment }}-deployment
+          aws-region: ${{ vars.BRIDGEFU_AWS_REGION }}
+
+      - name: Prove the workload account
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ vars.BRIDGEFU_AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT_ID"
+
+      - name: Build the reviewed administrator binary
+        run: cargo build --locked --release --bin bridgefu
+
+      - name: Run the requested guarded lifecycle operation
+        env:
+          BRIDGEFU_OPERATION: ${{ inputs.operation }}
+          BRIDGEFU_DESCRIPTOR: ${{ inputs.descriptor_path }}
+          BRIDGEFU_PROFILE: ${{ inputs.profile }}
+          BRIDGEFU_CONFIRM_STACK: ${{ inputs.confirm_stack }}
+          BRIDGEFU_CHANGE_SET_NAME: ${{ inputs.change_set_name }}
+        run: |
+          set -euo pipefail
+          case "$BRIDGEFU_OPERATION" in
+            preflight)
+              target/release/bridgefu recipe preflight "$BRIDGEFU_DESCRIPTOR" --profile "$BRIDGEFU_PROFILE"
+              ;;
+            review)
+              target/release/bridgefu recipe deploy "$BRIDGEFU_DESCRIPTOR" --profile "$BRIDGEFU_PROFILE" \
+                --change-set-name "$BRIDGEFU_CHANGE_SET_NAME"
+              ;;
+            execute)
+              target/release/bridgefu recipe deploy "$BRIDGEFU_DESCRIPTOR" --profile "$BRIDGEFU_PROFILE" \
+                --execute --change-set-name "$BRIDGEFU_CHANGE_SET_NAME" \
+                --confirm "$BRIDGEFU_CONFIRM_STACK"
+              ;;
+            doctor)
+              target/release/bridgefu recipe doctor "$BRIDGEFU_DESCRIPTOR" --profile "$BRIDGEFU_PROFILE"
+              ;;
+            *)
+              exit 2
+              ;;
+          esac

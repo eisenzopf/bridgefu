@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/recipes/vapi-amazon-connect-screen-pop/qualification/missing-context-participant-observation-v1.schema.json",
+  "title": "Bridgefu controlled missing-context Agent Workspace observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_revision_sha256",
+    "execution_id",
+    "scenario_id",
+    "hangup_origin",
+    "correlation_fingerprint",
+    "source_call_fingerprint",
+    "observed_at",
+    "generic_screen",
+    "media",
+    "hangup",
+    "redacted"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "bridgefu-agent-workspace-playwright@1"},
+    "producer_revision_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^bft-[a-z0-9-]{4,20}$"},
+    "scenario_id": {
+      "enum": [
+        "sip-rtp-pcmu",
+        "sip-rtp-pcma",
+        "sips-srtp-pcmu",
+        "sips-srtp-pcma"
+      ]
+    },
+    "hangup_origin": {"const": "source"},
+    "correlation_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "source_call_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "generic_screen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "visible",
+        "context_available_false",
+        "synthetic_context_absent",
+        "screenshot_sha256"
+      ],
+      "properties": {
+        "visible": {"const": true},
+        "context_available_false": {"const": true},
+        "synthetic_context_absent": {"const": true},
+        "screenshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_to_agent_marker_frames",
+        "source_marker_observed_at_ms",
+        "agent_marker_sent_at_ms",
+        "agent_to_source_marker_frames_sent",
+        "dtmf_source_to_agent_observed",
+        "dtmf_agent_to_source_sent"
+      ],
+      "properties": {
+        "source_to_agent_marker_frames": {"type": "integer", "minimum": 1},
+        "source_marker_observed_at_ms": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 16,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "agent_marker_sent_at_ms": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 32,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "agent_to_source_marker_frames_sent": {"type": "integer", "minimum": 5},
+        "dtmf_source_to_agent_observed": {"const": true},
+        "dtmf_agent_to_source_sent": {"const": true}
+      }
+    },
+    "hangup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "local_end_completed",
+        "remote_end_observed",
+        "cleanup_observed"
+      ],
+      "properties": {
+        "origin": {"const": "source"},
+        "local_end_completed": {"const": false},
+        "remote_end_observed": {"const": true},
+        "cleanup_observed": {"const": true}
+      }
+    },
+    "redacted": {"const": true}
+  }
+}

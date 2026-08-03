@@ -49,11 +49,11 @@ x-public-ports: &public-ports
   - 4443:4443/udp
 
 services:
-  # Existing StandardCharter flow. Supply BRIDGEFU_CONFIG and AWS credentials
+  # Existing ReferenceTenant flow. Supply BRIDGEFU_CONFIG and AWS credentials
   # through the normal AWS credential chain; no credential is baked here.
-  standardcharter:
+  reference-tenant:
     <<: *bridgefu-service
-    profiles: [standardcharter]
+    profiles: [reference-tenant]
     ports: *public-ports
 
   # Generic SIP <-> WebRTC. Coturn is enabled by the same profile, but its

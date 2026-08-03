@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>Bridgefu recipe test call</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Bridgefu recipe test</p>
+      <h1>Vapi to Amazon Connect</h1>
+      <p class="lede">
+        Start a synthetic browser call, ask the assistant for a person, and
+        verify that the Amazon Connect agent receives the call and screen pop.
+      </p>
+
+      <section aria-labelledby="status-heading">
+        <h2 id="status-heading">Call status</h2>
+        <output id="status" aria-live="polite">Loading test configuration…</output>
+        <p id="transcript" class="transcript" aria-live="polite"></p>
+        <div class="actions">
+          <button id="start" type="button" disabled>Start test call</button>
+          <button id="mute" type="button" disabled>Mute</button>
+          <button id="end" type="button" disabled>End call</button>
+        </div>
+      </section>
+
+      <section aria-labelledby="instructions-heading">
+        <h2 id="instructions-heading">What to say</h2>
+        <ol>
+          <li>Use synthetic details only.</li>
+          <li>Describe a simple support issue.</li>
+          <li>Ask to speak with a person.</li>
+          <li>Confirm the agent sees the same details before continuing.</li>
+        </ol>
+      </section>
+
+      <p class="notice">
+        Nonproduction test page. It contains a Vapi public key and assistant
+        ID only—never an AWS, Vapi private, or Bridgefu control credential.
+      </p>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

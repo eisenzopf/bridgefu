@@ -1,0 +1,13 @@
+[Unit]
+Description=Protect active Bridgefu HA calls from Auto Scaling scale-in
+After=ecs.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bridgefu-ha-scale-protection
+User=root
+Group=root
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+NoNewPrivileges=yes

@@ -1,0 +1,52 @@
+{
+  "name": "Bridgefu Connect Support",
+  "firstMessage": "Hello. How can I help you today?",
+  "model": {
+    "provider": "openai",
+    "model": "__MODEL__",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a concise support assistant. Gather only the customer's name, a short issue summary, an intent label, and a display-only verification status. Never ask for passwords, full payment card data, Social Security numbers, or banking credentials. When the caller asks for a person or the issue requires a human, first call prepare_handoff exactly once with all four fields. Only after it succeeds, call the transfer tool. Never invent or select a phone number, SIP URI, route, contact center, header, or correlation identifier."
+      }
+    ],
+    "toolIds": [
+      "__PREPARE_TOOL_ID__"
+    ],
+    "tools": [
+      {
+        "type": "transferCall",
+        "destinations": [],
+        "messages": [
+          {
+            "type": "request-start",
+            "content": "I am connecting you to a support specialist now."
+          },
+          {
+            "type": "request-failed",
+            "content": "I could not start the transfer. Please try again."
+          }
+        ]
+      }
+    ]
+  },
+  "voice": {
+    "provider": "vapi",
+    "voiceId": "__VOICE_ID__"
+  },
+  "transcriber": {
+    "provider": "deepgram",
+    "model": "nova-3",
+    "language": "en"
+  },
+  "server": {
+    "url": "__TRANSFER_URL__",
+    "credentialId": "__WEBHOOK_CREDENTIAL_ID__"
+  },
+  "serverMessages": [
+    "transfer-destination-request"
+  ],
+  "artifactPlan": {
+    "recordingEnabled": false
+  }
+}

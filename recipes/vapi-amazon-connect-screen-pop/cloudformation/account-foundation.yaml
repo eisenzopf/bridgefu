@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Persistent Bridgefu workload-account foundation. Owns the versioned release
+  bucket, immutable ECR repository, and narrowly scoped deployer and
+  CloudFormation service roles used by the administrator lifecycle.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [nonproduction, production]
+  TrustedHumanPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+  GitHubOidcProviderArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  PublicHostedZoneId:
+    Type: String
+    Default: none
+    AllowedPattern: '^(none|[A-Z0-9]+)$'
+    Description: >-
+      Public Route 53 hosted-zone ID for SIPS/SRTP, or none for the
+      nonproduction direct-IP SIP/RTP proof.
+  NestedTemplateBaseUrl:
+    Type: String
+    AllowedPattern: '^https://[^[:space:]]+/cloudformation$'
+
+Conditions:
+  NonproductionEnvironment: !Equals [!Ref Environment, nonproduction]
+
+Rules:
+  ProductionRequiresPublicDns:
+    RuleCondition: !Equals [!Ref Environment, production]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicHostedZoneId, none]]
+        AssertDescription: Production account foundations require the approved public hosted-zone ID.
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'bridgefu-recipe-${AWS::AccountId}-${AWS::Region}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+            BucketKeyEnabled: true
+            BlockedEncryptionTypes: {EncryptionType: [SSE-C]}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-foundation}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub 'bridgefu/${Environment}'
+      EncryptionConfiguration: {EncryptionType: AES256}
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Expire untagged images after 30 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":30},"action":{"type":"expire"}}]}
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PullFromThisAccountOnly
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-foundation}
+        - {Key: Environment, Value: !Ref Environment}
+
+  DeploymentRollbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'bridgefu-${Environment}-rollback'
+      AlarmDescription: >-
+        Persistent CloudFormation rollback trigger. Missing data is healthy;
+        operators may publish RollbackGuard=1 or set ALARM during a protected
+        deployment to force rollback.
+      Namespace: Bridgefu/Deployment
+      MetricName: RollbackGuard
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-foundation}
+        - {Key: Environment, Value: !Ref Environment}
+
+  DeploymentPermissions:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}/test-deployment-role.yaml'
+      Parameters:
+        ExecutionId: !Sub 'bft-${Environment}'
+        TrustedPrincipalArn: !Ref TrustedHumanPrincipalArn
+        GitHubOidcProviderArn: !Ref GitHubOidcProviderArn
+        GitHubRepository: eisenzopf/bridgefu
+        GitHubEnvironment: !Sub 'bridgefu-${Environment}'
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        ConnectMode: Existing
+        EnableQualificationRunner: !If [NonproductionEnvironment, 'true', 'false']
+        ArtifactBucketName: !Ref ArtifactBucket
+        EcrRepositoryName: !Ref ImageRepository
+        ArtifactAccessMode: PersistentReadOnly
+        PublicHostedZoneId: !Ref PublicHostedZoneId
+        EnableDemoSite: 'false'
+      Tags:
+        - {Key: Project, Value: bridgefu-recipe}
+        - {Key: ManagedBy, Value: bridgefu-account-foundation}
+        - {Key: BridgefuExecutionId, Value: !Sub 'bft-${Environment}'}
+        - {Key: BridgefuRecipe, Value: vapi-amazon-connect-screen-pop@1}
+        - {Key: Environment, Value: !Ref Environment}
+
+Outputs:
+  ArtifactBucketName: {Value: !Ref ArtifactBucket}
+  ImageRepositoryName: {Value: !Ref ImageRepository}
+  ImageRepositoryArn: {Value: !GetAtt ImageRepository.Arn}
+  DeploymentRollbackAlarmArn: {Value: !GetAtt DeploymentRollbackAlarm.Arn}
+  DeploymentRoleArn: {Value: !GetAtt DeploymentPermissions.Outputs.DeploymentRoleArn}
+  CloudFormationExecutionRoleArn: {Value: !GetAtt DeploymentPermissions.Outputs.CloudFormationExecutionRoleArn}
+  DeploymentRoleSessionName: {Value: !GetAtt DeploymentPermissions.Outputs.DeploymentRoleSessionName}
+  QualificationRoleArn: {Value: !GetAtt DeploymentPermissions.Outputs.QualificationRoleArn}
+  QualificationRoleSessionName: {Value: !GetAtt DeploymentPermissions.Outputs.QualificationRoleSessionName}
+  QualificationRunnerRoleArn:
+    Condition: NonproductionEnvironment
+    Value: !GetAtt DeploymentPermissions.Outputs.QualificationRunnerRoleArn
+  QualificationSourceEipAllocationId:
+    Condition: NonproductionEnvironment
+    Value: !GetAtt DeploymentPermissions.Outputs.QualificationSourceEipAllocationId
+  QualificationSourceEipPublicIp:
+    Condition: NonproductionEnvironment
+    Value: !GetAtt DeploymentPermissions.Outputs.QualificationSourceEipPublicIp

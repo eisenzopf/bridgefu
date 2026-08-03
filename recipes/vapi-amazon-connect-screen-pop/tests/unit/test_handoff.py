@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import base64
+import json
+import sys
+import unittest
+from pathlib import Path
+
+
+COMMON = Path(__file__).resolve().parents[2] / "lambda" / "common"
+sys.path.insert(0, str(COMMON))
+
+from bridgefu_handoff import (  # noqa: E402
+    CORRELATION_HEADER,
+    HandoffError,
+    SipReservation,
+    VapiIdentity,
+    connect_lookup,
+    decode_http_json,
+    derive_correlation_id,
+    prepare_handoff,
+    prepare_vapi_response,
+    transfer_destination,
+    verify_bearer,
+)
+
+
+KEY = b"correlation-key-is-distinct-and-at-least-32-bytes"
+DEPLOYMENT = "recipe-test"
+NOW = 1_800_000_000
+
+
+def prepare_event(**overrides):
+    values = {
+        "customer_name": "Ada Lovelace",
+        "issue_summary": "Needs help with a disputed order.",
+        "intent": "order_dispute",
+        "verification_status": "verified",
+    }
+    values.update(overrides)
+    return {
+        "message": {
+            "type": "tool-calls",
+            "call": {"id": "call_test_001", "orgId": "org_test_001"},
+            "toolCallList": [
+                {
+                    "id": "tool_test_001",
+                    "name": "prepare_handoff",
+                    "arguments": values,
+                }
+            ],
+        }
+    }
+
+
+def transfer_event(**extra):
+    message = {
+        "type": "transfer-destination-request",
+        "call": {"id": "call_test_001", "orgId": "org_test_001"},
+    }
+    message.update(extra)
+    return {"message": message}
+
+
+class FakeStore:
+    def __init__(self):
+        self.records = {}
+        self.reserve_updates = 0
+
+    def put_prepared(self, record):
+        existing = self.records.get(record["correlation_id"])
+        if existing is None:
+            self.records[record["correlation_id"]] = dict(record)
+            return "created"
+        if (
+            existing["content_hash"] == record["content_hash"]
+            and existing["vapi_call_fingerprint"] == record["vapi_call_fingerprint"]
+            and existing["handoff_status"] in ("PREPARED", "RESERVED")
+        ):
+            return "replayed"
+        raise HandoffError("handoff_replay_conflict", 409)
+
+    def get(self, correlation_id):
+        record = self.records.get(correlation_id)
+        return dict(record) if record is not None else None
+
+    def mark_reserved(
+        self,
+        correlation_id,
+        updated_at,
+        bridgefu_call_id,
+        attachment_expires_at,
+    ):
+        record = self.records[correlation_id]
+        if record["handoff_status"] not in ("PREPARED", "RESERVED"):
+            raise HandoffError("handoff_state_conflict", 409)
+        record.update(
+            handoff_status="RESERVED",
+            updated_at=updated_at,
+            bridgefu_call_id=bridgefu_call_id,
+            attachment_expires_at=attachment_expires_at,
+        )
+        self.reserve_updates += 1
+
+
+class HandoffContractTests(unittest.TestCase):
+    def test_correlation_is_deterministic_opaque_and_versioned(self):
+        identity = VapiIdentity("org_test_001", "call_test_001")
+        first = derive_correlation_id(KEY, DEPLOYMENT, identity)
+        self.assertEqual(first, derive_correlation_id(KEY, DEPLOYMENT, identity))
+        self.assertRegex(first, r"^bf1_[A-Za-z0-9_-]{43}$")
+        self.assertNotIn(identity.call_id, first)
+        self.assertNotEqual(
+            first,
+            derive_correlation_id(KEY, "another-deployment", identity),
+        )
+
+    def test_prepare_is_bounded_idempotent_and_hides_correlation_from_model(self):
+        store = FakeStore()
+        created = prepare_handoff(
+            prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW
+        )
+        replayed = prepare_handoff(
+            prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW + 5
+        )
+        self.assertFalse(created.replayed)
+        self.assertTrue(replayed.replayed)
+        self.assertEqual(created.correlation_id, replayed.correlation_id)
+        self.assertEqual(len(store.records), 1)
+        response = prepare_vapi_response(created)
+        self.assertEqual(response["results"][0]["result"], {"status": "prepared"})
+        self.assertNotIn(created.correlation_id, json.dumps(response))
+        record = store.records[created.correlation_id]
+        self.assertEqual(record["handoff_status"], "PREPARED")
+        self.assertEqual(record["expires_at"], NOW + 86_400)
+        self.assertNotIn("transcript", record)
+
+    def test_prepare_rejects_conflicting_replay_unknown_fields_and_controls(self):
+        store = FakeStore()
+        prepare_handoff(prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW)
+        with self.assertRaisesRegex(HandoffError, "handoff_replay_conflict"):
+            prepare_handoff(
+                prepare_event(issue_summary="Different content"),
+                store,
+                KEY,
+                DEPLOYMENT,
+                86_400,
+                now=NOW,
+            )
+        for event in (
+            prepare_event(extra="not allowed"),
+            prepare_event(customer_name="bad\nname"),
+            prepare_event(issue_summary="x" * 1025),
+        ):
+            with self.assertRaises(HandoffError):
+                prepare_handoff(event, FakeStore(), KEY, DEPLOYMENT, 86_400, now=NOW)
+
+    def test_transfer_uses_only_fixed_route_output_and_one_header(self):
+        store = FakeStore()
+        prepared = prepare_handoff(
+            prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW
+        )
+        observed = {}
+
+        def reserve(correlation_id, idempotency_key):
+            observed.update(
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+            )
+            return SipReservation(
+                uri="sips:one-use-token@sip.example.test:5061;transport=tls",
+                call_id="018f4d41-0000-7000-8000-000000000001",
+                expires_at=NOW + 120,
+            )
+
+        response = transfer_destination(
+            transfer_event(
+                route="attacker-route",
+                sipUri="sip:attacker.invalid",
+                sipHeaders={"Authorization": "leak"},
+            ),
+            store,
+            KEY,
+            DEPLOYMENT,
+            reserve,
+            "sips",
+            now=NOW,
+        )
+        self.assertEqual(observed["correlation_id"], prepared.correlation_id)
+        self.assertTrue(observed["idempotency_key"].startswith("vapi-transfer-"))
+        destination = response["destination"]
+        self.assertEqual(destination["type"], "sip")
+        self.assertEqual(
+            destination["sipUri"],
+            "sips:one-use-token@sip.example.test:5061;transport=tls",
+        )
+        self.assertEqual(
+            destination["sipHeaders"],
+            {CORRELATION_HEADER: prepared.correlation_id},
+        )
+        self.assertEqual(store.reserve_updates, 1)
+
+    def test_transfer_rejects_missing_expired_identity_and_scheme_conflicts(self):
+        with self.assertRaisesRegex(HandoffError, "handoff_not_prepared"):
+            transfer_destination(
+                transfer_event(),
+                FakeStore(),
+                KEY,
+                DEPLOYMENT,
+                lambda *_: None,
+                "sips",
+                now=NOW,
+            )
+        store = FakeStore()
+        prepared = prepare_handoff(
+            prepare_event(), store, KEY, DEPLOYMENT, 300, now=NOW
+        )
+        with self.assertRaisesRegex(HandoffError, "handoff_expired"):
+            transfer_destination(
+                transfer_event(),
+                store,
+                KEY,
+                DEPLOYMENT,
+                lambda *_: None,
+                "sips",
+                now=NOW + 301,
+            )
+        store.records[prepared.correlation_id]["expires_at"] = NOW + 600
+        store.records[prepared.correlation_id]["vapi_call_fingerprint"] = "0" * 64
+        with self.assertRaisesRegex(HandoffError, "handoff_identity_conflict"):
+            transfer_destination(
+                transfer_event(),
+                store,
+                KEY,
+                DEPLOYMENT,
+                lambda *_: None,
+                "sips",
+                now=NOW,
+            )
+        store.records[prepared.correlation_id]["vapi_call_fingerprint"] = next(
+            iter(FakeStoreFromEvent().records.values())
+        )["vapi_call_fingerprint"]
+        with self.assertRaisesRegex(HandoffError, "bridgefu_destination_invalid"):
+            transfer_destination(
+                transfer_event(),
+                store,
+                KEY,
+                DEPLOYMENT,
+                lambda *_: SipReservation(
+                    "sip:clear@example.test:5060",
+                    "018f4d41-0000-7000-8000-000000000001",
+                    NOW + 120,
+                ),
+                "sips",
+                now=NOW,
+            )
+
+    def test_connect_lookup_returns_only_fixed_flat_strings_and_fails_open(self):
+        store = FakeStore()
+        prepared = prepare_handoff(
+            prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW
+        )
+        event = {
+            "Details": {
+                "ContactData": {
+                    "Attributes": {"correlation_id": prepared.correlation_id}
+                }
+            }
+        }
+        available = connect_lookup(event, store, now=NOW)
+        self.assertEqual(available["context_available"], "true")
+        self.assertEqual(
+            set(available),
+            {
+                "context_available",
+                "customer_name",
+                "issue_summary",
+                "intent",
+                "verification_status",
+                "vapi_call_reference",
+            },
+        )
+        self.assertTrue(all(isinstance(value, str) for value in available.values()))
+        self.assertNotIn(prepared.correlation_id, available.values())
+        self.assertEqual(
+            connect_lookup({}, store, now=NOW)["context_available"], "false"
+        )
+        store.records[prepared.correlation_id]["expires_at"] = NOW
+        self.assertEqual(
+            connect_lookup(event, store, now=NOW)["context_available"], "false"
+        )
+
+    def test_http_auth_and_body_contract(self):
+        secret = "v" * 32
+        verify_bearer({"Authorization": f"Bearer {secret}"}, secret)
+        for headers in (
+            {},
+            {"authorization": "Bearer wrong"},
+            {"Authorization": f"Bearer {secret}", "authorization": f"Bearer {secret}"},
+        ):
+            with self.assertRaisesRegex(HandoffError, "unauthorized"):
+                verify_bearer(headers, secret)
+        body = json.dumps(prepare_event())
+        decoded, _ = decode_http_json(
+            {
+                "headers": {"Content-Type": "application/json; charset=utf-8"},
+                "body": base64.b64encode(body.encode()).decode(),
+                "isBase64Encoded": True,
+            }
+        )
+        self.assertEqual(decoded, prepare_event())
+        with self.assertRaisesRegex(HandoffError, "unsupported_content_type"):
+            decode_http_json(
+                {
+                    "headers": {"content-type": "text/plain"},
+                    "body": body,
+                    "isBase64Encoded": False,
+                }
+            )
+
+
+class FakeStoreFromEvent(FakeStore):
+    def __init__(self):
+        super().__init__()
+        prepare_handoff(prepare_event(), self, KEY, DEPLOYMENT, 86_400, now=NOW)
+
+
+if __name__ == "__main__":
+    unittest.main()

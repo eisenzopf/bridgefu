@@ -11,7 +11,7 @@ ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd9
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 ARG BUILDER_DEBIAN_SNAPSHOT=20260518T000000Z
 
-FROM ${RUST_IMAGE} AS builder
+FROM ${RUST_IMAGE} AS build-base
 
 ARG BUILDER_DEBIAN_SNAPSHOT
 ARG SOURCE_DATE_EPOCH=0
@@ -36,10 +36,13 @@ RUN sed -i \
 COPY . /src/bridgefu
 WORKDIR /src/bridgefu
 
+FROM build-base AS builder
+
 RUN cargo build --locked --release \
     && install -D -m 0755 target/release/bridgefu /out/bridgefu \
     && strip /out/bridgefu \
-    && install -d -m 0750 /out/var/lib/bridgefu
+    && install -d -m 0750 /out/var/lib/bridgefu \
+    && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE} AS runtime
 
