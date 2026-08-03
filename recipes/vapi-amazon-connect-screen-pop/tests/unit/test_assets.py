@@ -134,6 +134,10 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertIn("VpcConfig", project)
         self.assertEqual(project["Cache"], {"Type": "NO_CACHE"})
         self.assertNotIn("\ncache:", project["Source"]["BuildSpec"])
+        self.assertNotIn("set -euo pipefail", project["Source"]["BuildSpec"])
+        self.assertIn(
+            "aws s3api get-object", project["Source"]["BuildSpec"]
+        )
 
     def test_vapi_tools_leave_destination_and_correlation_server_owned(self):
         prepare = load_template("vapi/prepare-handoff-tool.json.tmpl")

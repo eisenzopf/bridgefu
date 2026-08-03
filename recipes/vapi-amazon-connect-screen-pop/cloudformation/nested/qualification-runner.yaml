@@ -188,7 +188,6 @@ Resources:
                 python: 3.12
                 nodejs: 22
               commands:
-                - set -euo pipefail
                 - aws s3api get-object --bucket '${ArtifactBucket}' --key '${QualificationArtifactKey}' --version-id '${QualificationArtifactVersion}' /tmp/qualification-source.zip
                 - echo '${QualificationArtifactSha256}  /tmp/qualification-source.zip' | sha256sum --check --strict
                 - mkdir -p /opt/bridgefu && cd /opt/bridgefu && unzip -q /tmp/qualification-source.zip
