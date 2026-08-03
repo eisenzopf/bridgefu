@@ -2674,14 +2674,91 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             "def destroy_finalize", 1
         )[0]
         self.assertIn('"destroyed_ledger_reaudit_failed"', destroy)
+        self.assertIn("delete_owned_empty_review_stacks", destroy)
+        self.assertLess(
+            destroy.index("review_stack_ids_for_execution(ledger)"),
+            destroy.index('record(path, ledger, "bootstrap_stack_delete_requested")'),
+        )
+        preview_cleanup = source.split(
+            "def delete_owned_empty_review_stacks", 1
+        )[1].split("def cleanup_orphans", 1)[0]
         cleanup = source.split("def cleanup_orphans", 1)[1].split(
             "def run_headless", 1
         )[0]
-        self.assertIn("without exact tags or ledger ancestry", cleanup)
-        self.assertIn("top_level_review_stack_is_owned_by_ledger", cleanup)
+        self.assertIn("without exact tags or ledger ancestry", preview_cleanup)
+        self.assertIn("top_level_review_stack_is_owned_by_ledger", preview_cleanup)
+        self.assertIn("delete_owned_empty_review_stacks", cleanup)
         self.assertIn("owned_connect_log_group_exists(ledger, None)", cleanup)
         self.assertIn("unless it is exact and empty", cleanup)
         self.assertIn('"orphan-cleanup-evidence.json"', cleanup)
+
+    def test_empty_preview_cleanup_deletes_children_before_parents(self):
+        execution = "bft-20990102a"
+        root_name = f"bridgefu-{execution}"
+        root_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/"
+            f"{root_name}/00000000-0000-0000-0000-000000000000"
+        )
+        parent_name = f"{root_name}-RecipeApplication-AAAA"
+        parent_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/"
+            f"{parent_name}/00000000-0000-0000-0000-000000000001"
+        )
+        child_name = f"{parent_name}-Network-BBBB"
+        child_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/"
+            f"{child_name}/00000000-0000-0000-0000-000000000002"
+        )
+        ledger = {
+            "execution_id": execution,
+            "account_id": "123456789012",
+            "region": "us-west-2",
+            "stack_name": root_name,
+            "review_stack_id": root_id,
+            "created_at": "2000-01-01T00:00:00Z",
+        }
+        descriptions = {
+            parent_id: {
+                "StackName": parent_name,
+                "StackId": parent_id,
+                "StackStatus": "REVIEW_IN_PROGRESS",
+                "RootId": root_id,
+                "ParentId": root_id,
+                "CreationTime": "2000-01-01T00:01:00Z",
+            },
+            child_id: {
+                "StackName": child_name,
+                "StackId": child_id,
+                "StackStatus": "REVIEW_IN_PROGRESS",
+                "RootId": root_id,
+                "ParentId": parent_id,
+                "CreationTime": "2000-01-01T00:02:00Z",
+            },
+        }
+        deleted = []
+
+        def aws_response(arguments, **_kwargs):
+            stack_id = arguments[arguments.index("--stack-name") + 1]
+            if "describe-stacks" in arguments:
+                return {"Stacks": [descriptions[stack_id]]}
+            if "list-stack-resources" in arguments:
+                return {"StackResourceSummaries": []}
+            if "delete-stack" in arguments:
+                deleted.append(stack_id)
+                return {}
+            self.fail(f"unexpected AWS operation: {arguments}")
+
+        with mock.patch.object(
+            LIVE, "aws_json", side_effect=aws_response
+        ), mock.patch.object(LIVE, "aws_wait") as waiter:
+            self.assertEqual(
+                LIVE.delete_owned_empty_review_stacks(
+                    ledger, [parent_id, child_id], environment={"SAFE": "1"}
+                ),
+                [child_id, parent_id],
+            )
+        self.assertEqual(deleted, [child_id, parent_id])
+        self.assertEqual(waiter.call_count, 2)
 
     def test_top_level_preview_shell_requires_exact_id_and_full_tags(self):
         execution = "bft-20990102a"
@@ -3546,6 +3623,8 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             LIVE, "recover_vapi_teardown_contract", return_value="not_created"
         ), mock.patch.object(
             LIVE, "prove_vapi_teardown_contract"
+        ), mock.patch.object(
+            LIVE, "review_stack_ids_for_execution", return_value=[]
         ), mock.patch.object(
             LIVE, "aws_json"
         ) as aws, mock.patch.object(

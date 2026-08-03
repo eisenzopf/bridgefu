@@ -9993,6 +9993,33 @@ def inventory_headless_build_ids(ledger: dict[str, Any]) -> list[str]:
     return sorted(active)
 
 
+def review_stack_ids_for_execution(
+    ledger: dict[str, Any], environment: dict[str, str] | None = None
+) -> list[str]:
+    stacks = aws_json(
+        [
+            "cloudformation",
+            "list-stacks",
+            "--region",
+            ledger["region"],
+            "--stack-status-filter",
+            "REVIEW_IN_PROGRESS",
+        ],
+        env=environment,
+    )
+    if not isinstance(stacks, dict) or not isinstance(
+        stacks.get("StackSummaries"), list
+    ):
+        raise LiveTestError("CloudFormation preview inventory returned an invalid result")
+    execution_id = ledger["execution_id"]
+    return sorted(
+        stack.get("StackId", stack["StackName"])
+        for stack in stacks["StackSummaries"]
+        if execution_id in stack.get("StackName", "")
+        and stack.get("StackStatus") == "REVIEW_IN_PROGRESS"
+    )
+
+
 def inventory_for_execution(ledger: dict[str, Any]) -> dict[str, Any]:
     bind_active_ledger_identity(ledger)
     execution_id = ledger["execution_id"]
@@ -13772,6 +13799,18 @@ def destroy(args: argparse.Namespace) -> None:
             env=env,
         )
         record(path, ledger, f"{event_prefix}_deleted")
+    deleted_preview_stacks = delete_owned_empty_review_stacks(
+        ledger,
+        review_stack_ids_for_execution(ledger),
+        environment=env,
+    )
+    if deleted_preview_stacks:
+        record(
+            path,
+            ledger,
+            "orphan_preview_stacks_deleted_before_bootstrap",
+            count=len(deleted_preview_stacks),
+        )
     prove_vapi_teardown_contract(path, ledger, env)
     if ledger.get("vapi_api_key_secret_arn"):
         request_secret_force_delete(
@@ -14055,21 +14094,16 @@ def top_level_review_stack_is_owned_by_ledger(
     return all(tags.get(key) == value for key, value in expected_tags.items())
 
 
-def cleanup_orphans(args: argparse.Namespace) -> None:
-    """Delete only empty, exactly owned preview shells and Connect log groups."""
-    path, ledger = load_ledger(args.execution_id)
-    if args.confirm != ledger["execution_id"]:
-        raise LiveTestError("--confirm must exactly equal the execution ID")
-    if ledger.get("status") not in {"destroyed", "teardown_incomplete"}:
-        raise LiveTestError("orphan cleanup requires a completed teardown ledger")
-    execution_id = ledger["execution_id"]
+def delete_owned_empty_review_stacks(
+    ledger: dict[str, Any],
+    review_stack_ids: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> list[str]:
+    """Delete empty, ledger-bound preview shells before their service role."""
     region = ledger["region"]
-    inventory_before = inventory_for_execution(ledger)
-    deleted_review_stacks: list[str] = []
-    deleted_log_groups: list[str] = []
-
     verified: list[tuple[str, str | None]] = []
-    for stack_id in inventory_before.get("review_stack_ids", []):
+    for stack_id in review_stack_ids:
         description = aws_json(
             [
                 "cloudformation",
@@ -14078,11 +14112,14 @@ def cleanup_orphans(args: argparse.Namespace) -> None:
                 region,
                 "--stack-name",
                 stack_id,
-            ]
+            ],
+            env=environment,
         )["Stacks"][0]
         if description.get("StackStatus") != "REVIEW_IN_PROGRESS":
             raise LiveTestError("preview stack status changed during cleanup")
-        top_level_owner = top_level_review_stack_is_owned_by_ledger(ledger, description)
+        top_level_owner = top_level_review_stack_is_owned_by_ledger(
+            ledger, description
+        )
         nested_owner = review_stack_is_owned_by_ledger(ledger, description)
         if not top_level_owner and not nested_owner:
             raise LiveTestError(
@@ -14096,7 +14133,8 @@ def cleanup_orphans(args: argparse.Namespace) -> None:
                 region,
                 "--stack-name",
                 stack_id,
-            ]
+            ],
+            env=environment,
         ).get("StackResourceSummaries", [])
         if resources:
             raise LiveTestError(
@@ -14124,6 +14162,7 @@ def cleanup_orphans(args: argparse.Namespace) -> None:
     stacks_by_depth: dict[int, list[str]] = {}
     for item in verified:
         stacks_by_depth.setdefault(preview_depth(item), []).append(item[0])
+    deleted_review_stacks: list[str] = []
     for depth in sorted(stacks_by_depth, reverse=True):
         stack_ids = sorted(stacks_by_depth[depth])
         # Siblings have no dependency on one another. Request their deletions
@@ -14137,7 +14176,8 @@ def cleanup_orphans(args: argparse.Namespace) -> None:
                     region,
                     "--stack-name",
                     stack_id,
-                ]
+                ],
+                env=environment,
             )
         for stack_id in stack_ids:
             aws_wait(
@@ -14149,9 +14189,29 @@ def cleanup_orphans(args: argparse.Namespace) -> None:
                     region,
                     "--stack-name",
                     stack_id,
-                ]
+                ],
+                env=environment,
             )
             deleted_review_stacks.append(stack_id)
+    return deleted_review_stacks
+
+
+def cleanup_orphans(args: argparse.Namespace) -> None:
+    """Delete only empty, exactly owned preview shells and Connect log groups."""
+    path, ledger = load_ledger(args.execution_id)
+    if args.confirm != ledger["execution_id"]:
+        raise LiveTestError("--confirm must exactly equal the execution ID")
+    if ledger.get("status") not in {"destroyed", "teardown_incomplete"}:
+        raise LiveTestError("orphan cleanup requires a completed teardown ledger")
+    execution_id = ledger["execution_id"]
+    region = ledger["region"]
+    inventory_before = inventory_for_execution(ledger)
+    deleted_review_stacks: list[str] = []
+    deleted_log_groups: list[str] = []
+
+    deleted_review_stacks = delete_owned_empty_review_stacks(
+        ledger, inventory_before.get("review_stack_ids", [])
+    )
 
     for log_group in inventory_before.get("connect_log_group_names", []):
         if (
