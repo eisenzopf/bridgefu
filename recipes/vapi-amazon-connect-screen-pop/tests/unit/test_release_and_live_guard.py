@@ -3201,6 +3201,18 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         self.assertEqual(ledger["qualification_stack_id"], qualification_stack_id)
         self.assertEqual(ledger["stack_id"], application_stack_id)
 
+    def test_preexecution_ownership_uses_reviewed_change_set_tags(self):
+        source = SCRIPT.read_text()
+        validator = source.split(
+            "def validate_reviewed_create_for_execution(", 1
+        )[1].split("def execute(args", 1)[0]
+        self.assertIn(
+            'require_ownership_tags(description.get("Tags", []),', validator
+        )
+        self.assertNotIn(
+            'require_ownership_tags(stack.get("Tags", []),', validator
+        )
+
     def test_execute_rejects_review_deployment_stack_id_drift_before_aws(self):
         reviewed_stack_id = (
             "arn:aws:cloudformation:us-west-2:123456789012:stack/"

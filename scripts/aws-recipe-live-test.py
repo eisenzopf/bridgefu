@@ -6941,9 +6941,12 @@ def validate_reviewed_create_for_execution(
             description,
             changes,
             disposable_template_contract or {},
-        )
+    )
     stack = stack_description(ledger, environment, expected_stack_id)
-    require_ownership_tags(stack.get("Tags", []), ledger["execution_id"])
+    # CREATE review shells do not expose stack tags until execution. The
+    # reviewed change set is the authoritative pre-execution tag contract;
+    # deployed-stack verification checks the resulting stack tags later.
+    require_ownership_tags(description.get("Tags", []), ledger["execution_id"])
     expected_description = (
         f"Approved Bridgefu qualification runner {ledger['execution_id']}"
         if qualification
