@@ -633,9 +633,9 @@ Resources:
               - logs:TagResource
               - logs:UntagResource
             Resource:
-              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bridgefu-${ExecutionId}-*'
-              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/bridgefu-${ExecutionId}-*'
-              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/bridgefu/${ExecutionId}/*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/bridgefu-${ExecutionId}-*:*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/bridgefu-${ExecutionId}-*:*'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/bridgefu/${ExecutionId}/*:*'
           - Sid: DiscoverRecipeLogGroups
             Effect: Allow
             Action: logs:DescribeLogGroups
@@ -1179,7 +1179,7 @@ Resources:
               - logs:PutRetentionPolicy
               - logs:TagResource
               - logs:UntagResource
-            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/connect/${ExecutionId}-connect'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/connect/${ExecutionId}-connect:*'
           - Sid: DiscoverConnectLogGroup
             Effect: Allow
             Action: logs:DescribeLogGroups

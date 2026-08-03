@@ -63,6 +63,49 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
+    def test_bootstrap_log_permissions_cover_cloudwatch_resource_suffixes(self):
+        template = yaml.load(
+            (
+                ROOT
+                / "recipes"
+                / "vapi-amazon-connect-screen-pop"
+                / "cloudformation"
+                / "test-deployment-role.yaml"
+            ).read_text(),
+            Loader=CfnLoader,
+        )
+        resources = template["Resources"]
+        policy_documents = [
+            resource["Properties"]["PolicyDocument"]
+            for resource in resources.values()
+            if resource.get("Type") == "AWS::IAM::ManagedPolicy"
+        ]
+        def mappings(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from mappings(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from mappings(child)
+
+        statements = [
+            mapping
+            for document in policy_documents
+            for mapping in mappings(document["Statement"])
+            if "Sid" in mapping
+        ]
+        by_sid = {statement.get("Sid"): statement for statement in statements}
+        expected_sids = {"ManageRecipeLogsOnly", "ManageExactConnectLogGroup"}
+        self.assertTrue(expected_sids.issubset(by_sid))
+        for sid in expected_sids:
+            statement = by_sid[sid]
+            resources = statement["Resource"]
+            if isinstance(resources, str):
+                resources = [resources]
+            self.assertTrue(resources)
+            self.assertTrue(all(resource.endswith(":*") for resource in resources))
+
     def bootstrap_stack_id(self) -> str:
         return (
             "arn:aws:cloudformation:us-west-2:111122223333:stack/"
@@ -2277,8 +2320,22 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         ):
             self.assertIn(action, template)
         self.assertNotIn("AdministratorAccess", template)
-        self.assertNotIn("iam:*", template)
-        self.assertNotIn("connect:*", template)
+        parsed = yaml.load(template, Loader=CfnLoader)
+
+        def scalar_values(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield key
+                    yield from scalar_values(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from scalar_values(child)
+            else:
+                yield value
+
+        values = set(scalar_values(parsed))
+        self.assertNotIn("iam:*", values)
+        self.assertNotIn("connect:*", values)
         source = SCRIPT.read_text()
         self.assertIn('"bootstrap_stack_adopted"', source)
         self.assertIn("adopted bootstrap stack parameters do not match", source)
