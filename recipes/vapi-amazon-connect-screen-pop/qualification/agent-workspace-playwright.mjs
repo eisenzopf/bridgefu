@@ -640,8 +640,12 @@ async function authenticate(options) {
         .locator('input[autocomplete="current-password"], input[name*="password" i], input[type="password"]')
         .first();
       await username.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 60_000) });
-      await password.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 60_000) });
       await username.fill(credential.username);
+      if (!(await password.isVisible().catch(() => false))) {
+        const continued = await clickButton(page, [/^Next$/i, /^Continue$/i]);
+        if (!continued) fail("Connect login username continuation was unavailable");
+      }
+      await password.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 60_000) });
       await password.fill(credential.password);
       const submitted = await clickButton(page, [/Sign in/i, /Log in/i, /Login/i]);
       if (!submitted) fail("Connect login submit control was unavailable");

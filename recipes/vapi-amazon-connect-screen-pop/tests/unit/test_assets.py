@@ -47,6 +47,22 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class RecipeAssetContractTests(unittest.TestCase):
+    def test_agent_workspace_supports_two_step_native_connect_login(self):
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        fill_username = source.index("await username.fill(credential.username)")
+        continue_username = source.index(
+            'await clickButton(page, [/^Next$/i, /^Continue$/i])'
+        )
+        wait_for_password = source.index(
+            'await password.waitFor({ state: "visible"', continue_username
+        )
+        fill_password = source.index(
+            "await password.fill(credential.password)", wait_for_password
+        )
+        self.assertLess(fill_username, continue_username)
+        self.assertLess(continue_username, wait_for_password)
+        self.assertLess(wait_for_password, fill_password)
+
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
         templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))
