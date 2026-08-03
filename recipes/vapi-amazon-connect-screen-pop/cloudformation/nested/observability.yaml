@@ -415,7 +415,7 @@ Resources:
             {
               "type": "text",
               "x": 0, "y": 0, "width": 24, "height": 2,
-              "properties": {"markdown": "# Bridgefu ${DeploymentId}\nRecipe `vapi-amazon-connect-screen-pop@1` — Starter capacity: ${MaxConcurrentCalls} calls. Use alarm descriptions to open the matching runbook."}
+              "properties": {"markdown": "# Bridgefu ${DeploymentId}\nRecipe `vapi-amazon-connect-screen-pop@1` - Starter capacity: ${MaxConcurrentCalls} calls. Use alarm descriptions to open the matching runbook."}
             },
             {
               "type": "metric",

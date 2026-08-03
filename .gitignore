@@ -19,6 +19,7 @@ __pycache__/
 
 # Local agent/editor and operating-system metadata
 /.claude/worktrees/
+/tmp/
 .DS_Store
 
 # Logs

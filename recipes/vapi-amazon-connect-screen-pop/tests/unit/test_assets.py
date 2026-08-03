@@ -55,6 +55,14 @@ class RecipeAssetContractTests(unittest.TestCase):
             with self.subTest(template=template.name):
                 yaml.load(template.read_text(), Loader=CfnLoader)
 
+    def test_cloudformation_templates_are_ascii_stable_for_service_round_trip(self):
+        templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
+        templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))
+        self.assertGreaterEqual(len(templates), 14)
+        for template in templates:
+            with self.subTest(template=template.name):
+                template.read_bytes().decode("ascii")
+
     def test_bootstrap_deployment_permissions_fit_managed_policy_limits(self):
         source = (
             RECIPE / "cloudformation/test-deployment-role.yaml"
