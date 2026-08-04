@@ -72,6 +72,27 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertIn('await buttonVisible(page, [/^Available$/i])', ensure)
         self.assertNotIn("clickButton", ensure)
 
+    def test_disposable_agent_auto_accepts_and_browser_proves_media_attachment(self):
+        connect = yaml.load(
+            (RECIPE / "cloudformation/nested/demo-connect.yaml").read_text(),
+            Loader=CfnLoader,
+        )
+        self.assertIs(
+            connect["Resources"]["DemoAgent"]["Properties"]["PhoneConfig"][
+                "AutoAccept"
+            ],
+            True,
+        )
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        auto_accept = source.split(
+            "async function waitForAutoAcceptedContact", 1
+        )[1].split("async function endControlVisible", 1)[0]
+        self.assertIn("probe.remoteAudioTracks > 0", auto_accept)
+        self.assertIn("probe.audioPacketsSent > 0", auto_accept)
+        self.assertIn("probe.audioBytesSent > 0", auto_accept)
+        observe = source.split("async function observe", 1)[1]
+        self.assertIn("await waitForAutoAcceptedContact(page, timeoutMs)", observe)
+
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
         templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))
@@ -133,6 +154,11 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertEqual(source.count("connect:ListAgentStatuses"), 1)
         self.assertIn(
             "instance/*/agent-state/*'",
+            source,
+        )
+        self.assertIn("instance/*/agent/*'", source)
+        self.assertIn(
+            "instance/????????-????-????-????-????????????'",
             source,
         )
 

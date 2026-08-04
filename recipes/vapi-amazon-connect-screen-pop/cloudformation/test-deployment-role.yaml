@@ -1354,7 +1354,12 @@ Resources:
                 - Sid: SetDisposableAgentAvailability
                   Effect: Allow
                   Action: connect:PutUserStatus
-                  Resource: !Sub 'arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/*/agent-state/*'
+                  Resource:
+                    # PutUserStatus authorization is evaluated against the
+                    # instance, generated user, and selected agent status.
+                    - !Sub 'arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/????????-????-????-????-????????????'
+                    - !Sub 'arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/*/agent/*'
+                    - !Sub 'arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/*/agent-state/*'
                 - !Ref AWS::NoValue
               - !If
                 - CreateQualificationRunner

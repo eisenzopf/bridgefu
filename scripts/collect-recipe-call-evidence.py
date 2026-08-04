@@ -1830,6 +1830,7 @@ SAFE_AGENT_FAILURE_PREFIXES = (
     "Agent Workspace could not select Available",
     "Agent Workspace did not become Available",
     "Agent Workspace did not receive an answerable synthetic contact",
+    "Agent Workspace did not auto-accept the synthetic contact",
     "Agent Workspace did not render the exact synthetic screen pop",
     "Agent Workspace did not render the missing-context guide",
     "Agent Workspace media/DTMF browser observations did not converge",
@@ -1840,6 +1841,27 @@ SAFE_AGENT_FAILURE_PREFIXES = (
     "Agent Workspace contact controls did not clean up",
     "Agent Workspace final media evidence is incomplete",
     "Agent Workspace harness failed",
+)
+
+SAFE_SOURCE_FAILURE_PREFIXES = (
+    "controlled recipe call was not answered",
+    "SRTP negotiation was not observed",
+    "SRTP contexts were not installed",
+    "plaintext RTP scenario unexpectedly negotiated SRTP",
+    "opening controlled recipe audio",
+    "sending source marker frame",
+    "sending source marker spacing",
+    "sending source RFC 4733 DTMF",
+    "agent-to-source RFC 4733 DTMF was not observed",
+    "agent marker observation timed out",
+    "agent marker observer stopped unexpectedly",
+    "agent-to-source audio marker evidence is incomplete",
+    "source BYE did not complete",
+    "agent BYE was not observed",
+    "agent BYE observer stopped",
+    "sending the controlled attachment replay",
+    "one-use SIP attachment replay was answered",
+    "wire-level INVITE/header/transport evidence failed",
 )
 
 
@@ -1862,6 +1884,32 @@ def agent_failure_detail(process: subprocess.Popen[str]) -> str | None:
 
 def agent_failure(process: subprocess.Popen[str], message: str) -> EvidenceError:
     detail = agent_failure_detail(process)
+    return EvidenceError(f"{message}: {detail}" if detail else message)
+
+
+def source_failure_detail(process: subprocess.Popen[str]) -> str | None:
+    try:
+        _, error = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        return None
+    if not isinstance(error, str):
+        return None
+    for line in error.splitlines():
+        detail = None
+        if line.startswith("Error: "):
+            detail = line.removeprefix("Error: ")
+        elif line.startswith("error: "):
+            detail = line.removeprefix("error: ")
+        if detail is None:
+            continue
+        for prefix in SAFE_SOURCE_FAILURE_PREFIXES:
+            if detail.startswith(prefix):
+                return prefix
+    return None
+
+
+def source_failure(process: subprocess.Popen[str], message: str) -> EvidenceError:
+    detail = source_failure_detail(process)
     return EvidenceError(f"{message}: {detail}" if detail else message)
 
 
@@ -1983,7 +2031,7 @@ def run_direct_with_deployment(
                 env=process_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
             )
             deadline = time.monotonic() + args.observer_timeout_seconds + 60
@@ -1993,7 +2041,9 @@ def run_direct_with_deployment(
                         agent, "the protected Agent Workspace observer failed"
                     )
                 if source.poll() not in {None, 0}:
-                    raise EvidenceError("the protected direct SIP source failed")
+                    raise source_failure(
+                        source, "the protected direct SIP source failed"
+                    )
                 if time.monotonic() >= deadline:
                     raise EvidenceError(
                         "protected direct-call observers exceeded their deadline"
@@ -2004,11 +2054,12 @@ def run_direct_with_deployment(
                     agent, "the protected Agent Workspace observer failed"
                 )
             if source.returncode != 0:
-                raise EvidenceError("the protected direct SIP source failed")
+                raise source_failure(source, "the protected direct SIP source failed")
         finally:
             if source is not None:
                 terminate_process(source)
-                source.communicate(timeout=5)
+                if source.stderr is not None and not source.stderr.closed:
+                    source.communicate(timeout=5)
             if agent is not None:
                 terminate_process(agent)
                 agent.communicate(timeout=5)

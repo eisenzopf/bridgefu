@@ -215,7 +215,10 @@ Resources:
         LastName: Demo Agent
       PhoneConfig:
         PhoneType: SOFT_PHONE
-        AutoAccept: false
+        # Qualification must not depend on a time-sensitive Agent Workspace
+        # button selector. The headless browser proves the resulting WebRTC
+        # media attachment before it treats the contact as answered.
+        AutoAccept: true
         AfterContactWorkTimeLimit: 1
       RoutingProfileArn: !GetAtt DemoRoutingProfile.RoutingProfileArn
       SecurityProfileArns:

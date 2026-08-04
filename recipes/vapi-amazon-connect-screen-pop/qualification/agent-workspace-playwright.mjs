@@ -392,6 +392,23 @@ async function ensureAvailable(page, timeoutMs) {
   );
 }
 
+async function waitForAutoAcceptedContact(page, timeoutMs) {
+  return waitUntil(
+    async () => {
+      const probe = await probeSnapshot(page);
+      return (
+        Number.isInteger(probe.captureRequestedAtMs) &&
+        Number.isInteger(probe.captureResolvedAtMs) &&
+        probe.remoteAudioTracks > 0 &&
+        probe.audioPacketsSent > 0 &&
+        probe.audioBytesSent > 0
+      );
+    },
+    timeoutMs,
+    "Agent Workspace did not auto-accept the synthetic contact",
+  );
+}
+
 async function endControlVisible(page) {
   for (const frame of page.frames()) {
     for (const pattern of [/End call/i, /Hang up/i, /Disconnect/i]) {
@@ -709,11 +726,7 @@ async function observe(options) {
       "authenticated Agent Workspace was not ready",
     );
     await ensureAvailable(page, timeoutMs);
-    await waitUntil(
-      () => clickButton(page, [/^Accept$/i, /^Answer$/i, /Accept call/i]),
-      timeoutMs,
-      "Agent Workspace did not receive an answerable synthetic contact",
-    );
+    await waitForAutoAcceptedContact(page, timeoutMs);
     const acceptedAtMs = Date.now();
     if (expectMissingContext) {
       await waitUntil(

@@ -41,6 +41,20 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(COLLECTOR.agent_failure_detail(unsafe))
 
+    def test_source_failure_detail_only_exposes_allowlisted_prefix(self):
+        safe = mock.Mock()
+        safe.communicate.return_value = (
+            "",
+            "Error: agent-to-source RFC 4733 DTMF was not observed\n",
+        )
+        unsafe = mock.Mock()
+        unsafe.communicate.return_value = ("", "Error: private-session-secret\n")
+        self.assertEqual(
+            COLLECTOR.source_failure_detail(safe),
+            "agent-to-source RFC 4733 DTMF was not observed",
+        )
+        self.assertIsNone(COLLECTOR.source_failure_detail(unsafe))
+
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
         for path, minimum_helper_uses in (
             (COLLECTOR_PATH, 4),
