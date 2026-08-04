@@ -4185,6 +4185,41 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
         ):
             self.assertEqual(LIVE.inventory_headless_build_ids(ledger), [])
 
+    def test_failed_headless_run_is_archived_before_same_suite_retry(self):
+        current = {
+            "suite": "smoke",
+            "phase": "terminal",
+            "run_id": "smoke-1785690000",
+            "terminal_status": "FAILED",
+        }
+        replacement = {
+            "suite": "smoke",
+            "phase": "prepared",
+            "run_id": "smoke-1785691000",
+        }
+        ledger = {"headless_run": current, "events": []}
+        with mock.patch.object(
+            LIVE, "headless_run_history", return_value=[]
+        ), mock.patch.object(
+            LIVE, "validate_headless_run_state", return_value=current
+        ), mock.patch.object(
+            LIVE, "create_headless_run_state", return_value=replacement
+        ) as create:
+            observed = LIVE.adopt_headless_run(
+                Path("ledger.json"), ledger, "smoke", 3600
+            )
+
+        self.assertIs(observed, replacement)
+        self.assertEqual(ledger["headless_run_history"], [current])
+        self.assertNotIn("headless_run", ledger)
+        self.assertEqual(
+            ledger["events"][-1]["event"],
+            "failed_headless_run_archived_for_retry",
+        )
+        create.assert_called_once_with(
+            Path("ledger.json"), ledger, "smoke", 3600
+        )
+
     def test_headless_teardown_stops_and_polls_before_returning(self):
         build_id = (
             "bridgefu-bft-safe1-qualification:" "00000000-0000-0000-0000-000000000001"

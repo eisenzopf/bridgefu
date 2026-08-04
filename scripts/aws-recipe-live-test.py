@@ -14587,6 +14587,26 @@ def adopt_headless_run(
         return create_headless_run_state(path, ledger, suite, remaining_seconds)
     current = validate_headless_run_state(ledger, current_value)
     if current["suite"] == suite:
+        if (
+            current["phase"] == "terminal"
+            and current.get("terminal_status") != "SUCCEEDED"
+        ):
+            if len(history) >= MAX_HEADLESS_RUN_HISTORY:
+                raise LiveTestError("headless run history is full")
+            ledger["headless_run_history"] = [*history, dict(current)]
+            ledger.pop("headless_run")
+            ledger.setdefault("events", []).append(
+                {
+                    "at": utc_now(),
+                    "event": "failed_headless_run_archived_for_retry",
+                    "suite": current["suite"],
+                    "run_id": current["run_id"],
+                    "terminal_status": current["terminal_status"],
+                }
+            )
+            return create_headless_run_state(
+                path, ledger, suite, remaining_seconds
+            )
         return current
     if current["phase"] != "verified":
         raise LiveTestError(
