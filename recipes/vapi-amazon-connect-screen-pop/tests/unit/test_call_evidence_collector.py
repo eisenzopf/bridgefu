@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import copy
 import sys
@@ -383,14 +384,30 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         order: list[str] = []
         deployment = (Path("ledger.json"), {"execution_id": args.execution_id}, {})
         session = Path("fresh.private.json")
+        @contextlib.contextmanager
+        def controlled(*_arguments):
+            order.append("network")
+            yield {"controller": "test"}
+
         with mock.patch.object(
             COLLECTOR,
             "stable_deployment",
             side_effect=lambda _execution_id: (order.append("validate"), deployment)[1],
         ) as stable, mock.patch.object(
             COLLECTOR,
+            "controlled_network",
+            side_effect=controlled,
+        ) as network, mock.patch.object(
+            COLLECTOR.secrets,
+            "token_hex",
+            return_value="0123456789abcdef01234567",
+        ), mock.patch.object(
+            COLLECTOR,
             "create_direct_session",
-            side_effect=lambda *_arguments: (order.append("reserve"), session)[1],
+            side_effect=lambda *_arguments, **_keywords: (
+                order.append("reserve"),
+                session,
+            )[1],
         ) as create, mock.patch.object(
             COLLECTOR,
             "run_direct_with_deployment",
@@ -398,11 +415,21 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         ) as observe:
             COLLECTOR.run_direct_fresh(args)
 
-        self.assertEqual(order, ["validate", "reserve", "observe"])
+        self.assertEqual(order, ["validate", "network", "reserve", "observe"])
         stable.assert_called_once_with(args.execution_id)
-        create.assert_called_once_with(args, *deployment)
+        network.assert_called_once_with(
+            *deployment,
+            args.network_profile,
+            "0123456789abcdef01234567",
+        )
+        create.assert_called_once_with(
+            args,
+            *deployment,
+            session_id="0123456789abcdef01234567",
+        )
         observed_args = observe.call_args.args[0]
         self.assertEqual(observed_args.session, session)
+        self.assertEqual(observe.call_args.args[-1], {"controller": "test"})
 
     def test_vapi_call_contract_requires_owned_assistant_and_both_tools(self):
         call = {

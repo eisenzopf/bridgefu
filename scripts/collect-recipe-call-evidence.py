@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -1113,6 +1113,8 @@ def create_direct_session(
     path: Path,
     ledger: dict[str, Any],
     environment: dict[str, str],
+    *,
+    session_id: str | None = None,
 ) -> Path:
     parameters = stack_parameters(ledger, environment)
     security, codec = scenario_contract(
@@ -1129,7 +1131,9 @@ def create_direct_session(
         environment,
         handoff["CorrelationKeySecretArn"],
     )
-    nonce = secrets.token_hex(12)
+    nonce = session_id or secrets.token_hex(12)
+    if re.fullmatch(r"[0-9a-f]{24}", nonce) is None:
+        raise EvidenceError("direct call session ID has the wrong shape")
     call_id = f"call_bridgefu_{nonce}"
     org_id = "org_bridgefu_qualification"
     tool_id = f"tool_bridgefu_{nonce}"
@@ -1843,6 +1847,7 @@ def run_direct_with_deployment(
     path: Path,
     ledger: dict[str, Any],
     environment: dict[str, str],
+    prepared_network_observation: dict[str, Any] | None = None,
 ) -> None:
     session_path = args.session.resolve()
     session = require_private_session(session_path, args.execution_id)
@@ -1905,13 +1910,18 @@ def run_direct_with_deployment(
     agent: subprocess.Popen[str] | None = None
     source: subprocess.Popen[str] | None = None
     network_observation: dict[str, Any]
-    with controlled_network(
-        path,
-        ledger,
-        environment,
-        str(session["network_profile"]),
-        session_id,
-    ) as network_observation:
+    network_context = (
+        nullcontext(prepared_network_observation)
+        if prepared_network_observation is not None
+        else controlled_network(
+            path,
+            ledger,
+            environment,
+            str(session["network_profile"]),
+            session_id,
+        )
+    )
+    with network_context as network_observation:
         try:
             agent = subprocess.Popen(
                 agent_command,
@@ -1988,14 +1998,34 @@ def run_direct_fresh(args: argparse.Namespace) -> None:
         raise EvidenceError(
             "run-direct-fresh supports only the four direct SIP scenarios"
         )
-    # Keep the expensive live deployment validation ahead of reservation
-    # creation. A named-route call has a short setup deadline; creating its
-    # one-use attachment in a separate process can spend that entire window
-    # revalidating CloudFormation before the INVITE is sent.
+    # Keep every expensive live operation ahead of reservation creation. A
+    # named-route call has a short setup deadline; both CloudFormation
+    # validation and the SSM-backed network controller can otherwise spend
+    # that entire window before the INVITE is sent.
     path, ledger, environment = stable_deployment(args.execution_id)
-    session_path = create_direct_session(args, path, ledger, environment)
-    direct_args = argparse.Namespace(**vars(args), session=session_path)
-    run_direct_with_deployment(direct_args, path, ledger, environment)
+    session_id = secrets.token_hex(12)
+    with controlled_network(
+        path,
+        ledger,
+        environment,
+        args.network_profile,
+        session_id,
+    ) as network_observation:
+        session_path = create_direct_session(
+            args,
+            path,
+            ledger,
+            environment,
+            session_id=session_id,
+        )
+        direct_args = argparse.Namespace(**vars(args), session=session_path)
+        run_direct_with_deployment(
+            direct_args,
+            path,
+            ledger,
+            environment,
+            network_observation,
+        )
 
 
 def wait_for_ready_file(
