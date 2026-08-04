@@ -1825,6 +1825,46 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+SAFE_AGENT_FAILURE_PREFIXES = (
+    "authenticated Agent Workspace was not ready",
+    "Agent Workspace could not select Available",
+    "Agent Workspace did not become Available",
+    "Agent Workspace did not receive an answerable synthetic contact",
+    "Agent Workspace did not render the exact synthetic screen pop",
+    "Agent Workspace did not render the missing-context guide",
+    "Agent Workspace media/DTMF browser observations did not converge",
+    "Agent Workspace keypad control was not available",
+    "Agent Workspace did not expose DTMF digit 6",
+    "Agent Workspace end-call control was unavailable",
+    "Agent Workspace did not observe the source hangup",
+    "Agent Workspace contact controls did not clean up",
+    "Agent Workspace final media evidence is incomplete",
+    "Agent Workspace harness failed",
+)
+
+
+def agent_failure_detail(process: subprocess.Popen[str]) -> str | None:
+    try:
+        _, error = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        return None
+    if not isinstance(error, str):
+        return None
+    for line in error.splitlines():
+        if not line.startswith("error: "):
+            continue
+        detail = line.removeprefix("error: ")
+        for prefix in SAFE_AGENT_FAILURE_PREFIXES:
+            if detail.startswith(prefix):
+                return prefix
+    return None
+
+
+def agent_failure(process: subprocess.Popen[str], message: str) -> EvidenceError:
+    detail = agent_failure_detail(process)
+    return EvidenceError(f"{message}: {detail}" if detail else message)
+
+
 def validate_connect_url(value: str) -> None:
     try:
         connect_url = urllib.parse.urlsplit(value)
@@ -1929,12 +1969,14 @@ def run_direct_with_deployment(
                 env=process_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
             )
             time.sleep(3)
             if agent.poll() is not None:
-                raise EvidenceError("Agent Workspace observer stopped before the call")
+                raise agent_failure(
+                    agent, "Agent Workspace observer stopped before the call"
+                )
             source = subprocess.Popen(
                 source_command,
                 cwd=ROOT,
@@ -1947,7 +1989,9 @@ def run_direct_with_deployment(
             deadline = time.monotonic() + args.observer_timeout_seconds + 60
             while agent.poll() is None or source.poll() is None:
                 if agent.poll() not in {None, 0}:
-                    raise EvidenceError("the protected Agent Workspace observer failed")
+                    raise agent_failure(
+                        agent, "the protected Agent Workspace observer failed"
+                    )
                 if source.poll() not in {None, 0}:
                     raise EvidenceError("the protected direct SIP source failed")
                 if time.monotonic() >= deadline:
@@ -1956,7 +2000,9 @@ def run_direct_with_deployment(
                     )
                 time.sleep(0.25)
             if agent.returncode != 0:
-                raise EvidenceError("the protected Agent Workspace observer failed")
+                raise agent_failure(
+                    agent, "the protected Agent Workspace observer failed"
+                )
             if source.returncode != 0:
                 raise EvidenceError("the protected direct SIP source failed")
         finally:
@@ -2280,14 +2326,16 @@ def run_vapi(args: argparse.Namespace) -> None:
                     env=agent_environment,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     text=True,
                 )
                 time.sleep(3)
                 if agent.poll() is not None or browser.poll() is not None:
-                    raise EvidenceError(
-                        "a protected Vapi observer stopped before transfer"
-                    )
+                    if agent.poll() is not None:
+                        raise agent_failure(
+                            agent, "a protected Vapi observer stopped before transfer"
+                        )
+                    raise EvidenceError("a protected Vapi observer stopped before transfer")
                 write_private_json(trigger_path, {"schema_version": 1})
                 deadline = time.monotonic() + args.observer_timeout_seconds + 60
                 while agent.poll() is None or browser.poll() is None:
@@ -2295,6 +2343,8 @@ def run_vapi(args: argparse.Namespace) -> None:
                         None,
                         0,
                     }:
+                        if agent.poll() not in {None, 0}:
+                            raise agent_failure(agent, "a protected Vapi observer failed")
                         raise EvidenceError("a protected Vapi observer failed")
                     if time.monotonic() >= deadline:
                         raise EvidenceError(
@@ -2302,6 +2352,8 @@ def run_vapi(args: argparse.Namespace) -> None:
                         )
                     time.sleep(0.25)
                 if agent.returncode != 0 or browser.returncode != 0:
+                    if agent.returncode != 0:
+                        raise agent_failure(agent, "a protected Vapi observer failed")
                     raise EvidenceError("a protected Vapi observer failed")
             network_path = write_network_observation(
                 path, ledger, network_observation

@@ -63,6 +63,19 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertLess(continue_username, wait_for_password)
         self.assertLess(wait_for_password, fill_password)
 
+    def test_agent_workspace_reopens_status_menu_while_selecting_available(self):
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        ensure = source.split("async function ensureAvailable", 1)[1].split(
+            "async function endControlVisible", 1
+        )[0]
+        select_available = ensure.index(
+            'await clickButton(page, [/^Available$/i])'
+        )
+        reopen_status = ensure.index(
+            "await clickButton(page, [/Offline/i, /Not Ready/i, /Break/i, /After Contact Work/i])"
+        )
+        self.assertLess(select_available, reopen_status)
+
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
         templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))

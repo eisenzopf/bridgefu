@@ -384,9 +384,12 @@ async function workspaceReady(page) {
 
 async function ensureAvailable(page, timeoutMs) {
   if (await visibleExact(page, "Available")) return;
-  await clickButton(page, [/Offline/i, /Not Ready/i, /Break/i, /After Contact Work/i]);
   await waitUntil(
-    () => clickButton(page, [/^Available$/i]),
+    async () => {
+      if (await clickButton(page, [/^Available$/i])) return true;
+      await clickButton(page, [/Offline/i, /Not Ready/i, /Break/i, /After Contact Work/i]);
+      return false;
+    },
     Math.min(timeoutMs, 30_000),
     "Agent Workspace could not select Available",
   );

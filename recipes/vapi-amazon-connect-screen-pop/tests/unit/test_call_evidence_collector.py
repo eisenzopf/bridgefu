@@ -27,6 +27,20 @@ SPEC.loader.exec_module(COLLECTOR)
 
 
 class CallEvidenceCollectorTests(unittest.TestCase):
+    def test_agent_failure_detail_only_exposes_allowlisted_prefix(self):
+        safe = mock.Mock()
+        safe.communicate.return_value = (
+            "",
+            "error: Agent Workspace could not select Available: locator detail\n",
+        )
+        unsafe = mock.Mock()
+        unsafe.communicate.return_value = ("", "error: credential=value\n")
+        self.assertEqual(
+            COLLECTOR.agent_failure_detail(safe),
+            "Agent Workspace could not select Available",
+        )
+        self.assertIsNone(COLLECTOR.agent_failure_detail(unsafe))
+
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
         for path, minimum_helper_uses in (
             (COLLECTOR_PATH, 4),
