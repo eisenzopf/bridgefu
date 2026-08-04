@@ -274,7 +274,7 @@ def stable_deployment(execution_id: str) -> tuple[Path, dict[str, Any], dict[str
     if ledger.get("publication_source_tree_sha256") != current_digest:
         raise EvidenceError("working tree no longer matches the immutable candidate")
     environment = LIVE.assume_env(ledger, "qualification")
-    stack = LIVE.stack_description(ledger, environment, ledger["stack_name"])
+    stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
     if stack.get("StackStatus") not in {
         "CREATE_COMPLETE",
         "UPDATE_COMPLETE",
@@ -689,7 +689,7 @@ def validated_network_observation(
 def stack_parameters(
     ledger: Mapping[str, Any], environment: Mapping[str, str]
 ) -> dict[str, str]:
-    stack = LIVE.stack_description(dict(ledger), dict(environment), ledger["stack_name"])
+    stack = LIVE.stack_description(dict(ledger), dict(environment), ledger["stack_id"])
     return {
         item["ParameterKey"]: item.get("ParameterValue", "")
         for item in stack.get("Parameters", [])
@@ -1582,7 +1582,7 @@ def collect(args: argparse.Namespace) -> None:
         ):
             raise EvidenceError("source observation changed the scenario transport contract")
 
-    root_stack = LIVE.stack_description(ledger, environment, ledger["stack_name"])
+    root_stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
     root_outputs = LIVE.outputs(root_stack)
     row = get_handoff_row(
         ledger,

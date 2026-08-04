@@ -656,7 +656,7 @@ def stable_live_ledger(
             "working tree no longer matches the immutable candidate"
         )
     environment = LIVE.assume_env(ledger, "qualification")
-    stack = LIVE.stack_description(ledger, environment, ledger["stack_name"])
+    stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
     if stack.get("StackStatus") not in {
         "CREATE_COMPLETE",
         "UPDATE_COMPLETE",
@@ -1270,7 +1270,7 @@ def negative_sip(args: argparse.Namespace) -> None:
             LIVE.stack_description(
                 dict(ledger),
                 dict(qualification_environment),
-                str(ledger["stack_name"]),
+                str(ledger["stack_id"]),
             )
         )
         row = COLLECTOR.get_handoff_row(
@@ -1564,7 +1564,7 @@ def negative_missing_context(args: argparse.Namespace) -> None:
         LIVE.stack_description(
             dict(ledger),
             dict(qualification_environment),
-            str(ledger["stack_name"]),
+            str(ledger["stack_id"]),
         )
     )
     table_name = root_outputs["HandoffTableName"]
@@ -2712,7 +2712,7 @@ def host_recovery_action(
     parameters = {
         item["ParameterKey"]: item.get("ParameterValue", "")
         for item in LIVE.stack_description(
-            dict(ledger), dict(qualification_environment), str(ledger["stack_name"])
+            dict(ledger), dict(qualification_environment), str(ledger["stack_id"])
         ).get("Parameters", [])
     }
     runtime, _ = runtime_log_outputs(ledger, qualification_environment)

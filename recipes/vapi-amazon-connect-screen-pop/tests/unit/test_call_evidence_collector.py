@@ -15,6 +15,7 @@ import jsonschema
 RECIPE = Path(__file__).resolve().parents[2]
 ROOT = RECIPE.parents[1]
 COLLECTOR_PATH = ROOT / "scripts" / "collect-recipe-call-evidence.py"
+QUALIFICATION_PATH = ROOT / "scripts" / "run-recipe-qualification.py"
 SPEC = importlib.util.spec_from_file_location("bridgefu_call_evidence", COLLECTOR_PATH)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import guard
     raise RuntimeError("unable to load call evidence collector")
@@ -24,6 +25,29 @@ SPEC.loader.exec_module(COLLECTOR)
 
 
 class CallEvidenceCollectorTests(unittest.TestCase):
+    def test_cloudformation_descriptions_use_exact_stack_ids(self):
+        for path, minimum_exact_uses in (
+            (COLLECTOR_PATH, 3),
+            (QUALIFICATION_PATH, 4),
+        ):
+            with self.subTest(path=path.name):
+                source = path.read_text()
+                self.assertNotIn(
+                    'LIVE.stack_description(ledger, environment, ledger["stack_name"])',
+                    source,
+                )
+                self.assertNotIn(
+                    'LIVE.stack_description(dict(ledger), dict(environment), ledger["stack_name"])',
+                    source,
+                )
+                self.assertNotIn(
+                    'dict(qualification_environment), str(ledger["stack_name"])',
+                    source,
+                )
+                self.assertGreaterEqual(
+                    source.count('ledger["stack_id"]'), minimum_exact_uses
+                )
+
     def participant(self):
         return {
             "schema_version": 1,
