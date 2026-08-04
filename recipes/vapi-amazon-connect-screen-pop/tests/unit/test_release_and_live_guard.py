@@ -4220,6 +4220,66 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             Path("ledger.json"), ledger, "smoke", 3600
         )
 
+    def test_failed_terminal_headless_run_is_valid_history(self):
+        now = LIVE.dt.datetime.now(LIVE.dt.timezone.utc)
+        started = now.isoformat().replace("+00:00", "Z")
+        terminal = (now + LIVE.dt.timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        deadline = (now + LIVE.dt.timedelta(hours=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        qualification_deadline = (
+            now + LIVE.dt.timedelta(hours=2)
+        ).isoformat().replace("+00:00", "Z")
+        source_digest = "a" * 64
+        run_id = "smoke-1785690000"
+        project = "bridgefu-bft-safe1-qualification"
+        input_path = Path("/private/state") / f"{run_id}-runner-input.private.json"
+        state = {
+            "schema_version": 1,
+            "execution_id": "bft-safe1",
+            "suite": "smoke",
+            "run_id": run_id,
+            "input_key": f"qualification/bft-safe1/runs/{run_id}/input.json",
+            "evidence_key": (
+                f"qualification/bft-safe1/runs/{run_id}/evidence.tar.gz"
+            ),
+            "idempotency_token": LIVE.headless_idempotency_token(
+                "bft-safe1", "smoke", source_digest, run_id
+            ),
+            "source_tree_sha256": source_digest,
+            "phase": "terminal",
+            "input_path": str(input_path),
+            "input_sha256": "b" * 64,
+            "started_at": started,
+            "deadline_at": deadline,
+            "input_version": "version-1",
+            "build_id": (
+                f"{project}:00000000-0000-0000-0000-000000000001"
+            ),
+            "terminal_status": "FAILED",
+            "terminal_at": terminal,
+        }
+        ledger = {
+            "execution_id": "bft-safe1",
+            "publication_source_tree_sha256": source_digest,
+            "qualification_deadline_at": qualification_deadline,
+            "qualification_project_name": project,
+            "headless_run_history": [state],
+        }
+        with mock.patch.object(
+            LIVE,
+            "ledger_path",
+            return_value=Path("/private/state/ledger.json"),
+        ):
+            self.assertEqual(LIVE.headless_run_history(ledger), [state])
+            state["phase"] = "build_started"
+            state.pop("terminal_status")
+            state.pop("terminal_at")
+            with self.assertRaisesRegex(LIVE.LiveTestError, "unfinished run"):
+                LIVE.headless_run_history(ledger)
+
     def test_headless_teardown_stops_and_polls_before_returning(self):
         build_id = (
             "bridgefu-bft-safe1-qualification:" "00000000-0000-0000-0000-000000000001"

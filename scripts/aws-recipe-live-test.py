@@ -14416,7 +14416,13 @@ def validate_headless_run_state(
         or deadline > qualification_deadline
     ):
         raise LiveTestError("headless deadline exceeds its authorization")
-    if historical and phase != "verified":
+    if historical and not (
+        phase == "verified"
+        or (
+            phase == "terminal"
+            and state.get("terminal_status") != "SUCCEEDED"
+        )
+    ):
         raise LiveTestError("headless history contains an unfinished run")
     if "input_version" in state and (
         not isinstance(state["input_version"], str) or not state["input_version"]
