@@ -1341,6 +1341,22 @@ Resources:
                 Action: connect:SearchContacts
                 Resource: !If [CreateDisposableConnect, '*', !Ref ConnectInstanceArn]
               - !If
+                - CreateDisposableConnect
+                - Sid: DiscoverDisposableAgentAvailability
+                  Effect: Allow
+                  Action:
+                    - connect:ListAgentStatuses
+                    - connect:ListUsers
+                  Resource: '*'
+                - !Ref AWS::NoValue
+              - !If
+                - CreateDisposableConnect
+                - Sid: SetDisposableAgentAvailability
+                  Effect: Allow
+                  Action: connect:PutUserStatus
+                  Resource: !Sub 'arn:${AWS::Partition}:connect:${AWS::Region}:${AWS::AccountId}:instance/*/agent-state/*'
+                - !Ref AWS::NoValue
+              - !If
                 - CreateQualificationRunner
                 - Sid: RunHeadlessQualification
                   Effect: Allow

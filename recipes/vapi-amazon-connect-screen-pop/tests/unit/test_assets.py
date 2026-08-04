@@ -63,18 +63,14 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertLess(continue_username, wait_for_password)
         self.assertLess(wait_for_password, fill_password)
 
-    def test_agent_workspace_reopens_status_menu_while_selecting_available(self):
+    def test_agent_workspace_requires_api_selected_available_without_menu_clicks(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
         ensure = source.split("async function ensureAvailable", 1)[1].split(
             "async function endControlVisible", 1
         )[0]
-        select_available = ensure.index(
-            'await clickButton(page, [/^Available$/i])'
-        )
-        reopen_status = ensure.index(
-            "await clickButton(page, [/Offline/i, /Not Ready/i, /Break/i, /After Contact Work/i])"
-        )
-        self.assertLess(select_available, reopen_status)
+        self.assertIn('await visibleExact(page, "Available")', ensure)
+        self.assertIn('await buttonVisible(page, [/^Available$/i])', ensure)
+        self.assertNotIn("clickButton", ensure)
 
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
@@ -133,6 +129,12 @@ class RecipeAssetContractTests(unittest.TestCase):
             self.assertIn(action, source)
         self.assertIn("ManageExactConnectLogGroup", source)
         self.assertIn("/aws/connect/${ExecutionId}-connect", source)
+        self.assertEqual(source.count("connect:PutUserStatus"), 1)
+        self.assertEqual(source.count("connect:ListAgentStatuses"), 1)
+        self.assertIn(
+            "instance/*/agent-state/*'",
+            source,
+        )
 
         compute_statements = resources["DeploymentComputePolicy"]["Properties"][
             "PolicyDocument"

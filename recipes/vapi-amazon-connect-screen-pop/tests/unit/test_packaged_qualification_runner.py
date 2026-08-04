@@ -27,6 +27,91 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class PackagedQualificationRunnerTests(unittest.TestCase):
+    def test_connect_agent_availability_is_exact_and_idempotent(self):
+        ledger = {
+            "execution_id": "bft-test1234",
+            "connect_mode": "disposable",
+            "connect_instance_arn": (
+                "arn:aws:connect:us-west-2:123456789012:instance/instance-1"
+            ),
+            "partition": "aws",
+            "region": "us-west-2",
+            "account_id": "123456789012",
+        }
+        responses = [
+            {
+                "UserSummaryList": [
+                    {
+                        "Username": "bridgefu-demo-agent",
+                        "Id": "user-1",
+                        "Arn": ledger["connect_instance_arn"] + "/agent/user-1",
+                    }
+                ]
+            },
+            {
+                "AgentStatusSummaryList": [
+                    {
+                        "Name": "Available",
+                        "Type": "ROUTABLE",
+                        "Id": "status-1",
+                        "Arn": (
+                            ledger["connect_instance_arn"]
+                            + "/agent-state/status-1"
+                        ),
+                    }
+                ]
+            },
+        ]
+        completed = RUNNER.subprocess.CompletedProcess(
+            [],
+            255,
+            "",
+            "InvalidRequestException: User already in requested status",
+        )
+        with mock.patch.object(
+            RUNNER.LIVE, "assume_env", return_value={"AWS_REGION": "us-west-2"}
+        ), mock.patch.object(
+            RUNNER.LIVE, "aws_json", side_effect=responses
+        ), mock.patch.object(
+            RUNNER.subprocess, "run", return_value=completed
+        ) as put:
+            RUNNER.ensure_connect_agent_available(ledger, "bridgefu-demo-agent")
+
+        invocation = put.call_args.args[0]
+        self.assertIn("put-user-status", invocation)
+        self.assertEqual(invocation[invocation.index("--user-id") + 1], "user-1")
+        self.assertEqual(
+            invocation[invocation.index("--agent-status-id") + 1], "status-1"
+        )
+
+    def test_connect_agent_availability_rejects_an_ambiguous_user(self):
+        ledger = {
+            "execution_id": "bft-test1234",
+            "connect_mode": "disposable",
+            "connect_instance_arn": (
+                "arn:aws:connect:us-west-2:123456789012:instance/instance-1"
+            ),
+            "partition": "aws",
+            "region": "us-west-2",
+            "account_id": "123456789012",
+        }
+        duplicate = {
+            "Username": "bridgefu-demo-agent",
+            "Id": "user-1",
+            "Arn": ledger["connect_instance_arn"] + "/agent/user-1",
+        }
+        with mock.patch.object(
+            RUNNER.LIVE, "assume_env", return_value={"AWS_REGION": "us-west-2"}
+        ), mock.patch.object(
+            RUNNER.LIVE,
+            "aws_json",
+            side_effect=[
+                {"UserSummaryList": [duplicate, duplicate]},
+                {"AgentStatusSummaryList": []},
+            ],
+        ), self.assertRaisesRegex(RUNNER.RunnerError, "lookup was not exact"):
+            RUNNER.ensure_connect_agent_available(ledger, "bridgefu-demo-agent")
+
     def test_packaged_state_root_is_private_isolated_and_matches_live_override(self):
         container, state_root = RUNNER.create_packaged_state_root()
         try:

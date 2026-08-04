@@ -383,20 +383,12 @@ async function workspaceReady(page) {
 }
 
 async function ensureAvailable(page, timeoutMs) {
-  if (await visibleExact(page, "Available")) return;
   await waitUntil(
-    async () => {
-      if (await clickButton(page, [/^Available$/i])) return true;
-      await clickButton(page, [/Offline/i, /Not Ready/i, /Break/i, /After Contact Work/i]);
-      return false;
-    },
+    async () =>
+      (await visibleExact(page, "Available")) ||
+      (await buttonVisible(page, [/^Available$/i])),
     Math.min(timeoutMs, 30_000),
-    "Agent Workspace could not select Available",
-  );
-  await waitUntil(
-    () => visibleExact(page, "Available"),
-    Math.min(timeoutMs, 30_000),
-    "Agent Workspace did not become Available",
+    "Agent Workspace did not present the API-selected Available status",
   );
 }
 

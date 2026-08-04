@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -28,6 +30,15 @@ AGENT = (
     / "qualification"
     / "agent-workspace-playwright.mjs"
 )
+LIVE_SCRIPT = ROOT / "scripts" / "aws-recipe-live-test.py"
+LIVE_SPEC = importlib.util.spec_from_file_location(
+    "bridgefu_packaged_qualification_live", LIVE_SCRIPT
+)
+if LIVE_SPEC is None or LIVE_SPEC.loader is None:  # pragma: no cover - import guard
+    raise RuntimeError("unable to load guarded AWS lifecycle controller")
+LIVE = importlib.util.module_from_spec(LIVE_SPEC)
+sys.modules[LIVE_SPEC.name] = LIVE
+LIVE_SPEC.loader.exec_module(LIVE)
 SCENARIOS = {
     "sip-rtp-pcmu",
     "sip-rtp-pcma",
@@ -84,6 +95,108 @@ LIVE_STATE_OVERRIDE_ENV = "BRIDGEFU_AWS_LIVE_STATE_DIR"
 
 class RunnerError(RuntimeError):
     pass
+
+
+def ensure_connect_agent_available(
+    ledger: dict[str, Any], username: str
+) -> None:
+    """Select the one disposable agent's routable status through Connect's API."""
+
+    instance_arn = ledger.get("connect_instance_arn")
+    expected_arn = re.compile(
+        rf"^arn:{re.escape(str(ledger.get('partition', '')))}:connect:"
+        rf"{re.escape(str(ledger.get('region', '')))}:"
+        rf"{re.escape(str(ledger.get('account_id', '')))}:instance/"
+        r"([A-Za-z0-9-]+)$"
+    )
+    match = expected_arn.fullmatch(instance_arn or "")
+    if (
+        ledger.get("connect_mode") != "disposable"
+        or match is None
+        or username != "bridgefu-demo-agent"
+    ):
+        raise RunnerError("Connect availability target is not the exact disposable agent")
+    instance_id = match.group(1)
+    environment = LIVE.assume_env(ledger, "qualification")
+    users = LIVE.aws_json(
+        [
+            "connect",
+            "list-users",
+            "--region",
+            ledger["region"],
+            "--instance-id",
+            instance_id,
+        ],
+        env=environment,
+    )
+    statuses = LIVE.aws_json(
+        [
+            "connect",
+            "list-agent-statuses",
+            "--region",
+            ledger["region"],
+            "--instance-id",
+            instance_id,
+        ],
+        env=environment,
+    )
+    if not isinstance(users, dict) or not isinstance(statuses, dict):
+        raise RunnerError("Connect availability lookup did not return objects")
+    user_summaries = users.get("UserSummaryList")
+    status_summaries = statuses.get("AgentStatusSummaryList")
+    if not isinstance(user_summaries, list) or not isinstance(
+        status_summaries, list
+    ):
+        raise RunnerError("Connect availability lookup did not return lists")
+    user_matches = [
+        item
+        for item in user_summaries
+        if isinstance(item, dict)
+        and item.get("Username") == username
+        and item.get("Arn", "").startswith(f"{instance_arn}/agent/")
+        and re.fullmatch(r"[A-Za-z0-9-]{1,100}", item.get("Id", ""))
+    ]
+    status_matches = [
+        item
+        for item in status_summaries
+        if isinstance(item, dict)
+        and item.get("Name") == "Available"
+        and item.get("Type") == "ROUTABLE"
+        and item.get("Arn", "").startswith(f"{instance_arn}/agent-state/")
+        and re.fullmatch(r"[A-Za-z0-9-]{1,100}", item.get("Id", ""))
+    ]
+    if len(user_matches) != 1 or len(status_matches) != 1:
+        raise RunnerError("Connect availability lookup was not exact")
+    result = subprocess.run(
+        [
+            "aws",
+            "connect",
+            "put-user-status",
+            "--region",
+            ledger["region"],
+            "--instance-id",
+            instance_id,
+            "--user-id",
+            user_matches[0]["Id"],
+            "--agent-status-id",
+            status_matches[0]["Id"],
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    already_available = (
+        result.returncode != 0
+        and "InvalidRequestException" in result.stderr
+        and "User already in requested status" in result.stderr
+    )
+    if result.returncode != 0 and not already_available:
+        raise RunnerError("Connect could not set the generated agent Available")
 
 
 def create_packaged_state_root() -> tuple[Path, Path]:
@@ -987,6 +1100,7 @@ def main() -> int:
             ],
             env=environment,
         )
+        ensure_connect_agent_available(ledger, credential["username"])
         if value["suite"] == "full":
             jobs = run_full_suite(
                 execution_id,
