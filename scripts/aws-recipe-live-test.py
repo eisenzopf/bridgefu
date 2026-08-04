@@ -14633,6 +14633,21 @@ def adopt_headless_run(
     return create_headless_run_state(path, ledger, suite, remaining_seconds)
 
 
+def headless_run_needs_window(
+    current: dict[str, Any] | None, suite: str
+) -> bool:
+    return (
+        current is None
+        or current["suite"] != suite
+        or current["phase"] in {"prepared", "input_published"}
+        or (
+            current["suite"] == suite
+            and current["phase"] == "terminal"
+            and current.get("terminal_status") != "SUCCEEDED"
+        )
+    )
+
+
 def load_headless_runner_input(ledger: dict[str, Any], state: dict[str, Any]) -> Path:
     input_path = Path(state["input_path"])
     try:
@@ -15402,11 +15417,7 @@ def run_headless(args: argparse.Namespace) -> None:
         raise LiveTestError(
             "full headless qualification must run before the lifecycle test"
         )
-    needs_start_or_adoption = (
-        current is None
-        or current["suite"] != args.suite
-        or current["phase"] in {"prepared", "input_published"}
-    )
+    needs_start_or_adoption = headless_run_needs_window(current, args.suite)
     remaining_seconds = (
         require_qualification_deadline(
             path, ledger, "headless qualification start or resume"

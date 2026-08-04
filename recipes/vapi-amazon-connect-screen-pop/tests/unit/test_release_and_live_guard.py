@@ -4280,6 +4280,21 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(LIVE.LiveTestError, "unfinished run"):
                 LIVE.headless_run_history(ledger)
 
+    def test_failed_terminal_retry_requires_a_fresh_authorization_window(self):
+        failed = {
+            "suite": "smoke",
+            "phase": "terminal",
+            "terminal_status": "STOPPED",
+        }
+        succeeded = {
+            "suite": "smoke",
+            "phase": "verified",
+            "terminal_status": "SUCCEEDED",
+        }
+        self.assertTrue(LIVE.headless_run_needs_window(failed, "smoke"))
+        self.assertTrue(LIVE.headless_run_needs_window(succeeded, "full"))
+        self.assertFalse(LIVE.headless_run_needs_window(succeeded, "smoke"))
+
     def test_headless_teardown_stops_and_polls_before_returning(self):
         build_id = (
             "bridgefu-bft-safe1-qualification:" "00000000-0000-0000-0000-000000000001"
