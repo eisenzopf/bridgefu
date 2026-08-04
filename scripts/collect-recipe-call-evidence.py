@@ -1851,6 +1851,8 @@ SAFE_SOURCE_FAILURE_PREFIXES = (
     "opening controlled recipe audio",
     "sending source marker frame",
     "sending source marker spacing",
+    "sending source in-band DTMF",
+    "sending source in-band DTMF spacing",
     "sending source RFC 4733 DTMF",
     "agent-to-source RFC 4733 DTMF was not observed",
     "agent marker observation timed out",

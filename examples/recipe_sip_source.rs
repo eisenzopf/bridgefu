@@ -2,9 +2,9 @@
 //!
 //! The binary reads the collector's mode-0600 private session, places exactly
 //! one call with exactly one `X-Correlation-Id`, sends deterministic audio and
-//! RFC 4733 probes, observes the reciprocal probes and BYE, and writes only a
-//! strict redacted observation. Raw identifiers, SIP/SDP, and media never
-//! leave process memory.
+//! an in-band DTMF probe plus RFC 4733, observes the reciprocal probes and BYE,
+//! and writes only a strict redacted observation. Raw identifiers, SIP/SDP,
+//! and media never leave process memory.
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -31,10 +31,14 @@ const FRAME_SAMPLES: usize = 160;
 const FRAME_DURATION: Duration = Duration::from_millis(20);
 const MARKER_FREQUENCY: f32 = 997.0;
 const AGENT_MARKER_FREQUENCY: f64 = 880.0;
+const DTMF_FIVE_LOW_FREQUENCY: f32 = 770.0;
+const DTMF_FIVE_HIGH_FREQUENCY: f32 = 1_336.0;
 const SOURCE_MARKER_PULSES: usize = 30;
 const REQUIRED_AGENT_MARKERS: usize = 5;
 const MARKER_TONE_FRAMES: usize = 5;
 const MARKER_SILENCE_FRAMES: usize = 45;
+const IN_BAND_DTMF_FRAMES: usize = 15;
+const IN_BAND_DTMF_TRAILING_SILENCE_FRAMES: usize = 5;
 const MAX_SESSION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Parser)]
@@ -473,10 +477,30 @@ fn tone_frame(frequency: f32, phase: &mut f32) -> Vec<i16> {
         .collect()
 }
 
-async fn send_markers(sender: rvoip_sip::AudioSender) -> anyhow::Result<(Vec<u64>, usize)> {
+fn dual_tone_frame(
+    low_frequency: f32,
+    high_frequency: f32,
+    low_phase: &mut f32,
+    high_phase: &mut f32,
+) -> Vec<i16> {
+    let low_step = 2.0 * std::f32::consts::PI * low_frequency / 8_000.0;
+    let high_step = 2.0 * std::f32::consts::PI * high_frequency / 8_000.0;
+    (0..FRAME_SAMPLES)
+        .map(|_| {
+            let sample = (low_phase.sin() + high_phase.sin()) * 0.125 * f32::from(i16::MAX);
+            *low_phase = (*low_phase + low_step) % (2.0 * std::f32::consts::PI);
+            *high_phase = (*high_phase + high_step) % (2.0 * std::f32::consts::PI);
+            sample as i16
+        })
+        .collect()
+}
+
+async fn send_markers(
+    sender: &rvoip_sip::AudioSender,
+    timestamp: &mut u32,
+) -> anyhow::Result<(Vec<u64>, usize)> {
     let mut timestamps = Vec::with_capacity(SOURCE_MARKER_PULSES);
     let mut phase = 0.0;
-    let mut timestamp = 0_u32;
     let mut frames = 0;
     for _ in 0..SOURCE_MARKER_PULSES {
         timestamps.push(now_ms());
@@ -486,24 +510,69 @@ async fn send_markers(sender: rvoip_sip::AudioSender) -> anyhow::Result<(Vec<u64
                     tone_frame(MARKER_FREQUENCY, &mut phase),
                     8_000,
                     1,
-                    timestamp,
+                    *timestamp,
                 ))
                 .await
                 .context("sending source marker frame")?;
-            timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+            *timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
             frames += 1;
             tokio::time::sleep(FRAME_DURATION).await;
         }
         for _ in 0..MARKER_SILENCE_FRAMES {
             sender
-                .send(AudioFrame::new(vec![0; FRAME_SAMPLES], 8_000, 1, timestamp))
+                .send(AudioFrame::new(
+                    vec![0; FRAME_SAMPLES],
+                    8_000,
+                    1,
+                    *timestamp,
+                ))
                 .await
                 .context("sending source marker spacing")?;
-            timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+            *timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
             tokio::time::sleep(FRAME_DURATION).await;
         }
     }
     Ok((timestamps, frames))
+}
+
+async fn send_in_band_dtmf_five(
+    sender: &rvoip_sip::AudioSender,
+    timestamp: &mut u32,
+) -> anyhow::Result<()> {
+    let mut low_phase = 0.0;
+    let mut high_phase = 0.0;
+    for _ in 0..IN_BAND_DTMF_FRAMES {
+        sender
+            .send(AudioFrame::new(
+                dual_tone_frame(
+                    DTMF_FIVE_LOW_FREQUENCY,
+                    DTMF_FIVE_HIGH_FREQUENCY,
+                    &mut low_phase,
+                    &mut high_phase,
+                ),
+                8_000,
+                1,
+                *timestamp,
+            ))
+            .await
+            .context("sending source in-band DTMF")?;
+        *timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+        tokio::time::sleep(FRAME_DURATION).await;
+    }
+    for _ in 0..IN_BAND_DTMF_TRAILING_SILENCE_FRAMES {
+        sender
+            .send(AudioFrame::new(
+                vec![0; FRAME_SAMPLES],
+                8_000,
+                1,
+                *timestamp,
+            ))
+            .await
+            .context("sending source in-band DTMF spacing")?;
+        *timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+        tokio::time::sleep(FRAME_DURATION).await;
+    }
+    Ok(())
 }
 
 fn write_observation(path: &Path, observation: &Observation) -> anyhow::Result<()> {
@@ -656,8 +725,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
         detector
     });
+    let mut source_audio_timestamp = 0_u32;
     let (source_marker_sent_at_ms, source_to_agent_marker_frames_sent) =
-        send_markers(sender).await?;
+        send_markers(&sender, &mut source_audio_timestamp).await?;
+    send_in_band_dtmf_five(&sender, &mut source_audio_timestamp).await?;
     handle
         .send_dtmf('5')
         .await
@@ -782,6 +853,22 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_band_five_contains_both_dtmf_frequencies() {
+        let mut low_phase = 0.0;
+        let mut high_phase = 0.0;
+        let frame = dual_tone_frame(
+            DTMF_FIVE_LOW_FREQUENCY,
+            DTMF_FIVE_HIGH_FREQUENCY,
+            &mut low_phase,
+            &mut high_phase,
+        );
+        assert_eq!(frame.len(), FRAME_SAMPLES);
+        assert!(rms(&frame) >= 0.05);
+        assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_LOW_FREQUENCY)) >= 0.001);
+        assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_HIGH_FREQUENCY)) >= 0.001);
+    }
 
     #[test]
     fn detector_records_bounded_rising_edges() {

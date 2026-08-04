@@ -55,6 +55,14 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(COLLECTOR.source_failure_detail(unsafe))
 
+    def test_direct_source_pairs_in_band_and_rfc4733_dtmf(self):
+        source = (ROOT / "examples" / "recipe_sip_source.rs").read_text()
+        in_band = source.index("send_in_band_dtmf_five(&sender")
+        rfc4733 = source.index(".send_dtmf('5')", in_band)
+        self.assertLess(in_band, rfc4733)
+        self.assertIn("DTMF_FIVE_LOW_FREQUENCY: f32 = 770.0", source)
+        self.assertIn("DTMF_FIVE_HIGH_FREQUENCY: f32 = 1_336.0", source)
+
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
         for path, minimum_helper_uses in (
             (COLLECTOR_PATH, 4),
