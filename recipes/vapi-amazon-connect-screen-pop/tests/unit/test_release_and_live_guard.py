@@ -63,6 +63,58 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
+    def test_deployed_recipe_stack_id_selects_and_validates_nested_application(self):
+        root_stack_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/root/"
+            "11111111-1111-1111-1111-111111111111"
+        )
+        application_stack_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/application/"
+            "22222222-2222-2222-2222-222222222222"
+        )
+        ledger = {
+            "partition": "aws",
+            "region": "us-west-2",
+            "account_id": "123456789012",
+            "application_stack_name": application_stack_id,
+        }
+        with (
+            mock.patch.object(
+                LIVE, "reviewed_create_stack_id", return_value=root_stack_id
+            ),
+            mock.patch.object(
+                LIVE, "nested_stack_id", return_value=application_stack_id
+            ) as nested,
+            mock.patch.object(LIVE, "exact_nested_stack_description") as describe,
+        ):
+            self.assertEqual(
+                LIVE.deployed_recipe_stack_id(ledger, {}), application_stack_id
+            )
+        nested.assert_called_once_with(
+            ledger, {}, "RecipeApplication", root_stack_id
+        )
+        describe.assert_called_once_with(
+            ledger,
+            {},
+            application_stack_id,
+            parent_stack_id=root_stack_id,
+            root_stack_id=root_stack_id,
+        )
+
+    def test_deployed_recipe_stack_id_uses_root_without_wrapper(self):
+        root_stack_id = (
+            "arn:aws:cloudformation:us-west-2:123456789012:stack/root/"
+            "11111111-1111-1111-1111-111111111111"
+        )
+        with (
+            mock.patch.object(
+                LIVE, "reviewed_create_stack_id", return_value=root_stack_id
+            ),
+            mock.patch.object(LIVE, "nested_stack_id") as nested,
+        ):
+            self.assertEqual(LIVE.deployed_recipe_stack_id({}, {}), root_stack_id)
+        nested.assert_not_called()
+
     def test_bootstrap_log_permissions_cover_cloudwatch_resource_suffixes(self):
         template = yaml.load(
             (

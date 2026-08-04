@@ -7515,6 +7515,32 @@ def exact_nested_stack_description(
     return description
 
 
+def deployed_recipe_stack_id(
+    ledger: dict[str, Any], environment: dict[str, str]
+) -> str:
+    """Return the exact recipe stack, below a disposable-demo wrapper if present."""
+    root_stack_id = reviewed_create_stack_id(ledger, qualification=False)
+    application_stack_id = ledger.get("application_stack_name")
+    if application_stack_id is None:
+        return root_stack_id
+    application_stack_id = require_stack_id_authority(
+        ledger, application_stack_id, "application nested stack"
+    )
+    discovered_stack_id = nested_stack_id(
+        ledger, environment, "RecipeApplication", root_stack_id
+    )
+    if discovered_stack_id != application_stack_id:
+        raise LiveTestError("application nested stack differs from its ledger binding")
+    exact_nested_stack_description(
+        ledger,
+        environment,
+        application_stack_id,
+        parent_stack_id=root_stack_id,
+        root_stack_id=root_stack_id,
+    )
+    return application_stack_id
+
+
 VAPI_OUTPUT_BINDINGS = (
     ("AssistantId", "vapi_assistant_id", "assistant"),
     ("PrepareToolId", "vapi_prepare_tool_id", "tool"),

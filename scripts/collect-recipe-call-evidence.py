@@ -274,7 +274,8 @@ def stable_deployment(execution_id: str) -> tuple[Path, dict[str, Any], dict[str
     if ledger.get("publication_source_tree_sha256") != current_digest:
         raise EvidenceError("working tree no longer matches the immutable candidate")
     environment = LIVE.assume_env(ledger, "qualification")
-    stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(ledger, environment)
+    stack = LIVE.stack_description(ledger, environment, recipe_stack_id)
     if stack.get("StackStatus") not in {
         "CREATE_COMPLETE",
         "UPDATE_COMPLETE",
@@ -689,7 +690,14 @@ def validated_network_observation(
 def stack_parameters(
     ledger: Mapping[str, Any], environment: Mapping[str, str]
 ) -> dict[str, str]:
-    stack = LIVE.stack_description(dict(ledger), dict(environment), ledger["stack_id"])
+    mutable_ledger = dict(ledger)
+    mutable_environment = dict(environment)
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(
+        mutable_ledger, mutable_environment
+    )
+    stack = LIVE.stack_description(
+        mutable_ledger, mutable_environment, recipe_stack_id
+    )
     return {
         item["ParameterKey"]: item.get("ParameterValue", "")
         for item in stack.get("Parameters", [])
@@ -701,8 +709,17 @@ def nested_outputs(
     environment: Mapping[str, str],
     logical_id: str,
 ) -> dict[str, str]:
-    stack_id = LIVE.nested_stack_id(dict(ledger), dict(environment), logical_id)
-    return LIVE.outputs(LIVE.stack_description(dict(ledger), dict(environment), stack_id))
+    mutable_ledger = dict(ledger)
+    mutable_environment = dict(environment)
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(
+        mutable_ledger, mutable_environment
+    )
+    stack_id = LIVE.nested_stack_id(
+        mutable_ledger, mutable_environment, logical_id, recipe_stack_id
+    )
+    return LIVE.outputs(
+        LIVE.stack_description(mutable_ledger, mutable_environment, stack_id)
+    )
 
 
 def synthetic_context(scenario_id: str, hangup_origin: str) -> dict[str, str]:
@@ -1582,7 +1599,8 @@ def collect(args: argparse.Namespace) -> None:
         ):
             raise EvidenceError("source observation changed the scenario transport contract")
 
-    root_stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(ledger, environment)
+    root_stack = LIVE.stack_description(ledger, environment, recipe_stack_id)
     root_outputs = LIVE.outputs(root_stack)
     row = get_handoff_row(
         ledger,

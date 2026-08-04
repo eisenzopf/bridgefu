@@ -656,7 +656,8 @@ def stable_live_ledger(
             "working tree no longer matches the immutable candidate"
         )
     environment = LIVE.assume_env(ledger, "qualification")
-    stack = LIVE.stack_description(ledger, environment, ledger["stack_id"])
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(ledger, environment)
+    stack = LIVE.stack_description(ledger, environment, recipe_stack_id)
     if stack.get("StackStatus") not in {
         "CREATE_COMPLETE",
         "UPDATE_COMPLETE",
@@ -674,13 +675,19 @@ def runtime_instance_ids(
 ) -> list[str]:
     profile = ledger.get("runtime_profile", "starter")
     if profile == "starter":
+        mutable_ledger = dict(ledger)
+        mutable_environment = dict(qualification_environment)
+        recipe_stack_id = LIVE.deployed_recipe_stack_id(
+            mutable_ledger, mutable_environment
+        )
         stack_id = LIVE.nested_stack_id(
-            dict(ledger), dict(qualification_environment), "StarterRuntime"
+            mutable_ledger,
+            mutable_environment,
+            "StarterRuntime",
+            recipe_stack_id,
         )
         runtime = LIVE.outputs(
-            LIVE.stack_description(
-                dict(ledger), dict(qualification_environment), stack_id
-            )
+            LIVE.stack_description(mutable_ledger, mutable_environment, stack_id)
         )
         instance_ids = [runtime.get("InstanceId", "")]
     else:
@@ -1266,11 +1273,14 @@ def negative_sip(args: argparse.Namespace) -> None:
         handoff = COLLECTOR.nested_outputs(
             ledger, qualification_environment, "HandoffService"
         )
+        mutable_ledger = dict(ledger)
+        mutable_environment = dict(qualification_environment)
+        recipe_stack_id = LIVE.deployed_recipe_stack_id(
+            mutable_ledger, mutable_environment
+        )
         root = LIVE.outputs(
             LIVE.stack_description(
-                dict(ledger),
-                dict(qualification_environment),
-                str(ledger["stack_id"]),
+                mutable_ledger, mutable_environment, recipe_stack_id
             )
         )
         row = COLLECTOR.get_handoff_row(
@@ -1560,12 +1570,13 @@ def negative_missing_context(args: argparse.Namespace) -> None:
     if storage_state.stat().st_mode & 0o077:
         raise QualificationError("Agent Workspace storage state must be mode 0600")
     COLLECTOR.validate_connect_url(args.connect_url)
+    mutable_ledger = dict(ledger)
+    mutable_environment = dict(qualification_environment)
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(
+        mutable_ledger, mutable_environment
+    )
     root_outputs = LIVE.outputs(
-        LIVE.stack_description(
-            dict(ledger),
-            dict(qualification_environment),
-            str(ledger["stack_id"]),
-        )
+        LIVE.stack_description(mutable_ledger, mutable_environment, recipe_stack_id)
     )
     table_name = root_outputs["HandoffTableName"]
     row = COLLECTOR.get_handoff_row(
@@ -2709,10 +2720,15 @@ def host_recovery_action(
 ) -> float:
     if len(instance_ids) != 1:
         raise QualificationError("Starter host recovery requires one exact host")
+    mutable_ledger = dict(ledger)
+    mutable_environment = dict(qualification_environment)
+    recipe_stack_id = LIVE.deployed_recipe_stack_id(
+        mutable_ledger, mutable_environment
+    )
     parameters = {
         item["ParameterKey"]: item.get("ParameterValue", "")
         for item in LIVE.stack_description(
-            dict(ledger), dict(qualification_environment), str(ledger["stack_id"])
+            mutable_ledger, mutable_environment, recipe_stack_id
         ).get("Parameters", [])
     }
     runtime, _ = runtime_log_outputs(ledger, qualification_environment)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import copy
 import sys
@@ -26,8 +27,8 @@ SPEC.loader.exec_module(COLLECTOR)
 
 class CallEvidenceCollectorTests(unittest.TestCase):
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
-        for path, minimum_exact_uses in (
-            (COLLECTOR_PATH, 3),
+        for path, minimum_helper_uses in (
+            (COLLECTOR_PATH, 4),
             (QUALIFICATION_PATH, 4),
         ):
             with self.subTest(path=path.name):
@@ -45,8 +46,22 @@ class CallEvidenceCollectorTests(unittest.TestCase):
                     source,
                 )
                 self.assertGreaterEqual(
-                    source.count('ledger["stack_id"]'), minimum_exact_uses
+                    source.count("LIVE.deployed_recipe_stack_id("),
+                    minimum_helper_uses,
                 )
+                tree = ast.parse(source)
+                nested_calls = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "LIVE"
+                    and node.func.attr == "nested_stack_id"
+                ]
+                self.assertTrue(nested_calls)
+                for call in nested_calls:
+                    self.assertEqual(len(call.args), 4)
 
     def participant(self):
         return {
