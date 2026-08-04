@@ -367,6 +367,43 @@ class CallEvidenceCollectorTests(unittest.TestCase):
                         Path("session.json"), Path("source.json"), 180
                     )
 
+    def test_fresh_direct_call_validates_before_creating_the_attachment(self):
+        args = COLLECTOR.argparse.Namespace(
+            execution_id="bft-test1234",
+            confirm="bft-test1234",
+            scenario="sip-rtp-pcmu",
+            hangup_origin="source",
+            network_profile="baseline",
+            connect_url="https://example.my.connect.aws/agent-app-v2/",
+            storage_state=Path("storage.json"),
+            observer_timeout_seconds=180,
+            wait_seconds=120,
+            headed=False,
+        )
+        order: list[str] = []
+        deployment = (Path("ledger.json"), {"execution_id": args.execution_id}, {})
+        session = Path("fresh.private.json")
+        with mock.patch.object(
+            COLLECTOR,
+            "stable_deployment",
+            side_effect=lambda _execution_id: (order.append("validate"), deployment)[1],
+        ) as stable, mock.patch.object(
+            COLLECTOR,
+            "create_direct_session",
+            side_effect=lambda *_arguments: (order.append("reserve"), session)[1],
+        ) as create, mock.patch.object(
+            COLLECTOR,
+            "run_direct_with_deployment",
+            side_effect=lambda *_arguments: order.append("observe"),
+        ) as observe:
+            COLLECTOR.run_direct_fresh(args)
+
+        self.assertEqual(order, ["validate", "reserve", "observe"])
+        stable.assert_called_once_with(args.execution_id)
+        create.assert_called_once_with(args, *deployment)
+        observed_args = observe.call_args.args[0]
+        self.assertEqual(observed_args.session, session)
+
     def test_vapi_call_contract_requires_owned_assistant_and_both_tools(self):
         call = {
             "id": "call_test",

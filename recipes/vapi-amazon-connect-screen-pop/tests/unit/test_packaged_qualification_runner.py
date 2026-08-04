@@ -75,6 +75,33 @@ class PackagedQualificationRunnerTests(unittest.TestCase):
             },
         )
 
+    def test_direct_call_reserves_and_observes_in_one_collector_process(self):
+        retained = Path("/private/call-evidence/direct.json")
+        with mock.patch.object(
+            RUNNER, "command", return_value=os.fspath(retained)
+        ) as command, mock.patch.object(
+            RUNNER, "output_path", return_value=retained
+        ):
+            result = RUNNER.run_call(
+                "bft-test1234",
+                "sip-rtp-pcmu",
+                "baseline",
+                "source",
+                "https://example.my.connect.aws/agent-app-v2/",
+                Path("/private/storage.json"),
+                {"BRIDGEFU_PACKAGED_SOURCE": "1"},
+                Path("/private"),
+            )
+
+        self.assertEqual(result, retained)
+        invocation = command.call_args.args[0]
+        self.assertIn("run-direct-fresh", invocation)
+        self.assertNotIn("start-direct", invocation)
+        self.assertNotIn("run-direct", invocation)
+        self.assertEqual(invocation[invocation.index("--scenario") + 1], "sip-rtp-pcmu")
+        self.assertEqual(invocation[invocation.index("--hangup-origin") + 1], "source")
+        self.assertEqual(invocation[invocation.index("--network-profile") + 1], "baseline")
+
     def test_official_archive_excludes_ledger_release_and_private_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

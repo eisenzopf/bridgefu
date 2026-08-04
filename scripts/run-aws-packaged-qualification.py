@@ -608,35 +608,6 @@ def output_path(output: str, parent: Path, label: str) -> Path:
     return path
 
 
-def start_direct_session(
-    execution_id: str,
-    scenario: str,
-    origin: str,
-    network_profile: str,
-    environment: dict[str, str],
-    evidence_dir: Path,
-) -> Path:
-    output = command(
-        [
-            "python3",
-            os.fspath(COLLECTOR),
-            "start-direct",
-            "--execution-id",
-            execution_id,
-            "--scenario",
-            scenario,
-            "--hangup-origin",
-            origin,
-            "--network-profile",
-            network_profile,
-            "--confirm",
-            execution_id,
-        ],
-        env=environment,
-    )
-    return output_path(output, evidence_dir / "call-sessions", "direct session start")
-
-
 def run_call(
     execution_id: str,
     scenario: str,
@@ -669,23 +640,19 @@ def run_call(
             env=environment,
         )
     else:
-        session = start_direct_session(
-            execution_id,
-            scenario,
-            origin,
-            network_profile,
-            environment,
-            evidence_dir,
-        )
         output = command(
             [
                 "python3",
                 os.fspath(COLLECTOR),
-                "run-direct",
+                "run-direct-fresh",
                 "--execution-id",
                 execution_id,
-                "--session",
-                os.fspath(session),
+                "--scenario",
+                scenario,
+                "--hangup-origin",
+                origin,
+                "--network-profile",
+                network_profile,
                 "--connect-url",
                 connect_url,
                 "--storage-state",

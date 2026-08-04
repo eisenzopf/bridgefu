@@ -1108,12 +1108,12 @@ def wait_for_vapi_call_contract(
             time.sleep(min(2, max(0.1, deadline - time.monotonic())))
 
 
-def start_direct(args: argparse.Namespace) -> None:
-    if args.confirm != args.execution_id:
-        raise EvidenceError("start-direct requires the exact execution ID confirmation")
-    if args.scenario not in DIRECT_SCENARIOS:
-        raise EvidenceError("start-direct supports only the four direct SIP scenarios")
-    path, ledger, environment = stable_deployment(args.execution_id)
+def create_direct_session(
+    args: argparse.Namespace,
+    path: Path,
+    ledger: dict[str, Any],
+    environment: dict[str, str],
+) -> Path:
     parameters = stack_parameters(ledger, environment)
     security, codec = scenario_contract(
         args.scenario, parameters.get("SipSecurity")
@@ -1226,6 +1226,16 @@ def start_direct(args: argparse.Namespace) -> None:
         hangup_origin=args.hangup_origin,
         network_profile=args.network_profile,
     )
+    return output
+
+
+def start_direct(args: argparse.Namespace) -> None:
+    if args.confirm != args.execution_id:
+        raise EvidenceError("start-direct requires the exact execution ID confirmation")
+    if args.scenario not in DIRECT_SCENARIOS:
+        raise EvidenceError("start-direct supports only the four direct SIP scenarios")
+    path, ledger, environment = stable_deployment(args.execution_id)
+    output = create_direct_session(args, path, ledger, environment)
     print(output)
 
 
@@ -1826,10 +1836,14 @@ def validate_connect_url(value: str) -> None:
         or connect_url.fragment
     ):
         raise EvidenceError("use the default HTTPS Amazon Connect Agent Workspace URL")
-def run_direct(args: argparse.Namespace) -> None:
-    if args.confirm != args.execution_id:
-        raise EvidenceError("run-direct requires the exact execution ID confirmation")
-    path, ledger, environment = stable_deployment(args.execution_id)
+
+
+def run_direct_with_deployment(
+    args: argparse.Namespace,
+    path: Path,
+    ledger: dict[str, Any],
+    environment: dict[str, str],
+) -> None:
     session_path = args.session.resolve()
     session = require_private_session(session_path, args.execution_id)
     validate_private_session(session, args.execution_id, ledger, environment)
@@ -1922,15 +1936,19 @@ def run_direct(args: argparse.Namespace) -> None:
             )
             deadline = time.monotonic() + args.observer_timeout_seconds + 60
             while agent.poll() is None or source.poll() is None:
-                if agent.poll() not in {None, 0} or source.poll() not in {None, 0}:
-                    raise EvidenceError("a protected direct-call observer failed")
+                if agent.poll() not in {None, 0}:
+                    raise EvidenceError("the protected Agent Workspace observer failed")
+                if source.poll() not in {None, 0}:
+                    raise EvidenceError("the protected direct SIP source failed")
                 if time.monotonic() >= deadline:
                     raise EvidenceError(
                         "protected direct-call observers exceeded their deadline"
                     )
                 time.sleep(0.25)
-            if agent.returncode != 0 or source.returncode != 0:
-                raise EvidenceError("a protected direct-call observer failed")
+            if agent.returncode != 0:
+                raise EvidenceError("the protected Agent Workspace observer failed")
+            if source.returncode != 0:
+                raise EvidenceError("the protected direct SIP source failed")
         finally:
             if source is not None:
                 terminate_process(source)
@@ -1952,6 +1970,32 @@ def run_direct(args: argparse.Namespace) -> None:
             confirm=args.confirm,
         )
     )
+
+
+def run_direct(args: argparse.Namespace) -> None:
+    if args.confirm != args.execution_id:
+        raise EvidenceError("run-direct requires the exact execution ID confirmation")
+    path, ledger, environment = stable_deployment(args.execution_id)
+    run_direct_with_deployment(args, path, ledger, environment)
+
+
+def run_direct_fresh(args: argparse.Namespace) -> None:
+    if args.confirm != args.execution_id:
+        raise EvidenceError(
+            "run-direct-fresh requires the exact execution ID confirmation"
+        )
+    if args.scenario not in DIRECT_SCENARIOS:
+        raise EvidenceError(
+            "run-direct-fresh supports only the four direct SIP scenarios"
+        )
+    # Keep the expensive live deployment validation ahead of reservation
+    # creation. A named-route call has a short setup deadline; creating its
+    # one-use attachment in a separate process can spend that entire window
+    # revalidating CloudFormation before the INVITE is sent.
+    path, ledger, environment = stable_deployment(args.execution_id)
+    session_path = create_direct_session(args, path, ledger, environment)
+    direct_args = argparse.Namespace(**vars(args), session=session_path)
+    run_direct_with_deployment(direct_args, path, ledger, environment)
 
 
 def wait_for_ready_file(
@@ -2341,6 +2385,22 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--headed", action="store_true")
     run.add_argument("--confirm", required=True)
     run.set_defaults(function=run_direct)
+    fresh = subparsers.add_parser("run-direct-fresh")
+    fresh.add_argument("--execution-id", required=True)
+    fresh.add_argument("--scenario", choices=sorted(DIRECT_SCENARIOS), required=True)
+    fresh.add_argument("--hangup-origin", choices=("source", "agent"), required=True)
+    fresh.add_argument(
+        "--network-profile", choices=sorted(NETWORK_PROFILES), default="baseline"
+    )
+    fresh.add_argument("--connect-url", required=True)
+    fresh.add_argument("--storage-state", type=Path, required=True)
+    fresh.add_argument(
+        "--observer-timeout-seconds", type=bounded_observer_timeout, default=180
+    )
+    fresh.add_argument("--wait-seconds", type=bounded_wait_seconds, default=120)
+    fresh.add_argument("--headed", action="store_true")
+    fresh.add_argument("--confirm", required=True)
+    fresh.set_defaults(function=run_direct_fresh)
     vapi = subparsers.add_parser("run-vapi")
     vapi.add_argument("--execution-id", required=True)
     vapi.add_argument("--hangup-origin", choices=("source", "agent"), required=True)
