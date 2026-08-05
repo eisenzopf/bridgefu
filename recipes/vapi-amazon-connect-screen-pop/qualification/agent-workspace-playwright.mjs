@@ -293,7 +293,10 @@ function writeProbeWav(path) {
     let value = 0;
     if (inPulse) {
       value = Math.round(
-        Math.sin((2 * Math.PI * AGENT_MARKER_HZ * sample) / SAMPLE_RATE) * 8191,
+        (Math.sin((2 * Math.PI * AGENT_MARKER_HZ * sample) / SAMPLE_RATE) +
+          Math.sin((2 * Math.PI * AGENT_DTMF_SIX_LOW_HZ * sample) / SAMPLE_RATE) +
+          Math.sin((2 * Math.PI * AGENT_DTMF_SIX_HIGH_HZ * sample) / SAMPLE_RATE)) *
+          2730,
       );
     } else if (inDtmfSix) {
       value = Math.round(

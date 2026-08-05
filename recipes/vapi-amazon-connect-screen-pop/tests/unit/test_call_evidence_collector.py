@@ -73,6 +73,12 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertIn("AGENT_DTMF_SIX_LOW_HZ = 770", source)
         self.assertIn("AGENT_DTMF_SIX_HIGH_HZ = 1_477", source)
         self.assertIn("const inDtmfSix =", source)
+        marker_probe = source.split("if (inPulse) {", 1)[1].split(
+            "} else if (inDtmfSix)", 1
+        )[0]
+        self.assertIn("AGENT_MARKER_HZ", marker_probe)
+        self.assertIn("AGENT_DTMF_SIX_LOW_HZ", marker_probe)
+        self.assertIn("AGENT_DTMF_SIX_HIGH_HZ", marker_probe)
         keypad = source.index("const keypadOpened = await clickButton")
         digit = source.index("const digitSent = await clickButton", keypad)
         self.assertLess(keypad, digit)

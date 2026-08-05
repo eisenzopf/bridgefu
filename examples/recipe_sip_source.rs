@@ -771,13 +771,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
     while let Ok(digit) = dtmf_rx.try_recv() {
         rfc4733_agent_dtmf |= digit == '6';
     }
-    if !in_band_agent_dtmf && !rfc4733_agent_dtmf {
-        bail!("agent-to-source DTMF was not observed");
-    }
     if agent_marker.timestamps.len() != REQUIRED_AGENT_MARKERS
         || agent_marker.frames < REQUIRED_AGENT_MARKERS
     {
         bail!("agent-to-source audio marker evidence is incomplete");
+    }
+    if !in_band_agent_dtmf && !rfc4733_agent_dtmf {
+        bail!("agent-to-source DTMF was not observed");
     }
 
     let (local_bye_completed, remote_bye_observed) = if session.private.hangup_origin == "source" {
