@@ -92,7 +92,6 @@ const PROBE_PULSE_MS = 100;
 const PROBE_DTMF_SIX_START_MS = 4_500;
 const PROBE_DTMF_SIX_DURATION_MS = 300;
 const SOURCE_PROBE_SETTLE_MS = 31_000;
-const REQUIRED_DTMF_ANALYSER_FRAMES = 8;
 
 class HarnessError extends Error {}
 
@@ -559,6 +558,9 @@ function agentMarkerSchedule(captureStartedAtMs, acceptedAtMs, observedAtMs) {
 
 function installProbe() {
   if (globalThis.__bridgefuAgentProbe) return;
+  // Playwright serializes this function into the browser page, so every value
+  // used by the probe must be defined inside the function rather than captured.
+  const requiredDtmfAnalyserFrames = 8;
   const state = {
     captureRequestedAtMs: null,
     captureResolvedAtMs: null,
@@ -639,7 +641,7 @@ function installProbe() {
       const high = power(samples, context.sampleRate, 1336);
       const dtmf = rms > 0.01 && low > 0.00015 && high > 0.00015;
       state.dtmfConsecutiveFrames = dtmf ? state.dtmfConsecutiveFrames + 1 : 0;
-      if (state.dtmfConsecutiveFrames >= REQUIRED_DTMF_ANALYSER_FRAMES) {
+      if (state.dtmfConsecutiveFrames >= requiredDtmfAnalyserFrames) {
         state.dtmfSourceToAgentObserved = true;
       }
     }, 20);

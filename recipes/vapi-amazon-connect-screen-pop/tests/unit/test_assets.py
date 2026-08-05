@@ -121,16 +121,17 @@ class RecipeAssetContractTests(unittest.TestCase):
     def test_agent_requires_sustained_source_dtmf(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
         self.assertIn("const SOURCE_PROBE_SETTLE_MS = 31_000", source)
-        self.assertIn("const REQUIRED_DTMF_ANALYSER_FRAMES = 8", source)
         probe = source.split("function installProbe", 1)[1].split(
             "async function authenticate", 1
         )[0]
+        self.assertIn("const requiredDtmfAnalyserFrames = 8", probe)
+        self.assertNotIn("REQUIRED_DTMF_ANALYSER_FRAMES", source)
         self.assertIn(
             "state.dtmfConsecutiveFrames = dtmf ? state.dtmfConsecutiveFrames + 1 : 0",
             probe,
         )
         self.assertIn(
-            "state.dtmfConsecutiveFrames >= REQUIRED_DTMF_ANALYSER_FRAMES",
+            "state.dtmfConsecutiveFrames >= requiredDtmfAnalyserFrames",
             probe,
         )
 
