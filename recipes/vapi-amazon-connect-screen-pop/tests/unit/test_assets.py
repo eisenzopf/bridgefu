@@ -93,6 +93,47 @@ class RecipeAssetContractTests(unittest.TestCase):
         observe = source.split("async function observe", 1)[1]
         self.assertIn("await waitForAutoAcceptedContact(page, timeoutMs)", observe)
 
+    def test_agent_waits_for_reverse_markers_after_source_media_is_ready(self):
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        observe = source.split("async function observe", 1)[1]
+        wait_gate = observe.split(
+            '"Agent Workspace media/DTMF browser observations did not converge"', 1
+        )[0]
+        self.assertIn(
+            "const sourceMediaReadyAtMs = probe.sourceMarkerObservedAtMs[0]",
+            wait_gate,
+        )
+        self.assertIn(
+            "agentMarkerSchedule(\n            probe.captureRequestedAtMs,\n"
+            "            sourceMediaReadyAtMs,",
+            wait_gate,
+        )
+        self.assertIn(
+            "Date.now() - sourceMediaReadyAtMs >= SOURCE_PROBE_SETTLE_MS",
+            wait_gate,
+        )
+        final_schedule = observe.split(
+            "const agentMarkerSentAtMs = agentMarkerSchedule", 1
+        )[1].split(");", 1)[0]
+        self.assertIn("mediaProbe.sourceMarkerObservedAtMs[0]", final_schedule)
+        self.assertNotIn("acceptedAtMs", observe)
+
+    def test_agent_requires_sustained_source_dtmf(self):
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        self.assertIn("const SOURCE_PROBE_SETTLE_MS = 31_000", source)
+        self.assertIn("const REQUIRED_DTMF_ANALYSER_FRAMES = 8", source)
+        probe = source.split("function installProbe", 1)[1].split(
+            "async function authenticate", 1
+        )[0]
+        self.assertIn(
+            "state.dtmfConsecutiveFrames = dtmf ? state.dtmfConsecutiveFrames + 1 : 0",
+            probe,
+        )
+        self.assertIn(
+            "state.dtmfConsecutiveFrames >= REQUIRED_DTMF_ANALYSER_FRAMES",
+            probe,
+        )
+
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
         templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))

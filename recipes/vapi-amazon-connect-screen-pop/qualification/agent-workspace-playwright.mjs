@@ -85,6 +85,8 @@ const PROBE_PULSES_PER_CYCLE = 5;
 const PROBE_PULSE_MS = 100;
 const PROBE_DTMF_SIX_START_MS = 4_500;
 const PROBE_DTMF_SIX_DURATION_MS = 300;
+const SOURCE_PROBE_SETTLE_MS = 31_000;
+const REQUIRED_DTMF_ANALYSER_FRAMES = 8;
 
 class HarnessError extends Error {}
 
@@ -540,7 +542,7 @@ function installProbe() {
     sourceMarkerActive: false,
     sourceMarkerLastEdgeMs: 0,
     dtmfSourceToAgentObserved: false,
-    dtmfActive: false,
+    dtmfConsecutiveFrames: 0,
     remoteAudioTracks: 0,
   };
   globalThis.__bridgefuAgentProbe = state;
@@ -611,8 +613,10 @@ function installProbe() {
       const low = power(samples, context.sampleRate, 770);
       const high = power(samples, context.sampleRate, 1336);
       const dtmf = rms > 0.01 && low > 0.00015 && high > 0.00015;
-      if (dtmf && !state.dtmfActive) state.dtmfSourceToAgentObserved = true;
-      state.dtmfActive = dtmf;
+      state.dtmfConsecutiveFrames = dtmf ? state.dtmfConsecutiveFrames + 1 : 0;
+      if (state.dtmfConsecutiveFrames >= REQUIRED_DTMF_ANALYSER_FRAMES) {
+        state.dtmfSourceToAgentObserved = true;
+      }
     }, 20);
   };
 
@@ -747,7 +751,6 @@ async function observe(options) {
     );
     await ensureAvailable(page, timeoutMs);
     await waitForAutoAcceptedContact(page, timeoutMs);
-    const acceptedAtMs = Date.now();
     if (expectMissingContext) {
       await waitUntil(
         async () =>
@@ -781,10 +784,18 @@ async function observe(options) {
     await waitUntil(
       async () => {
         const probe = await probeSnapshot(page);
+        const sourceMediaReadyAtMs = probe.sourceMarkerObservedAtMs[0];
         return (
           probe.sourceMarkerObservedAtMs.length >= 5 &&
           probe.dtmfSourceToAgentObserved &&
           probe.captureRequestedAtMs &&
+          Number.isInteger(sourceMediaReadyAtMs) &&
+          Date.now() - sourceMediaReadyAtMs >= SOURCE_PROBE_SETTLE_MS &&
+          agentMarkerSchedule(
+            probe.captureRequestedAtMs,
+            sourceMediaReadyAtMs,
+            Date.now(),
+          ).length >= 5 &&
           probe.remoteAudioTracks > 0 &&
           probe.audioPacketsSent > 0 &&
           probe.audioBytesSent > 0
@@ -827,7 +838,7 @@ async function observe(options) {
     const observedAtMs = Date.now();
     const agentMarkerSentAtMs = agentMarkerSchedule(
       mediaProbe.captureRequestedAtMs,
-      acceptedAtMs,
+      mediaProbe.sourceMarkerObservedAtMs[0],
       observedAtMs,
     );
     if (
