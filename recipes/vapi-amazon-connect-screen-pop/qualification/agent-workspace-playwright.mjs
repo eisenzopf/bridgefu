@@ -77,10 +77,14 @@ const MAX_JSON_BYTES = 1024 * 1024;
 const PROBE_SECONDS = 120;
 const SAMPLE_RATE = 48_000;
 const AGENT_MARKER_HZ = 880;
+const AGENT_DTMF_SIX_LOW_HZ = 770;
+const AGENT_DTMF_SIX_HIGH_HZ = 1_477;
 const PROBE_INITIAL_SILENCE_MS = 5_000;
 const PROBE_CYCLE_MS = 10_000;
 const PROBE_PULSES_PER_CYCLE = 5;
 const PROBE_PULSE_MS = 100;
+const PROBE_DTMF_SIX_START_MS = 4_500;
+const PROBE_DTMF_SIX_DURATION_MS = 300;
 
 class HarnessError extends Error {}
 
@@ -282,9 +286,22 @@ function writeProbeWav(path) {
       afterSilence >= 0 &&
       pulseIndex < PROBE_PULSES_PER_CYCLE &&
       cycle - pulseIndex * 1000 < PROBE_PULSE_MS;
-    const value = inPulse
-      ? Math.round(Math.sin((2 * Math.PI * AGENT_MARKER_HZ * sample) / SAMPLE_RATE) * 8191)
-      : 0;
+    const inDtmfSix =
+      afterSilence >= 0 &&
+      cycle >= PROBE_DTMF_SIX_START_MS &&
+      cycle < PROBE_DTMF_SIX_START_MS + PROBE_DTMF_SIX_DURATION_MS;
+    let value = 0;
+    if (inPulse) {
+      value = Math.round(
+        Math.sin((2 * Math.PI * AGENT_MARKER_HZ * sample) / SAMPLE_RATE) * 8191,
+      );
+    } else if (inDtmfSix) {
+      value = Math.round(
+        (Math.sin((2 * Math.PI * AGENT_DTMF_SIX_LOW_HZ * sample) / SAMPLE_RATE) +
+          Math.sin((2 * Math.PI * AGENT_DTMF_SIX_HIGH_HZ * sample) / SAMPLE_RATE)) *
+          4095,
+      );
+    }
     buffer.writeInt16LE(value, 44 + sample * bytesPerSample);
   }
   const descriptor = openSync(path, "wx", 0o600);

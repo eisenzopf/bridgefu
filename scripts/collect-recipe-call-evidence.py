@@ -1854,7 +1854,7 @@ SAFE_SOURCE_FAILURE_PREFIXES = (
     "sending source in-band DTMF",
     "sending source in-band DTMF spacing",
     "sending source RFC 4733 DTMF",
-    "agent-to-source RFC 4733 DTMF was not observed",
+    "agent-to-source DTMF was not observed",
     "agent marker observation timed out",
     "agent marker observer stopped unexpectedly",
     "agent-to-source audio marker evidence is incomplete",

@@ -45,13 +45,13 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         safe = mock.Mock()
         safe.communicate.return_value = (
             "",
-            "Error: agent-to-source RFC 4733 DTMF was not observed\n",
+            "Error: agent-to-source DTMF was not observed\n",
         )
         unsafe = mock.Mock()
         unsafe.communicate.return_value = ("", "Error: private-session-secret\n")
         self.assertEqual(
             COLLECTOR.source_failure_detail(safe),
-            "agent-to-source RFC 4733 DTMF was not observed",
+            "agent-to-source DTMF was not observed",
         )
         self.assertIsNone(COLLECTOR.source_failure_detail(unsafe))
 
@@ -62,6 +62,20 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertLess(in_band, rfc4733)
         self.assertIn("DTMF_FIVE_LOW_FREQUENCY: f32 = 770.0", source)
         self.assertIn("DTMF_FIVE_HIGH_FREQUENCY: f32 = 1_336.0", source)
+        self.assertIn("DTMF_SIX_LOW_FREQUENCY: f64 = 770.0", source)
+        self.assertIn("DTMF_SIX_HIGH_FREQUENCY: f64 = 1_477.0", source)
+        self.assertIn("if !in_band_agent_dtmf && !rfc4733_agent_dtmf", source)
+
+    def test_agent_probe_pairs_keypad_with_audible_dtmf_six(self):
+        source = (
+            RECIPE / "qualification/agent-workspace-playwright.mjs"
+        ).read_text()
+        self.assertIn("AGENT_DTMF_SIX_LOW_HZ = 770", source)
+        self.assertIn("AGENT_DTMF_SIX_HIGH_HZ = 1_477", source)
+        self.assertIn("const inDtmfSix =", source)
+        keypad = source.index("const keypadOpened = await clickButton")
+        digit = source.index("const digitSent = await clickButton", keypad)
+        self.assertLess(keypad, digit)
 
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
         for path, minimum_helper_uses in (

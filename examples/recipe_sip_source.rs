@@ -33,6 +33,8 @@ const MARKER_FREQUENCY: f32 = 997.0;
 const AGENT_MARKER_FREQUENCY: f64 = 880.0;
 const DTMF_FIVE_LOW_FREQUENCY: f32 = 770.0;
 const DTMF_FIVE_HIGH_FREQUENCY: f32 = 1_336.0;
+const DTMF_SIX_LOW_FREQUENCY: f64 = 770.0;
+const DTMF_SIX_HIGH_FREQUENCY: f64 = 1_477.0;
 const SOURCE_MARKER_PULSES: usize = 30;
 const REQUIRED_AGENT_MARKERS: usize = 5;
 const MARKER_TONE_FRAMES: usize = 5;
@@ -243,6 +245,14 @@ impl ToneEdges {
         }
         self.active = present;
     }
+}
+
+fn dual_tone_present(frame: &AudioFrame, low_frequency: f64, high_frequency: f64) -> bool {
+    frame.channels == 1
+        && (8_000..=48_000).contains(&frame.sample_rate)
+        && rms(&frame.samples) >= 0.01
+        && tone_power(&frame.samples, frame.sample_rate, low_frequency) >= 0.001
+        && tone_power(&frame.samples, frame.sample_rate, high_frequency) >= 0.001
 }
 
 fn now_ms() -> u64 {
@@ -710,20 +720,39 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (sender, mut receiver) = audio.split();
     let receive_task = tokio::spawn(async move {
         let mut detector = ToneEdges::default();
+        let mut in_band_dtmf_six_observed = false;
+        let mut marker_complete_at = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        while detector.timestamps.len() < REQUIRED_AGENT_MARKERS {
+        while tokio::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match tokio::time::timeout(remaining.min(Duration::from_secs(2)), receiver.recv()).await
             {
-                Ok(Some(frame)) => detector.observe(&frame, AGENT_MARKER_FREQUENCY),
+                Ok(Some(frame)) => {
+                    detector.observe(&frame, AGENT_MARKER_FREQUENCY);
+                    in_band_dtmf_six_observed |=
+                        dual_tone_present(&frame, DTMF_SIX_LOW_FREQUENCY, DTMF_SIX_HIGH_FREQUENCY);
+                    if detector.timestamps.len() == REQUIRED_AGENT_MARKERS {
+                        marker_complete_at.get_or_insert_with(tokio::time::Instant::now);
+                    }
+                    if in_band_dtmf_six_observed
+                        && detector.timestamps.len() == REQUIRED_AGENT_MARKERS
+                    {
+                        break;
+                    }
+                }
                 Ok(None) => break,
                 Err(_) => {}
             }
+            if marker_complete_at
+                .is_some_and(|completed| completed.elapsed() >= Duration::from_secs(5))
+            {
+                break;
+            }
         }
-        detector
+        (detector, in_band_dtmf_six_observed)
     });
     let mut source_audio_timestamp = 0_u32;
     let (source_marker_sent_at_ms, source_to_agent_marker_frames_sent) =
@@ -733,23 +762,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .send_dtmf('5')
         .await
         .context("sending source RFC 4733 DTMF")?;
-    let agent_dtmf = tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(digit) = dtmf_rx.recv().await {
-            if digit == '6' {
-                return true;
-            }
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
-    if !agent_dtmf {
-        bail!("agent-to-source RFC 4733 DTMF was not observed");
+    let (agent_marker, in_band_agent_dtmf) =
+        tokio::time::timeout(Duration::from_secs(50), receive_task)
+            .await
+            .context("agent marker observation timed out")?
+            .context("agent marker observer stopped unexpectedly")?;
+    let mut rfc4733_agent_dtmf = false;
+    while let Ok(digit) = dtmf_rx.try_recv() {
+        rfc4733_agent_dtmf |= digit == '6';
     }
-    let agent_marker = tokio::time::timeout(Duration::from_secs(50), receive_task)
-        .await
-        .context("agent marker observation timed out")?
-        .context("agent marker observer stopped unexpectedly")?;
+    if !in_band_agent_dtmf && !rfc4733_agent_dtmf {
+        bail!("agent-to-source DTMF was not observed");
+    }
     if agent_marker.timestamps.len() != REQUIRED_AGENT_MARKERS
         || agent_marker.frames < REQUIRED_AGENT_MARKERS
     {
@@ -868,6 +892,28 @@ mod tests {
         assert!(rms(&frame) >= 0.05);
         assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_LOW_FREQUENCY)) >= 0.001);
         assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_HIGH_FREQUENCY)) >= 0.001);
+    }
+
+    #[test]
+    fn detector_recognizes_in_band_dtmf_six() {
+        let mut low_phase = 0.0;
+        let mut high_phase = 0.0;
+        let frame = AudioFrame::new(
+            dual_tone_frame(
+                DTMF_SIX_LOW_FREQUENCY as f32,
+                DTMF_SIX_HIGH_FREQUENCY as f32,
+                &mut low_phase,
+                &mut high_phase,
+            ),
+            8_000,
+            1,
+            0,
+        );
+        assert!(dual_tone_present(
+            &frame,
+            DTMF_SIX_LOW_FREQUENCY,
+            DTMF_SIX_HIGH_FREQUENCY,
+        ));
     }
 
     #[test]
