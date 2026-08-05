@@ -134,6 +134,18 @@ class RecipeAssetContractTests(unittest.TestCase):
             probe,
         )
 
+    def test_headless_browsers_enable_the_wav_backed_fake_media_device(self):
+        for relative in (
+            "qualification/agent-workspace-playwright.mjs",
+            "qualification/vapi-web-playwright.mjs",
+        ):
+            with self.subTest(relative=relative):
+                source = (RECIPE / relative).read_text()
+                self.assertIn('"--use-fake-device-for-media-stream"', source)
+                fake_device = source.index('"--use-fake-device-for-media-stream"')
+                fake_audio = source.index("--use-file-for-fake-audio-capture=")
+                self.assertLess(fake_device, fake_audio)
+
     def test_cloudformation_templates_have_unique_mapping_keys(self):
         templates = sorted((RECIPE / "cloudformation").glob("*.yaml"))
         templates.extend(sorted((RECIPE / "cloudformation/nested").glob("*.yaml")))

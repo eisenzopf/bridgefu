@@ -730,6 +730,7 @@ async function observe(options) {
     headless: !options.has("--headed"),
     args: [
       "--use-fake-ui-for-media-stream",
+      "--use-fake-device-for-media-stream",
       `--use-file-for-fake-audio-capture=${probePath}`,
       "--autoplay-policy=no-user-gesture-required",
       "--no-sandbox",
