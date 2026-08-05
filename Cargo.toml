@@ -88,17 +88,17 @@ webrtc = { package = "rvoip-webrtc-stack", version = "=0.3.5" }
 # compatibility when an endpoint does not negotiate SDES MID. Patching every
 # rvoip crate Bridgefu consumes keeps shared signaling/media types sourced from
 # one immutable revision.
-rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-moq = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-quic = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-redis = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-sip = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
-rvoip-webrtc-stack = { git = "https://github.com/eisenzopf/rvoip.git", rev = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1" }
+rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-moq = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-quic = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-redis = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-sip = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
+rvoip-webrtc-stack = { git = "https://github.com/eisenzopf/rvoip.git", rev = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are
