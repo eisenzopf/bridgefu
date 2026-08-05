@@ -193,7 +193,7 @@ fi
 grep -Eq 'file: bridgefu/deploy/Dockerfile' .github/workflows/ci.yml
 grep -Eq 'platform: linux/amd64' .github/workflows/ci.yml
 grep -Eq 'platform: linux/arm64' .github/workflows/ci.yml
-grep -Fq 'Verify locked rvoip crates.io graph' .github/workflows/ci.yml
+grep -Fq 'Verify locked rvoip graph and exact dialog backport' .github/workflows/ci.yml
 release_workflow=.github/workflows/release-image-candidate.yml
 test -f "$release_workflow"
 grep -Eq '^  workflow_dispatch:$' "$release_workflow"
@@ -370,10 +370,19 @@ invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
     if package["version"] != "0.3.5"
-    or not package.get("source", "").startswith("registry+")
+    or (
+        package.get("source")
+        != "git+https://github.com/eisenzopf/rvoip.git"
+        "?rev=c701081159a579d7bc5495f45ea9ae1bdc241d56"
+        "#c701081159a579d7bc5495f45ea9ae1bdc241d56"
+        if package["name"] == "rvoip-sip-dialog"
+        else not package.get("source", "").startswith("registry+")
+    )
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.5 rvoip packages: {invalid}")
+    raise SystemExit(f"Cargo.lock differs from the reviewed rvoip 0.3.5 graph: {invalid}")
+if sum(package["name"] == "rvoip-sip-dialog" for package in packages) != 1:
+    raise SystemExit("Cargo.lock must contain the exact dialog backport once")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",

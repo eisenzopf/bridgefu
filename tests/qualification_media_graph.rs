@@ -12,7 +12,7 @@ mod qualification_support;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
-use qualification_support::{rvoip_registry_evidence, RvoipRegistryEvidence};
+use qualification_support::{rvoip_lock_evidence, RvoipLockEvidence};
 use rvoip_core::capability::CodecInfo;
 use rvoip_core::ids::StreamId;
 use rvoip_core::media_graph::{ManagedMediaRoute, MediaGraphHandle};
@@ -196,7 +196,7 @@ struct MediaQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RvoipRegistryEvidence,
+    rvoip: RvoipLockEvidence,
     host: HostEvidence,
     calls: usize,
     media_graphs: usize,
@@ -342,7 +342,7 @@ async fn qualifies_bidirectional_transcoded_worker_media() {
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: rvoip_registry_evidence(&manifest_dir),
+        rvoip: rvoip_lock_evidence(&manifest_dir),
         host: host_evidence(),
         calls: parameters.calls,
         media_graphs: parameters.calls * 2,

@@ -189,7 +189,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends protobuf-compiler
           protoc --version
-      - name: Verify locked rvoip crates.io graph
+      - name: Verify locked rvoip graph and exact dialog backport
         working-directory: bridgefu
         run: |
           python3 - <<'PY'
@@ -207,15 +207,29 @@ jobs:
           ]
           if not packages:
               raise SystemExit("locked graph contains no rvoip packages")
-          invalid = [
-              (package["name"], package["version"], package["source"])
-              for package in packages
-              if package["version"] != "0.3.5"
-              or not (package["source"] or "").startswith("registry+")
-          ]
+          dialog_revision = "c701081159a579d7bc5495f45ea9ae1bdc241d56"
+          dialog_source = (
+              "git+https://github.com/eisenzopf/rvoip.git"
+              f"?rev={dialog_revision}#{dialog_revision}"
+          )
+          invalid = []
+          for package in packages:
+              source = package["source"] or ""
+              valid_source = (
+                  source == dialog_source
+                  if package["name"] == "rvoip-sip-dialog"
+                  else source.startswith("registry+")
+              )
+              if package["version"] != "0.3.5" or not valid_source:
+                  invalid.append((package["name"], package["version"], source))
           if invalid:
-              raise SystemExit(f"rvoip graph is not registry-only 0.3.5: {invalid}")
-          print(f"verified {len(packages)} locked rvoip 0.3.5 registry packages")
+              raise SystemExit(f"rvoip graph differs from the reviewed 0.3.5 graph: {invalid}")
+          if sum(package["source"] == dialog_source for package in packages) != 1:
+              raise SystemExit("locked graph must contain the exact dialog backport once")
+          print(
+              f"verified {len(packages) - 1} registry rvoip 0.3.5 packages "
+              "and the exact dialog backport"
+          )
           PY
       - name: Formatting
         working-directory: bridgefu

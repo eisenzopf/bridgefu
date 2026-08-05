@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -505,6 +505,77 @@ fn dual_tone_frame(
         .collect()
 }
 
+fn sip_route_destination(uri: &str) -> anyhow::Result<(String, u16)> {
+    let (scheme, remainder) = uri
+        .split_once(':')
+        .context("SIP destination has no scheme")?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "sip" => 5060,
+        "sips" => 5061,
+        _ => bail!("destination is not SIP or SIPS"),
+    };
+    let authority = remainder
+        .rsplit_once('@')
+        .map_or(remainder, |(_, authority)| authority)
+        .split([';', '?'])
+        .next()
+        .context("SIP destination has no authority")?;
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed
+            .split_once(']')
+            .context("SIP destination has an unterminated IPv6 host")?;
+        let port = match suffix.strip_prefix(':') {
+            Some(value) => value
+                .parse::<u16>()
+                .context("invalid SIP destination port")?,
+            None if suffix.is_empty() => default_port,
+            None => bail!("invalid SIP destination authority"),
+        };
+        if host.is_empty() {
+            bail!("SIP destination host is empty");
+        }
+        return Ok((host.to_owned(), port));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, value)) if !host.contains(':') => (
+            host,
+            value
+                .parse::<u16>()
+                .context("invalid SIP destination port")?,
+        ),
+        _ => (authority, default_port),
+    };
+    if host.is_empty() {
+        bail!("SIP destination host is empty");
+    }
+    Ok((host.to_owned(), port))
+}
+
+fn routed_media_ip(uri: &str) -> anyhow::Result<IpAddr> {
+    let (host, port) = sip_route_destination(uri)?;
+    let destinations = (host.as_str(), port)
+        .to_socket_addrs()
+        .context("resolving SIP destination for media advertisement")?;
+    for destination in destinations {
+        let bind = match destination {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let socket = UdpSocket::bind(bind).context("opening media route probe")?;
+        if socket.connect(destination).is_err() {
+            continue;
+        }
+        let local_ip = socket
+            .local_addr()
+            .context("reading media route probe address")?
+            .ip();
+        if !local_ip.is_unspecified() {
+            return Ok(local_ip);
+        }
+    }
+    bail!("SIP destination has no routable local media address")
+}
+
 async fn send_markers(
     sender: &rvoip_sip::AudioSender,
     timestamp: &mut u32,
@@ -619,6 +690,7 @@ fn write_observation(path: &Path, observation: &Observation) -> anyhow::Result<(
 async fn run(args: Args) -> anyhow::Result<()> {
     validate_args(&args)?;
     let session = validate_session(read_session(&args.session)?)?;
+    let media_ip = routed_media_ip(&session.private.sip_uri)?;
     let mut config = Config::on(
         "bridgefu-recipe-qualification-source",
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -633,6 +705,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     config.active_call_no_media_timeout_secs = args.timeout_seconds;
     config.active_call_media_idle_timeout_secs = args.timeout_seconds;
     config.setup_teardown_timeout_secs = args.timeout_seconds;
+    // Bind SIP on all interfaces so NAT-observed dialog routing remains under
+    // qualification, but advertise the concrete VPC route for bidirectional RTP.
+    config.media_public_addr = Some(SocketAddr::new(media_ip, 0));
     config.sip_trace = SipTraceConfig::enabled();
     if session.security == Security::SipsSrtp {
         config.sip_tls_mode = SipTlsMode::ClientOnly;
@@ -892,6 +967,18 @@ mod tests {
         assert!(rms(&frame) >= 0.05);
         assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_LOW_FREQUENCY)) >= 0.001);
         assert!(tone_power(&frame, 8_000, f64::from(DTMF_FIVE_HIGH_FREQUENCY)) >= 0.001);
+    }
+
+    #[test]
+    fn sip_route_destination_preserves_ip_only_nonproduction_targets() {
+        assert_eq!(
+            sip_route_destination("sip:bridgefu@10.20.30.40:5060;transport=udp").unwrap(),
+            ("10.20.30.40".to_owned(), 5060)
+        );
+        assert_eq!(
+            sip_route_destination("sips:bridgefu@[2001:db8::10]").unwrap(),
+            ("2001:db8::10".to_owned(), 5061)
+        );
     }
 
     #[test]
