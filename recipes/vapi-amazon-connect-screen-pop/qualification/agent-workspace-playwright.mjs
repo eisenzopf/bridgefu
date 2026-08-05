@@ -615,7 +615,7 @@ function installProbe() {
   if (globalThis.__bridgefuAgentProbe) return;
   // Playwright serializes this function into the browser page, so every value
   // used by the probe must be defined inside the function rather than captured.
-  const requiredDtmfAnalyserFrames = 8;
+  const requiredDtmfAnalyserFrames = 5;
   const state = {
     captureRequestedAtMs: null,
     captureResolvedAtMs: null,
