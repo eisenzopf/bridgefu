@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -63,6 +64,44 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
+    def test_rvoip_dialog_backport_is_the_only_git_patched_crate(self):
+        expected_revision = "c701081159a579d7bc5495f45ea9ae1bdc241d56"
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        self.assertEqual(
+            manifest["patch"]["crates-io"],
+            {
+                "rvoip-sip-dialog": {
+                    "git": "https://github.com/eisenzopf/rvoip.git",
+                    "rev": expected_revision,
+                }
+            },
+        )
+
+        lockfile = tomllib.loads((ROOT / "Cargo.lock").read_text())
+        rvoip_packages = {
+            package["name"]: package
+            for package in lockfile["package"]
+            if package["name"].startswith("rvoip-")
+        }
+        dialog = rvoip_packages.pop("rvoip-sip-dialog")
+        self.assertEqual(dialog["version"], "0.3.5")
+        self.assertEqual(
+            dialog["source"],
+            "git+https://github.com/eisenzopf/rvoip.git"
+            f"?rev={expected_revision}#{expected_revision}",
+        )
+        self.assertNotIn("checksum", dialog)
+        self.assertTrue(rvoip_packages)
+        self.assertTrue(
+            all(
+                package["version"] == "0.3.5"
+                and package["source"]
+                == "registry+https://github.com/rust-lang/crates.io-index"
+                and len(package["checksum"]) == 64
+                for package in rvoip_packages.values()
+            )
+        )
+
     def test_deployed_recipe_stack_id_selects_and_validates_nested_application(self):
         root_stack_id = (
             "arn:aws:cloudformation:us-west-2:123456789012:stack/root/"

@@ -5133,8 +5133,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-dialog"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b958c0152026f657686bd76e6da5173ab97728c0df1da2339c07668c4f40c9ee"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=c701081159a579d7bc5495f45ea9ae1bdc241d56#c701081159a579d7bc5495f45ea9ae1bdc241d56"
 dependencies = [
  "anyhow",
  "arc-swap",

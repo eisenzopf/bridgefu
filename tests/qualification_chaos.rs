@@ -17,8 +17,8 @@ mod qualification_support;
 
 use chrono::{DateTime, Utc};
 use qualification_support::{
-    git_revision, host_evidence, rvoip_registry_evidence, write_report, HostEvidence,
-    RevisionEvidence, RvoipRegistryEvidence, COORDINATED_RVOIP_VERSION, CRATES_IO_REGISTRY_SOURCE,
+    git_revision, host_evidence, rvoip_lock_evidence, write_report, HostEvidence, RevisionEvidence,
+    RvoipLockEvidence, COORDINATED_RVOIP_VERSION, CRATES_IO_REGISTRY_SOURCE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,7 +150,7 @@ struct ChaosQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    bridgefu_locked_rvoip_graph: RvoipRegistryEvidence,
+    bridgefu_locked_rvoip_graph: RvoipLockEvidence,
     rvoip_package_source_execution: RvoipPackageSourceExecutionEvidence,
     host: HostEvidence,
     execution_profile: &'static str,
@@ -458,7 +458,7 @@ fn qualifies_deterministic_chaos_matrix() {
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        bridgefu_locked_rvoip_graph: rvoip_registry_evidence(&manifest_dir),
+        bridgefu_locked_rvoip_graph: rvoip_lock_evidence(&manifest_dir),
         rvoip_package_source_execution,
         host: host_evidence(),
         execution_profile: "finite_deterministic_smoke",
