@@ -4,8 +4,9 @@
  *
  * This harness obtains facts from the real browser session: exact synthetic
  * screen-pop values, an instrumented inbound WebRTC track, the deterministic
- * fake microphone stream plus outbound RTP counters, Agent Workspace keypad
- * interaction, and the contact's terminal UI. It accepts selectors and paths,
+ * fake microphone stream plus outbound RTP counters, Connect Streams DTMF with
+ * an Agent Workspace keypad fallback, and the contact's terminal UI. It accepts
+ * selectors and paths,
  * never pass/fail booleans. Only field names, counts, timestamps, hashes, and a
  * 12-hex correlation fingerprint are retained.
  */
@@ -399,6 +400,60 @@ async function clickButton(page, patterns) {
       } catch {
         // Continue across transient frames and the next exact control pattern.
       }
+    }
+  }
+  return false;
+}
+
+async function sendDigitsViaConnectStreams(page, digits) {
+  for (const frame of page.frames()) {
+    try {
+      const sent = await frame.evaluate(async (value) => {
+        const streams = globalThis.connect;
+        if (typeof streams?.Agent !== "function") return false;
+        const agent = new streams.Agent();
+        const contacts =
+          typeof agent.getContacts === "function" ? agent.getContacts() : [];
+        for (const contact of contacts) {
+          const connection =
+            contact.getActiveInitialConnection?.()
+            ?? contact.getInitialConnection?.();
+          if (
+            !connection
+            || typeof connection.sendDigits !== "function"
+            || (typeof connection.isActive === "function" && !connection.isActive())
+          ) continue;
+          return await new Promise((resolvePromise) => {
+            let finished = false;
+            const settle = (result) => {
+              if (finished) return;
+              finished = true;
+              resolvePromise(result);
+            };
+            const timer = setTimeout(() => settle(false), 3000);
+            const callbacks = {
+              success: () => {
+                clearTimeout(timer);
+                settle(true);
+              },
+              failure: () => {
+                clearTimeout(timer);
+                settle(false);
+              },
+            };
+            try {
+              connection.sendDigits(value, callbacks);
+            } catch {
+              clearTimeout(timer);
+              settle(false);
+            }
+          });
+        }
+        return false;
+      }, digits);
+      if (sent) return true;
+    } catch {
+      // The Streams API is hosted in one of the Agent Workspace frames.
     }
   }
   return false;
@@ -840,10 +895,13 @@ async function observe(options) {
       Math.min(timeoutMs, 90_000),
       "Agent Workspace media/DTMF browser observations did not converge",
     );
-    const keypadOpened = await clickButton(page, [/Keypad/i, /Dial pad/i]);
-    if (!keypadOpened) fail("Agent Workspace keypad control was not available");
-    const digitSent = await clickButton(page, [/^6$/]);
-    if (!digitSent) fail("Agent Workspace did not expose DTMF digit 6");
+    const streamsDigitSent = await sendDigitsViaConnectStreams(page, "6");
+    if (!streamsDigitSent) {
+      const keypadOpened = await clickButton(page, [/Keypad/i, /Dial pad/i]);
+      if (!keypadOpened) fail("Agent Workspace keypad control was not available");
+      const digitSent = await clickButton(page, [/^6$/]);
+      if (!digitSent) fail("Agent Workspace did not expose DTMF digit 6");
+    }
 
     const mediaProbe = await probeSnapshot(page);
     await page.screenshot({ path: screenshotPath, fullPage: false });

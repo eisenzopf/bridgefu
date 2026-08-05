@@ -79,9 +79,17 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertIn("AGENT_MARKER_HZ", marker_probe)
         self.assertIn("AGENT_DTMF_SIX_LOW_HZ", marker_probe)
         self.assertIn("AGENT_DTMF_SIX_HIGH_HZ", marker_probe)
-        keypad = source.index("const keypadOpened = await clickButton")
+        streams = source.index('sendDigitsViaConnectStreams(page, "6")')
+        keypad = source.index("const keypadOpened = await clickButton", streams)
         digit = source.index("const digitSent = await clickButton", keypad)
+        self.assertLess(streams, keypad)
         self.assertLess(keypad, digit)
+        streams_helper = source.split(
+            "async function sendDigitsViaConnectStreams", 1
+        )[1].split("async function buttonVisible", 1)[0]
+        self.assertIn("const agent = new streams.Agent()", streams_helper)
+        self.assertIn("contact.getActiveInitialConnection?.()", streams_helper)
+        self.assertIn("connection.sendDigits(value, callbacks)", streams_helper)
 
     def test_cloudformation_descriptions_use_exact_stack_ids(self):
         for path, minimum_helper_uses in (
