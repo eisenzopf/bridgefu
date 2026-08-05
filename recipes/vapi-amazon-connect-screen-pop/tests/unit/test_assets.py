@@ -134,6 +134,29 @@ class RecipeAssetContractTests(unittest.TestCase):
             probe,
         )
 
+    def test_agent_screen_pop_matches_exact_labeled_values(self):
+        source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
+        for field, label in {
+            "customer_name": "Customer:",
+            "issue_summary": "Issue:",
+            "intent": "Intent:",
+            "verification_status": "Verification:",
+        }.items():
+            self.assertIn(f'{field}: "{label}"', source)
+        self.assertIn("async function visibleLabeledValue", source)
+        self.assertIn("SCREEN_POP_LABELS[field]", source)
+        self.assertIn(
+            'visibleLabeledValue(page, "Context available:", "true")',
+            source,
+        )
+        missing_context = source.split("if (expectMissingContext)", 1)[1].split(
+            "} else {", 1
+        )[0]
+        self.assertIn(
+            'visibleLabeledValue(page, "Context available:", "false")',
+            missing_context,
+        )
+
     def test_headless_browsers_enable_the_wav_backed_fake_media_device(self):
         for relative in (
             "qualification/agent-workspace-playwright.mjs",

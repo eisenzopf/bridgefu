@@ -64,17 +64,28 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
-    def test_rvoip_dialog_backport_is_the_only_git_patched_crate(self):
-        expected_revision = "c701081159a579d7bc5495f45ea9ae1bdc241d56"
+    def test_rvoip_workspace_backports_share_one_immutable_revision(self):
+        expected_revision = "11156dd37e559e0ae57c7955fb314f8abf5d75df"
+        expected_repository = "https://github.com/eisenzopf/rvoip.git"
+        expected_patches = {
+            "rvoip-amazon-connect",
+            "rvoip-auth-core",
+            "rvoip-core",
+            "rvoip-media-core",
+            "rvoip-moq",
+            "rvoip-quic",
+            "rvoip-redis",
+            "rvoip-sip",
+            "rvoip-uctp",
+            "rvoip-webrtc",
+            "rvoip-webrtc-stack",
+        }
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        patches = manifest["patch"]["crates-io"]
+        self.assertEqual(set(patches), expected_patches)
         self.assertEqual(
-            manifest["patch"]["crates-io"],
-            {
-                "rvoip-sip-dialog": {
-                    "git": "https://github.com/eisenzopf/rvoip.git",
-                    "rev": expected_revision,
-                }
-            },
+            set((patch["git"], patch["rev"]) for patch in patches.values()),
+            {(expected_repository, expected_revision)},
         )
 
         lockfile = tomllib.loads((ROOT / "Cargo.lock").read_text())
@@ -83,21 +94,15 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             for package in lockfile["package"]
             if package["name"].startswith("rvoip-")
         }
-        dialog = rvoip_packages.pop("rvoip-sip-dialog")
-        self.assertEqual(dialog["version"], "0.3.5")
-        self.assertEqual(
-            dialog["source"],
-            "git+https://github.com/eisenzopf/rvoip.git"
-            f"?rev={expected_revision}#{expected_revision}",
-        )
-        self.assertNotIn("checksum", dialog)
         self.assertTrue(rvoip_packages)
+        expected_source = (
+            f"git+{expected_repository}?rev={expected_revision}#{expected_revision}"
+        )
         self.assertTrue(
             all(
                 package["version"] == "0.3.5"
-                and package["source"]
-                == "registry+https://github.com/rust-lang/crates.io-index"
-                and len(package["checksum"]) == 64
+                and package["source"] == expected_source
+                and "checksum" not in package
                 for package in rvoip_packages.values()
             )
         )

@@ -40,6 +40,12 @@ const REQUIRED_FIELDS = [
   "intent",
   "verification_status",
 ];
+const SCREEN_POP_LABELS = Object.freeze({
+  customer_name: "Customer:",
+  issue_summary: "Issue:",
+  intent: "Intent:",
+  verification_status: "Verification:",
+});
 const SESSION_KEYS = new Set([
   "schema_version",
   "execution_id",
@@ -356,9 +362,28 @@ async function visibleTextIncludes(page, values) {
   return false;
 }
 
+async function visibleLabeledValue(page, label, value) {
+  const expected = `${label} ${value}`.replace(/\s+/g, " ").trim();
+  for (const frame of page.frames()) {
+    try {
+      const text = await frame.locator("body").innerText({ timeout: 1000 });
+      if (text.replace(/\s+/g, " ").includes(expected)) return true;
+    } catch {
+      // A frame can detach while Agent Workspace changes contacts.
+    }
+  }
+  return false;
+}
+
 async function syntheticContextAbsent(page, session) {
   for (const field of REQUIRED_FIELDS) {
-    if (await visibleExact(page, session.expected_context[field])) return false;
+    if (
+      await visibleLabeledValue(
+        page,
+        SCREEN_POP_LABELS[field],
+        session.expected_context[field],
+      )
+    ) return false;
   }
   return true;
 }
@@ -755,11 +780,9 @@ async function observe(options) {
     if (expectMissingContext) {
       await waitUntil(
         async () =>
-          (await visibleTextIncludes(page, [
-            "Bridgefu caller context",
-            "Context available:",
-            "false",
-          ])) && (await syntheticContextAbsent(page, session)),
+          (await visibleTextIncludes(page, ["Bridgefu caller context"]))
+          && (await visibleLabeledValue(page, "Context available:", "false"))
+          && (await syntheticContextAbsent(page, session)),
         Math.min(timeoutMs, 60_000),
         "Agent Workspace did not render the missing-context guide",
       );
@@ -773,8 +796,18 @@ async function observe(options) {
     } else {
       await waitUntil(
         async () => {
+          if (
+            !(await visibleTextIncludes(page, ["Bridgefu caller context"]))
+            || !(await visibleLabeledValue(page, "Context available:", "true"))
+          ) return false;
           for (const field of REQUIRED_FIELDS) {
-            if (!(await visibleExact(page, session.expected_context[field]))) return false;
+            if (
+              !(await visibleLabeledValue(
+                page,
+                SCREEN_POP_LABELS[field],
+                session.expected_context[field],
+              ))
+            ) return false;
           }
           return true;
         },
