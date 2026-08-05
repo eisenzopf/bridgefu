@@ -2624,15 +2624,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3605,7 +3596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools",
  "log",
  "multimap",
  "once_cell",
@@ -3625,7 +3616,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn",
@@ -3638,7 +3629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn",
@@ -3942,7 +3933,7 @@ dependencies = [
  "crc16",
  "futures",
  "futures-util",
- "itertools 0.13.0",
+ "itertools",
  "itoa",
  "log",
  "num-bigint",
@@ -4681,8 +4672,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rvoip-amazon-connect"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cca6317886caa626287e0037452b2f5485c1dc86c52df8ab5da756ccf3d786f"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4716,8 +4706,7 @@ dependencies = [
 [[package]]
 name = "rvoip-auth-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928072029143fd44922ed3d930b3329942f9a00b9ffd4a61063942c3a55ce42f"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4746,8 +4735,7 @@ dependencies = [
 [[package]]
 name = "rvoip-codec-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "176c9b6ab1b50e5e345c6394a194892bd897dda2602bfc79678fdc0c376949c3"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "opus",
  "thiserror 1.0.69",
@@ -4758,8 +4746,7 @@ dependencies = [
 [[package]]
 name = "rvoip-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44d300cb616e6d1b312ec6a75b8c7f23dacb921337518a6dbdfde33bc20c4d52"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4783,8 +4770,7 @@ dependencies = [
 [[package]]
 name = "rvoip-core-traits"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efd3dd6caa0538530d29460cd50b8ba5dad9f51d1d9a2d018edc196615aab0f2"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4801,8 +4787,7 @@ dependencies = [
 [[package]]
 name = "rvoip-infra-common"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b80f4d5f88b7cab657f5897bbe04a962e644627e9a9a626643756eceb7deaf0"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4824,8 +4809,7 @@ dependencies = [
 [[package]]
 name = "rvoip-media-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8055514ad62d3e0a3b974ee3a961d347b74e455df9c0a8110953942ca0b3fd5a"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "apodize",
@@ -4856,8 +4840,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c25124db3d2221e2ede1528ea9198f1a9de27285cea9be0b82d6264d1428ac0"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4884,8 +4867,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-native"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f12770192c008a9a85f863a946d61eb503245ffeeebf93dcfba34edb3f77c3"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "clap",
@@ -4911,8 +4893,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-relay"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb6ea4d5b3c91fa09a3a7060caf6e111a74b63107de4878e1183a5cea032baa0"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4935,8 +4916,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-transport"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cff6b1c25592a15e6d21ab9bd6400292824301f3a5b24aa1c72f14db8156431"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "bytes",
  "futures",
@@ -4955,8 +4935,7 @@ dependencies = [
 [[package]]
 name = "rvoip-quic"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebf81c855a250a1180e951024a7d51066be8219562f54ad5fc5d75467e0c6824"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4980,8 +4959,7 @@ dependencies = [
 [[package]]
 name = "rvoip-redis"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07a7cc6755bc84179bcf6d1362658057c2cb06adfad674ac11ab27b34a1f3a8"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4997,8 +4975,7 @@ dependencies = [
 [[package]]
 name = "rvoip-rtc"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c8f847e10d2cd6d59248ebc94c7d79d128c78d20c925316918b678ca539e40b"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "bytes",
  "hex",
@@ -5033,8 +5010,7 @@ dependencies = [
 [[package]]
 name = "rvoip-rtp-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34150fba29d13661ba8d85c8e65c8714c3dff7a1f9f8f4feaeda7a6129c484a1"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5071,8 +5047,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2fd66d3a21140eacaf96a0ed057ce5199c57745c237bca324bf32eeeade67a7"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5113,8 +5088,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-core"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27817bc4225a6f34b9c62a95847b0090f8917d24dd520fad6d6e9c3893aa371f"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5133,7 +5107,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-dialog"
 version = "0.3.5"
-source = "git+https://github.com/eisenzopf/rvoip.git?rev=c701081159a579d7bc5495f45ea9ae1bdc241d56#c701081159a579d7bc5495f45ea9ae1bdc241d56"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5159,8 +5133,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-proxy"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36ebc41adffb17ddeefe8dae6881f0d0b1a763fe6f6c7762c3dfee799821e34c"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5177,8 +5150,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-registrar"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f133aadd274e7c3e0e4ea44ece90e85265a94f2de007e2eaaa8e22c2edc2b112"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5200,8 +5172,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-transport"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff576ffb6ecada18ecaf037dd1ff0fce0653fc136fb1040482d3c136190d202"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5228,8 +5199,7 @@ dependencies = [
 [[package]]
 name = "rvoip-uctp"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1038f0ee436873d4ba99c84fa4a0900bdf3dd9da9cb8ae5c71c45f5f542c8657"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5258,8 +5228,7 @@ dependencies = [
 [[package]]
 name = "rvoip-vcon"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1d730667e8f66cfd708238dc528f3c07e8c9d0df4ee2432661f580202a2d134"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5279,8 +5248,7 @@ dependencies = [
 [[package]]
 name = "rvoip-webrtc"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0db3e9f2dee27be25591c04a4771a8791840c34607f59262c3a5bb4edd8ed9da"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "axum",
@@ -5319,8 +5287,7 @@ dependencies = [
 [[package]]
 name = "rvoip-webrtc-stack"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1b26d943ab85260f0920bd6f0b379ac79dd3685cc7ecfda4e971cefaaf911e"
+source = "git+https://github.com/eisenzopf/rvoip.git?rev=70d78bf049258ccab743b3ef119a49a80ef6c0ad#70d78bf049258ccab743b3ef119a49a80ef6c0ad"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7006,7 +6973,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
