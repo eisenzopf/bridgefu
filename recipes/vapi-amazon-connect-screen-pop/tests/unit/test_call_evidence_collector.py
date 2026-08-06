@@ -375,6 +375,9 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         sent = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000]
         observed = [1_250, 2_250, 3_250, 4_250, 5_250]
         self.assertEqual(COLLECTOR.marker_latency_ms(sent, observed), 250.0)
+        self.assertEqual(
+            COLLECTOR.marker_latency_ms(sent, [*observed, 6_250, 7_000]), 250.0
+        )
         with self.assertRaises(COLLECTOR.EvidenceError):
             COLLECTOR.marker_latency_ms(sent, [900, 2_250, 3_250])
         with self.assertRaises(COLLECTOR.EvidenceError):

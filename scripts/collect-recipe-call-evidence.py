@@ -1497,10 +1497,12 @@ def marker_latency_ms(sent: Any, observed: Any) -> float:
         candidates = [
             index
             for index, sent_at in enumerate(sent)
-            if previous_index < index and sent_at <= received_at
+            if previous_index < index
+            and sent_at <= received_at
+            and received_at - sent_at <= 5_000
         ]
         if not candidates:
-            raise EvidenceError("media marker observation has no matching send")
+            continue
         index = candidates[-1]
         latencies.append(received_at - sent[index])
         previous_index = index
