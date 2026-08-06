@@ -897,7 +897,12 @@ async function observe(options) {
     );
     const streamsDigitSent = await sendDigitsViaConnectStreams(page, "6");
     if (!streamsDigitSent) {
-      const keypadOpened = await clickButton(page, [/Keypad/i, /Dial pad/i]);
+      const keypadOpened = await clickButton(page, [
+        /Number pad/i,
+        /Keypad/i,
+        /Dial pad/i,
+        /Dialpad/i,
+      ]);
       if (!keypadOpened) fail("Agent Workspace keypad control was not available");
       const digitSent = await clickButton(page, [/^6$/]);
       if (!digitSent) fail("Agent Workspace did not expose DTMF digit 6");

@@ -84,6 +84,7 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         digit = source.index("const digitSent = await clickButton", keypad)
         self.assertLess(streams, keypad)
         self.assertLess(keypad, digit)
+        self.assertIn("/Number pad/i", source[keypad:digit])
         streams_helper = source.split(
             "async function sendDigitsViaConnectStreams", 1
         )[1].split("async function buttonVisible", 1)[0]
