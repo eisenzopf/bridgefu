@@ -79,11 +79,11 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertIn("AGENT_MARKER_HZ", marker_probe)
         self.assertIn("AGENT_DTMF_SIX_LOW_HZ", marker_probe)
         self.assertIn("AGENT_DTMF_SIX_HIGH_HZ", marker_probe)
-        streams = source.index('sendDigitsViaConnectStreams(page, "6")')
-        keypad = source.index("const keypadOpened = await clickButton", streams)
-        digit = source.index("const digitSent = await clickButton", keypad)
-        self.assertLess(streams, keypad)
+        keypad = source.index("const keypadOpened = await clickButton")
+        digit = source.index("const keypadDigitSent = keypadOpened", keypad)
+        streams = source.index('sendDigitsViaConnectStreams(page, "6")', digit)
         self.assertLess(keypad, digit)
+        self.assertLess(digit, streams)
         self.assertIn("/Number pad/i", source[keypad:digit])
         streams_helper = source.split(
             "async function sendDigitsViaConnectStreams", 1

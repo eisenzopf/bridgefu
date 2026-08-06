@@ -4,8 +4,8 @@
  *
  * This harness obtains facts from the real browser session: exact synthetic
  * screen-pop values, an instrumented inbound WebRTC track, the deterministic
- * fake microphone stream plus outbound RTP counters, Connect Streams DTMF with
- * an Agent Workspace keypad fallback, and the contact's terminal UI. It accepts
+ * fake microphone stream plus outbound RTP counters, Agent Workspace number-pad
+ * DTMF with a Connect Streams fallback, and the contact's terminal UI. It accepts
  * selectors and paths,
  * never pass/fail booleans. Only field names, counts, timestamps, hashes, and a
  * 12-hex correlation fingerprint are retained.
@@ -893,17 +893,21 @@ async function observe(options) {
       Math.min(timeoutMs, 90_000),
       "Agent Workspace media/DTMF browser observations did not converge",
     );
-    const streamsDigitSent = await sendDigitsViaConnectStreams(page, "6");
-    if (!streamsDigitSent) {
-      const keypadOpened = await clickButton(page, [
-        /Number pad/i,
-        /Keypad/i,
-        /Dial pad/i,
-        /Dialpad/i,
-      ]);
+    const keypadOpened = await clickButton(page, [
+      /Number pad/i,
+      /Keypad/i,
+      /Dial pad/i,
+      /Dialpad/i,
+    ]);
+    const keypadDigitSent = keypadOpened
+      ? await clickButton(page, [/^6$/])
+      : false;
+    const streamsDigitSent = keypadDigitSent
+      ? false
+      : await sendDigitsViaConnectStreams(page, "6");
+    if (!keypadDigitSent && !streamsDigitSent) {
       if (!keypadOpened) fail("Agent Workspace keypad control was not available");
-      const digitSent = await clickButton(page, [/^6$/]);
-      if (!digitSent) fail("Agent Workspace did not expose DTMF digit 6");
+      fail("Agent Workspace did not expose DTMF digit 6");
     }
 
     const mediaProbe = await probeSnapshot(page);
