@@ -385,7 +385,14 @@ async function runBrowser(routeCall, hangupOrigin, sourceWav) {
     page.on("console", (message) => diagnostics.push(`console:${message.type()}:${message.text()}`));
     page.on("pageerror", (error) => diagnostics.push(`pageerror:${error.message}`));
     await page.goto(`http://127.0.0.1:${address.port}/`, { waitUntil: "load", timeout: 20_000 });
-    const result = await page.evaluate(() => window.__bridgefuSmoke);
+    let result;
+    try {
+      result = await page.evaluate(() => window.__bridgefuSmoke);
+    } catch (error) {
+      throw new SmokeError(
+        `browser qualification failed: ${error.message}; diagnostics=${JSON.stringify(diagnostics.slice(0, 20))}`,
+      );
+    }
     await context.close();
     return { ...result, diagnostics: diagnostics.slice(0, 20) };
   } finally {
@@ -500,12 +507,18 @@ async function main() {
   privateJson(sessionPath, session);
   writeSourceWav(sourceWav);
   const agent = runAgent(connectUrl, storageState, sessionPath, screenshotPath, agentObservationPath);
+  let agentError = null;
+  const agentCompletion = agent.completion.catch((error) => {
+    agentError = error;
+  });
   let browserObservation;
   try {
     browserObservation = await runBrowser(routeCall, hangupOrigin, sourceWav);
-    await agent.completion;
+    await agentCompletion;
+    if (agentError) throw agentError;
   } catch (error) {
     agent.child.kill("SIGTERM");
+    await agentCompletion;
     throw error;
   } finally {
     rmSync(sourceWav, { force: true });
