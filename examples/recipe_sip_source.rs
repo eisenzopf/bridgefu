@@ -883,6 +883,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .context("agent BYE observer stopped")?;
         (false, true)
     };
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let replay_call_id = control
         .invite(session.private.sip_uri.clone())
         .with_raw_header(

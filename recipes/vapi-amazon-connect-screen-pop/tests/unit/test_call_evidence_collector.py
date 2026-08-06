@@ -87,6 +87,13 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertIn("DTMF_SIX_LOW_FREQUENCY: f64 = 770.0", source)
         self.assertIn("DTMF_SIX_HIGH_FREQUENCY: f64 = 1_477.0", source)
         self.assertIn("if !in_band_agent_dtmf && !rfc4733_agent_dtmf", source)
+        remote_bye = source.index("agent BYE observer stopped")
+        replay_settle = source.index(
+            "tokio::time::sleep(Duration::from_millis(500)).await", remote_bye
+        )
+        replay_invite = source.index("let replay_call_id = control", replay_settle)
+        self.assertLess(remote_bye, replay_settle)
+        self.assertLess(replay_settle, replay_invite)
 
     def test_agent_probe_pairs_keypad_with_audible_dtmf_six(self):
         source = (
