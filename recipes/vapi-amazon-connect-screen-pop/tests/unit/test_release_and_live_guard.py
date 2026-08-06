@@ -65,7 +65,7 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
     def test_rvoip_workspace_backports_share_one_immutable_revision(self):
-        expected_revision = "c6b989abb5e8f5b12d3e2f14a6fed1865bc5f8a1"
+        expected_revision = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a"
         expected_repository = "https://github.com/eisenzopf/rvoip.git"
         expected_patches = {
             "rvoip-amazon-connect",

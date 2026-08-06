@@ -1938,7 +1938,7 @@ def run_direct_with_deployment(
     ledger: dict[str, Any],
     environment: dict[str, str],
     prepared_network_observation: dict[str, Any] | None = None,
-) -> None:
+) -> tuple[Path, Path, Path, Path] | None:
     session_path = args.session.resolve()
     session = require_private_session(session_path, args.execution_id)
     validate_private_session(session, args.execution_id, ledger, environment)
@@ -2065,6 +2065,9 @@ def run_direct_with_deployment(
             if agent is not None:
                 terminate_process(agent)
                 agent.communicate(timeout=5)
+    if prepared_network_observation is not None:
+        return session_path, participant_path, source_path, screenshot_path
+
     network_path = write_network_observation(path, ledger, network_observation)
 
     collect(
@@ -2079,6 +2082,7 @@ def run_direct_with_deployment(
             confirm=args.confirm,
         )
     )
+    return None
 
 
 def run_direct(args: argparse.Namespace) -> None:
@@ -2118,13 +2122,29 @@ def run_direct_fresh(args: argparse.Namespace) -> None:
             session_id=session_id,
         )
         direct_args = argparse.Namespace(**vars(args), session=session_path)
-        run_direct_with_deployment(
+        observation_paths = run_direct_with_deployment(
             direct_args,
             path,
             ledger,
             environment,
             network_observation,
         )
+    if observation_paths is None:
+        raise EvidenceError("fresh direct call did not return its observations")
+    session_path, participant_path, source_path, screenshot_path = observation_paths
+    network_path = write_network_observation(path, ledger, network_observation)
+    collect(
+        argparse.Namespace(
+            execution_id=args.execution_id,
+            session=session_path,
+            participant_observation=participant_path,
+            source_observation=source_path,
+            screenshot=screenshot_path,
+            network_observation=network_path,
+            wait_seconds=args.wait_seconds,
+            confirm=args.confirm,
+        )
+    )
 
 
 def wait_for_ready_file(

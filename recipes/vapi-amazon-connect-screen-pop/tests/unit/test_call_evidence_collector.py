@@ -449,10 +449,17 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         order: list[str] = []
         deployment = (Path("ledger.json"), {"execution_id": args.execution_id}, {})
         session = Path("fresh.private.json")
+        participant = Path("participant.json")
+        source = Path("source.json")
+        screenshot = Path("screenshot.png")
+
         @contextlib.contextmanager
         def controlled(*_arguments):
             order.append("network")
-            yield {"controller": "test"}
+            observation = {"controller": "test", "removed_after_call": False}
+            yield observation
+            observation["removed_after_call"] = True
+            order.append("network-cleanup")
 
         with mock.patch.object(
             COLLECTOR,
@@ -476,11 +483,37 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         ) as create, mock.patch.object(
             COLLECTOR,
             "run_direct_with_deployment",
-            side_effect=lambda *_arguments: order.append("observe"),
+            side_effect=lambda *_arguments: (
+                order.append("observe"),
+                (session, participant, source, screenshot),
+            )[1],
         ) as observe:
-            COLLECTOR.run_direct_fresh(args)
+            with mock.patch.object(
+                COLLECTOR,
+                "write_network_observation",
+                side_effect=lambda *_arguments: (
+                    order.append("retain-network"),
+                    Path("network.json"),
+                )[1],
+            ) as retain, mock.patch.object(
+                COLLECTOR,
+                "collect",
+                side_effect=lambda *_arguments: order.append("collect"),
+            ) as collect:
+                COLLECTOR.run_direct_fresh(args)
 
-        self.assertEqual(order, ["validate", "network", "reserve", "observe"])
+        self.assertEqual(
+            order,
+            [
+                "validate",
+                "network",
+                "reserve",
+                "observe",
+                "network-cleanup",
+                "retain-network",
+                "collect",
+            ],
+        )
         stable.assert_called_once_with(args.execution_id)
         network.assert_called_once_with(
             *deployment,
@@ -494,7 +527,17 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         )
         observed_args = observe.call_args.args[0]
         self.assertEqual(observed_args.session, session)
-        self.assertEqual(observe.call_args.args[-1], {"controller": "test"})
+        self.assertTrue(observe.call_args.args[-1]["removed_after_call"])
+        retain.assert_called_once_with(
+            *deployment[:2],
+            observe.call_args.args[-1],
+        )
+        collected_args = collect.call_args.args[0]
+        self.assertEqual(collected_args.session, session)
+        self.assertEqual(collected_args.participant_observation, participant)
+        self.assertEqual(collected_args.source_observation, source)
+        self.assertEqual(collected_args.screenshot, screenshot)
+        self.assertEqual(collected_args.network_observation, Path("network.json"))
 
     def test_vapi_call_contract_requires_owned_assistant_and_both_tools(self):
         call = {
