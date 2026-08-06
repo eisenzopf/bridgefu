@@ -1,6 +1,6 @@
 # Bridgefu-Owned Browser WebRTC to Amazon Connect Plan
 
-Status: proposed implementation and qualification plan  
+Status: runtime dependency qualified; CloudFormation implementation pending
 Scope: nonproduction first, then a separate non-HA production deployment  
 Target region for the first proof: `us-west-2`  
 Current release verdict: not yet proven live end to end
@@ -74,16 +74,18 @@ It was reviewed before freezing this runtime dependency and was not imported
 wholesale:
 
 - Bridgefu pins the rvoip `0.3.5` crate family to qualified commit
-  `03757173c4850fb7b3e5038f364d476904c294f7`. It descends from the prior
-  Connect-specific startup media-route fix and selectively adds the generic
-  establishment-eviction hardening.
+  `7eb6f3f040139d7bad24629968284a683bf77f68`. It descends from the prior
+  Connect-specific startup media-route and establishment-eviction fixes, adds
+  a bounded inclusive UDP allocator, avoids unnecessary Opus-to-Opus
+  transcoding when only `fmtp` differs, and preserves the browser's offered
+  codec preference order in SDP answers.
 - The local rvoip branch `fix/media-graph-establishment-eviction` is divergent
   from that pin and contains 14 commits beyond its `main`: 12 are on the remote
   branch and two are currently local-only.
-- The first branch commit, `40ea95f9`, was cleanly cherry-picked as
-  `03757173`. It changes generic `rvoip-core` media-graph behavior so
-  establishment backpressure does not evict a healthy media sink and adds
-  sinkless-frame evidence.
+- The first branch commit, `40ea95f9`, was cleanly cherry-picked in the
+  ancestry of the current pin. It changes generic `rvoip-core` media-graph
+  behavior so establishment backpressure does not evict a healthy media sink
+  and adds sinkless-frame evidence.
 - The core portions of the latency, renegotiation, and flush commits may also
   be relevant. They need source and test review against the browser WebRTC and
   Connect adapters.
@@ -97,23 +99,32 @@ wholesale:
 The clean candidate was created from the prior Bridgefu pin, preserving the
 Connect startup-route fix. A follow-up experiment that reduced the media queue
 to 500 ms and re-armed eviction history on renegotiation failed the Chromium
-gate twice with timing-sensitive replacement-media failures; it was excluded
-from the qualified revision. The accepted candidate passed:
+gate twice with timing-sensitive replacement-media failures; it was excluded.
+The later Chromium failure was traced to answer codec ordering: rvoip removed
+matching codecs from the offer in reverse-index order but failed to reverse the
+result, causing Chrome to prefer PCMA while the graph recorded Opus as primary.
+The accepted candidate corrects that ordering and passed:
 
-1. rvoip media-graph tests, 46/46;
-2. rvoip Amazon Connect media-bridge tests, 4/4;
-3. Bridgefu's direct browser-to-Connect hermetic qualification;
-4. four consecutive local-path Chromium qualifications;
-5. three consecutive Chromium qualifications from the pushed Git revision;
-   and
-6. exact graph assertions for zero unintended route eviction and bounded
-   queues.
+1. bounded allocator uniqueness, exhaustion, invalid-range, and reuse tests,
+   2/2;
+2. rvoip RTC library tests, 181/181, plus the new codec-order regression;
+3. rvoip media-graph tests, 46/46;
+4. the full `rvoip-webrtc` package suite and `rvoip-amazon-connect` package
+   suite with every non-ignored test green;
+5. four consecutive bounded direct browser-protocol-to-Connect hermetic
+   qualifications, including one from the pushed Git revision;
+6. four consecutive bounded real-Chromium assistant-handoff-to-Connect
+   qualifications, including one from the pushed Git revision; and
+7. three consecutive real-Chromium qualifications of the exact direct
+   browser-to-Connect route, covering two-way Opus, DTMF, initial context,
+   replay rejection, both hangup directions, and cleanup; and
+8. exact SDP evidence that Chromium received the single configured UDP port.
 
 Repeated live Connect proof remains part of the AWS deployment gate.
 
 Bridgefu must consume a pushed immutable revision or published, checksummed
-crate release. It must not depend on `/Users/jonathan/Developer/rvoip`,
-`/Users/jonathan/vapi-local`, an unpushed commit, or a mutable branch name.
+crate release. It must not depend on a developer-local checkout, an unpushed
+commit, or a mutable branch name.
 
 ## 3. Boundaries and non-goals
 
@@ -302,16 +313,15 @@ The runtime spike found a concrete gap in the initial qualified rvoip revision:
   browser and Connect legs of one call are separate peer connections and the
   second bind would collide.
 
-The pushed rvoip branch commit `08eb5cd1` is an unaccepted allocator candidate,
-not Bridgefu's pin. Its allocator unit tests pass for concurrent uniqueness,
-exhaustion, reuse, and invalid ranges, but Chromium requalification exposed a
-separate media-graph defect: the graph attempted Opus/PT111-to-Opus/PT111
-transcoding solely because the browser supplied `fmtp` and the synthetic
-Connect side did not. Almost every frame failed transcoding. A follow-up
-pass-through fix eliminates those transcode failures in unit tests but the
-handoff fixture still does not deliver a qualifying browser frame to its
-late-acquired synthetic Connect receiver. Do not promote the allocator until
-that behavior is understood and three consecutive Chromium runs pass.
+The accepted rvoip revision `7eb6f3f0` implements the bounded allocator and is
+now Bridgefu's immutable pin. Its unit tests prove concurrent uniqueness,
+exhaustion, reuse, and invalid-range rejection. The media-graph pass-through
+and codec-answer-order fixes close the two failures exposed by Chromium, and
+the bounded Chromium gate passed four consecutive times. Bridgefu now maps the
+range into both browser and Connect adapters and rejects ranges smaller than
+two ports per configured concurrent call. Deployment remains blocked until the
+CloudFormation security-group range and generated YAML are derived from the
+same parameters.
 
 The accepted implementation must bind exactly one available UDP socket per
 peer from a configured inclusive range. Binding must be atomic at socket
@@ -606,10 +616,10 @@ evidence. Only then promote the recipe support tier.
    `udp_bind: 0.0.0.0:0` allocates an unbounded ephemeral socket per peer and
    that a fixed port collides across the browser and Connect legs. Implement
    and qualify the inclusive allocator contract in section 5.3 before any
-   media security-group rule or deployment. The allocator candidate is
-   unit-qualified on the rvoip branch but failed the mandatory Chromium gate,
-   so Bridgefu remains pinned to `03757173` and deployment integration is
-   intentionally blocked.
+   media security-group rule or deployment. Revision `7eb6f3f0` has passed the
+   allocator and Chromium gates and is now pinned. The remaining requirement
+   is one-source-of-truth integration across Bridgefu configuration,
+   readiness/capacity output, and CloudFormation ingress rules.
 2. **TURN/TLS without custom DNS.** The first no-custom-DNS proof can use
    direct ICE and TURN/UDP. A broadly portable TURN/TLS endpoint needs a
    trusted name/certificate or a compatible managed relay provider; this must
@@ -639,9 +649,9 @@ evidence. Only then promote the recipe support tier.
 
 Execute in this order:
 
-1. Freeze the remaining direct descriptor fixtures and record the SDK package
-   digest; the rvoip intake and context-key cleanup are complete.
-2. Resolve and test bounded rvoip WebRTC media port allocation.
+1. Freeze the remaining descriptor fixtures and record the SDK package digest.
+2. Complete readiness/capacity reporting for the bounded UDP configuration;
+   schema, runtime, Connect-adapter, and capacity validation are integrated.
 3. Build the minimal session broker and exact CloudFront WSS subprotocol spike.
 4. Implement the new non-HA CloudFormation template family.
 5. Complete three clean static/change-set audits.

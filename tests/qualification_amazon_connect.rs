@@ -48,8 +48,9 @@ use rvoip_webrtc::signaling::auth::{AuthContext, AuthRejection, WsAuthHook};
 use rvoip_webrtc::signaling::websocket::serve_tls_listener_with_auth_and_shutdown;
 use rvoip_webrtc::tls::TlsConfig;
 use rvoip_webrtc::{
-    StaticWebRtcBearerCredentialProvider, WebRtcAdapter, WebRtcBearerCredential, WebRtcConfig,
-    WebRtcOriginateContext, WebRtcTargetPolicy, WebRtcTlsClientTrust,
+    StaticWebRtcBearerCredentialProvider, UdpPortRangeConfig, WebRtcAdapter,
+    WebRtcBearerCredential, WebRtcConfig, WebRtcOriginateContext, WebRtcTargetPolicy,
+    WebRtcTlsClientTrust,
 };
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -68,6 +69,27 @@ async fn bounded<T>(label: &'static str, future: impl std::future::Future<Output
     tokio::time::timeout(Duration::from_secs(20), future)
         .await
         .unwrap_or_else(|_| panic!("{label} deadline"))
+}
+
+fn available_loopback_udp_port() -> u16 {
+    for port in 30_000..60_000 {
+        if let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            drop(socket);
+            return port;
+        }
+    }
+    panic!("no loopback UDP port is available for bounded WebRTC qualification");
+}
+
+fn bounded_loopback_webrtc_config() -> (WebRtcConfig, u16) {
+    let port = available_loopback_udp_port();
+    let mut config = WebRtcConfig::loopback();
+    config.udp_port_range = Some(UdpPortRangeConfig {
+        bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port_start: port,
+        port_end: port,
+    });
+    (config, port)
 }
 
 fn principal() -> ApiPrincipal {
@@ -624,7 +646,7 @@ async fn run_direct_browser_amazon_case(terminal: TerminalSide) {
             .with_media_connector(connector)
             .build();
 
-    let mut bridge_config = WebRtcConfig::loopback();
+    let (mut bridge_config, _bridge_udp_port) = bounded_loopback_webrtc_config();
     bridge_config.max_concurrent_sessions = 4;
     bridge_config.trickle_ice = true;
     let bridge_adapter = WebRtcAdapter::new_with_inbound_admission_confirmation(
@@ -970,6 +992,285 @@ fn direct_browser_to_amazon_connect_is_full_duplex_context_bound_and_leak_free()
         .expect("browser-to-Amazon qualification panicked");
 }
 
+fn chromium_answer_audio_port(browser: &crate::browser_sdk::BrowserSdkController) -> u16 {
+    let diagnostics = browser
+        .diagnostics()
+        .expect("Chromium published SDP diagnostics");
+    diagnostics["answerAudio"]
+        .as_array()
+        .and_then(|lines| lines.first())
+        .and_then(serde_json::Value::as_str)
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|port| port.parse().ok())
+        .expect("Chromium answer audio line contains a numeric port")
+}
+
+async fn run_actual_chromium_direct_amazon_case(
+    terminal_side: crate::browser_sdk::BrowserTerminalSide,
+) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = generated.cert.pem().into_bytes();
+    let private_key = generated.signing_key.serialize_pem().into_bytes();
+    let tls = TlsConfig::from_pem_bytes(&certificate, &private_key)
+        .await
+        .unwrap();
+
+    let runtime = call_runtime().await;
+    let orchestrator = Orchestrator::new(CoreConfig::default());
+    let starter = Arc::new(CapturingStarter::default());
+    let session = HermeticConnectSession::new();
+    let starter_trait: Arc<dyn ConnectContactStarter> = starter.clone();
+    let connector: Arc<dyn ConnectMediaConnector> = Arc::new(HermeticConnector {
+        session: Arc::clone(&session),
+    });
+    let (mut bridge_config, web_udp_port) = bounded_loopback_webrtc_config();
+    bridge_config.max_concurrent_sessions = 4;
+    bridge_config.trickle_ice = true;
+    let amazon =
+        AmazonConnectAdapter::builder(ConnectConfig::new(INSTANCE_ID, FLOW_ID), starter_trait)
+            .with_media_connector(connector)
+            .build()
+            .with_webrtc_config(bridge_config.clone());
+    let bridge_adapter = WebRtcAdapter::new_with_inbound_admission_confirmation(
+        bridge_config,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let supervisor = CallExecutionSupervisor::install_with_leg_executors_context_canary_broadcast_and_outbound_profiles(
+        Arc::clone(&orchestrator),
+        Arc::clone(&runtime),
+        Arc::new(DisabledProviderLegExecutor),
+        Some(Arc::clone(&amazon)),
+        Arc::new(ContextPolicy {
+            allow_headers: BTreeMap::from([
+                ("X-Correlation-Id".into(), "correlation_id".into()),
+                ("X-Account-Tier".into(), "account_tier".into()),
+            ]),
+            ..ContextPolicy::default()
+        }),
+        None,
+        None,
+        Arc::new(DisabledOutboundProfileResolver),
+        4,
+        Duration::from_secs(15),
+    )
+    .await
+    .unwrap();
+    orchestrator
+        .register(Arc::clone(&bridge_adapter) as Arc<dyn ConnectionAdapter>)
+        .unwrap();
+    orchestrator
+        .register(Arc::clone(&amazon) as Arc<dyn ConnectionAdapter>)
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let bridge_listener = {
+        let adapter = Arc::clone(&bridge_adapter);
+        let auth: Arc<dyn WsAuthHook> = Arc::new(AttachmentAuth {
+            principal: principal().authenticated().clone(),
+        });
+        tokio::spawn(async move {
+            serve_tls_listener_with_auth_and_shutdown(listener, tls, adapter, auth, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        })
+    };
+
+    let idempotency = match terminal_side {
+        crate::browser_sdk::BrowserTerminalSide::Browser => "chromium-direct-browser-terminal",
+        crate::browser_sdk::BrowserTerminalSide::Destination => "chromium-direct-connect-terminal",
+    };
+    let created = runtime
+        .service()
+        .create_named_route_call(
+            &principal(),
+            &IdempotencyKey::parse(idempotency).unwrap(),
+            route_input(),
+            route_binding(),
+        )
+        .await
+        .unwrap();
+    let call_id = created.value.call.call_id;
+    let source = created
+        .value
+        .call
+        .legs
+        .iter()
+        .find(|leg| leg.direction == LegDirection::Inbound)
+        .unwrap();
+    let source_leg_id = source.leg_id;
+    let attachment = source.attachment.as_ref().unwrap();
+    let scenario = crate::browser_sdk::BrowserScenario::direct(
+        "amazon-connect",
+        "chromium-direct-correlation",
+        crate::browser_sdk::BrowserDestinationBoundary::AmazonConnectTestSeam,
+    )
+    .with_terminal_side(terminal_side);
+    let browser =
+        crate::browser_sdk::BrowserSdkController::launch(crate::browser_sdk::attachment_fixture(
+            format!("wss://localhost:{}/signal", bridge_address.port()),
+            attachment.token.clone(),
+            attachment.expires_at.to_rfc3339(),
+            TENANT,
+            call_id.to_string(),
+            source_leg_id.to_string(),
+            scenario,
+        ))
+        .await;
+
+    wait_for_call(&runtime, call_id, |stored| {
+        stored.call.aggregate.state() == CallState::Active
+    })
+    .await;
+    let starts = starter.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].attributes,
+        BTreeMap::from([
+            ("account_tier".into(), "gold".into()),
+            (
+                "correlation_id".into(),
+                "chromium-direct-correlation".into()
+            ),
+            ("server_route".into(), "support".into()),
+        ])
+    );
+    browser.mark_initial_destination_ready();
+    browser.wait_for_phase("direct-source-live").await;
+    assert_eq!(chromium_answer_audio_port(&browser), web_udp_port);
+
+    let mut connect_audio = session.stream.take_output();
+    let at_connect = bounded("Chromium direct Opus at Connect", async {
+        loop {
+            let frame = connect_audio.recv().await?;
+            if frame.payload_type == Some(111) {
+                return Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("Connect media stream stayed live");
+    assert!(!at_connect.payload.is_empty());
+    session.stream.inject(96_000).await;
+    browser.wait_for_phase("direct-agent-audio").await;
+    browser.wait_for_phase("direct-actions-sent").await;
+    bounded("direct Chromium DTMF at Connect", async {
+        loop {
+            if session.sent_dtmf.lock().unwrap().as_slice() == [("5".into(), 120)] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    browser.mark_destination_verified();
+
+    if terminal_side == crate::browser_sdk::BrowserTerminalSide::Destination {
+        browser.wait_for_phase("destination-hangup-ready").await;
+        session.end_remotely();
+    }
+    let result = browser.complete().await;
+    assert_eq!(result["connected"], true);
+    assert_eq!(result["finalState"], "closed");
+    assert_eq!(result["finalPeerConnectionState"], "closed");
+    assert_eq!(result["finalContextChannelState"], "closed");
+    assert_eq!(result["localAudioTrackState"], "ended");
+    assert_eq!(result["replayRejected"], true);
+    assert_eq!(result["dtmfSupported"], true);
+    assert!(result["outboundAudioBytes"].as_u64().unwrap_or_default() > 0);
+    assert!(result["inboundAudioBytes"].as_u64().unwrap_or_default() > 0);
+
+    wait_for_call(&runtime, call_id, |stored| {
+        stored.call.aggregate.state().is_terminal()
+    })
+    .await;
+    session.wait_closed().await;
+    bounded("exact direct Chromium StopContact", async {
+        loop {
+            if starter.stops.lock().unwrap().len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(amazon.metrics().active_sessions, 0);
+    wait_for_orchestrator_idle(&orchestrator).await;
+    assert!(bridge_adapter.routes().is_empty());
+
+    let _ = shutdown_tx.send(());
+    bounded("direct Chromium WSS listener shutdown", bridge_listener)
+        .await
+        .unwrap()
+        .unwrap();
+    bounded(
+        "direct Chromium supervisor shutdown",
+        supervisor.shutdown(Duration::from_secs(5)),
+    )
+    .await;
+    amazon.begin_drain();
+    assert_eq!(
+        amazon
+            .drain_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .remaining_routes,
+        0
+    );
+    bounded(
+        "direct Chromium prepared outbound drain",
+        orchestrator.drain_prepared_outbound_connections(),
+    )
+    .await;
+    bounded(
+        "direct Chromium lifecycle drain",
+        orchestrator.drain_connection_lifecycle_tasks(),
+    )
+    .await;
+    drop(bridge_adapter);
+    bounded(
+        "direct Chromium call runtime shutdown",
+        Arc::try_unwrap(runtime)
+            .expect("direct Chromium runtime owner released")
+            .shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires npm-installed pinned Playwright Chromium"]
+fn built_typescript_sdk_directly_bridges_to_amazon_and_cleans_both_terminal_directions() {
+    let _serial = AMAZON_QUALIFICATION_TEST_LOCK.lock().unwrap();
+    std::thread::Builder::new()
+        .name("chromium-direct-amazon-connect-qualification".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(6)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    run_actual_chromium_direct_amazon_case(
+                        crate::browser_sdk::BrowserTerminalSide::Browser,
+                    )
+                    .await;
+                    run_actual_chromium_direct_amazon_case(
+                        crate::browser_sdk::BrowserTerminalSide::Destination,
+                    )
+                    .await;
+                });
+        })
+        .unwrap()
+        .join()
+        .expect("direct Chromium-to-Amazon qualification panicked");
+}
+
 mod direct_assistant_handoff {
     use super::*;
 
@@ -1225,6 +1526,7 @@ mod direct_assistant_handoff {
         default_starter: Arc<CapturingStarter>,
         supervisor: CallExecutionSupervisor,
         web_address: std::net::SocketAddr,
+        web_udp_port: u16,
         web_trust: Arc<WebRtcTlsClientTrust>,
         web_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
         web_listener: tokio::task::JoinHandle<std::result::Result<(), rvoip_webrtc::WebRtcError>>,
@@ -1338,7 +1640,7 @@ mod direct_assistant_handoff {
 
         let runtime = handoff_runtime().await;
         let orchestrator = Orchestrator::new(CoreConfig::default());
-        let mut web_config = WebRtcConfig::loopback();
+        let (mut web_config, web_udp_port) = bounded_loopback_webrtc_config();
         web_config.max_concurrent_sessions = 4;
         web_config.trickle_ice = true;
         let web_adapter = WebRtcAdapter::new_with_inbound_admission_confirmation(
@@ -1458,6 +1760,7 @@ mod direct_assistant_handoff {
             default_starter,
             supervisor,
             web_address,
+            web_udp_port,
             web_trust,
             web_shutdown: Some(web_shutdown),
             web_listener,
@@ -2552,6 +2855,23 @@ mod direct_assistant_handoff {
         run_actual_chromium_amazon_case(crate::browser_sdk::BrowserTerminalSide::Destination).await;
     }
 
+    fn chromium_answer_audio_port(browser: &crate::browser_sdk::BrowserSdkController) -> u16 {
+        let diagnostics = browser
+            .diagnostics()
+            .expect("Chromium published SDP diagnostics");
+        let media_line = diagnostics["answerAudio"]
+            .as_array()
+            .and_then(|lines| lines.first())
+            .and_then(serde_json::Value::as_str)
+            .expect("Chromium diagnostics include the answer audio media line");
+        media_line
+            .split_whitespace()
+            .nth(1)
+            .expect("answer audio media line includes a port")
+            .parse()
+            .expect("answer audio port is numeric")
+    }
+
     async fn run_actual_chromium_amazon_case(
         terminal_side: crate::browser_sdk::BrowserTerminalSide,
     ) {
@@ -2600,6 +2920,11 @@ mod direct_assistant_handoff {
         .expect("browser microphone route remained live");
         assert_eq!(browser_audio.payload_type, Some(0));
         call.browser.wait_for_phase("assistant-ready").await;
+        assert_eq!(
+            chromium_answer_audio_port(&call.browser),
+            harness.web_udp_port,
+            "the Chromium answer must advertise the deployment-bounded UDP port"
+        );
         initial_assistant_media.await.unwrap();
         wait_for_chromium_assistant_dtmf(
             &mut harness.assistant.events,
@@ -2685,11 +3010,22 @@ mod direct_assistant_handoff {
 
         let source_live = call.browser.wait_for_phase("success-source-live").await;
         let mut amazon_audio = session.stream.take_output();
-        let at_amazon = match tokio::time::timeout(Duration::from_secs(20), amazon_audio.recv())
-            .await
+        let at_amazon = match tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let frame = amazon_audio.recv().await?;
+                if frame.payload_type == Some(111) {
+                    return Some(frame);
+                }
+                // The synthetic Connect output receiver is intentionally not
+                // acquired until after handoff, so it can retain pre-handoff
+                // fixture audio that a live continuously-draining peer would
+                // already have consumed. Qualify the first browser Opus frame.
+            }
+        })
+        .await
         {
             Ok(Some(frame)) => frame,
-            Ok(None) => panic!("Amazon media route ended before Chromium audio arrived"),
+            Ok(None) => panic!("Amazon media route ended before Chromium Opus arrived"),
             Err(_) => {
                 let amazon_connection = active.call.bindings[&call.destination_leg_id]
                     .connection_id

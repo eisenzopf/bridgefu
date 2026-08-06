@@ -486,6 +486,10 @@ pub struct GenericSymmetricRtpCfg {
 pub struct GenericWebRtcNetworkCfg {
     #[serde(default = "default_generic_webrtc_udp_bind")]
     pub udp_bind: String,
+    /// Optional bounded alternative to `udp_bind`. Each browser or Amazon
+    /// Connect peer atomically claims one socket from this inclusive range.
+    #[serde(default)]
+    pub udp_port_range: Option<GenericWebRtcUdpPortRangeCfg>,
     /// Primary audio codecs registered by the public WebRTC edge. The
     /// production default is intentionally Opus-only so a browser answer has
     /// one deterministic primary RTP payload mapping.
@@ -507,6 +511,14 @@ pub struct GenericWebRtcNetworkCfg {
     pub connection_timeout_secs: u64,
     #[serde(default = "default_true")]
     pub trickle_ice: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenericWebRtcUdpPortRangeCfg {
+    pub bind_ip: String,
+    pub port_start: u16,
+    pub port_end: u16,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -863,6 +875,28 @@ impl GenericWebRtcNetworkCfg {
             })
             .collect::<Result<Vec<_>>>()?;
         config.udp_bind.clone_from(&self.udp_bind);
+        config.udp_port_range = self
+            .udp_port_range
+            .as_ref()
+            .map(|range| {
+                let bind_ip = range.bind_ip.parse::<IpAddr>().map_err(|_| {
+                    anyhow!("generic_bridge.webrtc.udp_port_range.bind_ip must be an IP address")
+                })?;
+                if bind_ip.is_multicast()
+                    || range.port_start == 0
+                    || range.port_start > range.port_end
+                {
+                    return Err(anyhow!(
+                        "generic_bridge.webrtc.udp_port_range requires a non-multicast bind IP and an inclusive nonzero start <= end"
+                    ));
+                }
+                Ok(rvoip_webrtc::UdpPortRangeConfig {
+                    bind_ip,
+                    port_start: range.port_start,
+                    port_end: range.port_end,
+                })
+            })
+            .transpose()?;
         config.nat_1to1_ips.clone_from(&self.nat_1to1_ips);
         config.nat_1to1_candidate_type = match self.nat_1to1_candidate_type {
             GenericNatCandidateType::Host => rvoip_webrtc::Nat1To1CandidateType::Host,
@@ -5300,6 +5334,22 @@ impl Config {
             ));
         }
         self.generic_bridge.validate_networking()?;
+        if let Some(range) = &self.generic_bridge.webrtc.udp_port_range {
+            let available = usize::from(range.port_end)
+                .checked_sub(usize::from(range.port_start))
+                .and_then(|width| width.checked_add(1))
+                .ok_or_else(|| anyhow!("generic WebRTC UDP port range capacity overflow"))?;
+            let required = self
+                .runtime
+                .max_concurrent_calls
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("generic WebRTC UDP port requirement overflow"))?;
+            if available < required {
+                return Err(anyhow!(
+                    "generic_bridge.webrtc.udp_port_range provides {available} ports but runtime.max_concurrent_calls requires at least {required} for browser and Amazon Connect peers"
+                ));
+            }
+        }
         if let (Some(generic), Some(telnyx)) = (
             self.generic_bridge.sip.digest.as_ref(),
             self.providers.telnyx.as_ref(),
@@ -5973,10 +6023,15 @@ impl Config {
         let egress_profiles = self
             .sip_egress_profile_configs("bridgefu-gateway", sip_bind)
             .context("configuring gateway named SIP egress profiles")?;
-        let webrtc_stack = self
+        let mut webrtc_stack = self
             .generic_bridge
             .webrtc_stack_config()
             .context("configuring gateway WebRTC ICE/DTLS networking")?;
+        webrtc_stack.max_concurrent_sessions = self
+            .runtime
+            .max_concurrent_calls
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("gateway native WebRTC capacity overflow"))?;
         let tls = self
             .api
             .tls
@@ -6082,7 +6137,12 @@ impl Config {
                 .register_profile(profile, Arc::clone(&starter))
                 .map_err(|_| anyhow!("configured Amazon Connect profile catalog is invalid"))?;
         }
-        Ok(builder.build())
+        let mut webrtc = self
+            .generic_bridge
+            .webrtc_stack_config()
+            .context("configuring Amazon Connect WebRTC UDP allocation")?;
+        webrtc.max_concurrent_sessions = self.runtime.max_concurrent_calls;
+        Ok(builder.build().with_webrtc_config(webrtc))
     }
 
     fn build_amazon_connect_config(&self) -> Result<ConnectConfig> {
@@ -7375,6 +7435,7 @@ impl Default for GenericWebRtcNetworkCfg {
     fn default() -> Self {
         Self {
             udp_bind: default_generic_webrtc_udp_bind(),
+            udp_port_range: None,
             audio_codecs: default_generic_webrtc_audio_codecs(),
             ice_servers: None,
             ice_transport_policy: GenericIceTransportPolicy::All,
@@ -9427,6 +9488,35 @@ sip_profiles:
             names,
             BTreeSet::from(["g.711-a".into(), "g.711-mu".into(), "opus".into()])
         );
+
+        let bounded = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    udp_port_range:\n      bind_ip: 0.0.0.0\n      port_start: 40000\n      port_end: 40199\n"
+        ));
+        bounded.validate().unwrap();
+        let range = bounded
+            .generic_bridge
+            .webrtc_stack_config()
+            .unwrap()
+            .udp_port_range
+            .expect("bounded WebRTC range");
+        assert_eq!(range.bind_ip, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!((range.port_start, range.port_end), (40000, 40199));
+
+        let too_small = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    udp_port_range:\n      bind_ip: 0.0.0.0\n      port_start: 40000\n      port_end: 40198\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(too_small.contains("requires at least 200"));
+
+        let reversed = parse(&format!(
+            "{base}generic_bridge:\n  webrtc:\n    udp_port_range:\n      bind_ip: 0.0.0.0\n      port_start: 40100\n      port_end: 40000\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(reversed.contains("inclusive nonzero start <= end"));
     }
 
     #[test]

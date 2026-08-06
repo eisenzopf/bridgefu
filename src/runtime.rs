@@ -114,9 +114,10 @@ impl GenericBridgeRuntime {
             .checked_mul(2)
             .ok_or_else(|| anyhow!("generic bridge admission capacity overflow"))?;
 
-        let rtc_config = config
+        let mut rtc_config = config
             .webrtc_stack_config()
             .context("configuring generic WebRTC ICE/DTLS networking")?;
+        rtc_config.max_concurrent_sessions = admission_capacity;
         let (sip_stack_config, sip_nat_config) = sip_stack;
         let webrtc_auth = Arc::new(
             AuthCoreHook::new(webrtc_bearer_validator)

@@ -361,7 +361,12 @@ generic_bridge:
       max_sequence_jump: 512
 
   webrtc:
+    # The same inclusive range supplies both browser and Amazon Connect peers.
     udp_bind: 0.0.0.0:0
+    udp_port_range:
+      bind_ip: 0.0.0.0
+      port_start: 40000
+      port_end: 40399 # >= 2 ports per runtime.max_concurrent_calls
     # One deterministic primary browser codec; MediaGraph transcodes to the
     # independently negotiated SIP or Amazon Connect codec when required.
     audio_codecs: [opus]

@@ -198,6 +198,11 @@ impl AmazonCleanupJournal {
                 resolved += 1;
             }
         }
+        let failed = attempted.saturating_sub(resolved);
+        if failed > 0 {
+            metrics::counter!("bridgefu_amazon_cleanup_reconcile_failures_total")
+                .increment(failed as u64);
+        }
         Ok(AmazonCleanupReconcileReport {
             attempted,
             resolved,
@@ -229,6 +234,11 @@ impl AmazonCleanupJournal {
             ) {
                 resolved += 1;
             }
+        }
+        let failed = attempted.saturating_sub(resolved);
+        if failed > 0 {
+            metrics::counter!("bridgefu_amazon_cleanup_reconcile_failures_total")
+                .increment(failed as u64);
         }
         AmazonCleanupReconcileReport {
             attempted,

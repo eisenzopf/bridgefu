@@ -438,7 +438,13 @@ generic_bridge:
       rebind_window_secs: 2
       max_sequence_jump: 512
   webrtc:
+    # udp_bind remains the backwards-compatible fallback when no bounded
+    # range is configured. Production recipes use udp_port_range instead.
     udp_bind: 0.0.0.0:0
+    udp_port_range:
+      bind_ip: 0.0.0.0
+      port_start: 40000
+      port_end: 40399 # >= 2 ports per runtime.max_concurrent_calls
     # Keep browser ingress deterministic: the final answer has exactly one
     # primary audio codec/PT. SIP destinations still negotiate G.711 on their
     # independent SIP profile and Bridgefu transcodes at the MediaGraph.

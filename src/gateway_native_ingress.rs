@@ -229,6 +229,7 @@ impl fmt::Debug for GatewayNativeWebRtcConfig {
             .field("websocket_bind", &self.websocket_bind)
             .field("whip_whep_bind", &self.whip_whep_bind)
             .field("media_udp_bind", &self.stack.udp_bind)
+            .field("media_udp_port_range", &self.stack.udp_port_range)
             .field("tls", &self.tls.is_some())
             .finish_non_exhaustive()
     }

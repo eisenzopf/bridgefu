@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
 pub const COORDINATED_RVOIP_VERSION: &str = "0.3.5";
 const LATENCY_MAX_US: u64 = 1_000_000;
-pub const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
-pub const RVOIP_SIP_DIALOG_PATCH_SOURCE: &str = "git+https://github.com/eisenzopf/rvoip.git?rev=c701081159a579d7bc5495f45ea9ae1bdc241d56#c701081159a579d7bc5495f45ea9ae1bdc241d56";
+pub const APPROVED_RVOIP_REVISION: &str = "7eb6f3f040139d7bad24629968284a683bf77f68";
+pub const APPROVED_RVOIP_SOURCE: &str = "git+https://github.com/eisenzopf/rvoip.git?rev=7eb6f3f040139d7bad24629968284a683bf77f68#7eb6f3f040139d7bad24629968284a683bf77f68";
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -236,41 +236,22 @@ pub fn rvoip_lock_evidence(manifest_dir: &Path) -> RvoipLockEvidence {
                 "{} must resolve to the coordinated rvoip release",
                 package.name
             );
-            let expected_source = if package.name == "rvoip-sip-dialog" {
-                RVOIP_SIP_DIALOG_PATCH_SOURCE
-            } else {
-                CRATES_IO_REGISTRY_SOURCE
-            };
             assert_eq!(
                 package.source.as_deref(),
-                Some(expected_source),
+                Some(APPROVED_RVOIP_SOURCE),
                 "{} must resolve from its approved immutable source",
                 package.name
             );
-            let checksum = if package.name == "rvoip-sip-dialog" {
-                assert!(
-                    package.checksum.is_none(),
-                    "Git-patched rvoip-sip-dialog must not claim a registry checksum"
-                );
-                None
-            } else {
-                Some(
-                    package
-                        .checksum
-                        .filter(|checksum| {
-                            checksum.len() == 64
-                                && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("{} must have a Cargo.lock checksum", package.name)
-                        }),
-                )
-            };
+            assert!(
+                package.checksum.is_none(),
+                "Git-pinned {} must not claim a registry checksum",
+                package.name
+            );
             CargoPackageEvidence {
                 name: package.name,
                 version: package.version,
                 source: package.source.expect("validated immutable source"),
-                checksum,
+                checksum: None,
             }
         })
         .collect::<Vec<_>>();
@@ -426,25 +407,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_evidence_uses_the_coordinated_checked_release_and_dialog_backport() {
+    fn lock_evidence_uses_the_coordinated_immutable_git_revision() {
         let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
         assert_eq!(evidence.release_version, "0.3.5");
-        let dialog = evidence
-            .packages
-            .iter()
-            .find(|package| package.name == "rvoip-sip-dialog")
-            .expect("dialog package evidence");
-        assert_eq!(dialog.source, RVOIP_SIP_DIALOG_PATCH_SOURCE);
-        assert_eq!(dialog.checksum, None);
         assert!(evidence
             .packages
             .iter()
-            .filter(|package| package.name != "rvoip-sip-dialog")
             .all(|package| package.version == "0.3.5"
-                && package.source == CRATES_IO_REGISTRY_SOURCE
-                && package
-                    .checksum
-                    .as_ref()
-                    .is_some_and(|checksum| checksum.len() == 64)));
+                && package.source == APPROVED_RVOIP_SOURCE
+                && package.checksum.is_none()));
+        assert!(APPROVED_RVOIP_SOURCE.contains(APPROVED_RVOIP_REVISION));
     }
 }
