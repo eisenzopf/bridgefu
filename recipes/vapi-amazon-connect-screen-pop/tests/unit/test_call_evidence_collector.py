@@ -85,7 +85,14 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertLess(keypad, digit)
         self.assertLess(digit, streams)
         self.assertIn("/Number pad/i", source[keypad:digit])
-        self.assertIn("clickButtonWithin(page, [/^6$/], 1_500)", source[digit:streams])
+        self.assertIn(
+            'clickNestedNumberPadDigit(page, "6", 1_500)', source[digit:streams]
+        )
+        nested_helper = source.split(
+            "async function clickNestedNumberPadDigit", 1
+        )[1].split("async function sendDigitsViaConnectStreams", 1)[0]
+        self.assertIn('iframe[title="Contact Control Panel Number Pad"]', nested_helper)
+        self.assertIn('numberPad.getByRole("button"', nested_helper)
         streams_helper = source.split(
             "async function sendDigitsViaConnectStreams", 1
         )[1].split("async function buttonVisible", 1)[0]

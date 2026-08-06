@@ -413,6 +413,32 @@ async function clickButtonWithin(page, patterns, timeoutMs) {
   return false;
 }
 
+async function clickNestedNumberPadDigit(page, digit, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (const frame of page.frames()) {
+    for (const selector of [
+      'iframe[title="Contact Control Panel Number Pad"]',
+      'iframe[title*="Number Pad"]',
+    ]) {
+      const numberPad = frame.frameLocator(selector);
+      for (const control of [
+        numberPad.getByRole("button", { name: new RegExp(`^${digit}$`) }).first(),
+        numberPad.getByText(digit, { exact: true }).first(),
+      ]) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        try {
+          await control.click({ timeout: Math.min(remaining, 750) });
+          return true;
+        } catch {
+          // Continue across outer frames and keypad accessibility variants.
+        }
+      }
+    }
+  }
+  return false;
+}
+
 async function sendDigitsViaConnectStreams(page, digits) {
   for (const frame of page.frames()) {
     try {
@@ -909,7 +935,8 @@ async function observe(options) {
       /Dialpad/i,
     ]);
     const keypadDigitSent = keypadOpened
-      ? await clickButtonWithin(page, [/^6$/], 1_500)
+      ? (await clickNestedNumberPadDigit(page, "6", 1_500))
+        || (await clickButtonWithin(page, [/^6$/], 500))
       : false;
     const streamsDigitSent = keypadDigitSent
       ? false
