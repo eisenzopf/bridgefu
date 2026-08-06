@@ -56,6 +56,27 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(COLLECTOR.source_failure_detail(unsafe))
 
+        vapi = mock.Mock()
+        vapi.communicate.return_value = (
+            "",
+            "error: stock Vapi webCall did not start: provider detail\n",
+        )
+        self.assertEqual(
+            COLLECTOR.source_failure_detail(vapi),
+            "stock Vapi webCall did not start",
+        )
+
+    def test_vapi_browser_stderr_is_captured_for_allowlisted_diagnostics(self):
+        source = COLLECTOR_PATH.read_text()
+        browser_block = source.split("browser = subprocess.Popen(", 1)[1].split(
+            ")\n", 1
+        )[0]
+        self.assertIn("stderr=subprocess.PIPE", browser_block)
+        self.assertIn(
+            'raise source_failure(\n                process,\n                "protected browser source stopped before its handshake",',
+            source,
+        )
+
     def test_direct_source_pairs_in_band_and_rfc4733_dtmf(self):
         source = (ROOT / "examples" / "recipe_sip_source.rs").read_text()
         in_band = source.index("send_in_band_dtmf_five(&sender")

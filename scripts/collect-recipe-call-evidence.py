@@ -1869,6 +1869,15 @@ SAFE_SOURCE_FAILURE_PREFIXES = (
     "sending the controlled attachment replay",
     "one-use SIP attachment replay was answered",
     "wire-level INVITE/header/transport evidence failed",
+    "immutable Vapi demo site did not become ready",
+    "stock Vapi webCall did not start",
+    "Vapi transfer trigger was not accepted exactly once",
+    "Vapi browser media/DTMF observations did not converge",
+    "Vapi browser could not originate hangup",
+    "Vapi browser did not observe terminal cleanup",
+    "Vapi browser cleanup was not stable",
+    "Vapi browser final media evidence is incomplete",
+    "Vapi browser observer failed",
 )
 
 
@@ -2158,7 +2167,10 @@ def wait_for_ready_file(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise EvidenceError("protected browser source stopped before its handshake")
+            raise source_failure(
+                process,
+                "protected browser source stopped before its handshake",
+            )
         if path.exists():
             if path.stat().st_mode & 0o077:
                 raise EvidenceError("private browser handshake must be mode 0600")
@@ -2322,7 +2334,7 @@ def run_vapi(args: argparse.Namespace) -> None:
                 env=browser_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
             )
             ready = wait_for_ready_file(
@@ -2413,7 +2425,9 @@ def run_vapi(args: argparse.Namespace) -> None:
                         raise agent_failure(
                             agent, "a protected Vapi observer stopped before transfer"
                         )
-                    raise EvidenceError("a protected Vapi observer stopped before transfer")
+                    raise source_failure(
+                        browser, "a protected Vapi observer stopped before transfer"
+                    )
                 write_private_json(trigger_path, {"schema_version": 1})
                 deadline = time.monotonic() + args.observer_timeout_seconds + 60
                 while agent.poll() is None or browser.poll() is None:
@@ -2423,7 +2437,7 @@ def run_vapi(args: argparse.Namespace) -> None:
                     }:
                         if agent.poll() not in {None, 0}:
                             raise agent_failure(agent, "a protected Vapi observer failed")
-                        raise EvidenceError("a protected Vapi observer failed")
+                        raise source_failure(browser, "a protected Vapi observer failed")
                     if time.monotonic() >= deadline:
                         raise EvidenceError(
                             "protected Vapi observers exceeded their deadline"
@@ -2432,7 +2446,7 @@ def run_vapi(args: argparse.Namespace) -> None:
                 if agent.returncode != 0 or browser.returncode != 0:
                     if agent.returncode != 0:
                         raise agent_failure(agent, "a protected Vapi observer failed")
-                    raise EvidenceError("a protected Vapi observer failed")
+                    raise source_failure(browser, "a protected Vapi observer failed")
             network_path = write_network_observation(
                 path, ledger, network_observation
             )
