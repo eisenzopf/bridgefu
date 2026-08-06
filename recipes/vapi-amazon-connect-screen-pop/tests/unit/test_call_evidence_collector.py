@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib.util
 import copy
+import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -344,6 +345,14 @@ class CallEvidenceCollectorTests(unittest.TestCase):
                 )
             }
         ]
+        runtime = [
+            {
+                "message": json.dumps(
+                    {"log": f'{event["message"]}\n', "stream": "stdout"}
+                )
+            }
+            for event in runtime
+        ]
         counts, times, results = COLLECTOR.log_evidence(
             runtime, lookup, "123456abcdef"
         )
@@ -353,9 +362,11 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertTrue(
             COLLECTOR.sip_invite_header_evidence(runtime, "123456abcdef")
         )
-        runtime[-1]["message"] = runtime[-1]["message"].replace(
+        envelope = json.loads(runtime[-1]["message"])
+        envelope["log"] = envelope["log"].replace(
             '"header_count":1', '"header_count":2'
         )
+        runtime[-1]["message"] = json.dumps(envelope)
         self.assertFalse(
             COLLECTOR.sip_invite_header_evidence(runtime, "123456abcdef")
         )

@@ -1366,6 +1366,9 @@ def message_payloads(message: str) -> Iterable[dict[str, Any]]:
         if not isinstance(value, dict):
             continue
         yield value
+        wrapped = value.get("log")
+        if isinstance(wrapped, str) and wrapped not in seen:
+            candidates.append(wrapped)
         fields = value.get("fields")
         if isinstance(fields, dict):
             merged = dict(fields)
