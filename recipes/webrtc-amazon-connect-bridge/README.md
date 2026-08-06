@@ -29,3 +29,28 @@ attributes. The target Connect flow remains customer-owned and is never
 modified by this config-only recipe. Unlike the flagship Vapi/SIP recipe, this
 direct path does not need DynamoDB lookup unless the customer deliberately
 chooses the flagship wrapper-flow pattern.
+
+## Retained live diagnostic
+
+After the nonproduction stack is healthy, the protected diagnostic controller
+can mint a one-use browser attachment through SSM, drive the built SDK in real
+Chromium through the public CloudFront WSS endpoint, and run the synthetic
+Agent Workspace observer concurrently. The reusable API credential remains on
+the EC2 host; the controller writes only mode-`0600`, redacted observations to
+the private state directory supplied by the operator.
+
+```text
+node recipes/webrtc-amazon-connect-bridge/qualification/live-browser-connect-smoke.mjs \
+  --aws-profile PROFILE \
+  --region us-west-2 \
+  --stack-name STACK \
+  --connect-url https://INSTANCE-ALIAS.my.connect.aws/agent-app-v2/ \
+  --storage-state /private/path/agent-workspace.private.json \
+  --output-dir /private/path/evidence \
+  --hangup-origin source
+```
+
+Run a separate call with `--hangup-origin agent` to prove the opposite
+terminal direction. This is a live diagnostic, not support-promotion evidence:
+the three-run gate, adverse-path matrix, and TURN/browser coverage in the
+implementation plan remain mandatory.

@@ -79,6 +79,7 @@ const QUALIFIED_SCENARIOS = new Set([
   "sips-srtp-pcmu",
   "sips-srtp-pcma",
   "vapi-web-transfer",
+  "browser-webrtc-opus",
 ]);
 const MAX_JSON_BYTES = 1024 * 1024;
 const PROBE_SECONDS = 120;
@@ -165,9 +166,14 @@ function validNetworkContract(profile, contract) {
 function validateSession(path) {
   const value = boundedJson(path);
   if (!exactKeys(value, SESSION_KEYS)) fail("private session shape changed");
+  const recipeAndScenarioMatch =
+    (value.recipe === "vapi-amazon-connect-screen-pop@1" &&
+      value.scenario_id !== "browser-webrtc-opus") ||
+    (value.recipe === "webrtc-amazon-connect-bridge@1" &&
+      value.scenario_id === "browser-webrtc-opus");
   if (
     value.schema_version !== 1 ||
-    value.recipe !== "vapi-amazon-connect-screen-pop@1" ||
+    !recipeAndScenarioMatch ||
     !/^bft-[a-z0-9-]{4,20}$/.test(value.execution_id) ||
     !QUALIFIED_SCENARIOS.has(value.scenario_id) ||
     !validNetworkContract(value.network_profile, value.network_contract) ||
