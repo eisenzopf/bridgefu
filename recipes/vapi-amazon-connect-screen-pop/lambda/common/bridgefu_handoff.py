@@ -149,21 +149,55 @@ def _content_hash(fields: Mapping[str, str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _tool_arguments(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_CONTEXT_BYTES:
+        raise HandoffError("invalid_tool_arguments")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise HandoffError("invalid_tool_arguments")
+            result[key] = item
+        return result
+
+    try:
+        decoded = json.loads(value, object_pairs_hook=unique_object)
+    except json.JSONDecodeError:
+        raise HandoffError("invalid_tool_arguments") from None
+    if not isinstance(decoded, Mapping):
+        raise HandoffError("invalid_tool_arguments")
+    return decoded
+
+
 def _tool_call(message: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
     calls = message.get("toolCallList")
     if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], Mapping):
         raise HandoffError("invalid_tool_call")
     call = calls[0]
-    if call.get("name") != PREPARE_TOOL_NAME:
+    function = call.get("function")
+    if function is None:
+        name = call.get("name")
+        arguments = call.get("arguments")
+        parameters = call.get("parameters")
+    elif isinstance(function, Mapping):
+        if any(key in call for key in ("name", "arguments", "parameters")):
+            raise HandoffError("conflicting_tool_arguments")
+        if call.get("type") not in (None, "function"):
+            raise HandoffError("invalid_tool_call")
+        name = function.get("name")
+        arguments = function.get("arguments")
+        parameters = function.get("parameters")
+    else:
+        raise HandoffError("invalid_tool_call")
+    if name != PREPARE_TOOL_NAME:
         raise HandoffError("invalid_tool_name")
     tool_call_id = _bounded_identifier(call.get("id"), "tool_call_id")
-    arguments = call.get("arguments")
-    parameters = call.get("parameters")
     if arguments is not None and parameters is not None and arguments != parameters:
         raise HandoffError("conflicting_tool_arguments")
-    values = arguments if arguments is not None else parameters
-    if not isinstance(values, Mapping):
-        raise HandoffError("invalid_tool_arguments")
+    values = _tool_arguments(arguments if arguments is not None else parameters)
     if set(values) != set(DISPLAY_FIELDS):
         raise HandoffError("invalid_tool_arguments")
     return tool_call_id, values
@@ -217,9 +251,8 @@ def prepare_vapi_response(prepared: PreparedHandoff) -> dict[str, Any]:
     return {
         "results": [
             {
-                "name": PREPARE_TOOL_NAME,
                 "toolCallId": prepared.tool_call_id,
-                "result": {"status": "prepared"},
+                "result": "prepared",
             }
         ]
     }

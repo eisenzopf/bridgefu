@@ -53,6 +53,28 @@ def prepare_event(**overrides):
     }
 
 
+def current_prepare_event(**overrides):
+    event = prepare_event(**overrides)
+    tool_call = event["message"]["toolCallList"][0]
+    return {
+        "message": {
+            **event["message"],
+            "toolCallList": [
+                {
+                    "id": tool_call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tool_call["name"],
+                        "arguments": json.dumps(
+                            tool_call["arguments"], separators=(",", ":")
+                        ),
+                    },
+                }
+            ],
+        }
+    }
+
+
 def transfer_event(**extra):
     message = {
         "type": "transfer-destination-request",
@@ -128,12 +150,51 @@ class HandoffContractTests(unittest.TestCase):
         self.assertEqual(created.correlation_id, replayed.correlation_id)
         self.assertEqual(len(store.records), 1)
         response = prepare_vapi_response(created)
-        self.assertEqual(response["results"][0]["result"], {"status": "prepared"})
+        self.assertEqual(
+            response,
+            {
+                "results": [
+                    {
+                        "toolCallId": "tool_test_001",
+                        "result": "prepared",
+                    }
+                ]
+            },
+        )
         self.assertNotIn(created.correlation_id, json.dumps(response))
         record = store.records[created.correlation_id]
         self.assertEqual(record["handoff_status"], "PREPARED")
         self.assertEqual(record["expires_at"], NOW + 86_400)
         self.assertNotIn("transcript", record)
+
+    def test_prepare_accepts_current_nested_string_arguments(self):
+        store = FakeStore()
+        prepared = prepare_handoff(
+            current_prepare_event(), store, KEY, DEPLOYMENT, 86_400, now=NOW
+        )
+        self.assertFalse(prepared.replayed)
+        self.assertEqual(len(store.records), 1)
+        record = store.records[prepared.correlation_id]
+        self.assertEqual(record["customer_name"], "Ada Lovelace")
+        self.assertEqual(record["intent"], "order_dispute")
+
+    def test_prepare_rejects_ambiguous_or_malformed_current_tool_calls(self):
+        ambiguous = current_prepare_event()
+        ambiguous_call = ambiguous["message"]["toolCallList"][0]
+        ambiguous_call["name"] = "prepare_handoff"
+        malformed = current_prepare_event()
+        malformed["message"]["toolCallList"][0]["function"]["arguments"] = "{"
+        duplicate = current_prepare_event()
+        duplicate["message"]["toolCallList"][0]["function"]["arguments"] = (
+            '{"customer_name":"Ada","customer_name":"Grace",'
+            '"issue_summary":"Issue","intent":"help",'
+            '"verification_status":"verified"}'
+        )
+        wrong_type = current_prepare_event()
+        wrong_type["message"]["toolCallList"][0]["type"] = "transferCall"
+        for event in (ambiguous, malformed, duplicate, wrong_type):
+            with self.assertRaises(HandoffError):
+                prepare_handoff(event, FakeStore(), KEY, DEPLOYMENT, 86_400, now=NOW)
 
     def test_prepare_rejects_conflicting_replay_unknown_fields_and_controls(self):
         store = FakeStore()
