@@ -780,9 +780,26 @@ async function authenticate(options) {
   const storageState = resolve(required(options, "--storage-state"));
   const timeoutMs = timeoutMilliseconds(options, 300);
   const credentialPath = options.get("--credential-file");
+  const credentialStdin = options.has("--credential-stdin");
+  if (credentialPath && credentialStdin) {
+    fail("use exactly one credential input");
+  }
   let credential = null;
-  if (credentialPath) {
-    const value = boundedJson(resolve(credentialPath));
+  if (credentialPath || credentialStdin) {
+    let value;
+    if (credentialStdin) {
+      const input = readFileSync(0);
+      if (input.length <= 0 || input.length > MAX_JSON_BYTES) {
+        fail("credential stdin exceeds its size boundary");
+      }
+      try {
+        value = JSON.parse(input.toString("utf8"));
+      } catch {
+        fail("credential stdin is not valid UTF-8 JSON");
+      }
+    } else {
+      value = boundedJson(resolve(credentialPath));
+    }
     if (
       !exactKeys(value, new Set(["username", "password"])) ||
       typeof value.username !== "string" ||
@@ -1066,7 +1083,7 @@ async function observe(options) {
 async function main() {
   const [command, ...values] = process.argv.slice(2);
   if (command === "auth") {
-    const options = parseOptions(values, new Set(["--headed"]));
+    const options = parseOptions(values, new Set(["--headed", "--credential-stdin"]));
     for (const name of options.keys()) {
       if (
         ![
@@ -1074,6 +1091,7 @@ async function main() {
           "--storage-state",
           "--timeout-seconds",
           "--credential-file",
+          "--credential-stdin",
           "--headed",
         ].includes(name)
       ) {
