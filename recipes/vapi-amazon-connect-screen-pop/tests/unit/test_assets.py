@@ -131,7 +131,7 @@ class RecipeAssetContractTests(unittest.TestCase):
         probe = source.split("function installProbe", 1)[1].split(
             "async function authenticate", 1
         )[0]
-        self.assertIn("const requiredDtmfAnalyserFrames = 5", probe)
+        self.assertIn("const requiredDtmfAnalyserFrames = 3", probe)
         self.assertNotIn("REQUIRED_DTMF_ANALYSER_FRAMES", source)
         self.assertIn(
             "state.dtmfConsecutiveFrames = dtmf ? state.dtmfConsecutiveFrames + 1 : 0",
