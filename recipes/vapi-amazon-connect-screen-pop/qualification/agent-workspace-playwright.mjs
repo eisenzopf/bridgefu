@@ -92,7 +92,6 @@ const PROBE_PULSES_PER_CYCLE = 5;
 const PROBE_PULSE_MS = 100;
 const PROBE_DTMF_SIX_START_MS = 4_500;
 const PROBE_DTMF_SIX_DURATION_MS = 300;
-const SOURCE_PROBE_SETTLE_MS = 31_000;
 
 class HarnessError extends Error {}
 
@@ -881,7 +880,6 @@ async function observe(options) {
           probe.dtmfSourceToAgentObserved &&
           probe.captureRequestedAtMs &&
           Number.isInteger(sourceMediaReadyAtMs) &&
-          Date.now() - sourceMediaReadyAtMs >= SOURCE_PROBE_SETTLE_MS &&
           agentMarkerSchedule(
             probe.captureRequestedAtMs,
             sourceMediaReadyAtMs,

@@ -93,7 +93,7 @@ class RecipeAssetContractTests(unittest.TestCase):
         observe = source.split("async function observe", 1)[1]
         self.assertIn("await waitForAutoAcceptedContact(page, timeoutMs)", observe)
 
-    def test_agent_waits_for_reverse_markers_after_source_media_is_ready(self):
+    def test_agent_sends_dtmf_before_the_source_marker_timeout(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
         observe = source.split("async function observe", 1)[1]
         wait_gate = observe.split(
@@ -108,10 +108,7 @@ class RecipeAssetContractTests(unittest.TestCase):
             "            sourceMediaReadyAtMs,",
             wait_gate,
         )
-        self.assertIn(
-            "Date.now() - sourceMediaReadyAtMs >= SOURCE_PROBE_SETTLE_MS",
-            wait_gate,
-        )
+        self.assertNotIn("SOURCE_PROBE_SETTLE_MS", wait_gate)
         final_schedule = observe.split(
             "const agentMarkerSentAtMs = agentMarkerSchedule", 1
         )[1].split(");", 1)[0]
@@ -120,7 +117,7 @@ class RecipeAssetContractTests(unittest.TestCase):
 
     def test_agent_requires_sustained_source_dtmf(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
-        self.assertIn("const SOURCE_PROBE_SETTLE_MS = 31_000", source)
+        self.assertNotIn("SOURCE_PROBE_SETTLE_MS", source)
         probe = source.split("function installProbe", 1)[1].split(
             "async function authenticate", 1
         )[0]
