@@ -481,6 +481,36 @@ async function applicationSnapshot(page, nonce) {
   );
 }
 
+async function waitForSiteReady(page, timeoutMs) {
+  try {
+    await waitUntil(
+      () => page.locator("#start").isEnabled(),
+      timeoutMs,
+      "immutable Vapi demo site did not become ready",
+    );
+  } catch (error) {
+    const state = await page.evaluate(() => {
+      const value = globalThis.__BRIDGEFU_RECIPE_TEST__;
+      return value && typeof value === "object"
+        ? { status: value.status, errorType: value.errorType }
+        : null;
+    }).catch(() => null);
+    if (state?.status === "failed") {
+      if (state.errorType === "configuration-invalid") {
+        fail("immutable Vapi demo site rejected its configuration");
+      }
+      if (state.errorType === "configuration-unavailable") {
+        fail("immutable Vapi demo site configuration was unavailable");
+      }
+      fail("immutable Vapi demo site failed during initialization");
+    }
+    if (state?.status === "loading") {
+      fail("immutable Vapi demo site configuration load did not settle");
+    }
+    throw error;
+  }
+}
+
 function contentType(path) {
   if (path.endsWith(".html")) return "text/html; charset=utf-8";
   if (path.endsWith(".css")) return "text/css; charset=utf-8";
@@ -570,11 +600,7 @@ async function observe(options) {
     await context.addInitScript(installProbe);
     const page = await context.newPage();
     await page.goto(site.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    await waitUntil(
-      () => page.locator("#start").isEnabled(),
-      Math.min(timeoutMs, 30_000),
-      "immutable Vapi demo site did not become ready",
-    );
+    await waitForSiteReady(page, Math.min(timeoutMs, 30_000));
     const startedAtMs = Date.now();
     await page.locator("#start").click();
     const initial = await waitUntil(

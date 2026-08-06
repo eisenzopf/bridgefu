@@ -47,6 +47,16 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class RecipeAssetContractTests(unittest.TestCase):
+    def test_vapi_site_readiness_reports_only_safe_initialization_classes(self):
+        source = (RECIPE / "qualification/vapi-web-playwright.mjs").read_text()
+        readiness = source.split("async function waitForSiteReady", 1)[1].split(
+            "function contentType", 1
+        )[0]
+        self.assertIn("__BRIDGEFU_RECIPE_TEST__", readiness)
+        self.assertIn('state.errorType === "configuration-invalid"', readiness)
+        self.assertIn('state.errorType === "configuration-unavailable"', readiness)
+        self.assertIn("immutable Vapi demo site failed during initialization", readiness)
+
     def test_agent_workspace_supports_two_step_native_connect_login(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
         fill_username = source.index("await username.fill(credential.username)")
