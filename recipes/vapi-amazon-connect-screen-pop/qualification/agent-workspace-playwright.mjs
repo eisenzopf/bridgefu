@@ -930,6 +930,24 @@ async function observe(options) {
         "Agent Workspace did not render the exact synthetic screen pop",
       );
     }
+    const keypadOpened = await clickButton(page, [
+      /Number pad/i,
+      /Keypad/i,
+      /Dial pad/i,
+      /Dialpad/i,
+    ]);
+    const keypadDigitSent = keypadOpened
+      ? (await clickNestedNumberPadDigit(page, "6", 1_500))
+        || (await clickButtonWithin(page, [/^6$/], 500))
+      : false;
+    const streamsDigitSent = keypadDigitSent
+      ? false
+      : await sendDigitsViaConnectStreams(page, "6");
+    if (!keypadDigitSent && !streamsDigitSent) {
+      if (!keypadOpened) fail("Agent Workspace keypad control was not available");
+      fail("Agent Workspace did not expose DTMF digit 6");
+    }
+
     await waitUntil(
       async () => {
         const probe = await probeSnapshot(page);
@@ -952,24 +970,6 @@ async function observe(options) {
       Math.min(timeoutMs, 90_000),
       "Agent Workspace media/DTMF browser observations did not converge",
     );
-    const keypadOpened = await clickButton(page, [
-      /Number pad/i,
-      /Keypad/i,
-      /Dial pad/i,
-      /Dialpad/i,
-    ]);
-    const keypadDigitSent = keypadOpened
-      ? (await clickNestedNumberPadDigit(page, "6", 1_500))
-        || (await clickButtonWithin(page, [/^6$/], 500))
-      : false;
-    const streamsDigitSent = keypadDigitSent
-      ? false
-      : await sendDigitsViaConnectStreams(page, "6");
-    if (!keypadDigitSent && !streamsDigitSent) {
-      if (!keypadOpened) fail("Agent Workspace keypad control was not available");
-      fail("Agent Workspace did not expose DTMF digit 6");
-    }
-
     const mediaProbe = await probeSnapshot(page);
     await page.screenshot({ path: screenshotPath, fullPage: false });
     chmodSync(screenshotPath, 0o600);

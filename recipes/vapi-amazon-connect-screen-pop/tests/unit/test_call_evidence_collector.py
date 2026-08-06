@@ -82,8 +82,12 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         keypad = source.index("const keypadOpened = await clickButton")
         digit = source.index("const keypadDigitSent = keypadOpened", keypad)
         streams = source.index('sendDigitsViaConnectStreams(page, "6")', digit)
+        media_wait = source.index(
+            '"Agent Workspace media/DTMF browser observations did not converge"'
+        )
         self.assertLess(keypad, digit)
         self.assertLess(digit, streams)
+        self.assertLess(streams, media_wait)
         self.assertIn("/Number pad/i", source[keypad:digit])
         self.assertIn(
             'clickNestedNumberPadDigit(page, "6", 1_500)', source[digit:streams]
