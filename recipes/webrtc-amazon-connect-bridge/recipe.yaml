@@ -43,7 +43,7 @@ spec:
           - issue_summary
           - intent
           - verification_status
-          - vapi_call_reference
+          - source_call_reference
 
 assets:
   documentation: README.md

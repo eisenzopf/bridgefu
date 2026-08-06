@@ -7821,7 +7821,7 @@ private_forwarding:
             "issue_summary",
             "intent",
             "verification_status",
-            "vapi_call_reference",
+            "source_call_reference",
         ] {
             assert!(config.context.allow_metadata_keys.contains(key));
         }

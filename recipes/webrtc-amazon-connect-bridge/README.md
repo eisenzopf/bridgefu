@@ -5,6 +5,11 @@ WebRTC attachment and starts one fixed Amazon Connect WebRTC contact. It is the
 direct route for a website voice experience that hands a caller to an existing
 Connect flow without a SIP hop.
 
+See [the Bridgefu-owned browser WebRTC implementation plan](IMPLEMENTATION-PLAN.md)
+for the separate nonproduction-first, non-HA AWS deployment and live
+qualification path. That architecture terminates the browser peer connection
+at Bridgefu and has no hosted browser-call provider in the media path.
+
 **Support tier: `preview`.** The package, bounded context contract, and runtime
 projection are implemented. Promotion requires retained Chrome/Firefox/Safari,
 WSS, ICE/TURN, Amazon Connect, codec, DTMF, Agent Workspace, hangup,
@@ -19,7 +24,7 @@ reserving an attachment when that required context is absent or outside the
 route allowlist.
 
 Only `correlation_id`, `customer_name`, `issue_summary`, `intent`,
-`verification_status`, and `vapi_call_reference` can become Connect contact
+`verification_status`, and `source_call_reference` can become Connect contact
 attributes. The target Connect flow remains customer-owned and is never
 modified by this config-only recipe. Unlike the flagship Vapi/SIP recipe, this
 direct path does not need DynamoDB lookup unless the customer deliberately
