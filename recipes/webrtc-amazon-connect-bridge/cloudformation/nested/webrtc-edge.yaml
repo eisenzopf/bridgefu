@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS-assigned HTTPS and WSS edge for the single-instance nonproduction
+  browser WebRTC proof. CloudFront serves a private S3 site and proxies only
+  /webrtc to an ALB restricted to CloudFront origin-facing addresses.
+
+Metadata:
+  BridgefuRecipe:
+    Id: webrtc-amazon-connect-bridge@1
+    Component: webrtc-edge
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  CloudFrontOriginPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+  RuntimeOriginPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1024
+    MaxValue: 65535
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+
+Resources:
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: CloudFront-to-origin proof; never returned to a browser.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 48
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+        - {Key: BridgefuEnvironment, Value: nonproduction}
+
+  OriginLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudFront-only ingress to the Bridgefu WebSocket origin
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontOriginPrefixListId
+          Description: AWS CloudFront origin-facing managed prefix list only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref RuntimeOriginPort
+          ToPort: !Ref RuntimeOriginPort
+          CidrIp: !Ref VpcCidr
+          Description: Single Bridgefu origin target inside this VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-origin-alb'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  SignalingLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: [!Ref PublicSubnet1Id, !Ref PublicSubnet2Id]
+      SecurityGroups: [!Ref OriginLoadBalancerSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: deletion_protection.enabled, Value: 'false'}
+        - {Key: idle_timeout.timeout_seconds, Value: '120'}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-signaling'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  SignalingListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref SignalingLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: text/plain
+            MessageBody: not found
+            StatusCode: '404'
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-site-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-site'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${DeploymentId}-site'
+        Description: Private S3 origin for the browser qualification page
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${DeploymentId}-site-no-cache'
+        Comment: Nonproduction browser qualification assets are never cached.
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig: {CookieBehavior: none}
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig: {HeaderBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+
+  SignalingNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${DeploymentId}-wss-no-cache'
+        Comment: WebSocket signaling is never cached.
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig: {CookieBehavior: none}
+          EnableAcceptEncodingBrotli: false
+          EnableAcceptEncodingGzip: false
+          HeadersConfig: {HeaderBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: all}
+
+  SignalingOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${DeploymentId}-wss-origin'
+        Comment: Preserve rvoip WebSocket attachment subprotocols and origin.
+        CookiesConfig: {CookieBehavior: none}
+        QueryStringsConfig: {QueryStringBehavior: all}
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - Origin
+            - Sec-WebSocket-Key
+            - Sec-WebSocket-Version
+            - Sec-WebSocket-Protocol
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${DeploymentId}-browser-security'
+        Comment: Browser isolation for the direct WebRTC qualification page.
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: >-
+              default-src 'self'; base-uri 'self'; frame-ancestors 'none';
+              object-src 'none'; script-src 'self'; style-src 'self';
+              img-src 'self' data:; media-src 'self' blob:;
+              connect-src 'self'
+            Override: true
+          ContentTypeOptions: {Override: true}
+          FrameOptions: {FrameOption: DENY, Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+            Preload: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${DeploymentId} nonproduction browser WebRTC proof'
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: !Ref SiteNoCachePolicy
+          Compress: true
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+        CacheBehaviors:
+          - PathPattern: /webrtc*
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            CachePolicyId: !Ref SignalingNoCachePolicy
+            Compress: false
+            OriginRequestPolicyId: !Ref SignalingOriginRequestPolicy
+            TargetOriginId: signaling
+            ViewerProtocolPolicy: https-only
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt SiteBucket.RegionalDomainName
+            Id: site
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - DomainName: !GetAtt SignalingLoadBalancer.DNSName
+            Id: signaling
+            OriginCustomHeaders:
+              - HeaderName: X-Bridgefu-Origin-Verify
+                HeaderValue: !Sub '{{resolve:secretsmanager:${OriginVerifySecret}:SecretString}}'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginKeepaliveTimeout: 5
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginSSLProtocols: [TLSv1.2]
+        PriceClass: PriceClass_100
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub >-
+                  arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: RequireTls
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub '${SiteBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+  DemoUrl:
+    Value: !Sub 'https://${Distribution.DomainName}/'
+  SignalingUrl:
+    Value: !Sub 'wss://${Distribution.DomainName}/webrtc'
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  SignalingListenerArn:
+    Value: !Ref SignalingListener
+  OriginLoadBalancerSecurityGroupId:
+    Value: !GetAtt OriginLoadBalancerSecurityGroup.GroupId
+  OriginVerifySecretArn:
+    Value: !Ref OriginVerifySecret

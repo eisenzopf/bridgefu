@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Non-HA nonproduction Bridgefu browser WebRTC to Amazon Connect proof. This
+  composition creates exactly one Bridgefu EC2 runtime and uses no custom DNS.
+
+Metadata:
+  BridgefuRecipe:
+    Id: webrtc-amazon-connect-bridge@1
+    Environment: nonproduction
+
+Parameters:
+  DeploymentId:
+    Type: String
+    Default: bridgefu-browser-nonprod
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  NestedTemplateBaseUrl:
+    Type: String
+    Description: HTTPS S3 URL prefix containing the immutable nested templates.
+    AllowedPattern: '^https://[^\s]+/$'
+  VpcCidr:
+    Type: String
+    Default: 10.72.0.0/16
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.72.0.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.72.1.0/24
+  CloudFrontOriginPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+  TestClientCidr:
+    Type: String
+    Description: Exact nonproduction browser egress CIDR allowed to send ICE media.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  ConnectEntryFlowArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  ConnectEntryFlowId:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+  ArtifactBucket:
+    Type: String
+  RuntimeArtifactKey:
+    Type: String
+  RuntimeArtifactVersion:
+    Type: String
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  BridgefuImageUri:
+    Type: String
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuImageRepositoryArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues: [t4g.medium, t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large]
+  MaxConcurrentCalls:
+    Type: Number
+    Default: 4
+    AllowedValues: [1, 2, 4, 8]
+  MediaPortStart:
+    Type: Number
+    Default: 40000
+    MinValue: 1024
+    MaxValue: 65535
+  MediaPortEnd:
+    Type: Number
+    Default: 40015
+    MinValue: 1024
+    MaxValue: 65535
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+
+Resources:
+  Network:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}network.yaml'
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcCidr: !Ref VpcCidr
+        PublicSubnet1Cidr: !Ref PublicSubnet1Cidr
+        PublicSubnet2Cidr: !Ref PublicSubnet2Cidr
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  WebRtcEdge:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}webrtc-edge.yaml'
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcId: !GetAtt Network.Outputs.VpcId
+        VpcCidr: !GetAtt Network.Outputs.VpcCidr
+        PublicSubnet1Id: !GetAtt Network.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt Network.Outputs.PublicSubnet2Id
+        CloudFrontOriginPrefixListId: !Ref CloudFrontOriginPrefixListId
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  Runtime:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${NestedTemplateBaseUrl}runtime-starter.yaml'
+      Parameters:
+        DeploymentId: !Ref DeploymentId
+        VpcId: !GetAtt Network.Outputs.VpcId
+        PublicSubnetId: !GetAtt Network.Outputs.PublicSubnet1Id
+        OriginLoadBalancerSecurityGroupId: !GetAtt WebRtcEdge.Outputs.OriginLoadBalancerSecurityGroupId
+        SignalingListenerArn: !GetAtt WebRtcEdge.Outputs.SignalingListenerArn
+        SignalingHost: !GetAtt WebRtcEdge.Outputs.DistributionDomainName
+        OriginVerifySecretArn: !GetAtt WebRtcEdge.Outputs.OriginVerifySecretArn
+        TestClientCidr: !Ref TestClientCidr
+        ConnectInstanceArn: !Ref ConnectInstanceArn
+        ConnectEntryFlowArn: !Ref ConnectEntryFlowArn
+        ConnectEntryFlowId: !Ref ConnectEntryFlowId
+        ArtifactBucket: !Ref ArtifactBucket
+        RuntimeArtifactKey: !Ref RuntimeArtifactKey
+        RuntimeArtifactVersion: !Ref RuntimeArtifactVersion
+        RuntimeArtifactSha256: !Ref RuntimeArtifactSha256
+        BridgefuImageUri: !Ref BridgefuImageUri
+        BridgefuImageRepositoryArn: !Ref BridgefuImageRepositoryArn
+        AmiId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        MaxConcurrentCalls: !Ref MaxConcurrentCalls
+        MediaPortStart: !Ref MediaPortStart
+        MediaPortEnd: !Ref MediaPortEnd
+        ProjectTag: !Ref ProjectTag
+        ManagedByTag: !Ref ManagedByTag
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+Outputs:
+  DemoUrl:
+    Value: !GetAtt WebRtcEdge.Outputs.DemoUrl
+  SignalingUrl:
+    Value: !GetAtt WebRtcEdge.Outputs.SignalingUrl
+  RuntimeInstanceId:
+    Value: !GetAtt Runtime.Outputs.RuntimeInstanceId
+  RuntimePublicIp:
+    Value: !GetAtt Runtime.Outputs.RuntimePublicIp
+  RuntimeSecurityGroupId:
+    Value: !GetAtt Runtime.Outputs.RuntimeSecurityGroupId

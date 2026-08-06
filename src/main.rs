@@ -199,7 +199,22 @@ enum RecipeCommand {
     },
 }
 
+fn install_default_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    anyhow::ensure!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "installing the process-level rustls crypto provider"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // Install before parsing or compiling configuration. Recipe-projected
+    // WebRTC signaling may construct a TLS acceptor in the all-in-one path,
+    // before the role-specific helpers that also defensively install one.
+    install_default_crypto_provider()?;
     let args = Args::parse();
     let command = args.command.clone().unwrap_or(Command::Run);
 
@@ -1619,5 +1634,11 @@ mod tests {
         .unwrap();
         let worker = repository.worker_snapshot(worker_id).await.unwrap();
         assert!(worker.draining);
+    }
+
+    #[test]
+    fn process_installs_a_rustls_crypto_provider_before_tls_construction() {
+        install_default_crypto_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }

@@ -1,6 +1,6 @@
 # Bridgefu-Owned Browser WebRTC to Amazon Connect Plan
 
-Status: runtime dependency qualified; CloudFormation implementation pending
+Status: runtime dependency qualified; nonproduction core implemented and live dry-run review in progress
 Scope: nonproduction first, then a separate non-HA production deployment  
 Target region for the first proof: `us-west-2`  
 Current release verdict: not yet proven live end to end
@@ -270,14 +270,17 @@ For the first deployable version:
 - `/webrtc` routes WebSocket upgrade requests to the Bridgefu instance's rvoip
   signaling listener with caching disabled and the required WebSocket headers
   forwarded.
-- A public Application Load Balancer is not required for Starter. CloudFront
-  can use the instance's AWS-assigned public DNS name as a custom origin on the
-  signaling edge port. A small host reverse proxy binds that public origin
-  port, verifies a random CloudFront-to-origin header, and proxies only
-  `/webrtc` to Bridgefu on `127.0.0.1:18080`. Bridgefu itself stays on loopback.
-  Restrict the proxy's TCP port to the AWS managed CloudFront origin-facing
-  prefix list. Account for that prefix list's security-group rule weight during
-  static validation.
+- A public Application Load Balancer provides the stable CloudFront custom
+  origin. It does not add a second runtime or runtime HA: its target group
+  contains exactly the single Starter instance. The managed origin breaks a
+  bootstrap dependency cycle that otherwise requires the instance to know the
+  CloudFront hostname before CloudFront can know the instance hostname. A small
+  host reverse proxy binds the target port, verifies a random
+  CloudFront-to-origin header, and proxies only `/webrtc` to Bridgefu on
+  `127.0.0.1:18080`. Bridgefu itself stays on loopback. Restrict ALB ingress to
+  the AWS managed CloudFront origin-facing prefix list and runtime origin
+  ingress to the ALB security group. Account for the prefix list's rule weight
+  during static validation.
 - The Bridgefu control API remains on the private VPC address and accepts only
   the session-broker security group. It is never routed by CloudFront.
 - The EC2 instance has a stable Elastic IP for ICE/NAT advertisement and

@@ -1,0 +1,49 @@
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log /var/log/nginx/access.log combined;
+    server_tokens off;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    server {
+        listen 8080 default_server;
+        listen [::]:8080 default_server;
+
+        location = /origin-healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 'ok\n';
+        }
+
+        location = /webrtc {
+            if ($http_x_bridgefu_origin_verify != '__ORIGIN_VERIFY__') {
+                return 403;
+            }
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header Origin $http_origin;
+            proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;
+            proxy_read_timeout 120s;
+            proxy_send_timeout 120s;
+            proxy_ssl_verify off;
+            proxy_pass https://127.0.0.1:18080;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+}

@@ -1,0 +1,70 @@
+config_version: 1
+
+aws:
+  region: __AWS_REGION__
+
+edge:
+  public_host: __SIGNALING_HOST__
+  media_public_addr: __PUBLIC_IP__:0
+
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  tls:
+    certificate_chain: /etc/bridgefu/tls/signaling.crt
+    private_key: /etc/bridgefu/tls/signaling.key
+  rate_limit:
+    enabled: true
+    control_requests_per_second: 10
+    control_burst: 20
+    diagnostics_requests_per_second: 2
+    diagnostics_burst: 4
+    webhook_requests_per_second: 2
+    webhook_burst: 4
+    max_tracked_identities: 256
+    identity_idle_ttl_secs: 300
+
+recipes:
+  support:
+    use: builtin:webrtc-amazon-connect-bridge@1
+    with:
+      webrtc_signaling_uri: wss://__SIGNALING_HOST__/webrtc
+      connect_instance_arn: __CONNECT_INSTANCE_ARN__
+      connect_contact_flow_id: __CONNECT_ENTRY_FLOW_ID__
+
+persistence:
+  backend: sqlite
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  deployment_id: __DEPLOYMENT_ID__
+
+generic_bridge:
+  enabled: true
+  webrtc_ws_bind: 127.0.0.1:18080
+  webrtc:
+    udp_bind: 0.0.0.0:0
+    udp_port_range:
+      bind_ip: 0.0.0.0
+      port_start: __MEDIA_PORT_START__
+      port_end: __MEDIA_PORT_END__
+    audio_codecs: [opus]
+    ice_servers: []
+    ice_transport_policy: all
+    nat_1to1_ips: [__PUBLIC_IP__]
+    nat_1to1_candidate_type: host
+    gather_timeout_secs: 10
+    connection_timeout_secs: 30
+    trickle_ice: true
+
+observability:
+  log_level: info
+  log_format: json
+  http_bind: 0.0.0.0:9090
+
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: __MAX_CONCURRENT_CALLS__
+  setup_timeout_secs: 30
+  media_idle_timeout_secs: 180
+  drain_timeout_secs: 60

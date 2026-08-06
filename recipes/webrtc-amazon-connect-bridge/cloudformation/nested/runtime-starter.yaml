@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One non-HA Bridgefu EC2 runtime for direct browser WebRTC to an existing
+  Amazon Connect flow. No Auto Scaling group, replica, SIP, Vapi, or Daily
+  resource is created.
+
+Metadata:
+  BridgefuRecipe:
+    Id: webrtc-amazon-connect-bridge@1
+    Component: runtime-starter
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  OriginLoadBalancerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  SignalingListenerArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:elasticloadbalancing:[-a-z0-9]+:[0-9]{12}:listener/app/.+$'
+  SignalingHost:
+    Type: String
+    AllowedPattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$'
+  OriginVerifySecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  TestClientCidr:
+    Type: String
+    Description: Exact nonproduction browser egress CIDR allowed to send ICE media.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$'
+  ConnectInstanceArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+$'
+  ConnectEntryFlowArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
+  ConnectEntryFlowId:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+  ArtifactBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  RuntimeArtifactKey:
+    Type: String
+    MinLength: 1
+    MaxLength: 1024
+  RuntimeArtifactVersion:
+    Type: String
+    MinLength: 1
+  RuntimeArtifactSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+  BridgefuImageUri:
+    Type: String
+    Description: Immutable private ECR image URI including @sha256 digest.
+    AllowedPattern: '^[^\s@]+@sha256:[0-9a-f]{64}$'
+  BridgefuImageRepositoryArn:
+    Type: String
+    AllowedPattern: '^arn:aws[-a-z0-9]*:ecr:[-a-z0-9]+:[0-9]{12}:repository/[A-Za-z0-9._/-]+$'
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Resolved by the root stack from the regional AL2023 SSM parameter.
+  InstanceType:
+    Type: String
+    Default: t4g.large
+    AllowedValues: [t4g.medium, t4g.large, t4g.xlarge, c7g.large, c7g.xlarge, m7g.large]
+  RootVolumeGiB:
+    Type: Number
+    Default: 24
+    MinValue: 16
+    MaxValue: 100
+  MaxConcurrentCalls:
+    Type: Number
+    Default: 4
+    AllowedValues: [1, 2, 4, 8]
+  MediaPortStart:
+    Type: Number
+    Default: 40000
+    MinValue: 1024
+    MaxValue: 65535
+  MediaPortEnd:
+    Type: Number
+    Default: 40015
+    MinValue: 1024
+    MaxValue: 65535
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+
+Resources:
+  BridgefuApiBearerSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Private Bridgefu control API bearer; never returned to browsers.
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  BridgefuControlHmacSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Durable call-control HMAC key for the single runtime.
+      GenerateSecretString: {ExcludePunctuation: true, PasswordLength: 64}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  RuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bounded WSS origin and browser ICE media for one Bridgefu runtime
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref OriginLoadBalancerSecurityGroupId
+          Description: WSS origin from the CloudFront-facing ALB only
+        - IpProtocol: udp
+          FromPort: !Ref MediaPortStart
+          ToPort: !Ref MediaPortEnd
+          CidrIp: !Ref TestClientCidr
+          Description: Bounded direct browser ICE for the explicit test CIDR
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs, image pulls, DNS, time, and established WebRTC peers
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-runtime'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ExactBrowserConnectRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartOnlyConfiguredConnectFlow
+                Effect: Allow
+                Action: connect:StartWebRTCContact
+                Resource: !Ref ConnectEntryFlowArn
+              - Sid: StopOnlyConfiguredConnectInstanceContacts
+                Effect: Allow
+                Action: connect:StopContact
+                Resource: !Sub '${ConnectInstanceArn}/contact/*'
+              - Sid: ReadOnlyExactRuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref BridgefuApiBearerSecret
+                  - !Ref BridgefuControlHmacSecret
+                  - !Ref OriginVerifySecretArn
+              - Sid: ReadOnlyImmutableBootstrap
+                Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${RuntimeArtifactKey}'
+              - Sid: PullOnlyReviewedImage
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !Ref BridgefuImageRepositoryArn
+              - Sid: AuthenticatePrivateEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: SignalOnlyThisStack
+                Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  RuntimeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref RuntimeRole]
+
+  RuntimeEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-runtime'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  RuntimeNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: !Sub '${DeploymentId} single non-HA Bridgefu runtime'
+      SubnetId: !Ref PublicSubnetId
+      GroupSet: [!Ref RuntimeSecurityGroup]
+      SourceDestCheck: true
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-runtime'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  RuntimeEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt RuntimeEip.AllocationId
+      NetworkInterfaceId: !Ref RuntimeNetworkInterface
+
+  RuntimeInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: RuntimeEipAssociation
+    CreationPolicy:
+      ResourceSignal: {Count: 1, Timeout: PT30M}
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref RuntimeInstanceProfile
+      Monitoring: true
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          NetworkInterfaceId: !Ref RuntimeNetworkInterface
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: !Ref RootVolumeGiB
+            VolumeType: gp3
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              umask 077
+              status_file=/run/bridgefu-bootstrap-step
+              signal_stack() {
+                aws cloudformation signal-resource --region '${AWS::Region}' \
+                  --stack-name '${AWS::StackName}' --logical-resource-id RuntimeInstance \
+                  --unique-id bridgefu-runtime --status "$1" --no-cli-pager
+              }
+              fail() {
+                code=$?
+                step=unknown
+                [[ -r "$status_file" ]] && read -r step < "$status_file" || true
+                printf 'Bridgefu bootstrap failed during %s\n' "$step" >&2
+                signal_stack FAILURE || true
+                exit "$code"
+              }
+              trap fail ERR
+              printf '%s\n' packages > "$status_file"
+              dnf install -y docker nginx unzip
+              install -d -o root -g root -m 0755 /opt/bridgefu/bootstrap /etc/bridgefu
+              printf '%s\n' artifact-download > "$status_file"
+              aws s3api get-object --region '${AWS::Region}' --bucket '${ArtifactBucket}' \
+                --key '${RuntimeArtifactKey}' --version-id '${RuntimeArtifactVersion}' \
+                /opt/bridgefu/runtime.zip >/dev/null
+              printf '%s  %s\n' '${RuntimeArtifactSha256}' /opt/bridgefu/runtime.zip | sha256sum -c -
+              unzip -q /opt/bridgefu/runtime.zip -d /opt/bridgefu/bootstrap
+              chmod 0755 /opt/bridgefu/bootstrap/bootstrap.sh
+              cat > /etc/bridgefu/runtime.conf <<'BRIDGEFU_RUNTIME'
+              BRIDGEFU_DEPLOYMENT_ID='${DeploymentId}'
+              AWS_REGION='${AWS::Region}'
+              BRIDGEFU_SIGNALING_HOST='${SignalingHost}'
+              BRIDGEFU_PUBLIC_IP='${PublicIp}'
+              BRIDGEFU_MEDIA_PORT_START='${MediaPortStart}'
+              BRIDGEFU_MEDIA_PORT_END='${MediaPortEnd}'
+              BRIDGEFU_MAX_CONCURRENT_CALLS='${MaxConcurrentCalls}'
+              CONNECT_INSTANCE_ARN='${ConnectInstanceArn}'
+              CONNECT_ENTRY_FLOW_ID='${ConnectEntryFlowId}'
+              BRIDGEFU_IMAGE_URI='${BridgefuImageUri}'
+              BRIDGEFU_API_BEARER_SECRET_ARN='${ApiBearerSecretArn}'
+              BRIDGEFU_CONTROL_HMAC_SECRET_ARN='${ControlHmacSecretArn}'
+              BRIDGEFU_ORIGIN_VERIFY_SECRET_ARN='${OriginVerifySecretArn}'
+              BRIDGEFU_RUNTIME
+              chmod 0600 /etc/bridgefu/runtime.conf
+              printf '%s\n' runtime-bootstrap > "$status_file"
+              /opt/bridgefu/bootstrap/bootstrap.sh
+              printf '%s\n' ready > "$status_file"
+              signal_stack SUCCESS
+              trap - ERR
+            - PublicIp: !GetAtt RuntimeEip.PublicIp
+              ApiBearerSecretArn: !Ref BridgefuApiBearerSecret
+              ControlHmacSecretArn: !Ref BridgefuControlHmacSecret
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-runtime'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+        - {Key: BridgefuEnvironment, Value: nonproduction}
+
+  SignalingTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Port: 8080
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      Targets:
+        - Id: !Ref RuntimeInstance
+          Port: 8080
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /origin-healthz
+      Matcher: {HttpCode: '200'}
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+
+  SignalingListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref SignalingListenerArn
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: {Values: [/webrtc, '/webrtc/*']}
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref SignalingTargetGroup
+
+Outputs:
+  RuntimeInstanceId:
+    Value: !Ref RuntimeInstance
+  RuntimePrivateIp:
+    Value: !GetAtt RuntimeInstance.PrivateIp
+  RuntimePublicIp:
+    Value: !GetAtt RuntimeEip.PublicIp
+  RuntimeSecurityGroupId:
+    Value: !GetAtt RuntimeSecurityGroup.GroupId
+  BridgefuApiBearerSecretArn:
+    Value: !Ref BridgefuApiBearerSecret
+  SignalingTargetGroupArn:
+    Value: !Ref SignalingTargetGroup

@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Two-subnet public network edge for one non-HA Bridgefu runtime. The second
+  subnet exists only because the AWS-managed Application Load Balancer edge
+  requires two Availability Zones; no second Bridgefu server is created.
+
+Metadata:
+  BridgefuRecipe:
+    Id: webrtc-amazon-connect-bridge@1
+    Component: network
+
+Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+  VpcCidr:
+    Type: String
+    Default: 10.72.0.0/16
+    AllowedPattern: '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.).+$'
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.72.0.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.72.1.0/24
+  ProjectTag:
+    Type: String
+    Default: bridgefu-recipe
+  ManagedByTag:
+    Type: String
+    Default: bridgefu-cloudformation
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-vpc'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuRecipe, Value: webrtc-amazon-connect-bridge@1}
+        - {Key: BridgefuEnvironment, Value: nonproduction}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-igw'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-public-a'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-public-b'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${DeploymentId}-public'}
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  PublicSubnet1AvailabilityZone:
+    Value: !GetAtt PublicSubnet1.AvailabilityZone
+  PublicSubnet2AvailabilityZone:
+    Value: !GetAtt PublicSubnet2.AvailabilityZone
