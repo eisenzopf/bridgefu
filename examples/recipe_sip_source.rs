@@ -37,6 +37,7 @@ const DTMF_SIX_LOW_FREQUENCY: f64 = 770.0;
 const DTMF_SIX_HIGH_FREQUENCY: f64 = 1_477.0;
 const SOURCE_MARKER_PULSES: usize = 30;
 const REQUIRED_AGENT_MARKERS: usize = 5;
+const MARKER_REJECTION_RATIO: f64 = 4.0;
 const MARKER_TONE_FRAMES: usize = 5;
 const MARKER_SILENCE_FRAMES: usize = 45;
 const IN_BAND_DTMF_FRAMES: usize = 15;
@@ -227,10 +228,7 @@ struct ToneEdges {
 
 impl ToneEdges {
     fn observe(&mut self, frame: &AudioFrame, frequency: f64) {
-        let present = frame.channels == 1
-            && (8_000..=48_000).contains(&frame.sample_rate)
-            && rms(&frame.samples) >= 0.01
-            && tone_power(&frame.samples, frame.sample_rate, frequency) >= 0.001;
+        let present = marker_tone_present(frame, frequency);
         if present {
             self.frames += 1;
             let now = now_ms();
@@ -245,6 +243,22 @@ impl ToneEdges {
         }
         self.active = present;
     }
+}
+
+fn marker_tone_present(frame: &AudioFrame, frequency: f64) -> bool {
+    if frame.channels != 1
+        || !(8_000..=48_000).contains(&frame.sample_rate)
+        || rms(&frame.samples) < 0.01
+    {
+        return false;
+    }
+    let target_power = tone_power(&frame.samples, frame.sample_rate, frequency);
+    let source_marker_power = tone_power(
+        &frame.samples,
+        frame.sample_rate,
+        f64::from(MARKER_FREQUENCY),
+    );
+    target_power >= 0.001 && target_power >= source_marker_power * MARKER_REJECTION_RATIO
 }
 
 fn dual_tone_present(frame: &AudioFrame, low_frequency: f64, high_frequency: f64) -> bool {
@@ -1015,6 +1029,25 @@ mod tests {
         }
         assert_eq!(detector.timestamps.len(), 1);
         assert!(detector.frames >= 3);
+    }
+
+    #[test]
+    fn detector_rejects_source_marker_dominant_frames() {
+        let mut source_phase = 0.0;
+        let mut agent_phase = 0.0;
+        let frame = AudioFrame::new(
+            dual_tone_frame(
+                MARKER_FREQUENCY,
+                AGENT_MARKER_FREQUENCY as f32,
+                &mut source_phase,
+                &mut agent_phase,
+            ),
+            8_000,
+            1,
+            0,
+        );
+        assert!(tone_power(&frame.samples, 8_000, AGENT_MARKER_FREQUENCY) >= 0.001);
+        assert!(!marker_tone_present(&frame, AGENT_MARKER_FREQUENCY));
     }
 
     #[test]
