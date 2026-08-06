@@ -1,4 +1,6 @@
-import Vapi from "@vapi-ai/web";
+import VapiModule from "@vapi-ai/web";
+
+const Vapi = VapiModule.default ?? VapiModule;
 
 const elements = {
   status: document.querySelector("#status"),

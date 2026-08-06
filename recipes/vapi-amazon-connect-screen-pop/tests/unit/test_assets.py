@@ -47,6 +47,12 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class RecipeAssetContractTests(unittest.TestCase):
+    def test_demo_site_normalizes_vapi_commonjs_default_export(self):
+        source = (RECIPE / "demo-site/src/app.js").read_text()
+        self.assertIn('import VapiModule from "@vapi-ai/web"', source)
+        self.assertIn("const Vapi = VapiModule.default ?? VapiModule", source)
+        self.assertNotIn('import Vapi from "@vapi-ai/web"', source)
+
     def test_vapi_site_readiness_reports_only_safe_initialization_classes(self):
         source = (RECIPE / "qualification/vapi-web-playwright.mjs").read_text()
         readiness = source.split("async function waitForSiteReady", 1)[1].split(
