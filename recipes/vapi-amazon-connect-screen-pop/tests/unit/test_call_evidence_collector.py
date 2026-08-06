@@ -85,6 +85,7 @@ class CallEvidenceCollectorTests(unittest.TestCase):
         self.assertLess(keypad, digit)
         self.assertLess(digit, streams)
         self.assertIn("/Number pad/i", source[keypad:digit])
+        self.assertIn("clickButtonWithin(page, [/^6$/], 1_500)", source[digit:streams])
         streams_helper = source.split(
             "async function sendDigitsViaConnectStreams", 1
         )[1].split("async function buttonVisible", 1)[0]

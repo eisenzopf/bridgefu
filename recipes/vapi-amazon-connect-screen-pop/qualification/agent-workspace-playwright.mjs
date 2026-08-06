@@ -404,6 +404,15 @@ async function clickButton(page, patterns) {
   return false;
 }
 
+async function clickButtonWithin(page, patterns, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await clickButton(page, patterns)) return true;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  } while (Date.now() < deadline);
+  return false;
+}
+
 async function sendDigitsViaConnectStreams(page, digits) {
   for (const frame of page.frames()) {
     try {
@@ -900,7 +909,7 @@ async function observe(options) {
       /Dialpad/i,
     ]);
     const keypadDigitSent = keypadOpened
-      ? await clickButton(page, [/^6$/])
+      ? await clickButtonWithin(page, [/^6$/], 1_500)
       : false;
     const streamsDigitSent = keypadDigitSent
       ? false
