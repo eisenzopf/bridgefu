@@ -2427,10 +2427,10 @@ def run_vapi(args: argparse.Namespace) -> None:
                 if agent.poll() is not None or browser.poll() is not None:
                     if agent.poll() is not None:
                         raise agent_failure(
-                            agent, "a protected Vapi observer stopped before transfer"
+                            agent, "protected Vapi agent observer stopped before transfer"
                         )
                     raise source_failure(
-                        browser, "a protected Vapi observer stopped before transfer"
+                        browser, "protected Vapi source observer stopped before transfer"
                     )
                 write_private_json(trigger_path, {"schema_version": 1})
                 deadline = time.monotonic() + args.observer_timeout_seconds + 60
@@ -2440,8 +2440,8 @@ def run_vapi(args: argparse.Namespace) -> None:
                         0,
                     }:
                         if agent.poll() not in {None, 0}:
-                            raise agent_failure(agent, "a protected Vapi observer failed")
-                        raise source_failure(browser, "a protected Vapi observer failed")
+                            raise agent_failure(agent, "protected Vapi agent observer failed")
+                        raise source_failure(browser, "protected Vapi source observer failed")
                     if time.monotonic() >= deadline:
                         raise EvidenceError(
                             "protected Vapi observers exceeded their deadline"
@@ -2449,8 +2449,8 @@ def run_vapi(args: argparse.Namespace) -> None:
                     time.sleep(0.25)
                 if agent.returncode != 0 or browser.returncode != 0:
                     if agent.returncode != 0:
-                        raise agent_failure(agent, "a protected Vapi observer failed")
-                    raise source_failure(browser, "a protected Vapi observer failed")
+                        raise agent_failure(agent, "protected Vapi agent observer failed")
+                    raise source_failure(browser, "protected Vapi source observer failed")
             network_path = write_network_observation(
                 path, ledger, network_observation
             )
