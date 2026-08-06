@@ -228,7 +228,8 @@ struct ToneEdges {
 
 impl ToneEdges {
     fn observe(&mut self, frame: &AudioFrame, frequency: f64) {
-        let present = marker_tone_present(frame, frequency);
+        let present = marker_tone_present(frame, frequency)
+            && dual_tone_present(frame, DTMF_SIX_LOW_FREQUENCY, DTMF_SIX_HIGH_FREQUENCY);
         if present {
             self.frames += 1;
             let now = now_ms();
@@ -967,6 +968,25 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn agent_marker_frame(
+        agent_phase: &mut f32,
+        low_phase: &mut f32,
+        high_phase: &mut f32,
+    ) -> Vec<i16> {
+        let agent = tone_frame(AGENT_MARKER_FREQUENCY as f32, agent_phase);
+        let dtmf = dual_tone_frame(
+            DTMF_SIX_LOW_FREQUENCY as f32,
+            DTMF_SIX_HIGH_FREQUENCY as f32,
+            low_phase,
+            high_phase,
+        );
+        agent
+            .into_iter()
+            .zip(dtmf)
+            .map(|(marker, digit)| i32::from(marker).saturating_add(i32::from(digit)) as i16)
+            .collect()
+    }
+
     #[test]
     fn in_band_five_contains_both_dtmf_frequencies() {
         let mut low_phase = 0.0;
@@ -1020,10 +1040,17 @@ mod tests {
     #[test]
     fn detector_records_bounded_rising_edges() {
         let mut detector = ToneEdges::default();
-        let mut phase = 0.0;
+        let mut agent_phase = 0.0;
+        let mut low_phase = 0.0;
+        let mut high_phase = 0.0;
         for _ in 0..8 {
             detector.observe(
-                &AudioFrame::new(tone_frame(880.0, &mut phase), 8_000, 1, 0),
+                &AudioFrame::new(
+                    agent_marker_frame(&mut agent_phase, &mut low_phase, &mut high_phase),
+                    8_000,
+                    1,
+                    0,
+                ),
                 AGENT_MARKER_FREQUENCY,
             );
         }
@@ -1048,6 +1075,25 @@ mod tests {
         );
         assert!(tone_power(&frame.samples, 8_000, AGENT_MARKER_FREQUENCY) >= 0.001);
         assert!(!marker_tone_present(&frame, AGENT_MARKER_FREQUENCY));
+    }
+
+    #[test]
+    fn detector_rejects_marker_frequency_without_digit_signature() {
+        let mut detector = ToneEdges::default();
+        let mut phase = 0.0;
+        for _ in 0..8 {
+            detector.observe(
+                &AudioFrame::new(
+                    tone_frame(AGENT_MARKER_FREQUENCY as f32, &mut phase),
+                    8_000,
+                    1,
+                    0,
+                ),
+                AGENT_MARKER_FREQUENCY,
+            );
+        }
+        assert!(detector.timestamps.is_empty());
+        assert_eq!(detector.frames, 0);
     }
 
     #[test]
