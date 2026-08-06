@@ -420,6 +420,30 @@ async function clickNestedNumberPadDigit(page, digit, timeoutMs) {
       'iframe[title="Contact Control Panel Number Pad"]',
       'iframe[title*="Number Pad"]',
     ]) {
+      let childFrame = null;
+      let frameHandle = null;
+      try {
+        frameHandle = await frame.locator(selector).first().elementHandle();
+        childFrame = await frameHandle?.contentFrame();
+      } catch {
+        // The number-pad iframe may still be attaching.
+      }
+      if (childFrame) {
+        for (const control of [
+          childFrame.getByRole("button", { name: new RegExp(`^${digit}$`) }).first(),
+          childFrame.getByText(digit, { exact: true }).first(),
+        ]) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return false;
+          try {
+            await control.click({ timeout: Math.min(remaining, 750) });
+            return true;
+          } catch {
+            // Try the next keypad accessibility variant.
+          }
+        }
+      }
+      await frameHandle?.dispose();
       const numberPad = frame.frameLocator(selector);
       for (const control of [
         numberPad.getByRole("button", { name: new RegExp(`^${digit}$`) }).first(),

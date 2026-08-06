@@ -92,6 +92,7 @@ class CallEvidenceCollectorTests(unittest.TestCase):
             "async function clickNestedNumberPadDigit", 1
         )[1].split("async function sendDigitsViaConnectStreams", 1)[0]
         self.assertIn('iframe[title="Contact Control Panel Number Pad"]', nested_helper)
+        self.assertIn("frameHandle?.contentFrame()", nested_helper)
         self.assertIn('numberPad.getByRole("button"', nested_helper)
         streams_helper = source.split(
             "async function sendDigitsViaConnectStreams", 1
