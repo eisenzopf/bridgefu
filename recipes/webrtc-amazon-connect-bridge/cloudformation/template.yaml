@@ -31,6 +31,11 @@ Parameters:
   CloudFrontOriginPrefixListId:
     Type: String
     AllowedPattern: '^pl-[0-9a-f]+$'
+  CachingDisabledPolicyId:
+    Type: String
+    Default: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+    AllowedPattern: '^[0-9a-f-]{36}$'
+    Description: AWS managed CachingDisabled cache policy identifier.
   TestClientCidr:
     Type: String
     Description: Exact nonproduction browser egress CIDR allowed to send ICE media.
@@ -116,6 +121,7 @@ Resources:
         PublicSubnet1Id: !GetAtt Network.Outputs.PublicSubnet1Id
         PublicSubnet2Id: !GetAtt Network.Outputs.PublicSubnet2Id
         CloudFrontOriginPrefixListId: !Ref CloudFrontOriginPrefixListId
+        CachingDisabledPolicyId: !Ref CachingDisabledPolicyId
         ProjectTag: !Ref ProjectTag
         ManagedByTag: !Ref ManagedByTag
       Tags:

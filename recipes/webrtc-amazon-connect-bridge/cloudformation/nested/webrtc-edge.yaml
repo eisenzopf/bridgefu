@@ -31,6 +31,11 @@ Parameters:
     Default: 8080
     MinValue: 1024
     MaxValue: 65535
+  CachingDisabledPolicyId:
+    Type: String
+    Default: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+    AllowedPattern: '^[0-9a-f-]{36}$'
+    Description: AWS managed CachingDisabled cache policy identifier.
   ProjectTag:
     Type: String
     Default: bridgefu-recipe
@@ -143,38 +148,6 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
-  SiteNoCachePolicy:
-    Type: AWS::CloudFront::CachePolicy
-    Properties:
-      CachePolicyConfig:
-        Name: !Sub '${DeploymentId}-site-no-cache'
-        Comment: Nonproduction browser qualification assets are never cached.
-        DefaultTTL: 0
-        MaxTTL: 0
-        MinTTL: 0
-        ParametersInCacheKeyAndForwardedToOrigin:
-          CookiesConfig: {CookieBehavior: none}
-          EnableAcceptEncodingBrotli: true
-          EnableAcceptEncodingGzip: true
-          HeadersConfig: {HeaderBehavior: none}
-          QueryStringsConfig: {QueryStringBehavior: none}
-
-  SignalingNoCachePolicy:
-    Type: AWS::CloudFront::CachePolicy
-    Properties:
-      CachePolicyConfig:
-        Name: !Sub '${DeploymentId}-wss-no-cache'
-        Comment: WebSocket signaling is never cached.
-        DefaultTTL: 0
-        MaxTTL: 0
-        MinTTL: 0
-        ParametersInCacheKeyAndForwardedToOrigin:
-          CookiesConfig: {CookieBehavior: none}
-          EnableAcceptEncodingBrotli: false
-          EnableAcceptEncodingGzip: false
-          HeadersConfig: {HeaderBehavior: none}
-          QueryStringsConfig: {QueryStringBehavior: all}
-
   SignalingOriginRequestPolicy:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
@@ -222,7 +195,7 @@ Resources:
         DefaultCacheBehavior:
           AllowedMethods: [GET, HEAD, OPTIONS]
           CachedMethods: [GET, HEAD, OPTIONS]
-          CachePolicyId: !Ref SiteNoCachePolicy
+          CachePolicyId: !Ref CachingDisabledPolicyId
           Compress: true
           ResponseHeadersPolicyId: !Ref SecurityHeaders
           TargetOriginId: site
@@ -231,7 +204,7 @@ Resources:
           - PathPattern: /webrtc*
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
             CachedMethods: [GET, HEAD, OPTIONS]
-            CachePolicyId: !Ref SignalingNoCachePolicy
+            CachePolicyId: !Ref CachingDisabledPolicyId
             Compress: false
             OriginRequestPolicyId: !Ref SignalingOriginRequestPolicy
             TargetOriginId: signaling
