@@ -1950,6 +1950,28 @@ def validate_connect_url(value: str) -> None:
         raise EvidenceError("use the default HTTPS Amazon Connect Agent Workspace URL")
 
 
+def validate_demo_site_url(value: str) -> str:
+    try:
+        site_url = urllib.parse.urlsplit(value)
+    except ValueError as error:
+        raise EvidenceError("deployed demo-site URL is invalid") from error
+    if (
+        site_url.scheme != "https"
+        or site_url.username is not None
+        or site_url.password is not None
+        or site_url.port is not None
+        or site_url.hostname is None
+        or re.fullmatch(r"d[a-z0-9]+\.cloudfront\.net", site_url.hostname) is None
+        or site_url.path not in {"", "/"}
+        or site_url.query
+        or site_url.fragment
+    ):
+        raise EvidenceError(
+            "deployed demo-site URL must be an exact CloudFront HTTPS origin"
+        )
+    return f"https://{site_url.hostname}/"
+
+
 def run_direct_with_deployment(
     args: argparse.Namespace,
     path: Path,
@@ -2246,6 +2268,11 @@ def run_vapi(args: argparse.Namespace) -> None:
         "artifacts/demo-site/demo-site.zip",
         MAX_SITE_BUNDLE_BYTES,
     )
+    site_url = None
+    if ledger.get("enable_demo_site"):
+        site_url = validate_demo_site_url(
+            nested_outputs(ledger, environment, "DemoSite").get("TestSiteUrl", "")
+        )
 
     nonce = secrets.token_hex(12)
     basename = f"vapi-web-transfer-{args.hangup_origin}-{nonce}"
@@ -2288,8 +2315,6 @@ def run_vapi(args: argparse.Namespace) -> None:
             "node",
             os.fspath(VAPI_HARNESS),
             "observe",
-            "--site-dir",
-            os.fspath(site_dir),
             "--assistant-id",
             assistant_id,
             "--session",
@@ -2307,6 +2332,10 @@ def run_vapi(args: argparse.Namespace) -> None:
             "--timeout-seconds",
             str(args.observer_timeout_seconds),
         ]
+        if site_url is None:
+            browser_command.extend(["--site-dir", os.fspath(site_dir)])
+        else:
+            browser_command.extend(["--site-url", site_url])
         agent_command = [
             "node",
             os.fspath(AGENT_HARNESS),

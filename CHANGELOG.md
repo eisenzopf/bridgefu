@@ -4,9 +4,9 @@
 
 This working tree is not yet a published release. An owner-reviewed immutable
 revision and the protected two-platform OCI candidate remain 0.9.0 release
-gates. The rvoip #54 fix and fourth exact-Chromium pass, TURN/public-NAT,
-live-provider and reference tenant checks, cloud deployment evidence, and the
-one-hour qualification profiles remain explicit 1.0 gates.
+gates. TURN/public-NAT, live-provider and reference tenant checks, cloud
+deployment evidence, and the one-hour qualification profiles remain explicit
+1.0 gates.
 
 ### Neutral-label compatibility note
 
@@ -21,6 +21,30 @@ one-hour qualification profiles remain explicit 1.0 gates.
   preview must disable canary admission, drain calls and pending cleanup, wait
   the full 24-hour idempotency-retention window, deploy while disabled, and
   verify before re-enabling.
+
+### rvoip 0.3.7 registry integration — 2026-08-07
+
+- Repinned all 25 resolved rvoip packages to exact crates.io `0.3.7`
+  releases with registry checksums and removed the coordinated Git patch table.
+  The published archives identify release commit
+  `dba121e95be128a5333d0986cb077596bc509e21` in their Cargo VCS metadata.
+- Compared every Bridgefu-local rvoip commit after 0.3.5 with the 0.3.7
+  release. Ten changes are patch-equivalent in the release history; the
+  primary-audio-without-MID change was integrated with equivalent logic and
+  its regression test after intervening RTP work.
+- Reran focused published-package tests for late Amazon Connect tracks,
+  wildcard Contact routing, WebRTC driver backpressure and responsive unbind,
+  no-MID audio and DTMF, Connect startup/route retention, media establishment,
+  bounded UDP allocation, Opus fmtp passthrough, and remote codec preference.
+  All pass under the lockfiles shipped in the crates.io packages.
+- The exact ignored built-TypeScript-SDK Chromium→generic-WSS qualification
+  now passes both hangup directions. This closes the rvoip #54 dependency
+  blocker without a Bridgefu-local rvoip patch.
+- Strengthened the optional recipe demo-site gate to inspect the deployed
+  CloudFront distribution, OAC, zero-TTL policy, response-header policy,
+  private S3 origin, redirect, exact released asset bytes, and public config.
+  Deployed Vapi browser qualification now loads the CloudFront assets while
+  keeping its one-run nonce in browser interception rather than publishing it.
 
 ### Recipe-first product and AWS packaging — 2026-07-31
 
@@ -85,7 +109,7 @@ the PR and protected two-platform workflow pass.
 - The complete candidate diff, not only a historical commit range, is the
   review scope. Formatting, whitespace validation, strict all-target/all-feature
   Clippy, the locked all-target Rust suite, and the TypeScript SDK suite pass.
-- The release-candidate build now uses exact crates.io `=0.3.5` rvoip
+- The release-candidate build now uses exact crates.io `=0.3.7` rvoip
   component packages, with registry checksums and the complete transitive graph
   recorded in `Cargo.lock`; a sibling checkout is no longer a build input.
   Later references to `../rvoip` retain historical evidence from the original
@@ -93,10 +117,9 @@ the PR and protected two-platform workflow pass.
 - The credential-free nine-check runtime smoke and a hardened native
   `linux/arm64` image build pass. No cloud infrastructure, live provider call,
   registry publication, or one-hour release profile was run.
-- Exact built-SDK Chromium qualification passes for generic SIP, Amazon
-  Connect, and Telnyx. Generic WSS reaches Bridgefu's rvoip core but outbound
-  RFC 4733 never reaches Chromium; the dependency defect is recorded as
-  [rvoip issue #54](https://github.com/eisenzopf/rvoip/issues/54).
+- Exact built-SDK Chromium qualification passes for generic SIP, generic WSS,
+  Amazon Connect, and Telnyx. The 0.3.7 generic-WSS rerun closes the dependency
+  defect recorded as [rvoip issue #54](https://github.com/eisenzopf/rvoip/issues/54).
 
 ### rvoip 0.3.5 registry integration — 2026-07-31
 

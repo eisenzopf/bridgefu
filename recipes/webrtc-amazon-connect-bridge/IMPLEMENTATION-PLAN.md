@@ -69,34 +69,31 @@ for the exact browser-to-Connect path.
 
 ### 2.1 rvoip hardening intake
 
-There is additional rvoip work consumed by the separate `vapi-local` checkout.
-It was reviewed before freezing this runtime dependency and was not imported
-wholesale:
+Additional local rvoip work was reviewed before freezing this runtime
+dependency and was not imported wholesale:
 
-- Bridgefu pins the rvoip `0.3.5` crate family to qualified commit
-  `7eb6f3f040139d7bad24629968284a683bf77f68`. It descends from the prior
+- Bridgefu pins the exact checksummed rvoip `0.3.7` crate family from crates.io,
+  published from `dba121e95be128a5333d0986cb077596bc509e21`. It descends from the prior
   Connect-specific startup media-route and establishment-eviction fixes, adds
   a bounded inclusive UDP allocator, avoids unnecessary Opus-to-Opus
   transcoding when only `fmtp` differs, and preserves the browser's offered
   codec preference order in SDP answers.
-- The local rvoip branch `fix/media-graph-establishment-eviction` is divergent
-  from that pin and contains 14 commits beyond its `main`: 12 are on the remote
-  branch and two are currently local-only.
-- The first branch commit, `40ea95f9`, was cleanly cherry-picked in the
-  ancestry of the current pin. It changes generic `rvoip-core` media-graph
-  behavior so establishment backpressure does not evict a healthy media sink
-  and adds sinkless-frame evidence.
-- The core portions of the latency, renegotiation, and flush commits may also
-  be relevant. They need source and test review against the browser WebRTC and
-  Connect adapters.
+- All 11 Bridgefu-local commits after 0.3.5 are represented in 0.3.7. Ten are
+  patch-equivalent in the release history; the primary-audio-without-MID change
+  has equivalent release logic and its regression test after intervening RTP
+  work.
+- Published-package regressions pass for late Connect tracks, wildcard Contact
+  routing, driver backpressure and responsive unbind, no-MID audio and DTMF,
+  Connect route retention, establishment backpressure, bounded UDP allocation,
+  Opus fmtp passthrough, and answer codec preference.
 - Most other changes are specifically for `rvoip-vapi` raw WebSocket audio
   framing, jitter, pacing, queueing, control, and telemetry. That transport is
   not present in this architecture and must not become a new dependency.
 - The SIP listener-policy commit is also outside this direct path.
-- The `vapi-local` worktree has uncommitted work and local path dependencies.
-  It is evidence and a test consumer, not a release source for Bridgefu.
+- Any separate `vapi-local` worktree remains evidence and a test consumer, not
+  a release source for Bridgefu.
 
-The clean candidate was created from the prior Bridgefu pin, preserving the
+The historical clean candidate was created from the prior Bridgefu pin, preserving the
 Connect startup-route fix. A follow-up experiment that reduced the media queue
 to 500 ms and re-armed eviction history on renegotiation failed the Chromium
 gate twice with timing-sensitive replacement-media failures; it was excluded.

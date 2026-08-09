@@ -48,9 +48,19 @@ Parameters:
     AllowedValues: [sips_srtp, sip_rtp]
   ContextTtlSeconds:
     Type: Number
-    Default: 86400
+    Default: 3600
     MinValue: 300
     MaxValue: 604800
+  ScreenPopFieldsJson:
+    Type: String
+    MaxLength: 4096
+    Description: Ordered, bounded text/choice field schema shared by Vapi and Connect.
+  RoutingFieldKey:
+    Type: String
+    Default: ''
+    MaxLength: 40
+    AllowedPattern: '^$|^[a-z][a-z0-9_]{0,39}$'
+    Description: Optional choice-field key whose value selects a reviewed Connect flow.
   LambdaReservedConcurrencyPerFunction:
     Type: Number
     Default: 20
@@ -188,6 +198,17 @@ Resources:
         - {Key: ManagedBy, Value: !Ref ManagedByTag}
         - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
 
+  VapiIdentityBinding:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'bridgefu-${DeploymentId}-vapi-identity'
+      Description: Non-credential binding for the exact Vapi organization and owned template assistant.
+      SecretString: '{"status":"unbound"}'
+      Tags:
+        - {Key: Project, Value: !Ref ProjectTag}
+        - {Key: ManagedBy, Value: !Ref ManagedByTag}
+        - {Key: BridgefuExecutionId, Value: !Ref ExecutionIdTag}
+
   BridgefuApiBearerSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -265,10 +286,13 @@ Resources:
                 Resource: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret]
+                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret, !Ref VapiIdentityBinding]
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub '${PrepareLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TransferFunction.Arn
       Tags:
         - {Key: Project, Value: !Ref ProjectTag}
         - {Key: ManagedBy, Value: !Ref ManagedByTag}
@@ -294,7 +318,7 @@ Resources:
                 Resource: !If [RetainData, !GetAtt ProductionHandoffTable.Arn, !GetAtt TestHandoffTable.Arn]
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret, !Ref BridgefuApiBearerSecret]
+                Resource: [!Ref CorrelationKeySecret, !Ref VapiWebhookSecret, !Ref VapiIdentityBinding, !Ref BridgefuApiBearerSecret]
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub '${TransferLogGroup.Arn}:*'
@@ -349,7 +373,7 @@ Resources:
       Architectures: [arm64]
       Handler: handler.lambda_handler
       MemorySize: 256
-      Timeout: 10
+      Timeout: 20
       ReservedConcurrentExecutions: !If
         - UseReservedConcurrency
         - !Ref LambdaReservedConcurrencyPerFunction
@@ -364,8 +388,11 @@ Resources:
           HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
           CORRELATION_KEY_SECRET_ARN: !Ref CorrelationKeySecret
           VAPI_WEBHOOK_SECRET_ARN: !Ref VapiWebhookSecret
+          VAPI_IDENTITY_BINDING_ARN: !Ref VapiIdentityBinding
           DEPLOYMENT_ID: !Ref DeploymentId
           CONTEXT_TTL_SECONDS: !Ref ContextTtlSeconds
+          SCREEN_POP_FIELDS_JSON: !Ref ScreenPopFieldsJson
+          TRANSFER_FUNCTION_NAME: !Ref TransferFunction
       Tags:
         - {Key: Project, Value: !Ref ProjectTag}
         - {Key: ManagedBy, Value: !Ref ManagedByTag}
@@ -395,6 +422,7 @@ Resources:
           HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
           CORRELATION_KEY_SECRET_ARN: !Ref CorrelationKeySecret
           VAPI_WEBHOOK_SECRET_ARN: !Ref VapiWebhookSecret
+          VAPI_IDENTITY_BINDING_ARN: !Ref VapiIdentityBinding
           BRIDGEFU_API_BEARER_SECRET_ARN: !Ref BridgefuApiBearerSecret
           BRIDGEFU_CONTROL_BASE_URL: !Ref BridgefuControlBaseUrl
           BRIDGEFU_ROUTE_ID: !Ref BridgefuRouteId
@@ -432,6 +460,8 @@ Resources:
       Environment:
         Variables:
           HANDOFF_TABLE_NAME: !If [RetainData, !Ref ProductionHandoffTable, !Ref TestHandoffTable]
+          SCREEN_POP_FIELDS_JSON: !Ref ScreenPopFieldsJson
+          ROUTING_FIELD_KEY: !Ref RoutingFieldKey
       Tags:
         - {Key: Project, Value: !Ref ProjectTag}
         - {Key: ManagedBy, Value: !Ref ManagedByTag}
@@ -457,7 +487,7 @@ Resources:
       IntegrationUri: !GetAtt PrepareFunction.Arn
       IntegrationMethod: POST
       PayloadFormatVersion: '2.0'
-      TimeoutInMillis: 10000
+      TimeoutInMillis: 20000
 
   TransferIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -545,12 +575,16 @@ Outputs:
     Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
   PrepareUrl:
     Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/prepare-handoff'
+  VapiToolUrl:
+    Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/prepare-handoff'
   TransferUrl:
     Value: !Sub 'https://${HandoffApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v1/transfer-destination'
   CorrelationKeySecretArn:
     Value: !Ref CorrelationKeySecret
   VapiWebhookSecretArn:
     Value: !Ref VapiWebhookSecret
+  VapiIdentityBindingArn:
+    Value: !Ref VapiIdentityBinding
   BridgefuApiBearerSecretArn:
     Value: !Ref BridgefuApiBearerSecret
   PrepareLogGroupName:

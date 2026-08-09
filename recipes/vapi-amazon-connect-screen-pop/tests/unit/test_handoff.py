@@ -20,9 +20,13 @@ from bridgefu_handoff import (  # noqa: E402
     derive_correlation_id,
     prepare_handoff,
     prepare_vapi_response,
+    direct_transfer_response,
     transfer_destination,
+    vapi_control_url,
     verify_bearer,
+    verify_vapi_binding,
 )
+from screen_pop import parse_fields, schema_hash, vapi_parameters  # noqa: E402
 
 
 KEY = b"correlation-key-is-distinct-and-at-least-32-bytes"
@@ -41,7 +45,11 @@ def prepare_event(**overrides):
     return {
         "message": {
             "type": "tool-calls",
-            "call": {"id": "call_test_001", "orgId": "org_test_001"},
+            "call": {
+                "id": "call_test_001",
+                "orgId": "org_test_001",
+                "assistantId": "assistant_test_001",
+            },
             "toolCallList": [
                 {
                     "id": "tool_test_001",
@@ -78,7 +86,11 @@ def current_prepare_event(**overrides):
 def transfer_event(**extra):
     message = {
         "type": "transfer-destination-request",
-        "call": {"id": "call_test_001", "orgId": "org_test_001"},
+        "call": {
+            "id": "call_test_001",
+            "orgId": "org_test_001",
+            "assistantId": "assistant_test_001",
+        },
     }
     message.update(extra)
     return {"message": message}
@@ -334,6 +346,7 @@ class HandoffContractTests(unittest.TestCase):
             set(available),
             {
                 "context_available",
+                "routing_value",
                 "customer_name",
                 "issue_summary",
                 "intent",
@@ -342,6 +355,7 @@ class HandoffContractTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(isinstance(value, str) for value in available.values()))
+        self.assertEqual(available["routing_value"], "")
         self.assertNotIn(prepared.correlation_id, available.values())
         self.assertEqual(
             connect_lookup({}, store, now=NOW)["context_available"], "false"
@@ -378,6 +392,263 @@ class HandoffContractTests(unittest.TestCase):
                     "isBase64Encoded": False,
                 }
             )
+
+    def test_vapi_binding_rejects_another_org_or_assistant(self):
+        binding = {
+            "status": "bound",
+            "organization_id": "org_test_001",
+            "assistant_id": "assistant_test_001",
+        }
+        verify_vapi_binding(prepare_event(), binding)
+        verify_vapi_binding(prepare_event(), {"status": "unbound"})
+        wrong_org = prepare_event()
+        wrong_org["message"]["call"]["orgId"] = "org_attacker"
+        wrong_assistant = prepare_event()
+        wrong_assistant["message"]["call"]["assistantId"] = "assistant_attacker"
+        for event in (wrong_org, wrong_assistant):
+            with self.assertRaisesRegex(HandoffError, "vapi_identity_mismatch"):
+                verify_vapi_binding(event, binding)
+        with self.assertRaisesRegex(HandoffError, "vapi_identity_binding_invalid"):
+            verify_vapi_binding(prepare_event(), {"status": "bound"})
+
+    def test_configurable_text_and_choice_schema_round_trips_as_v2_slots(self):
+        fields = parse_fields(
+            [
+                {
+                    "key": "customer_name",
+                    "label": "Customer",
+                    "description": "Caller name.",
+                    "type": "text",
+                    "required": True,
+                    "max_length": 80,
+                },
+                {
+                    "key": "priority",
+                    "label": "Priority",
+                    "description": "Support priority.",
+                    "type": "choice",
+                    "required": True,
+                    "choices": ["normal", "urgent"],
+                },
+                {
+                    "key": "case_note",
+                    "label": "Case note",
+                    "description": "Optional case note.",
+                    "type": "text",
+                    "required": False,
+                    "max_length": 256,
+                },
+            ]
+        )
+        event = prepare_event()
+        call = event["message"]["toolCallList"][0]
+        call["name"] = "prepare_bridgefu_amazon_connect_transfer"
+        call["arguments"] = {
+            "customer_name": "Ada Lovelace",
+            "priority": "urgent",
+        }
+        store = FakeStore()
+        prepared = prepare_handoff(
+            event,
+            store,
+            KEY,
+            DEPLOYMENT,
+            3_600,
+            now=NOW,
+            configured_fields=fields,
+        )
+        record = store.records[prepared.correlation_id]
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["screen_pop_schema_hash"], schema_hash(fields))
+        self.assertEqual(
+            record["screen_pop_values"],
+            {
+                "customer_name": "Ada Lovelace",
+                "priority": "urgent",
+                "case_note": "",
+            },
+        )
+        lookup = connect_lookup(
+            {
+                "Details": {
+                    "ContactData": {
+                        "Attributes": {"correlation_id": prepared.correlation_id}
+                    }
+                }
+            },
+            store,
+            now=NOW,
+            configured_fields=fields,
+        )
+        self.assertEqual(lookup["context_available"], "true")
+        self.assertEqual(lookup["screen_pop_label_1"], "Customer")
+        self.assertEqual(lookup["screen_pop_value_1"], "Ada Lovelace")
+        self.assertEqual(lookup["screen_pop_label_2"], "Priority")
+        self.assertEqual(lookup["screen_pop_value_2"], "urgent")
+        self.assertEqual(lookup["screen_pop_label_3"], "Case note")
+        self.assertEqual(lookup["screen_pop_value_3"], "")
+        self.assertEqual(lookup["routing_value"], "")
+        routed = connect_lookup(
+            {
+                "Details": {
+                    "ContactData": {
+                        "Attributes": {"correlation_id": prepared.correlation_id}
+                    }
+                }
+            },
+            store,
+            now=NOW,
+            configured_fields=fields,
+            routing_field_key="priority",
+        )
+        self.assertEqual(routed["routing_value"], "urgent")
+        self.assertEqual(routed["context_available"], "true")
+        self.assertEqual(
+            connect_lookup(
+                {
+                    "Details": {
+                        "ContactData": {
+                            "Attributes": {"correlation_id": prepared.correlation_id}
+                        }
+                    }
+                },
+                store,
+                now=NOW,
+                configured_fields=fields,
+                routing_field_key="customer_name",
+            )["context_available"],
+            "false",
+        )
+        schema = vapi_parameters(fields)
+        self.assertEqual(schema["properties"]["priority"]["enum"], ["normal", "urgent"])
+        self.assertNotIn("case_note", schema["required"])
+
+    def test_configurable_values_reject_invalid_choice_missing_required_and_conflict(self):
+        fields = parse_fields(
+            [
+                {
+                    "key": "priority",
+                    "label": "Priority",
+                    "description": "Support priority.",
+                    "type": "choice",
+                    "required": True,
+                    "choices": ["normal", "urgent"],
+                }
+            ]
+        )
+
+        def event(arguments):
+            value = prepare_event()
+            call = value["message"]["toolCallList"][0]
+            call["name"] = "prepare_bridgefu_amazon_connect_transfer"
+            call["arguments"] = arguments
+            return value
+
+        for invalid in ({}, {"priority": "invalid"}, {"priority": "urgent", "extra": "x"}):
+            with self.assertRaises(HandoffError):
+                prepare_handoff(
+                    event(invalid),
+                    FakeStore(),
+                    KEY,
+                    DEPLOYMENT,
+                    3_600,
+                    now=NOW,
+                    configured_fields=fields,
+                )
+        store = FakeStore()
+        first = prepare_handoff(
+            event({"priority": "urgent"}),
+            store,
+            KEY,
+            DEPLOYMENT,
+            3_600,
+            now=NOW,
+            configured_fields=fields,
+        )
+        self.assertTrue(
+            prepare_handoff(
+                event({"priority": "urgent"}),
+                store,
+                KEY,
+                DEPLOYMENT,
+                3_600,
+                now=NOW + 1,
+                configured_fields=fields,
+            ).replayed
+        )
+        with self.assertRaisesRegex(HandoffError, "handoff_replay_conflict"):
+            prepare_handoff(
+                event({"priority": "normal"}),
+                store,
+                KEY,
+                DEPLOYMENT,
+                3_600,
+                now=NOW + 2,
+                configured_fields=fields,
+            )
+        self.assertNotIn(first.correlation_id, json.dumps(direct_transfer_response(first)))
+
+    def test_optional_choice_can_be_omitted_and_routes_to_default(self):
+        fields = parse_fields(
+            [
+                {
+                    "key": "queue",
+                    "label": "Queue",
+                    "description": "Reviewed support route.",
+                    "type": "choice",
+                    "required": False,
+                    "choices": ["sales", "support"],
+                }
+            ]
+        )
+        event = prepare_event()
+        call = event["message"]["toolCallList"][0]
+        call["name"] = "prepare_bridgefu_amazon_connect_transfer"
+        call["arguments"] = {}
+        store = FakeStore()
+        prepared = prepare_handoff(
+            event,
+            store,
+            KEY,
+            DEPLOYMENT,
+            3_600,
+            now=NOW,
+            configured_fields=fields,
+        )
+        lookup = connect_lookup(
+            {
+                "Details": {
+                    "ContactData": {
+                        "Attributes": {"correlation_id": prepared.correlation_id}
+                    }
+                }
+            },
+            store,
+            now=NOW,
+            configured_fields=fields,
+            routing_field_key="queue",
+        )
+        self.assertEqual(lookup["context_available"], "true")
+        self.assertEqual(lookup["routing_value"], "")
+
+    def test_vapi_control_url_rejects_ssrf_and_accepts_only_vapi_https(self):
+        event = prepare_event()
+        event["message"]["call"]["monitor"] = {
+            "controlUrl": "https://api.vapi.ai/call/control"
+        }
+        self.assertEqual(
+            vapi_control_url(event), "https://api.vapi.ai/call/control"
+        )
+        for invalid in (
+            "http://api.vapi.ai/control",
+            "https://api.vapi.ai@example.invalid/control",
+            "https://example.invalid/control",
+            "https://api.vapi.ai/control?token=secret",
+            "https://api.vapi.ai/../admin",
+        ):
+            event["message"]["call"]["monitor"]["controlUrl"] = invalid
+            with self.assertRaisesRegex(HandoffError, "vapi_control_url_invalid"):
+                vapi_control_url(event)
 
 
 class FakeStoreFromEvent(FakeStore):

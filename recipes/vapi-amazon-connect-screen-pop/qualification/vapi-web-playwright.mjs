@@ -2,8 +2,9 @@
 /**
  * Controlled stock Vapi webCall source for the flagship recipe.
  *
- * The exact immutable demo-site bundle is served only on 127.0.0.1. The
- * browser-safe public key stays in process memory, the raw Vapi call ID is
+ * The exact immutable demo-site bundle is served either by the deployed
+ * CloudFront distribution or, for a non-deployed qualification, on 127.0.0.1.
+ * The browser-safe public key stays in process memory, the raw Vapi call ID is
  * exchanged through a mode-0600 handshake, and retained output contains only
  * hashes, counts, timestamps, and fixed labels.
  */
@@ -205,6 +206,28 @@ function validateAssistantId(value) {
 function validateSha256(value, label) {
   if (!/^[0-9a-f]{64}$/.test(value)) fail(`${label} digest is invalid`);
   return value;
+}
+
+function validateSiteUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail("deployed demo-site URL is invalid");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.port ||
+    !/^d[a-z0-9]+\.cloudfront\.net$/.test(parsed.hostname) ||
+    !["", "/"].includes(parsed.pathname) ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    fail("deployed demo-site URL must be an exact CloudFront HTTPS origin");
+  }
+  return `${parsed.origin}/`;
 }
 
 function writeProbeWav(path) {
@@ -556,7 +579,13 @@ async function localSite(siteDir, config) {
 }
 
 async function observe(options) {
-  const siteDir = resolve(required(options, "--site-dir"));
+  const siteDirectoryOption = options.get("--site-dir");
+  const siteUrlOption = options.get("--site-url");
+  if ((typeof siteDirectoryOption === "string") === (typeof siteUrlOption === "string")) {
+    fail("provide exactly one of --site-dir or --site-url");
+  }
+  const siteDir =
+    typeof siteDirectoryOption === "string" ? resolve(siteDirectoryOption) : null;
   const assistantId = validateAssistantId(required(options, "--assistant-id"));
   const sessionPath = resolve(required(options, "--session"));
   const readyPath = resolve(required(options, "--ready"));
@@ -574,7 +603,7 @@ async function observe(options) {
     if (existsSync(output)) fail("qualification output path already exists");
   }
   const nonce = randomBytes(32).toString("base64url");
-  const site = await localSite(siteDir, {
+  const qualificationConfig = {
     schema_version: 1,
     recipe: "vapi-amazon-connect-screen-pop@1",
     vapi_public_key: publicKey,
@@ -582,7 +611,10 @@ async function observe(options) {
     release_revision: siteBundleSha256,
     qualification_nonce: nonce,
     qualification_hangup_origin: hangupOrigin,
-  });
+  };
+  const site = siteDir
+    ? await localSite(siteDir, qualificationConfig)
+    : { url: validateSiteUrl(siteUrlOption), close: async () => {} };
   const probePath = join(dirname(observationPath), `.vapi-probe-${randomBytes(12).toString("hex")}.wav`);
   writeProbeWav(probePath);
   const browser = await chromium.launch({
@@ -599,7 +631,36 @@ async function observe(options) {
     const context = await browser.newContext({ permissions: ["microphone"] });
     await context.addInitScript(installProbe);
     const page = await context.newPage();
-    await page.goto(site.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    if (!siteDir) {
+      await page.route(new URL("config.json", site.url).href, (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "application/json; charset=utf-8",
+          headers: { "Cache-Control": "no-store" },
+          body: JSON.stringify(qualificationConfig),
+        }),
+      );
+    }
+    const navigation = await page.goto(site.url, {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+    if (!navigation || navigation.status() !== 200) {
+      fail("immutable Vapi demo site navigation failed");
+    }
+    if (!siteDir) {
+      const headers = navigation.headers();
+      if (
+        !headers["cache-control"]?.toLowerCase().includes("no-store") ||
+        headers["x-frame-options"]?.toUpperCase() !== "DENY" ||
+        headers["x-content-type-options"]?.toLowerCase() !== "nosniff" ||
+        headers["cross-origin-opener-policy"]?.toLowerCase() !== "same-origin" ||
+        headers["permissions-policy"]?.replaceAll(" ", "") !== "microphone=(self)" ||
+        !headers["content-security-policy"]?.includes("frame-ancestors 'none'")
+      ) {
+        fail("deployed CloudFront demo site security headers changed");
+      }
+    }
     await waitForSiteReady(page, Math.min(timeoutMs, 30_000));
     const startedAtMs = Date.now();
     await page.locator("#start").click();

@@ -131,7 +131,14 @@ cleanup. The collector joins those facts to DynamoDB, Connect lookup, and all
 six runtime lifecycle stages.
 
 The Vapi path uses the exact immutable demo-site ZIP from the published
-release, served only from `127.0.0.1`. Put the browser-safe public key in the
+release. A demo-site-enabled live qualification loads its HTML, JavaScript,
+CSS, and license assets from the deployed CloudFront distribution; a
+non-deployed qualification falls back to a server bound only to `127.0.0.1`.
+For the live browser run, only `config.json` is intercepted in memory to add
+the one-run qualification nonce and selected hangup direction. `verify`
+separately proves the deployed public configuration, exact release bytes,
+private S3 origin, zero-cache policy, origin access control, redirect, content
+types, and security headers. Put the browser-safe public key in the
 environment; never substitute the private Vapi key. The private key remains in
 the execution-owned Secrets Manager secret and is read only by the qualifier
 role to verify the final Vapi call object:

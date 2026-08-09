@@ -13,10 +13,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
-pub const COORDINATED_RVOIP_VERSION: &str = "0.3.5";
+pub const COORDINATED_RVOIP_VERSION: &str = "0.3.7";
 const LATENCY_MAX_US: u64 = 1_000_000;
-pub const APPROVED_RVOIP_REVISION: &str = "7eb6f3f040139d7bad24629968284a683bf77f68";
-pub const APPROVED_RVOIP_SOURCE: &str = "git+https://github.com/eisenzopf/rvoip.git?rev=7eb6f3f040139d7bad24629968284a683bf77f68#7eb6f3f040139d7bad24629968284a683bf77f68";
+pub const PUBLISHED_RVOIP_REVISION: &str = "dba121e95be128a5333d0986cb077596bc509e21";
+pub const APPROVED_RVOIP_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -239,19 +239,23 @@ pub fn rvoip_lock_evidence(manifest_dir: &Path) -> RvoipLockEvidence {
             assert_eq!(
                 package.source.as_deref(),
                 Some(APPROVED_RVOIP_SOURCE),
-                "{} must resolve from its approved immutable source",
+                "{} must resolve from crates.io",
                 package.name
             );
             assert!(
-                package.checksum.is_none(),
-                "Git-pinned {} must not claim a registry checksum",
+                package
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|checksum| checksum.len() == 64
+                        && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                "registry package {} must have a SHA-256 checksum",
                 package.name
             );
             CargoPackageEvidence {
                 name: package.name,
                 version: package.version,
-                source: package.source.expect("validated immutable source"),
-                checksum: None,
+                source: package.source.expect("validated registry source"),
+                checksum: package.checksum,
             }
         })
         .collect::<Vec<_>>();
@@ -407,15 +411,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_evidence_uses_the_coordinated_immutable_git_revision() {
+    fn lock_evidence_uses_the_checksummed_registry_release() {
         let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert_eq!(evidence.release_version, "0.3.5");
+        assert_eq!(evidence.release_version, "0.3.7");
         assert!(evidence
             .packages
             .iter()
-            .all(|package| package.version == "0.3.5"
+            .all(|package| package.version == "0.3.7"
                 && package.source == APPROVED_RVOIP_SOURCE
-                && package.checksum.is_none()));
-        assert!(APPROVED_RVOIP_SOURCE.contains(APPROVED_RVOIP_REVISION));
+                && package
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|value| value.len() == 64)));
     }
 }

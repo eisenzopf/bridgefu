@@ -1,0 +1,398 @@
+name: Bridgefu Setup native packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed_release:
+        description: Publish signed installers after validating retained live-qualification evidence
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Existing setup-v* tag pointing at this exact commit (signed releases only)
+        required: false
+        type: string
+      qualification_run_id:
+        description: Workflow run containing bridgefu-setup-release-qualification (signed releases only)
+        required: false
+        type: string
+      qualification_evidence_sha256:
+        description: Reviewed SHA-256 of the qualification evidence JSON (signed releases only)
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  attestations: write
+  contents: write
+  id-token: write
+
+concurrency:
+  group: bridgefu-setup-native-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - label: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - label: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - label: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      SIGNED_RELEASE: ${{ inputs.signed_release }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: bridgefu
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pin
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: bridgefu
+          shared-key: setup-${{ matrix.label }}
+      - name: Install Linux desktop packaging prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libfuse2t64 patchelf protobuf-compiler rpm
+      - name: Install the exact Dioxus packaging CLI
+        run: cargo install dioxus-cli --version 0.7.10 --locked
+      - name: Verify setup engine and Vapire snapshot
+        working-directory: bridgefu
+        run: |
+          cargo test --locked -p bridgefu-setup-core
+          python3 scripts/check-vapire-iac-snapshot.py
+          python3 scripts/check-setup-release-qualification.py --self-test
+      - name: Build companion CLI
+        working-directory: bridgefu
+        run: cargo build --locked --release --bin bridgefu
+      - name: Stage Unix companion sidecar
+        if: runner.os != 'Windows'
+        working-directory: bridgefu
+        run: |
+          install -m 0755 target/release/bridgefu \
+            "apps/bridgefu-setup/bin/bridgefu-${{ matrix.target }}"
+      - name: Stage Windows companion sidecar
+        if: runner.os == 'Windows'
+        working-directory: bridgefu
+        shell: pwsh
+        run: |
+          Copy-Item target/release/bridgefu.exe `
+            "apps/bridgefu-setup/bin/bridgefu.exe-${{ matrix.target }}"
+
+      - name: Require Apple release credentials
+        if: runner.os == 'macOS' && inputs.signed_release
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name:-}" || { echo "missing required Apple release secret: $name" >&2; exit 1; }
+          done
+      - name: Sign the macOS companion sidecar
+        if: runner.os == 'macOS' && inputs.signed_release
+        working-directory: bridgefu
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/bridgefu-setup-signing.keychain-db"
+          certificate="$RUNNER_TEMP/bridgefu-setup-signing.p12"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/{print $2; exit}')"
+          test -n "$identity"
+          codesign --force --options runtime --timestamp --sign "$identity" \
+            "apps/bridgefu-setup/bin/bridgefu-${{ matrix.target }}"
+          codesign --verify --strict --verbose=2 \
+            "apps/bridgefu-setup/bin/bridgefu-${{ matrix.target }}"
+          perl -0pi -e 's/\[bundle\.macos\]\n/[bundle.macos]\nsigning_identity = "'"$identity"'"\n/' \
+            apps/bridgefu-setup/Dioxus.toml
+
+      - name: Require and install Windows release certificate
+        if: runner.os == 'Windows' && inputs.signed_release
+        working-directory: bridgefu
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "missing required Windows release certificate secrets"
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "bridgefu-setup-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD `
+            -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          if ($null -eq $certificate -or [string]::IsNullOrWhiteSpace($certificate.Thumbprint)) {
+            throw "Windows signing certificate import failed"
+          }
+          Add-Content apps/bridgefu-setup/Dioxus.toml `
+            "`ncertificate_thumbprint = `"$($certificate.Thumbprint)`""
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\signtool.exe$' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $signTool) { throw "signtool.exe was not found" }
+          $signTool.Directory.FullName | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          $thumbprint = $certificate.Thumbprint
+          & $signTool.FullName sign /fd sha256 /sha1 $thumbprint `
+            /tr http://timestamp.digicert.com /td sha256 target/release/bridgefu.exe
+          & $signTool.FullName sign /fd sha256 /sha1 $thumbprint `
+            /tr http://timestamp.digicert.com /td sha256 `
+            "apps/bridgefu-setup/bin/bridgefu.exe-${{ matrix.target }}"
+          Push-Location apps/bridgefu-setup
+          dx build --desktop --release --features bundle --target "${{ matrix.target }}"
+          Pop-Location
+          $setupExecutables = Get-ChildItem target/dx -Recurse -File -Filter *.exe |
+            Where-Object { $_.Name -ne 'bridgefu.exe' -and $_.Name -Match 'bridgefu.setup' }
+          if ($setupExecutables.Count -lt 1) { throw "Dioxus setup executable was not found" }
+          foreach ($executable in $setupExecutables) {
+            & $signTool.FullName sign /fd sha256 /sha1 $thumbprint `
+              /tr http://timestamp.digicert.com /td sha256 $executable.FullName
+          }
+
+      - name: Bundle candidate macOS packages
+        if: runner.os == 'macOS' && !inputs.signed_release
+        working-directory: bridgefu/apps/bridgefu-setup
+        run: >-
+          dx bundle --desktop --release --features bundle
+          --target "${{ matrix.target }}" --out-dir ../../target/setup-dist
+          --package-types macos --package-types dmg
+      - name: Bundle signed and notarized macOS packages
+        if: runner.os == 'macOS' && inputs.signed_release
+        working-directory: bridgefu/apps/bridgefu-setup
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: >-
+          dx bundle --desktop --release --features bundle
+          --target "${{ matrix.target }}" --out-dir ../../target/setup-dist
+          --package-types macos --package-types dmg
+      - name: Bundle Windows packages
+        if: runner.os == 'Windows'
+        working-directory: bridgefu/apps/bridgefu-setup
+        shell: pwsh
+        run: >-
+          dx bundle --desktop --release --features bundle
+          --target "${{ matrix.target }}" --out-dir ../../target/setup-dist
+          --package-types msi --package-types nsis
+      - name: Bundle Linux packages
+        if: runner.os == 'Linux'
+        working-directory: bridgefu/apps/bridgefu-setup
+        run: >-
+          dx bundle --desktop --release --features bundle
+          --target "${{ matrix.target }}" --out-dir ../../target/setup-dist
+          --package-types appimage --package-types deb --package-types rpm
+
+      - name: Smoke packaged macOS application
+        if: runner.os == 'macOS'
+        working-directory: bridgefu
+        run: |
+          set -euo pipefail
+          app="$(find target/setup-dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          test -x "$app/Contents/MacOS/bridgefu"
+          setup_executable="$(find "$app/Contents/MacOS" -maxdepth 1 -type f ! -name bridgefu -print -quit)"
+          test -x "$setup_executable"
+          "$setup_executable" --mock-workflow-smoke | grep '"status":"ok"'
+          if [[ "$SIGNED_RELEASE" == "true" ]]; then
+            codesign --verify --deep --strict --verbose=2 "$app"
+            xcrun stapler validate "$app"
+          fi
+      - name: Smoke packaged Windows application
+        if: runner.os == 'Windows'
+        working-directory: bridgefu
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem target/setup-dist -File -Filter *.exe | Select-Object -First 1
+          if ($null -eq $installer) { throw "NSIS installer was not produced" }
+          $installDirectory = Join-Path $env:RUNNER_TEMP 'BridgefuSetupSmoke'
+          $process = Start-Process -FilePath $installer.FullName `
+            -ArgumentList '/S', "/D=$installDirectory" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS smoke install failed" }
+          $sidecar = Get-ChildItem $installDirectory -Recurse -File -Filter bridgefu.exe |
+            Select-Object -First 1
+          $setup = Get-ChildItem $installDirectory -Recurse -File -Filter *.exe |
+            Where-Object { $_.Name -ne 'bridgefu.exe' -and $_.Name -NotMatch '^unins' } |
+            Select-Object -First 1
+          if ($null -eq $sidecar -or $null -eq $setup) {
+            throw "installed package does not contain Setup and its companion CLI"
+          }
+          $output = & $setup.FullName --mock-workflow-smoke
+          if ($LASTEXITCODE -ne 0 -or $output -notmatch '"status":"ok"') {
+            throw "installed Setup mocked workflow failed"
+          }
+          if ($env:SIGNED_RELEASE -eq 'true') {
+            foreach ($path in @($installer.FullName, $sidecar.FullName, $setup.FullName)) {
+              $signature = Get-AuthenticodeSignature $path
+              if ($signature.Status -ne 'Valid') {
+                throw "invalid Authenticode signature: $path ($($signature.Status))"
+              }
+            }
+          }
+      - name: Smoke packaged Linux application
+        if: runner.os == 'Linux'
+        working-directory: bridgefu
+        run: |
+          set -euo pipefail
+          appimage="$(find target/setup-dist -maxdepth 1 -type f -iname '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          chmod +x "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --mock-workflow-smoke \
+            | grep '"status":"ok"'
+
+      - name: Collect Unix packages and CLI archive
+        if: runner.os != 'Windows'
+        working-directory: bridgefu
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            app="$(find target/setup-dist -maxdepth 1 -type d -name '*.app' -print -quit)"
+            ditto -c -k --sequesterRsrc --keepParent "$app" \
+              "dist/Bridgefu-Setup-${{ matrix.label }}.app.zip"
+            find target/setup-dist -maxdepth 1 -type f -name '*.dmg' \
+              -exec cp {} dist/ \;
+          else
+            find target/setup-dist -maxdepth 1 -type f \
+              \( -iname '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+              -exec cp {} dist/ \;
+          fi
+          tar -C target/release -czf "dist/bridgefu-cli-${{ matrix.label }}.tar.gz" bridgefu
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum * > "SHA256SUMS-${{ matrix.label }}")
+          else
+            (cd dist && shasum -a 256 * > "SHA256SUMS-${{ matrix.label }}")
+          fi
+      - name: Collect Windows packages and CLI archive
+        if: runner.os == 'Windows'
+        working-directory: bridgefu
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/setup-dist/*.msi dist/
+          Copy-Item target/setup-dist/*.exe dist/
+          Compress-Archive target/release/bridgefu.exe `
+            dist/bridgefu-cli-${{ matrix.label }}.zip
+          Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content dist/SHA256SUMS-${{ matrix.label }}
+      - name: Attest native packages
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: bridgefu/dist/*
+      - name: Retain native packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridgefu-setup-${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 30
+          path: bridgefu/dist/*
+
+  assemble:
+    name: Assemble and optionally publish
+    needs: native
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: bridgefu
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bridgefu-setup-*
+          merge-multiple: true
+          path: release-dist
+      - name: Build combined SHA-256 manifest
+        run: |
+          set -euo pipefail
+          (cd release-dist && \
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - name: Download and validate exact live-qualification evidence
+        if: inputs.signed_release
+        env:
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+          QUALIFICATION_SHA256: ${{ inputs.qualification_evidence_sha256 }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^setup-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$QUALIFICATION_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$QUALIFICATION_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir qualification
+          gh run download "$QUALIFICATION_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name bridgefu-setup-release-qualification \
+            --dir qualification
+          mapfile -t evidence < <(find qualification -type f -name '*.json')
+          test "${#evidence[@]}" -eq 1
+          python3 bridgefu/scripts/check-setup-release-qualification.py \
+            "${evidence[0]}" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-sha256 "$QUALIFICATION_SHA256"
+          git -C bridgefu rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}"
+          test "$(git -C bridgefu rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"
+      - name: Attest assembled release set
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-dist/*
+      - name: Retain assembled candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridgefu-setup-native-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: release-dist/*
+      - name: Publish qualified signed release
+        if: inputs.signed_release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: >-
+          gh release create "$RELEASE_TAG" release-dist/*
+          --repo "$GITHUB_REPOSITORY" --verify-tag
+          --title "Bridgefu Setup ${RELEASE_TAG#setup-v}" --generate-notes

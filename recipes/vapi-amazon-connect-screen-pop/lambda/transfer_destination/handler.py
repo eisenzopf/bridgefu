@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -12,6 +13,7 @@ from bridgefu_handoff import (
     error_response,
     http_response,
     transfer_destination,
+    verify_vapi_binding,
     verify_bearer,
 )
 
@@ -48,10 +50,25 @@ def _bridgefu():
 def lambda_handler(event, _context):
     started_at = time.monotonic()
     try:
-        payload, headers = decode_http_json(event)
-        verify_bearer(
-            headers,
-            load_secret(os.environ["VAPI_WEBHOOK_SECRET_ARN"]),
+        internal = event.get("bridgefuInternalReserveV1")
+        if internal is not None:
+            if not isinstance(internal, dict) or set(internal) != {"call"}:
+                raise HandoffError("internal_reservation_invalid")
+            payload = {
+                "message": {
+                    "type": "transfer-destination-request",
+                    "call": internal["call"],
+                }
+            }
+        else:
+            payload, headers = decode_http_json(event)
+            verify_bearer(
+                headers,
+                load_secret(os.environ["VAPI_WEBHOOK_SECRET_ARN"]),
+            )
+        verify_vapi_binding(
+            payload,
+            json.loads(load_secret(os.environ["VAPI_IDENTITY_BINDING_ARN"])),
         )
         response = transfer_destination(
             payload,
@@ -62,7 +79,7 @@ def lambda_handler(event, _context):
             os.environ.get("SIP_SECURITY_SCHEME", "sips"),
         )
         result = "reserved"
-        output = http_response(200, response)
+        output = response if internal is not None else http_response(200, response)
     except HandoffError as error:
         result = error.code
         output = error_response(error)

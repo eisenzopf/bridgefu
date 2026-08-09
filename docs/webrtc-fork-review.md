@@ -8,17 +8,47 @@ maintainer contact.
 ## Authoritative release inputs
 
 Bridgefu now consumes exact crates.io
-`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.5 packages. The committed
+`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.7 packages. The committed
 Cargo.lock records their registry checksums and contains no Git or path package
-source. The validation runs below predate that package migration and were
+source. Each published package records release commit
+`dba121e95be128a5333d0986cb077596bc509e21` in `.cargo_vcs_info.json`. The
+historical validation runs below predate that package migration and were
 performed while both manifests temporarily used
 `rtc = { path = "../rtc/rtc" }` and Bridgefu's generated lock entry was
 path-resolved. Those overrides have been removed. Because the restored base
 and candidate worktrees were not the current published graph, the recorded
 RTC-dependent results remain local-composite validation rather than evidence
 for the authoritative release build. The local TURN and DTMF candidates
-described below must not be represented as qualified in 0.3.5 until their
-behavior is rerun against the locked package set.
+described below remain historical unless explicitly reconciled below.
+
+## 0.3.7 reconciliation of Bridgefu-local changes
+
+The 11 commits in Bridgefu's prior rvoip patch range were compared with the
+0.3.7 release history. Ten are patch-equivalent. The remaining
+primary-audio-without-MID commit is functionally present in release commit
+`43effd72`; its exact patch ID differs because the release integrated it after
+other RTP changes. The published source contains the same fail-closed behavior
+and regression test.
+
+Focused tests were run directly from the published packages with each
+package's shipped `Cargo.lock`:
+
+| Local behavior | Published 0.3.7 proof |
+|---|---|
+| Attach late Amazon Connect remote audio/DTMF tracks | `production_connector_uses_local_chime_and_rvoip_webrtc_only` |
+| Route wildcard SIP Contact through the observed source | `wildcard_contact_uses_observed_source_for_uas_bye` |
+| Wait through temporary driver backpressure while keeping unbind responsive | `rtp_write_waits_for_temporary_driver_backpressure` |
+| Accept primary audio without negotiated MID | `primary_audio_without_negotiated_mid_waits_for_track_binding` |
+| Preserve Connect media during startup backpressure | `connect_startup_backpressure_does_not_evict_the_media_route` and `amazon_connect_cross_transport_bridge_survives_startup_backpressure` |
+| Retain a healthy sink while another route establishes | `establishment_backpressure_does_not_evict` |
+| Bound, exhaust, and reuse per-peer UDP allocation atomically | `bounded_udp_allocator_is_atomic_exhaustible_and_reusable` |
+| Preserve encoded Opus when only fmtp differs | `opus_fmtp_asymmetry_preserves_the_encoded_payload_without_transcoding` |
+| Preserve the remote audio codec preference order | `answer_preserves_remote_audio_codec_preference_order` |
+| Deliver RFC 4733 without negotiated SDES MID | all four `dtmf_wire` tests, including `dtmf_reaches_a_peer_that_never_negotiates_the_sdes_mid_extension` |
+
+Bridgefu's exact ignored built-SDK Chromium→generic-WSS qualification also
+passes both terminal directions on the locked 0.3.7 graph. This closes the
+outbound-DTMF defect tracked as rvoip #54 without a local dependency patch.
 
 ## Local candidate provenance
 
@@ -161,16 +191,14 @@ composite; the TypeScript SDK passes 20/20. Bridgefu library 328/328,
 `call_execution_supervisor` 39/39, and the reference tenant's 48 core, 11 web, and
 16 Python tests plus production web build are also green.
 
-Those results prove only the recorded composite local checkouts. They do not
-prove that the current published rvoip 0.3.5 package graph has equivalent
-behavior.
+Those historical results prove only the recorded composite local checkouts.
+The 0.3.7 reconciliation above is the current published-package evidence for
+the behavior Bridgefu previously carried locally.
 
-Qualification now requires rerunning the focused suites, full WebRTC
-regressions, all four exact Chromium destinations, and the reference tenant
-regression gate against Bridgefu's committed Cargo.lock. If that exposes a
-missing engine fix, the project owner must review the minimal fork diff and
-approve a clean rvoip package update before Bridgefu changes versions. No fork
-push or upstream contact is authorized by this packet.
+The focused suites and the previously blocked exact Chromium generic-WSS case
+have been rerun against Bridgefu's committed 0.3.7 lock. Full release and live
+provider gates remain separate. No fork push or upstream contact is authorized
+by this packet.
 
 ## Owner-review and adoption sequence
 

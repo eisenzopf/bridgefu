@@ -1,3 +1,7 @@
+# Developer/runtime projection only. This is not an input to the initial
+# CloudFormation deployment. CloudFormation creates the recipe-owned wrapper
+# flow; replace connect_entry_contact_flow_id with the stack output only when
+# validating the compiled runtime projection after deployment.
 vapi_signaling_cidrs:
   - 198.51.100.0/24
 connect_instance_arn: arn:aws:connect:us-west-2:123456789012:instance/11111111-1111-1111-1111-111111111111

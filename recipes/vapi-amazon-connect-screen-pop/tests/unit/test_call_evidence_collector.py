@@ -28,6 +28,22 @@ SPEC.loader.exec_module(COLLECTOR)
 
 
 class CallEvidenceCollectorTests(unittest.TestCase):
+    def test_demo_site_url_accepts_only_an_exact_cloudfront_origin(self):
+        self.assertEqual(
+            COLLECTOR.validate_demo_site_url("https://d123example.cloudfront.net"),
+            "https://d123example.cloudfront.net/",
+        )
+        for value in (
+            "http://d123example.cloudfront.net",
+            "https://example.com",
+            "https://d123example.cloudfront.net/private",
+            "https://user@d123example.cloudfront.net",
+            "https://d123example.cloudfront.net?private=value",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(COLLECTOR.EvidenceError):
+                    COLLECTOR.validate_demo_site_url(value)
+
     def test_agent_failure_detail_only_exposes_allowlisted_prefix(self):
         safe = mock.Mock()
         safe.communicate.return_value = (

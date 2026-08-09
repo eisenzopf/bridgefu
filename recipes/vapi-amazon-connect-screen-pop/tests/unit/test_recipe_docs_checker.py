@@ -76,15 +76,24 @@ class RecipeDocsCheckerTests(unittest.TestCase):
         failures = self.failures(runbook=self.runbook.replace(path_b, mutated_path_b, 1))
         self.assertIn("fresh Path B must not use OLD_EXECUTION", failures)
 
-    def test_canonical_ip_only_init_rejects_forbidden_posture_flags(self):
-        mutated = self.runbook.replace(
-            "  --create-connect-demo\n",
+    def test_canonical_ip_only_init_requires_demo_site_and_rejects_dns_flags(self):
+        missing_demo = self.runbook.replace(
             "  --create-connect-demo \\\n  --enable-demo-site\n",
+            "  --create-connect-demo\n",
+            1,
+        )
+        self.assertIn(
+            "canonical live init must enable the CloudFront demo site",
+            self.failures(runbook=missing_demo),
+        )
+        mutated = self.runbook.replace(
+            "  --enable-demo-site\n",
+            "  --enable-demo-site \\\n  --hosted-zone-id Z123EXAMPLE\n",
             1,
         )
         self.assertTrue(
             any(
-                "canonical IP-only init contains DNS, SIPS, demo-site, or HA input"
+                "canonical IP-only init contains DNS, SIPS, or HA input"
                 in failure
                 for failure in self.failures(runbook=mutated)
             )
@@ -92,10 +101,10 @@ class RecipeDocsCheckerTests(unittest.TestCase):
 
     def test_canonical_ip_only_init_rejects_root_bootstrap_exception(self):
         mutated = self.runbook.replace(
-            "  --runtime-profile starter \\\n  --create-connect-demo\n",
+            "  --runtime-profile starter \\\n  --create-connect-demo \\\n",
             "  --runtime-profile starter \\\n"
             "  --allow-root-bootstrap \\\n"
-            "  --create-connect-demo\n",
+            "  --create-connect-demo \\\n",
             1,
         )
         self.assertIn(
@@ -106,10 +115,11 @@ class RecipeDocsCheckerTests(unittest.TestCase):
 
     def test_canonical_ip_only_init_rejects_additional_valid_option(self):
         mutated = self.runbook.replace(
-            "  --create-connect-demo\n",
+            "  --create-connect-demo \\\n  --enable-demo-site\n",
             "  --create-connect-demo \\\n"
             "  --target-flow-arn arn:aws:connect:us-west-2:111122223333:"
-            "instance/example/contact-flow/example\n",
+            "instance/example/contact-flow/example \\\n"
+            "  --enable-demo-site\n",
             1,
         )
         self.assertIn(
@@ -357,35 +367,6 @@ class RecipeDocsCheckerTests(unittest.TestCase):
             "$STATE_ROOT/$NEW_EXECUTION/bootstrap-refresh-change-set-review.json",
             self.failures(runbook=mutated),
         )
-
-    def test_existing_connect_controller_commands_require_profile_binding(self):
-        mutated = self.readme.replace(
-            'AWS_PROFILE="$AWS_PROFILE" python3 scripts/aws-recipe-live-test.py',
-            "python3 scripts/aws-recipe-live-test.py",
-            1,
-        )
-        self.assertTrue(
-            any(
-                "existing-Connect sample controller command does not pin AWS_PROFILE"
-                in failure
-                for failure in self.failures(readme=mutated)
-            )
-        )
-
-    def test_existing_connect_raw_cloudformation_requires_profile_binding(self):
-        mutated = self.readme.replace(
-            'aws cloudformation execute-change-set \\\n  --profile "$AWS_PROFILE" \\\n',
-            "aws cloudformation execute-change-set \\\n",
-            1,
-        )
-        self.assertTrue(
-            any(
-                "existing-Connect sample actionable AWS command does not use a prior "
-                "exported profile" in failure
-                for failure in self.failures(readme=mutated)
-            )
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

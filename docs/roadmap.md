@@ -70,7 +70,7 @@ Registry integration checkpoint recorded on 2026-07-29:
   full-beta pass. Its remaining browser, TURN, live-provider, split/cloud, and
   long-run gates remain open.
 
-Registry integration checkpoint recorded on 2026-07-31:
+Historical registry integration checkpoint recorded on 2026-07-31:
 
 - rvoip `0.3.5` is published as a coordinated 44-crate release at
   `c4f95e0c696a11e2e6e15183fbaa9b3dc6f94fec` and tagged `v0.3.5`.
@@ -78,11 +78,23 @@ Registry integration checkpoint recorded on 2026-07-31:
   with registry checksums and no Git or path overrides.
 - The locked application graph contains neither Smol nor async-std. Bridgefu
   uses Tokio throughout its runtime integration.
-- The 0.3.5 package graph is the authoritative Bridgefu 0.9.0 preview and 1.0
-  development dependency input.
+- At that checkpoint, the 0.3.5 package graph was the authoritative Bridgefu
+  0.9.0 preview and 1.0 development dependency input.
   Historical local-candidate and 0.3.4 results remain historical; downstream
   Rust, browser, TURN, provider, cloud, and long-run gates qualify only the
   committed 0.3.5 lockfile when rerun.
+
+Registry integration checkpoint recorded on 2026-08-07:
+
+- Bridgefu resolves exactly 25 checksummed rvoip `0.3.7` packages from
+  crates.io, published from `dba121e95be128a5333d0986cb077596bc509e21`,
+  with no Git, path, or Cargo patch override.
+- All 11 changes in the former Bridgefu-local patch range are present: ten are
+  patch-equivalent and the no-MID primary-audio change is functionally
+  equivalent after intervening RTP work. Focused published-package regressions
+  pass for each behavior.
+- The exact built-SDK Chromium→generic-WSS qualification passes both terminal
+  directions, closing the rvoip #54 outbound-DTMF blocker.
 
 ## B2BUA cancellation and stateful-proxy conformance overlay
 
@@ -113,7 +125,7 @@ The work has two independent tracks:
    pending admission but did not immediately terminate the correlated outbound
    leg. This result was qualified at the 2026-07-29 checkpoint on exact
    crates.io rvoip 0.3.4; the current release dependency is the superseding
-   exact 0.3.5 registry graph recorded above.
+   exact 0.3.7 registry graph recorded above.
 2. **rvoip transaction-stateful proxy conformance.** The original proxy's
    primary event stream received `TransactionEvent::CancelRequest`, while the
    proxy listened for a different cancellation event. The response-context,
@@ -143,7 +155,7 @@ to coordinate its two call legs.
 | BP-5 — ACK, Timer C, and routing | In progress | Focused tests now distinguish transaction-owned non-2xx ACK from stateless 2xx ACK. Per-branch Timer C, actual-transport Via stamping, Route/SIPS/RFC 3263, bounded state, UDP/TCP/TLS packet evidence, and cleanup remain open. |
 | BP-6 — independent conformance | Active | Mock and real UDP/TCP/TLS loopback coverage is in progress. On the current stable development source, a bounded Kamailio/rvoip-first UDP row and a bounded OpenSIPS/peer-first UDP row each pass all 10 counted core-and-cleanup scenarios with real external traversal, packet-bound Via evidence, unchanged proxy binaries, and clean process/port convergence. Earlier diagnostic runs exposed and led to corrections for SIPp CANCEL branch/duplicate-response modeling, an INVITE-487 Via fixture error, provisional-response timing, body-length evidence, and shell fail-open/stale-artifact risks. These short dirty-source rows deliberately omit the 130-second retention assertion and advanced scenarios, so they are development evidence rather than release evidence. The `0.3.2` release gate requires pinned real Kamailio and OpenSIPS peers in both adjacency orders (`UAC → rvoip → peer → UAS` and `UAC → peer → rvoip → UAS`), SIPp/raw-wire scenario traffic, verified TLS identities, packet captures proving both Via hops, a full protocol-retention drain, and machine-readable zero-retained-state evidence. Each peer must independently exercise the full required scenario inventory across its six rows; one peer cannot substitute for the other, and an in-process Rust test may supplement but cannot satisfy external interoperability coverage. The harness follows the existing Asterisk/FreeSWITCH lifecycle and provenance pattern while remaining self-contained in rvoip. A skipped peer, topology, required transport, scenario, capture, or cleanup assertion is a release failure. |
 | BP-7 — beta qualification | Pending | Full beta report, three canonical 2,000-CPS passes, PBX audio/teardown, 30-minute monolithic soak, and one-hour split soak pass. |
-| BP-8 — registry integration | Historical 0.3.4 checkpoint complete; superseded by 0.3.5 | At the 2026-07-29 checkpoint, rvoip 0.3.4 was published and Bridgefu's exact registry-only 0.3.4 graph passed its all-target compile/test matrix plus SIP cancellation, generic SIP, call-actor, reference tenant, and hermetic Amazon suites. The 2026-07-31 checkpoint above makes exact registry-only 0.3.5 the current release graph. Owner-gated TURN/public-NAT, live-provider, split/cloud, and long-run evidence remain later product-release gates rather than registry-integration claims. |
+| BP-8 — registry integration | Historical 0.3.4/0.3.5 checkpoints complete; superseded by 0.3.7 | At the 2026-07-29 checkpoint, rvoip 0.3.4 was published and Bridgefu's exact registry-only 0.3.4 graph passed its all-target compile/test matrix plus SIP cancellation, generic SIP, call-actor, reference tenant, and hermetic Amazon suites. The 2026-08-07 checkpoint above makes exact registry-only 0.3.7 the current release graph and reconciles every former local patch. Owner-gated TURN/public-NAT, live-provider, split/cloud, and long-run evidence remain later product-release gates rather than registry-integration claims. |
 
 ## Vapi Widget to Call Center full-duplex release gap
 
@@ -165,17 +177,17 @@ not sufficient.
 | Stock Vapi Web SDK → Bridgefu → generic SIP | The downstream one-use Vapi-like SIPS/SRTP attachment → named SIPS/SRTP destination composition is hermetically green, including Digest, media, DTMF, teardown, and context policy. Stock Vapi browser `webCall` → SIP transfer and live standards-PBX behavior remain unproven. | Partial; not yet supported end-to-end |
 | Stock Vapi Web SDK → Bridgefu → Telnyx | A Vapi-like trusted-CIDR SIPS/SRTP attachment is hermetically qualified through the production Telnyx executor and a distinct authenticated Telnyx media attachment, including linked dials, full-duplex audio, RFC 4733, signed callbacks, retries, both terminal directions, and exact cleanup. Stock Vapi browser `webCall` → SIP transfer and a restricted live Telnyx account remain unproven. | Partial; not yet supported end-to-end |
 | Stock Vapi Web SDK → Bridgefu → generic WebRTC/WSS | The downstream authenticated Vapi-like SIPS/SRTP attachment → interactive WSS route is hermetically qualified with real protocol adapters. Stock Vapi browser `webCall` → SIP transfer is still unproven, so this is not live Vapi evidence. | Partial; not yet supported end-to-end |
-| Direct Bridgefu browser WebRTC → generic SIP | The all-in-one named-route composition is hermetically green for authenticated browser WSS/TLS to a context-gated named SIPS/TLS+SRTP destination, Opus↔PCMU and Opus↔PCMA, bidirectional DataChannel↔SIP MESSAGE, RFC 4733, both hangup directions, and exact cleanup. The exact built TypeScript SDK/Chromium handoff now passes against the published registry-only rvoip 0.3.5 graph through a real one-use attachment, Digest SIPS/TLS+SRTP assistant, rejected-generation compensation, and successful retry to a separately profiled call center. Local split WHIP→SIP execution and SIP→WSS replacement are also hermetically green. TURN-only, built-SDK split, and live standards-PBX evidence remain open. | Partial; not yet supported end-to-end |
-| Direct Bridgefu browser WebRTC → Amazon Connect | The exact all-in-one named-route composition is hermetically green for a real authenticated, one-use browser WSS/WebRTC attachment through the production Amazon adapter seams: Opus full duplex, DTMF both ways, allowlisted initial StartWebRTCContact attributes/screen pop, both terminal directions, exactly one StopContact, and exact cleanup. The exact built-SDK Chromium→Connect handoff passes both terminal variants against the published registry-only rvoip 0.3.5 graph. Amazon remains initial-context-only. TURN-only, split execution, and live Connect evidence remain open. | Partial; not yet supported end-to-end |
-| Direct Bridgefu browser WebRTC → Telnyx | The production one-use authenticated WSS/WebRTC ingress and real-adapter Vapi-assistant handoff are hermetically composed with the Telnyx executor and distinct authenticated media attachment, including linked dials, full-duplex audio, RFC 4733, signed callbacks, retry behavior, both terminal directions, compensation, and cleanup. The exact built-SDK Chromium→Telnyx test passes both terminal variants against the published registry-only rvoip 0.3.5 graph. Split execution and a restricted live-account run remain open. | Partial; not yet supported end-to-end |
-| Direct Bridgefu browser WebRTC → generic WebRTC/WSS | The all-in-one named-route composition and real-adapter direct-mode handoff are hermetically green for authenticated WSS/TLS, Opus full duplex, arbitrary DataChannels, RFC 4733, hold/no-mix, application-ready promotion, rejection compensation, both hangup directions, and exact cleanup. The earlier local RTC composite passed both terminal variants. Against published rvoip 0.3.5, Chromium-to-WSS DTMF reaches Bridgefu correctly but outbound RFC 4733 returns success without reaching Chromium; this reproduces 3/3 and is tracked as rvoip #54. Local split WHIP→WSS execution and SIP→WSS replacement remain green. TURN-only, built-SDK split, live qualification, and a published dependency fix/rerun remain open. | Blocked on rvoip #54; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → generic SIP | The all-in-one named-route composition is hermetically green for authenticated browser WSS/TLS to a context-gated named SIPS/TLS+SRTP destination, Opus↔PCMU and Opus↔PCMA, bidirectional DataChannel↔SIP MESSAGE, RFC 4733, both hangup directions, and exact cleanup. The exact built TypeScript SDK/Chromium handoff passes against the published registry-only rvoip 0.3.7 graph through a real one-use attachment, Digest SIPS/TLS+SRTP assistant, rejected-generation compensation, and successful retry to a separately profiled call center. Local split WHIP→SIP execution and SIP→WSS replacement are also hermetically green. TURN-only, built-SDK split, and live standards-PBX evidence remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → Amazon Connect | The exact all-in-one named-route composition is hermetically green for a real authenticated, one-use browser WSS/WebRTC attachment through the production Amazon adapter seams: Opus full duplex, DTMF both ways, allowlisted initial StartWebRTCContact attributes/screen pop, both terminal directions, exactly one StopContact, and exact cleanup. The exact built-SDK Chromium→Connect handoff passes both terminal variants against the published registry-only rvoip 0.3.7 graph. Amazon remains initial-context-only. TURN-only, split execution, and live Connect evidence remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → Telnyx | The production one-use authenticated WSS/WebRTC ingress and real-adapter Vapi-assistant handoff are hermetically composed with the Telnyx executor and distinct authenticated media attachment, including linked dials, full-duplex audio, RFC 4733, signed callbacks, retry behavior, both terminal directions, compensation, and cleanup. The exact built-SDK Chromium→Telnyx test passes both terminal variants against the published registry-only rvoip 0.3.7 graph. Split execution and a restricted live-account run remain open. | Partial; not yet supported end-to-end |
+| Direct Bridgefu browser WebRTC → generic WebRTC/WSS | The all-in-one named-route composition and real-adapter direct-mode handoff are hermetically green for authenticated WSS/TLS, Opus full duplex, arbitrary DataChannels, RFC 4733, hold/no-mix, application-ready promotion, rejection compensation, both hangup directions, and exact cleanup. Against published rvoip 0.3.7, the exact Chromium test passes both terminal directions, including outbound RFC 4733 delivery to Chromium, closing rvoip #54. Local split WHIP→WSS execution and SIP→WSS replacement remain green. TURN-only, built-SDK split, and live qualification remain open. | Partial; not yet supported end-to-end |
 
 The original four-pass exact-Chromium results were produced against a temporary
 local RTC path override containing an uncommitted six-file candidate. The
-published-graph rerun now passes generic SIP, Amazon Connect, and Telnyx using
-the fetchable, checksummed rvoip 0.3.5 package family with no Git or path
-overrides. Generic WSS remains a real failing published-graph result, not a
-missing run; rvoip issue #54 records its exact boundary evidence.
+published-graph rerun now passes generic SIP, generic WSS, Amazon Connect, and
+Telnyx using the fetchable, checksummed rvoip 0.3.7 package family with no Git
+or path overrides. Rvoip issue #54 retains the prior failure boundary; the
+0.3.7 rerun closes it.
 
 Two ingress modes are required:
 
@@ -202,12 +214,12 @@ with its listed executable evidence.
 | Gap gate | Status | Required evidence |
 |---|---|---|
 | VF-0 — roadmap and Vapi feasibility | In progress — owner-gated harness implemented; live evidence absent | The reference tenant now has a manual-only, dry-run-by-default Chromium harness for both Vapi transfer mechanisms, a controlled SIP echo, and a generated Bridgefu SIPS attachment. Offline contract/redaction tests are executable, but they are not qualification evidence and no live browser run has occurred. Closure still requires owner-authorized, externally credentialed evidence for full-duplex audio, DTMF, allowlisted header names, both hangup directions, callbacks, final reason, and cleanup. Automation may only flag a vendor-blocked candidate after all four echo attempts explicitly report capability unsupported; only owner review may mark Vapi-managed ingress `vendor-blocked`, and direct ingress remains release-capable. |
-| VF-1 — rvoip edge foundations | In progress — local split initial, replacement, terminal, and drain paths are green; outbound browser DTMF is upstream-blocked | Staged inbound SIP answer, listener policy exposure, outbound SIPS/SRTP and authentication profiles, and WSS/HTTPS/ICE/TURN/DataMessage lifecycle pass their focused suites. Authenticated `offer-ready` provides two-phase WSS admission: it requires a leased `rvoip.webrtc.v1` route and a non-anonymous, unexpired principal; stages SDP and DataChannels before core publication; emits neither media nor `Connected` before exact request-bound acceptance; preserves legacy `offer`; and performs owner-bound rejection, timeout, disconnect, and expired-principal cleanup. Its focused suite passes 11/11. The private UCTP seam has versioned, bounded `prepare`, `activate`, `abort`, `end`, DTMF, DataMessage, response, and lifecycle envelopes; exact worker fence plus tenant/call/source-leg/source-generation/target-generation checks; command expiry/digest replay rejection; source cleanup; worker/gateway client dispatch; one-use generation-bound destination-stream admission; and distinct authenticated UCTP Session/Connection/MediaStream ownership. Gateway and worker roles install the SIP/WSS proxy lifecycle, Redis-backed state/replay, durable initial and replacement bindings, DTMF/DataMessage forwarding, terminal lifecycle journaling with exact durable ACKs, and awaited End/Abort cleanup during drain. Process-level Redis restart and non-loopback real-peer qualification remain open. The coordinated WebRTC/RTC implementation is supplied by the locked rvoip 0.3.5 crates.io graph. Three exact Chromium destinations pass; generic WSS exposes rvoip #54 after the DTMF event reaches Bridgefu's core boundary. Reproducible dependency defects are reported to `eisenzopf/rvoip`; Bridgefu carries no local rvoip patch. |
+| VF-1 — rvoip edge foundations | In progress — local split initial, replacement, terminal, and drain paths and all four exact Chromium destinations are green | Staged inbound SIP answer, listener policy exposure, outbound SIPS/SRTP and authentication profiles, and WSS/HTTPS/ICE/TURN/DataMessage lifecycle pass their focused suites. Authenticated `offer-ready` provides two-phase WSS admission: it requires a leased `rvoip.webrtc.v1` route and a non-anonymous, unexpired principal; stages SDP and DataChannels before core publication; emits neither media nor `Connected` before exact request-bound acceptance; preserves legacy `offer`; and performs owner-bound rejection, timeout, disconnect, and expired-principal cleanup. Its focused suite passes 11/11. The private UCTP seam has versioned, bounded `prepare`, `activate`, `abort`, `end`, DTMF, DataMessage, response, and lifecycle envelopes; exact worker fence plus tenant/call/source-leg/source-generation/target-generation checks; command expiry/digest replay rejection; source cleanup; worker/gateway client dispatch; one-use generation-bound destination-stream admission; and distinct authenticated UCTP Session/Connection/MediaStream ownership. Gateway and worker roles install the SIP/WSS proxy lifecycle, Redis-backed state/replay, durable initial and replacement bindings, DTMF/DataMessage forwarding, terminal lifecycle journaling with exact durable ACKs, and awaited End/Abort cleanup during drain. Process-level Redis restart and non-loopback real-peer qualification remain open. The coordinated WebRTC/RTC implementation is supplied by the locked rvoip 0.3.7 crates.io graph. All four exact Chromium destinations pass, including the generic-WSS outbound DTMF path that previously exposed rvoip #54. Reproducible dependency defects are reported to `eisenzopf/rvoip`; Bridgefu carries no local rvoip patch. |
 | VF-2 — secure routes and attachment lifecycle | In progress — local API, repository, and split-adapter ownership evidence is green | Named route/profile APIs, complete redacted one-use SIP and WebRTC attachment descriptors, `attach_then_dial`, durable 24-hour idempotency, atomic token consumption, tenant isolation, fail-closed split capability selection, and generation-bound split destination ownership pass focused suites. Closure still requires the final all-target regression and deployed topology evidence. |
 | VF-3 — generic SIP reference destination | In progress — secure SIP, true early media, all-in-one, cancellation, and local split execution are hermetically green; live qualification remains | `tests/generic_sip_reference.rs` composes the durable named-route actor with real rvoip source, Bridgefu B2BUA, and destination peers. All six exact local tests pass for authenticated SIPS/SRTP, non-silent destination-to-source media during 183 while both legs remain signaling, final-answer promotion onto the same source graph, full-duplex media, RFC 4733, proxy and origin Digest challenges, rejection, source CANCEL propagation within one second, and cleanup. The call-supervisor race suite additionally proves that source termination while the final answer is in flight commits the same exact-generation durable transition and immediately retires a connected peer. `tests/qualification_generic_wss.rs` separately covers authenticated browser WSS/TLS to named SIPS/TLS+SRTP with media, context translation, DTMF, hangup, and cleanup. The split topology test adds real authenticated WHIP ingress over loopback, private mTLS UCTP, staged SIP/WSS adapter fixtures, failed-generation compensation, successful replacement, and exact terminal/drain cleanup. Non-loopback/live standards-PBX and built-SDK split qualification remain open; this does not prove stock Vapi browser transfer. |
 | VF-4 — Vapi-managed ingress | In progress — local Vapi-like edges and reference-tenant control integration are green; VF-0/live evidence remains | `tests/qualification_generic_wss.rs` proves that a trusted-CIDR-authenticated, one-use named-route SIPS attachment with mandatory SRTP reaches configured WSS and generic-SIP destinations with the advertised media, context, DTMF, terminal, and cleanup behavior. The reference tenant locally creates only allowlisted managed route calls, preserves the Amazon default and rollback flag, and keeps URI/call/tenant/credential authority off the model. This is hermetic Vapi-like SIP and local control evidence, not proof that stock Vapi `webCall` can transfer. Closure still requires VF-0, owner-authorized canary evidence, and every claimed destination. |
-| VF-5 — direct browser ingress and handoff | In progress — SDK, server-owned mapping, assistant configuration, durable lifecycle, all-in-one handoffs, local split replacement, and three published-graph Chromium destinations are green | The reusable TypeScript client, reference tenant widget integration, signed server-owned session mapping, dedicated Vapi SIP assistant/tool configuration, generation-fenced make-before-break replacement, monotonic authenticated handoff status, success compensation, timeout/cancellation, replay, glare, and no-spoof/no-mix tests are implemented. Exact built-SDK Chromium handoffs to generic SIP, Amazon Connect, and Telnyx pass against published rvoip 0.3.5. Generic WSS reaches Bridgefu's core but is blocked by rvoip #54 on outbound RFC 4733. Real-adapter suites cover application/media-ready promotion, rejection compensation, no-mix holds, stable browser binding, exact profile revisions, terminal variants, and cleanup. The local split topology proves one failed replacement generation followed by a successful generation without cross-connect or leaked prior media, but remains an adapter-fixture/WHIP test rather than a built-SDK Chromium split matrix. Closure still requires the upstream fix/rerun, TURN-only and public-NAT evidence, built-SDK split execution, process-restart recovery, and deployed canary qualification. |
-| VF-6 — destination qualification | In progress — all-in-one paths and three published-graph exact built-SDK destinations are green; generic WSS is upstream-blocked | The published rvoip 0.3.5 Chromium rerun qualifies direct-browser → Vapi-like SIPS/SRTP assistant → generic SIP, Amazon Connect, and Telnyx. Generic WSS has a strict failing result recorded in rvoip #54. Real-adapter suites cover full-duplex media, DTMF, signed readiness, compensation, both terminal variants, and exact cleanup; Amazon remains initial-context-only. The local split test qualifies SIP/WSS adapter-fixture routing and replacement, not split Amazon/Telnyx, stock Vapi transfer, real TURN traversal, live provider/PBX behavior, or cloud infrastructure. |
+| VF-5 — direct browser ingress and handoff | In progress — SDK, server-owned mapping, assistant configuration, durable lifecycle, all-in-one handoffs, local split replacement, and all four published-graph Chromium destinations are green | The reusable TypeScript client, reference tenant widget integration, signed server-owned session mapping, dedicated Vapi SIP assistant/tool configuration, generation-fenced make-before-break replacement, monotonic authenticated handoff status, success compensation, timeout/cancellation, replay, glare, and no-spoof/no-mix tests are implemented. Exact built-SDK Chromium handoffs to generic SIP, generic WSS, Amazon Connect, and Telnyx pass against published rvoip 0.3.7; the generic-WSS result closes rvoip #54. Real-adapter suites cover application/media-ready promotion, rejection compensation, no-mix holds, stable browser binding, exact profile revisions, terminal variants, and cleanup. The local split topology proves one failed replacement generation followed by a successful generation without cross-connect or leaked prior media, but remains an adapter-fixture/WHIP test rather than a built-SDK Chromium split matrix. Closure still requires TURN-only and public-NAT evidence, built-SDK split execution, process-restart recovery, and deployed canary qualification. |
+| VF-6 — destination qualification | In progress — all-in-one paths and all four published-graph exact built-SDK destinations are green | The published rvoip 0.3.7 Chromium rerun qualifies direct-browser → Vapi-like SIPS/SRTP assistant → generic SIP, generic WSS, Amazon Connect, and Telnyx. Generic WSS now passes outbound RFC 4733; rvoip #54 retains the earlier failure record. Real-adapter suites cover full-duplex media, DTMF, signed readiness, compensation, both terminal variants, and exact cleanup; Amazon remains initial-context-only. The local split test qualifies SIP/WSS adapter-fixture routing and replacement, not split Amazon/Telnyx, stock Vapi transfer, real TURN traversal, live provider/PBX behavior, or cloud infrastructure. |
 | VF-7 — clustered and release qualification | In progress — local split execution, route-catalog fencing, runtime smoke, and native image are green; deployed qualification remains | Split workers advertise only concrete configured capabilities. The canonical SHA-256 route/capability fingerprint includes provider, Amazon, generic destination/profile, codec, and effective capability policy; ordering is stable, configuration changes alter the digest, workers advertise it, assignments retain it, gateways reject mismatched/legacy workers and fresh dispatch or attachment consumption after catalog change, and reconnect refresh is tested. A worker cannot advance to a changed catalog while either an active assignment or a released terminal assignment with unfinished recovery work still requires the previous catalog. Gateway and worker roles install the authenticated private egress command service, Redis-backed epoch/replay state, SIP/WSS staged adapters, separate target-generation media admission, durable initial/replacement supervision, DTMF/DataMessage carriage, progress/terminal reconciliation, exact lifecycle ACKs, source-loss fallback, and awaited drain cleanup. The nine-check runtime smoke and hardened native Linux ARM image pass. Closure still requires a real process-role Redis restart test, non-loopback gateway/worker peer qualification, the protected multi-architecture OCI candidate, AWS/GCP smoke, one-hour load, latency/memory, deployed chaos, and provider/reference tenant evidence. |
 
 VF-2 named-Vapi attachment-identity evidence recorded on 2026-07-15: route
@@ -410,11 +422,10 @@ edge is explicitly Opus-only.
 
 These RTC, rvoip, and exact Chromium results were produced through the temporary
 `../rtc/rtc` path override. The candidate is uncommitted, so the results are
-local-composite validation only. Bridgefu now resolves the coordinated
-checksummed rvoip 0.3.5 crates.io graph with no Git or path override. That
-fetchable package graph is the authoritative release input, but it does not
-inherit the historical candidate evidence: downstream browser, DTMF, codec,
-and TURN reruns remain mandatory.
+local-composite validation only. Bridgefu now resolves the coordinated,
+checksummed rvoip 0.3.7 crates.io graph with no Git or path override. Focused
+DTMF/codec regressions and the exact generic-WSS Chromium case have been rerun
+against that graph; TURN reruns remain mandatory.
 TURN-only/public-NAT, split built-SDK execution, and live destinations remain
 release blockers and are not claimed by this evidence.
 
@@ -508,7 +519,7 @@ At that time, after restoring the exact `1e5b7d4...` Git source and lock
 provenance,
 `cargo test --locked -p bridgefu --lib` independently passes the same 328/328
 library suite. This is historical evidence for the former graph; it does not
-qualify the current crates.io rvoip 0.3.5 packages or reproduce the four exact
+qualify the historical crates.io rvoip 0.3.5 packages or reproduce the four exact
 Chromium results.
 
 VF-1 local-candidate WebRTC signaling evidence recorded on 2026-07-15:
@@ -520,8 +531,8 @@ outbound_ws_originating -- --nocapture` passes 11/11 authenticated
 including all 13 tests added with the six-file candidate. These results resolve
 through the uncommitted local RTC path override and remain owner-review
 evidence rather than a result for the current published graph. A clean
-qualification rerun against the locked rvoip 0.3.5 packages and
-TURN-only/public-NAT qualification therefore remain open.
+qualification rerun against the locked rvoip 0.3.7 packages is now green for
+the previously carried behavior; TURN-only/public-NAT qualification remains open.
 
 Required public product interfaces for these gates are named, server-controlled
 routes (`GET /v1/routes`, `POST /v1/routes/{route_id}/calls`) and append-only,
@@ -550,7 +561,7 @@ explicitly. Draft changes are never adopted automatically; scheduled CI only
 reports changes in the IETF drafts or upstream implementation.
 
 Bridgefu consumes WebRTC through the exact crates.io
-`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.5 package graph and its
+`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.7 package graph and its
 Cargo.lock checksums. Future alpha-engine fixes may still be developed on an
 owner-controlled fork, but Bridgefu does not adopt a floating branch or
 unpublished path override, and no upstream contact occurs without owner
@@ -565,9 +576,10 @@ ambiguous ownership. Its six-file diff, current stable patch ID
 recorded in `docs/webrtc-fork-review.md`. The validation runs used temporary
 `../rtc/rtc` manifest overrides and a path-resolved generated lock entry. Those
 overrides are removed. The candidate remains historical validation-only
-evidence until equivalent downstream qualification is rerun against the
-published, locked 0.3.5 graph. Reproducible defects are reported to
-`eisenzopf/rvoip`; Bridgefu does not carry or publish a dependency patch.
+evidence. Equivalent focused regressions and the exact generic-WSS Chromium
+case have now been rerun against the published, locked 0.3.7 graph.
+Reproducible defects are reported to `eisenzopf/rvoip`; Bridgefu does not carry
+or publish a dependency patch.
 
 ### Provider scope
 
@@ -655,7 +667,7 @@ release gates above:
 | Gate | Status | Remaining release evidence or authority |
 |---|---|---|
 | 0–6 | Complete | None in the local implementation scope. |
-| 7 | Local adapter/component evidence substantial; Vapi widget and outbound-WSS-DTMF gaps open | VF-0 through VF-7, including the protected Vapi browser transfer feasibility run, API-level leg replacement, the rvoip #54 fix and generic-WSS Chromium rerun, exact destination compositions, and deployed public-NAT/TURN runs. Generic SIP, Amazon Connect, and Telnyx already pass against locked rvoip 0.3.5. |
+| 7 | Local adapter/component evidence substantial; Vapi widget and deployed-network gaps open | VF-0 through VF-7, including the protected Vapi browser transfer feasibility run, API-level leg replacement, exact destination compositions, and deployed public-NAT/TURN runs. Generic SIP, generic WSS, Amazon Connect, and Telnyx pass against locked rvoip 0.3.7. |
 | 8 | Local Telnyx implementation complete; live qualification pending | Restricted live Telnyx test-account control/media workflow. |
 | 9 | Direct UCTP and local/static MOQT complete; clustered dynamic MOQT pending | Owner review, immutable pin, enablement, and requalification of the private dynamic publisher-policy candidate. |
 | 10 | Local modes/config/observability/Compose preflight/Terraform validation complete | Protected multi-architecture artifact plus disposable AWS/GCP apply-smoke-destroy. |
@@ -672,7 +684,7 @@ provider calls remain outside automatic authority.
 - [x] Record exact starting revisions.
 - [x] Run and record the baseline test matrix.
 - [x] Separate existing scaffolding from new functional changes.
-- [x] Pin Bridgefu CI to the exact checksummed rvoip 0.3.5 crates.io graph
+- [x] Pin Bridgefu CI to the exact checksummed rvoip 0.3.7 crates.io graph
   rather than a floating branch or sibling checkout.
 
 Exit: all existing work is accounted for and the baseline is reproducible.
@@ -2473,11 +2485,11 @@ not hide an earlier adapter side effect behind a nominally staged API.
      `bridgefu.context.v1` before originate, while the production SIP wire test
      proves the resulting allowlisted headers exactly; it is not represented
      as one monolithic edge-to-edge test.
-   - [ ] 9c — Use the published, checksummed rvoip 0.3.5 WebRTC/RTC package
+   - [ ] 9c — Use the published, checksummed rvoip 0.3.7 WebRTC/RTC package
      graph as the clean fetchable input. That dependency migration is
-     complete; generic SIP, Amazon Connect, and Telnyx exact Chromium reruns
-     pass, while generic WSS is blocked by the reproducible outbound RFC 4733
-     defect in rvoip #54. Reconcile any behavior demonstrated only by the
+     complete; generic SIP, generic WSS, Amazon Connect, and Telnyx exact
+     Chromium reruns pass, and 0.3.7 closes the outbound RFC 4733 defect in
+     rvoip #54. Reconcile any behavior demonstrated only by the
      historical TURN, NACK/statistics, or `codex/dtmf-codec-identity`
      candidates in the rvoip repository before a
      future package update; do not add a Bridgefu path or floating-Git
@@ -2502,17 +2514,16 @@ the durable actor boundary and also exposed two reusable rvoip fixes: inbound
 `Connected`, and inbound BYE cleanup dispatches from a fresh owned task so the
 normal Tokio test stack is not exhausted. Scoped rvoip strict Clippy passes.
 Bridgefu's current strict all-target/all-feature Clippy passes. Item 9 remains
-open for the rvoip #54 fix and exact generic-WSS rerun plus deployed
-public-NAT/TURN proof; it is no longer waiting for the other three exact
-Chromium destinations to execute.
+open for deployed public-NAT/TURN proof; it is no longer waiting for any exact
+Chromium destination to execute.
 
-The current Bridgefu release declaration uses exact crates.io rvoip 0.3.5
+The current Bridgefu release declaration uses exact crates.io rvoip 0.3.7
 packages, and Cargo.lock records their registry checksums; the graph contains
 no Git or path package source. The earlier validation runs used temporary
 `../rtc/rtc` manifest overrides and a path-resolved generated lock entry, but
 that historical state is not current release provenance. Bridgefu does not
-carry a private dependency patch for the current failing browser behavior;
-rvoip issue #54 is the maintainer handoff. Any future private fork still
+carry a private dependency patch; rvoip issue #54 retains the earlier failure
+boundary and its 0.3.7 closure. Any future private fork still
 requires a minimal failing engine conformance test and separate owner review.
 
 The private TURN hardening work is complete locally at WebRTC revision
@@ -4108,7 +4119,7 @@ Gate 10 API admission and observability evidence recorded on 2026-07-14:
   do not replace live carrier, cloud apply/destroy, release-load, or protected
   image-candidate evidence.
   The retained smoke source record includes Bridgefu's tracked and untracked
-  state plus every exact lockfile-resolved rvoip 0.3.5 package and registry
+  state plus every exact lockfile-resolved rvoip 0.3.7 package and registry
   checksum; a sibling checkout is not consulted. Child tests
   strip inherited `BRIDGEFU_*`, `RVOIP_*`, `OTEL_*`, cloud, provider, and
   external-store variables so operator credentials/configuration cannot alter
@@ -4499,7 +4510,7 @@ not replace live Telnyx, actual PostgreSQL-process interruption, a deployed
 relay-tier failure, network impairment at release load, or any one-hour run.
 The v3 report separately records Bridgefu's locked rvoip application graph and
 the rvoip registry-package source tests. The latter are selected at exact
-crates.io 0.3.5 name/version/source/checksum from Bridgefu's locked metadata,
+crates.io 0.3.7 name/version/source/checksum from Bridgefu's locked metadata,
 then run with each published package's own packaged Cargo.lock; they do not
 misrepresent that independent test graph as Bridgefu-lock execution.
 The recorded pre-`VF-*` finite run passed all 16 scenarios: 14 local cases and

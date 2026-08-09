@@ -1,0 +1,28 @@
+[application]
+name = "Bridgefu Setup"
+default_platform = "desktop"
+sub_package = "bridgefu-setup"
+
+[web.app]
+title = "Bridgefu Setup"
+
+[bundle]
+identifier = "com.bridgefu.setup"
+publisher = "Bridgefu"
+resources = ["assets/main.css"]
+# Dioxus 0.7 appends the target triple after the configured name. Listing the
+# Windows-spelled name as well keeps the installed sidecar executable usable on
+# every native platform while missing platform variants are simply ignored.
+external_bin = ["bin/bridgefu", "bin/bridgefu.exe"]
+copyright = "Copyright © Bridgefu contributors"
+category = "DeveloperTool"
+short_description = "Configure Vapi transfers to Amazon Connect"
+long_description = "Creates a reviewed Bridgefu CloudFormation and Vapi template-assistant deployment bundle."
+
+[bundle.macos]
+hardened_runtime = true
+
+[bundle.windows]
+digest_algorithm = "sha256"
+timestamp_url = "http://timestamp.digicert.com"
+tsp = true

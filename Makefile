@@ -18,7 +18,7 @@ IP = $(shell $(TF) output -raw public_ip 2>/dev/null)
 
 # --- local dev ---------------------------------------------------------------
 .PHONY: build
-build: ## Locked release build against crates.io rvoip 0.3.5
+build: ## Locked release build against crates.io rvoip 0.3.7
 	cargo build --locked --release
 
 .PHONY: check

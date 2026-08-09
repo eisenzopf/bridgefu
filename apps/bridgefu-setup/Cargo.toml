@@ -1,0 +1,22 @@
+[package]
+name = "bridgefu-setup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Bridgefu Setup desktop application"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bridgefu-setup-core = { path = "../../crates/bridgefu-setup-core" }
+dioxus = { version = "0.7", features = ["desktop"] }
+rfd = "0.15"
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+zeroize = "1"
+
+[features]
+default = ["desktop"]
+desktop = []
+bundle = []

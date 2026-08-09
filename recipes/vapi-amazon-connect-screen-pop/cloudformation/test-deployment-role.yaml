@@ -1306,8 +1306,14 @@ Resources:
                 - Sid: ReadRecipeDemoCloudFront
                   Effect: Allow
                   Action:
+                    - cloudfront:GetCachePolicy
+                    - cloudfront:GetCachePolicyConfig
                     - cloudfront:GetDistribution
                     - cloudfront:GetDistributionConfig
+                    - cloudfront:GetOriginAccessControl
+                    - cloudfront:GetOriginAccessControlConfig
+                    - cloudfront:GetResponseHeadersPolicy
+                    - cloudfront:GetResponseHeadersPolicyConfig
                     - cloudfront:ListTagsForResource
                   Resource: '*'
                 - !Ref AWS::NoValue

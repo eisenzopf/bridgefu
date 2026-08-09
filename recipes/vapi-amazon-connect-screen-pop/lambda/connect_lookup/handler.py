@@ -7,6 +7,7 @@ import time
 
 from aws_runtime import DynamoHandoffStore, emit_correlation_evidence, emit_operation
 from bridgefu_handoff import RETURN_FIELDS, connect_correlation_id, connect_lookup
+from screen_pop import connect_rows, parse_fields
 
 
 _STORE = None
@@ -20,14 +21,33 @@ def _store():
 
 
 def _unavailable():
-    return {"context_available": "false", **{field: "" for field in RETURN_FIELDS}}
+    configured = os.environ.get("SCREEN_POP_FIELDS_JSON")
+    if configured:
+        fields = parse_fields(configured)
+        return {
+            "context_available": "false",
+            "vapi_call_reference": "",
+            "routing_value": "",
+            **connect_rows(fields, None),
+        }
+    return {
+        "context_available": "false",
+        "routing_value": "",
+        **{field: "" for field in RETURN_FIELDS},
+    }
 
 
 def lambda_handler(event, _context):
     started_at = time.monotonic()
     correlation_id = connect_correlation_id(event)
     try:
-        response = connect_lookup(event, _store())
+        configured = os.environ.get("SCREEN_POP_FIELDS_JSON")
+        response = connect_lookup(
+            event,
+            _store(),
+            configured_fields=parse_fields(configured) if configured else None,
+            routing_field_key=os.environ.get("ROUTING_FIELD_KEY") or None,
+        )
         result = (
             "available"
             if response["context_available"] == "true"

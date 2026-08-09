@@ -13,27 +13,34 @@ categories = ["network-programming", "multimedia::audio"]
 publish = false
 
 [workspace]
-members = ["tools/recipe-qualification"]
-default-members = ["."]
+members = [
+  "tools/recipe-qualification",
+  "crates/vapire-iac",
+  "crates/bridgefu-setup-core",
+  "apps/bridgefu-setup",
+]
+default-members = [".", "crates/vapire-iac", "crates/bridgefu-setup-core"]
 resolver = "2"
 
 [dependencies]
 # Bridgefu consumes the coordinated rvoip release from crates.io. Exact
 # component versions keep the signaling/media type graph aligned and make
 # Cargo.lock the complete reproducible dependency input.
-rvoip-amazon-connect = { version = "=0.3.5", features = ["server", "aws-control"] }
-rvoip-auth-core = "=0.3.5"
-rvoip-core = "=0.3.5"
-rvoip-moq = { version = "=0.3.5", features = ["relay-runtime"] }
-rvoip-redis = { version = "=0.3.5", features = ["moq"] }
-rvoip-quic = "=0.3.5"
-rvoip-uctp = "=0.3.5"
-rvoip-sip = { version = "=0.3.5", features = ["opus"] }
-rvoip-webrtc = { version = "=0.3.5", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
+rvoip-amazon-connect = { version = "=0.3.7", features = ["server", "aws-control"] }
+rvoip-auth-core = "=0.3.7"
+rvoip-core = "=0.3.7"
+rvoip-moq = { version = "=0.3.7", features = ["relay-runtime"] }
+rvoip-redis = { version = "=0.3.7", features = ["moq"] }
+rvoip-quic = "=0.3.7"
+rvoip-uctp = "=0.3.7"
+rvoip-sip = { version = "=0.3.7", features = ["opus"] }
+rvoip-webrtc = { version = "=0.3.7", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
 telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls-pemfile = "2"
+rpassword = "7"
+tempfile = "3"
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -74,35 +81,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+bridgefu-setup-core = { path = "crates/bridgefu-setup-core" }
 
 [dev-dependencies]
-rvoip-media-core = { version = "=0.3.5", features = ["opus"] }
+rvoip-media-core = { version = "=0.3.7", features = ["opus"] }
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
-webrtc = { package = "rvoip-webrtc-stack", version = "=0.3.5" }
-
-[patch.crates-io]
-# Pin the coordinated 0.3.5 graph to the reviewed backport commit. It includes
-# the wildcard-Contact dialog routing fix tracked in issue 167, the Amazon
-# Connect late-remote-track fix, bounded driver backpressure, and primary audio
-# compatibility when an endpoint does not negotiate SDES MID. It also prevents
-# a healthy media sink from being evicted while a new WebRTC/Connect route is
-# still establishing and exposes sinkless-frame evidence. It also provides a
-# bounded inclusive WebRTC UDP allocator and preserves the browser's offered
-# codec preference order when generating an SDP answer. Patching every rvoip
-# crate Bridgefu consumes keeps shared signaling/media types sourced from one
-# immutable revision.
-rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-moq = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-quic = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-redis = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-sip = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
-rvoip-webrtc-stack = { git = "https://github.com/eisenzopf/rvoip.git", rev = "7eb6f3f040139d7bad24629968284a683bf77f68" }
+webrtc = { package = "rvoip-webrtc-stack", version = "=0.3.7" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are

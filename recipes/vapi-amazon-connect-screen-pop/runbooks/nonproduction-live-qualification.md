@@ -8,7 +8,8 @@ Use this runbook to:
    was lost;
 2. retain the controller's zero-state proof; and
 3. start and qualify a fresh Starter execution in `us-west-2` using its public
-   IP directly with SIP/RTP.
+   IP directly with SIP/RTP and the optional private-S3/CloudFront Vapi test
+   page.
 
 This runbook does **not** authorize HA, DNS, certificates, SIPS/SRTP,
 production deployment, customer traffic, or reuse of the recovered execution
@@ -260,7 +261,7 @@ recovery. If another actor deletes it after the intent but leaves an adopted
 bucket or repository, zero proof fails closed; complete only the exact
 ledger-bound cleanup and then rerun proof.
 
-## Phase 6 — initialize a fresh IP-only Starter execution
+## Phase 6 — initialize a fresh IP-only Starter execution with the demo site
 
 Choose the subsection for the entry path selected above, then run the common
 `init` command. In both paths, choose a globally fresh execution ID that has
@@ -309,15 +310,18 @@ AWS_PROFILE="$AWS_PROFILE" python3 scripts/aws-recipe-live-test.py \
   --planned-hours 8 \
   --connect-minutes 30 \
   --runtime-profile starter \
-  --create-connect-demo
+  --create-connect-demo \
+  --enable-demo-site
 ```
 
 This qualification uses no DNS. For the IP-only path, omit
 `--hosted-zone-id`, `--delegated-zone-name`,
-`--sip-hostname`, `--secure-sips-proof`, and `--enable-demo-site`. The
-controller rejects DNS parameters for this SIP/RTP mode. Existing-Connect mode
-selects the secure DNS path in this controller and is therefore not the
-IP-only disposable qualification described here.
+`--sip-hostname`, and `--secure-sips-proof`. This run deliberately includes
+`--enable-demo-site`: the CloudFront hostname is AWS-owned and does not require
+the recipe DNS mode. The controller rejects the recipe DNS parameters for this
+SIP/RTP mode. Existing-Connect mode selects the secure DNS path in this
+controller and is therefore not the IP-only disposable qualification described
+here.
 
 `--max-usd` is a conservative planning-estimate ceiling, not an AWS Budget or
 real-time spend cap. The qualification deadline blocks new paid phases after
@@ -428,16 +432,26 @@ AWS_PROFILE="$AWS_PROFILE" python3 scripts/aws-recipe-live-test.py \
 AWS_PROFILE="$AWS_PROFILE" python3 scripts/aws-recipe-live-test.py \
   --execution-id "$NEW_EXECUTION" verify
 
+AWS_PROFILE="$AWS_PROFILE" python3 scripts/run-recipe-qualification.py \
+  zero-state --phase final \
+  --execution-id "$NEW_EXECUTION" --confirm "$NEW_EXECUTION"
+
 AWS_PROFILE="$AWS_PROFILE" python3 scripts/aws-recipe-live-test.py \
   --execution-id "$NEW_EXECUTION" \
   destroy --confirm "$NEW_EXECUTION"
+
+AWS_PROFILE="$AWS_PROFILE" python3 scripts/run-recipe-qualification.py \
+  assemble --execution-id "$NEW_EXECUTION" --confirm "$NEW_EXECUTION"
 ```
 
 The smoke run is an early IP-only proof. The full run, lifecycle rollback test,
-second verification, and retained teardown zero proof are required before this
-configuration can be used as evidence for a later production decision. Repeat
-a second nonproduction cycle with another fresh ID rather than reusing this
-one.
+second verification, final runtime zero-state observation, retained teardown
+zero proof, and independently validated assembled evidence are required before
+this configuration can be used as evidence for a later production decision.
+Both `verify` calls must prove the CloudFront distribution, policies, private
+S3 origin, exact release assets and public configuration. The Vapi cases in the
+headless suites must load the deployed CloudFront assets. Repeat a second
+nonproduction cycle with another fresh ID rather than reusing this one.
 
 ## AWS permissions
 

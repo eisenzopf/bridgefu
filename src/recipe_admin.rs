@@ -1341,6 +1341,16 @@ pub(crate) fn status(descriptor_path: &Path, profile: DeploymentProfile) -> Resu
     Ok(())
 }
 
+pub(crate) fn stack_outputs(
+    descriptor_path: &Path,
+    profile: DeploymentProfile,
+) -> Result<BTreeMap<String, String>> {
+    let deployment = load(descriptor_path, profile)?;
+    let stack = describe_stack(&deployment.descriptor)?;
+    verify_stack_ownership(&deployment.descriptor, &stack)?;
+    safe_outputs(&stack)
+}
+
 pub(crate) fn doctor(descriptor_path: &Path, profile: DeploymentProfile) -> Result<()> {
     let deployment = load(descriptor_path, profile)?;
     let descriptor = &deployment.descriptor;
@@ -1551,6 +1561,71 @@ pub(crate) fn destroy(
     ])?;
     println!("stack deleted: {}", descriptor.stack_name);
     println!("release artifacts are publisher-owned and were not deleted");
+    Ok(())
+}
+
+/// Setup-owned production uninstall. Unlike the generic recipe destroy path,
+/// this is reachable only through a sealed `.bridgefu` bundle and exact stack
+/// confirmation. Production retention policies remain in force.
+pub(crate) fn uninstall_setup_production(
+    descriptor_path: &Path,
+    profile: DeploymentProfile,
+    confirm: &str,
+) -> Result<()> {
+    let deployment = load(descriptor_path, profile)?;
+    let descriptor = &deployment.descriptor;
+    anyhow::ensure!(
+        descriptor.environment == Some(DeploymentEnvironment::Production),
+        "setup uninstall requires a production deployment descriptor"
+    );
+    anyhow::ensure!(
+        confirm == descriptor.stack_name,
+        "--confirm must exactly equal the stack name"
+    );
+    if let Some(expected_account_id) = descriptor.expected_account_id.as_deref() {
+        let identity = aws_json(["sts", "get-caller-identity"])?;
+        anyhow::ensure!(
+            identity["Account"].as_str() == Some(expected_account_id),
+            "active AWS account does not match expected_account_id"
+        );
+        let root_arn = format!("arn:aws:iam::{expected_account_id}:root");
+        anyhow::ensure!(
+            identity["Arn"].as_str() != Some(root_arn.as_str()),
+            "refusing to uninstall from the AWS account root principal"
+        );
+    }
+    let stack = describe_stack(descriptor)?;
+    verify_stack_ownership(descriptor, &stack)?;
+    aws_json([
+        "cloudformation",
+        "update-termination-protection",
+        "--region",
+        &descriptor.region,
+        "--stack-name",
+        &descriptor.stack_name,
+        "--no-enable-termination-protection",
+    ])?;
+    aws_json([
+        "cloudformation",
+        "delete-stack",
+        "--region",
+        &descriptor.region,
+        "--stack-name",
+        &descriptor.stack_name,
+        "--client-request-token",
+        &format!("bridgefu-setup-uninstall-{}", descriptor.deployment_id),
+    ])?;
+    aws([
+        "cloudformation",
+        "wait",
+        "stack-delete-complete",
+        "--region",
+        &descriptor.region,
+        "--stack-name",
+        &descriptor.stack_name,
+    ])?;
+    println!("AWS stack removed: {}", descriptor.stack_name);
+    println!("retained DynamoDB and audit resources follow the reviewed stack policies");
     Ok(())
 }
 

@@ -3,6 +3,8 @@
 /tests/moq-browser-e2e/node_modules
 /tests/moq-browser-e2e/dist
 node_modules/
+/apps/bridgefu-setup/bin/*
+!/apps/bridgefu-setup/bin/.gitkeep
 
 # Python validation/runtime-smoke bytecode
 __pycache__/
@@ -20,7 +22,12 @@ __pycache__/
 # Local agent/editor and operating-system metadata
 /.claude/worktrees/
 /tmp/
+/.tmp/
 .DS_Store
+
+# Generated local review artifacts
+/amazon-connect-screen-pop-aws-architecture.pptx
+/amazon-connect-screen-pop-aws-architecture.pptx.inspect.ndjson
 
 # Logs
 *.log

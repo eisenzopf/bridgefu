@@ -16,7 +16,7 @@
           "Description": "Information collected before this handoff. Confirm it with the caller when appropriate.",
           "Sections": [
             {
-              "TemplateString": "<h3>Support request</h3><p><strong>Customer:</strong> $.Attributes.customer_name</p><p><strong>Issue:</strong> $.Attributes.issue_summary</p><p><strong>Intent:</strong> $.Attributes.intent</p><p><strong>Verification:</strong> $.Attributes.verification_status</p>"
+              "TemplateString": "${AgentGuideTemplateString}"
             },
             {
               "TemplateString": "<p><strong>Context available:</strong> $.Attributes.context_available</p><p><strong>Voice AI call reference:</strong> $.Attributes.vapi_call_reference</p>"
@@ -24,12 +24,12 @@
           ],
           "AttributeBar": [
             {
-              "Label": "Customer",
-              "Value": "$.Attributes.customer_name"
+              "Label": "$.Attributes.screen_pop_label_1",
+              "Value": "$.Attributes.screen_pop_value_1"
             },
             {
-              "Label": "Intent",
-              "Value": "$.Attributes.intent"
+              "Label": "$.Attributes.screen_pop_label_2",
+              "Value": "$.Attributes.screen_pop_value_2"
             }
           ],
           "Actions": [],

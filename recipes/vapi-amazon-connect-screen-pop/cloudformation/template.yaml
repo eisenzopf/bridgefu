@@ -38,6 +38,7 @@ Metadata:
         Parameters:
           - ConnectInstanceArn
           - TargetContactFlowArn
+          - VapiProvisioningMode
           - VapiApiKeySecretArn
           - VapiModel
           - VapiVoiceId
@@ -84,6 +85,8 @@ Metadata:
           - DatabaseMaxStorageGiB
           - RedisNodeType
           - ContextTtlSeconds
+          - ScreenPopFieldsJson
+          - AgentGuideTemplateString
           - LambdaReservedConcurrencyPerFunction
           - DataRetentionMode
           - LogRetentionDays
@@ -173,7 +176,17 @@ Parameters:
     AllowedPattern: '^arn:aws[-a-z0-9]*:connect:[-a-z0-9]+:[0-9]{12}:instance/[A-Za-z0-9-]+/contact-flow/[A-Za-z0-9-]+$'
   VapiApiKeySecretArn:
     Type: String
+    Default: arn:aws:secretsmanager:us-east-1:000000000000:secret:unused
     AllowedPattern: '^arn:aws[-a-z0-9]*:secretsmanager:[-a-z0-9]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+    Description: Required only by the disposable ManagedDemo assistant mode.
+  VapiProvisioningMode:
+    Type: String
+    Default: TemplateAssistant
+    AllowedValues: [TemplateAssistant, ManagedDemo]
+    Description: >-
+      TemplateAssistant leaves Vapi provisioning to the reviewed Vapire
+      artifact and never modifies an existing assistant. ManagedDemo creates a
+      disposable recipe-owned assistant for qualification.
   VapiModel:
     Type: String
     Default: gpt-4.1-mini
@@ -324,9 +337,38 @@ Parameters:
     AllowedValues: [cache.t4g.small, cache.t4g.medium, cache.r7g.large, cache.r7g.xlarge]
   ContextTtlSeconds:
     Type: Number
-    Default: 86400
+    Default: 3600
     MinValue: 300
     MaxValue: 604800
+  ScreenPopFieldsJson:
+    Type: String
+    Default: '[{"key":"customer_name","label":"Customer","description":"Caller name for the agent.","type":"text","required":true,"max_length":256},{"key":"issue_summary","label":"Issue","description":"Short reason for the transfer.","type":"text","required":true,"max_length":1024},{"key":"intent","label":"Intent","description":"Routing or support intent.","type":"text","required":true,"max_length":128},{"key":"verification_status","label":"Verification","description":"Verification completed before transfer.","type":"choice","required":true,"choices":["verified","not_verified","not_required"]}]'
+    MaxLength: 4096
+  ScreenPopSchemaSha256:
+    Type: String
+    Default: '0000000000000000000000000000000000000000000000000000000000000000'
+    AllowedPattern: '^[0-9a-f]{64}$'
+  RoutingFieldKey:
+    Type: String
+    Default: ''
+    MaxLength: 40
+    AllowedPattern: '^$|^[a-z][a-z0-9_]{0,39}$'
+    Description: Optional configured choice-field key used for reviewed Connect routing.
+  RoutingConditionsJson:
+    Type: String
+    Default: '[]'
+    MaxLength: 4096
+    Description: Recipe-generated Connect Compare conditions; never accepts call-provided ARNs.
+  RoutingTransferActionsJson:
+    Type: String
+    Default: ''
+    MaxLength: 4096
+    Description: Recipe-generated allowlisted TransferToFlow actions, prefixed by a comma when nonempty.
+  AgentGuideTemplateString:
+    Type: String
+    Default: '<h3>Support request</h3><p><strong>$.Attributes.screen_pop_label_1:</strong> $.Attributes.screen_pop_value_1</p><p><strong>$.Attributes.screen_pop_label_2:</strong> $.Attributes.screen_pop_value_2</p><p><strong>$.Attributes.screen_pop_label_3:</strong> $.Attributes.screen_pop_value_3</p><p><strong>$.Attributes.screen_pop_label_4:</strong> $.Attributes.screen_pop_value_4</p>'
+    MinLength: 1
+    MaxLength: 4096
   LambdaReservedConcurrencyPerFunction:
     Type: Number
     Default: 20
@@ -350,6 +392,11 @@ Parameters:
     Default: ''
 
 Rules:
+  ManagedDemoRequiresVapiSecret:
+    RuleCondition: !Equals [!Ref VapiProvisioningMode, ManagedDemo]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VapiApiKeySecretArn, arn:aws:secretsmanager:us-east-1:000000000000:secret:unused]]
+        AssertDescription: ManagedDemo requires a Vapi private-key secret ARN.
   PrivateEcrRequiresRepositoryArn:
     RuleCondition: !Equals [!Ref BridgefuRegistryType, PrivateEcr]
     Assertions:
@@ -371,6 +418,8 @@ Rules:
         AssertDescription: EnableDemoSite requires the reviewed site artifact checksum.
       - Assert: !Not [!Equals [!Ref VapiPublicKey, disabled-test-public-key]]
         AssertDescription: EnableDemoSite requires the browser-safe Vapi public key.
+      - Assert: !Equals [!Ref VapiProvisioningMode, ManagedDemo]
+        AssertDescription: The disposable browser demo requires ManagedDemo Vapi provisioning.
   HighAvailabilityRequiresPrivateTls:
     RuleCondition: !Equals [!Ref RuntimeProfile, HighAvailability]
     Assertions:
@@ -396,6 +445,7 @@ Rules:
 
 Conditions:
   CreateDemoSite: !Equals [!Ref EnableDemoSite, 'true']
+  ManagedVapi: !Equals [!Ref VapiProvisioningMode, ManagedDemo]
   StarterProfile: !Equals [!Ref RuntimeProfile, Starter]
   HighAvailabilityProfile: !Equals [!Ref RuntimeProfile, HighAvailability]
   SecureSip: !Equals [!Ref SipSecurity, sips_srtp]
@@ -447,6 +497,8 @@ Resources:
         BridgefuRouteId: support
         SipSecurity: !Ref SipSecurity
         ContextTtlSeconds: !Ref ContextTtlSeconds
+        ScreenPopFieldsJson: !Ref ScreenPopFieldsJson
+        RoutingFieldKey: !Ref RoutingFieldKey
         LambdaReservedConcurrencyPerFunction: !Ref LambdaReservedConcurrencyPerFunction
         DataRetentionMode: !Ref DataRetentionMode
         LogRetentionDays: !Ref LogRetentionDays
@@ -470,6 +522,9 @@ Resources:
         ConnectInstanceArn: !Ref ConnectInstanceArn
         TargetContactFlowArn: !Ref TargetContactFlowArn
         LookupFunctionArn: !GetAtt HandoffService.Outputs.LookupFunctionArn
+        AgentGuideTemplateString: !Ref AgentGuideTemplateString
+        RoutingConditionsJson: !Ref RoutingConditionsJson
+        RoutingTransferActionsJson: !Ref RoutingTransferActionsJson
         ProjectTag: bridgefu-recipe
         ManagedByTag: bridgefu-cloudformation
         ExecutionIdTag: !Ref DeploymentId
@@ -591,6 +646,7 @@ Resources:
 
   VapiResources:
     Type: AWS::CloudFormation::Stack
+    Condition: ManagedVapi
     Properties:
       TemplateURL: !Sub '${NestedTemplateBaseUrl}/nested/vapi.yaml'
       TimeoutInMinutes: 20
@@ -654,7 +710,7 @@ Resources:
         PrepareFunctionName: !GetAtt HandoffService.Outputs.PrepareFunctionName
         TransferFunctionName: !GetAtt HandoffService.Outputs.TransferFunctionName
         LookupFunctionName: !GetAtt HandoffService.Outputs.LookupFunctionName
-        ProvisionerFunctionName: !GetAtt VapiResources.Outputs.ProvisionerFunctionName
+        ProvisionerFunctionName: !If [ManagedVapi, !GetAtt VapiResources.Outputs.ProvisionerFunctionName, bridgefu-vapire-external]
         PrepareLogGroupName: !GetAtt HandoffService.Outputs.PrepareLogGroupName
         TransferLogGroupName: !GetAtt HandoffService.Outputs.TransferLogGroupName
         LookupLogGroupName: !GetAtt HandoffService.Outputs.LookupLogGroupName
@@ -684,7 +740,7 @@ Resources:
         PrepareFunctionName: !GetAtt HandoffService.Outputs.PrepareFunctionName
         TransferFunctionName: !GetAtt HandoffService.Outputs.TransferFunctionName
         LookupFunctionName: !GetAtt HandoffService.Outputs.LookupFunctionName
-        ProvisionerFunctionName: !GetAtt VapiResources.Outputs.ProvisionerFunctionName
+        ProvisionerFunctionName: !If [ManagedVapi, !GetAtt VapiResources.Outputs.ProvisionerFunctionName, bridgefu-vapire-external]
         RuntimeClusterName: !GetAtt HighAvailabilityRuntime.Outputs.ClusterName
         DatabaseIdentifier: !GetAtt HighAvailabilityRuntime.Outputs.DatabaseIdentifier
         RedisReplicationGroupId: !GetAtt HighAvailabilityRuntime.Outputs.RedisReplicationGroupId
@@ -702,7 +758,7 @@ Outputs:
   Recipe:
     Value: vapi-amazon-connect-screen-pop@1
   SupportTier:
-    Value: !If [StarterProfile, supported, preview]
+    Value: preview
   BridgefuImage:
     Value: !Ref BridgefuImageUri
   RuntimeProfile:
@@ -710,9 +766,21 @@ Outputs:
   SipUri:
     Value: !If [StarterProfile, !GetAtt StarterRuntime.Outputs.SipUri, !GetAtt HighAvailabilityRuntime.Outputs.SipUri]
   VapiAssistantId:
-    Value: !GetAtt VapiResources.Outputs.AssistantId
+    Value: !If [ManagedVapi, !GetAtt VapiResources.Outputs.AssistantId, created-by-bridgefu-setup]
   VapiPrepareToolId:
-    Value: !GetAtt VapiResources.Outputs.PrepareToolId
+    Value: !If [ManagedVapi, !GetAtt VapiResources.Outputs.PrepareToolId, created-by-bridgefu-setup]
+  VapiProvisioningMode:
+    Value: !Ref VapiProvisioningMode
+  VapiToolUrl:
+    Value: !GetAtt HandoffService.Outputs.VapiToolUrl
+  VapiTransferUrl:
+    Value: !GetAtt HandoffService.Outputs.TransferUrl
+  VapiWebhookReference:
+    Value: !GetAtt HandoffService.Outputs.VapiWebhookSecretArn
+  VapiIdentityReference:
+    Value: !GetAtt HandoffService.Outputs.VapiIdentityBindingArn
+  ScreenPopSchemaSha256:
+    Value: !Ref ScreenPopSchemaSha256
   DemoSiteUrl:
     Condition: CreateDemoSite
     Value: !GetAtt DemoSite.Outputs.TestSiteUrl

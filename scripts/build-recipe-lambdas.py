@@ -18,7 +18,12 @@ HANDLERS = (
     "connect_lookup",
     "vapi_provisioner",
 )
-COMMON = ("bridgefu_handoff.py", "aws_runtime.py", "vapi_provisioning.py")
+COMMON = (
+    "bridgefu_handoff.py",
+    "aws_runtime.py",
+    "screen_pop.py",
+    "vapi_provisioning.py",
+)
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 

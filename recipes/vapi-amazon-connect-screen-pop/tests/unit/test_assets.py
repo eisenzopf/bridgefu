@@ -63,6 +63,13 @@ class RecipeAssetContractTests(unittest.TestCase):
         self.assertIn('state.errorType === "configuration-unavailable"', readiness)
         self.assertIn("immutable Vapi demo site failed during initialization", readiness)
 
+    def test_vapi_browser_uses_deployed_cloudfront_assets_when_available(self):
+        source = (RECIPE / "qualification/vapi-web-playwright.mjs").read_text()
+        self.assertIn('options.get("--site-url")', source)
+        self.assertIn('new URL("config.json", site.url).href', source)
+        self.assertIn("deployed CloudFront demo site security headers changed", source)
+        self.assertIn('headers["permissions-policy"]', source)
+
     def test_agent_workspace_supports_two_step_native_connect_login(self):
         source = (RECIPE / "qualification/agent-workspace-playwright.mjs").read_text()
         fill_username = source.index("await username.fill(credential.username)")
@@ -343,20 +350,32 @@ class RecipeAssetContractTests(unittest.TestCase):
         unavailable = actions["context-unavailable"]["Parameters"]["Attributes"]
         self.assertEqual(unavailable["context_available"], "false")
         self.assertEqual(unavailable["vapi_call_reference"], "unavailable")
-        self.assertNotIn("", unavailable.values())
+        self.assertEqual(unavailable["bridgefu_routing_value"], "")
+        self.assertNotIn(
+            "", {key: value for key, value in unavailable.items() if key != "bridgefu_routing_value"}.values()
+        )
         self.assertEqual(
             actions["context-unavailable"]["Transitions"]["NextAction"],
             "set-agent-guide",
         )
+        chooser = actions["choose-reviewed-route"]
+        self.assertEqual(chooser["Type"], "Compare")
+        self.assertEqual(chooser["Transitions"]["Conditions"], [])
+        self.assertEqual(
+            chooser["Transitions"]["NextAction"], "transfer-to-customer-flow"
+        )
 
-    def test_connect_guide_and_lambda_outputs_share_exact_fields(self):
+    def test_connect_guide_uses_only_bounded_screen_pop_slots(self):
         guide = load_template("connect/agent-guide-flow.json.tmpl")
         show = next(item for item in guide["Actions"] if item["Type"] == "ShowView")
         serialized = json.dumps(show["Parameters"]["ViewData"])
-        for field in RETURN_FIELDS:
-            self.assertIn(f"$.Attributes.{field}", serialized)
+        self.assertIn("${AgentGuideTemplateString}", serialized)
+        for index in range(1, 3):
+            self.assertIn(f"$.Attributes.screen_pop_label_{index}", serialized)
+            self.assertIn(f"$.Attributes.screen_pop_value_{index}", serialized)
         self.assertIn("$.Attributes.context_available", serialized)
 
+    def test_legacy_handoff_contract_remains_schema_v1_compatible(self):
         contract = load_template("handoff-contract.json")
         self.assertEqual(
             set(contract["required"]), {"correlation_id", *RETURN_FIELDS}
@@ -379,8 +398,13 @@ class RecipeAssetContractTests(unittest.TestCase):
             load_template("connect/agent-guide-flow.json.tmpl"),
         )
 
+        embedded_content = template["Resources"]["WrapperEntryFlow"]["Properties"][
+            "Content"
+        ]
         embedded_entry = json.loads(
-            template["Resources"]["WrapperEntryFlow"]["Properties"]["Content"]
+            embedded_content.replace("${RoutingConditionsJson}", "[]").replace(
+                "${RoutingTransferActionsJson}", ""
+            )
         )
         canonical_entry = load_template("connect/inbound-flow.json.tmpl")
         serialized = json.dumps(canonical_entry)
@@ -911,12 +935,33 @@ class RecipeAssetContractTests(unittest.TestCase):
         ]
         self.assertIn("cloudfront.amazonaws.com", json.dumps(policy))
 
+        response_policy = site["Resources"]["SecurityHeaders"]["Properties"][
+            "ResponseHeadersPolicyConfig"
+        ]
+        custom_headers = {
+            item["Header"]: (item["Value"], item["Override"])
+            for item in response_policy["CustomHeadersConfig"]["Items"]
+        }
+        self.assertEqual(
+            custom_headers,
+            {
+                "Cross-Origin-Opener-Policy": ("same-origin", True),
+                "Permissions-Policy": ("microphone=(self)", True),
+            },
+        )
+
         deployment_role = (
             RECIPE / "cloudformation/test-deployment-role.yaml"
         ).read_text()
         self.assertIn("ManageOnlyExactDemoSiteBucket", deployment_role)
         self.assertIn("ManageRecipeDemoCloudFront", deployment_role)
         self.assertIn("cloudfront:CreateDistribution", deployment_role)
+        for action in (
+            "cloudfront:GetCachePolicyConfig",
+            "cloudfront:GetOriginAccessControlConfig",
+            "cloudfront:GetResponseHeadersPolicyConfig",
+        ):
+            self.assertIn(action, deployment_role)
 
     def test_ha_profile_is_bounded_multi_az_and_never_creates_connect(self):
         root = yaml.load(

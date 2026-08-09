@@ -260,6 +260,14 @@ Resources:
       ResponseHeadersPolicyConfig:
         Name: !Sub 'bridgefu-${DeploymentId}-demo-security'
         Comment: Browser isolation for the optional Vapi recipe test page.
+        CustomHeadersConfig:
+          Items:
+            - Header: Cross-Origin-Opener-Policy
+              Override: true
+              Value: same-origin
+            - Header: Permissions-Policy
+              Override: true
+              Value: microphone=(self)
         SecurityHeadersConfig:
           ContentSecurityPolicy:
             ContentSecurityPolicy: >-

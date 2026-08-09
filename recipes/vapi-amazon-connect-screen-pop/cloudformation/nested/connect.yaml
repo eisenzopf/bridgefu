@@ -24,6 +24,19 @@ Parameters:
   LookupFunctionArn:
     Type: String
     AllowedPattern: '^arn:aws[-a-z0-9]*:lambda:[-a-z0-9]+:[0-9]{12}:function:[A-Za-z0-9-_]+$'
+  AgentGuideTemplateString:
+    Type: String
+    MinLength: 1
+    MaxLength: 4096
+    Description: Safe recipe-generated markup containing only configured field slots.
+  RoutingConditionsJson:
+    Type: String
+    Default: '[]'
+    MaxLength: 4096
+  RoutingTransferActionsJson:
+    Type: String
+    Default: ''
+    MaxLength: 4096
   ProjectTag:
     Type: String
     Default: bridgefu-recipe
@@ -60,7 +73,7 @@ Resources:
       Description: Recipe-owned Agent Workspace screen pop. Safe to remove with this stack.
       Type: CONTACT_FLOW
       State: ACTIVE
-      Content: |
+      Content: !Sub |
         {
           "Version": "2019-10-30",
           "StartAction": "show-context",
@@ -75,12 +88,12 @@ Resources:
                   "Heading": "Bridgefu caller context",
                   "Description": "Information collected before this handoff. Confirm it with the caller when appropriate.",
                   "Sections": [
-                    {"TemplateString": "<h3>Support request</h3><p><strong>Customer:</strong> $.Attributes.customer_name</p><p><strong>Issue:</strong> $.Attributes.issue_summary</p><p><strong>Intent:</strong> $.Attributes.intent</p><p><strong>Verification:</strong> $.Attributes.verification_status</p>"},
+                    {"TemplateString": "${AgentGuideTemplateString}"},
                     {"TemplateString": "<p><strong>Context available:</strong> $.Attributes.context_available</p><p><strong>Voice AI call reference:</strong> $.Attributes.vapi_call_reference</p>"}
                   ],
                   "AttributeBar": [
-                    {"Label": "Customer", "Value": "$.Attributes.customer_name"},
-                    {"Label": "Intent", "Value": "$.Attributes.intent"}
+                    {"Label": "$.Attributes.screen_pop_label_1", "Value": "$.Attributes.screen_pop_value_1"},
+                    {"Label": "$.Attributes.screen_pop_label_2", "Value": "$.Attributes.screen_pop_value_2"}
                   ],
                   "Actions": [],
                   "Back": {"Label": "Close"}
@@ -147,11 +160,24 @@ Resources:
               "Parameters": {
                 "Attributes": {
                   "context_available": "$.External.context_available",
-                  "customer_name": "$.External.customer_name",
-                  "issue_summary": "$.External.issue_summary",
-                  "intent": "$.External.intent",
-                  "verification_status": "$.External.verification_status",
-                  "vapi_call_reference": "$.External.vapi_call_reference"
+                  "screen_pop_label_1": "$.External.screen_pop_label_1",
+                  "screen_pop_value_1": "$.External.screen_pop_value_1",
+                  "screen_pop_label_2": "$.External.screen_pop_label_2",
+                  "screen_pop_value_2": "$.External.screen_pop_value_2",
+                  "screen_pop_label_3": "$.External.screen_pop_label_3",
+                  "screen_pop_value_3": "$.External.screen_pop_value_3",
+                  "screen_pop_label_4": "$.External.screen_pop_label_4",
+                  "screen_pop_value_4": "$.External.screen_pop_value_4",
+                  "screen_pop_label_5": "$.External.screen_pop_label_5",
+                  "screen_pop_value_5": "$.External.screen_pop_value_5",
+                  "screen_pop_label_6": "$.External.screen_pop_label_6",
+                  "screen_pop_value_6": "$.External.screen_pop_value_6",
+                  "screen_pop_label_7": "$.External.screen_pop_label_7",
+                  "screen_pop_value_7": "$.External.screen_pop_value_7",
+                  "screen_pop_label_8": "$.External.screen_pop_label_8",
+                  "screen_pop_value_8": "$.External.screen_pop_value_8",
+                  "vapi_call_reference": "$.External.vapi_call_reference",
+                  "bridgefu_routing_value": "$.External.routing_value"
                 }
               },
               "Transitions": {
@@ -165,11 +191,24 @@ Resources:
               "Parameters": {
                 "Attributes": {
                   "context_available": "false",
-                  "customer_name": "Context unavailable",
-                  "issue_summary": "Please ask the caller for a brief summary.",
-                  "intent": "unknown",
-                  "verification_status": "unknown",
-                  "vapi_call_reference": "unavailable"
+                  "screen_pop_label_1": "Context unavailable",
+                  "screen_pop_value_1": "Please ask the caller for a brief summary.",
+                  "screen_pop_label_2": "unavailable",
+                  "screen_pop_value_2": "unavailable",
+                  "screen_pop_label_3": "unavailable",
+                  "screen_pop_value_3": "unavailable",
+                  "screen_pop_label_4": "unavailable",
+                  "screen_pop_value_4": "unavailable",
+                  "screen_pop_label_5": "unavailable",
+                  "screen_pop_value_5": "unavailable",
+                  "screen_pop_label_6": "unavailable",
+                  "screen_pop_value_6": "unavailable",
+                  "screen_pop_label_7": "unavailable",
+                  "screen_pop_value_7": "unavailable",
+                  "screen_pop_label_8": "unavailable",
+                  "screen_pop_value_8": "unavailable",
+                  "vapi_call_reference": "unavailable",
+                  "bridgefu_routing_value": ""
                 }
               },
               "Transitions": {
@@ -182,8 +221,20 @@ Resources:
               "Type": "UpdateContactEventHooks",
               "Parameters": {"EventHooks": {"DefaultAgentUI": "${AgentGuideFlow.ContactFlowArn}"}},
               "Transitions": {
-                "NextAction": "transfer-to-customer-flow",
+                "NextAction": "choose-reviewed-route",
                 "Errors": [{"NextAction": "transfer-to-customer-flow", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Identifier": "choose-reviewed-route",
+              "Type": "Compare",
+              "Parameters": {"ComparisonValue": "$.Attributes.bridgefu_routing_value"},
+              "Transitions": {
+                "NextAction": "transfer-to-customer-flow",
+                "Conditions": ${RoutingConditionsJson},
+                "Errors": [
+                  {"NextAction": "transfer-to-customer-flow", "ErrorType": "NoMatchingCondition"}
+                ]
               }
             },
             {
@@ -194,7 +245,7 @@ Resources:
                 "NextAction": "disconnect",
                 "Errors": [{"NextAction": "disconnect", "ErrorType": "NoMatchingError"}]
               }
-            },
+            }${RoutingTransferActionsJson},
             {
               "Identifier": "disconnect",
               "Type": "DisconnectParticipant",

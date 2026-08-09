@@ -29,6 +29,11 @@ use bridgefu::recipes::{
     AmazonConnectMedia, CompiledRecipe, RecipeCatalog, RecipeEndpointSpec, RecipeSource,
     SipAdmissionMode, SipSecurity,
 };
+use bridgefu_setup_core::{
+    apply_vapi_template, delete_vapi_template, export_bundle, inspect_bundle, load_journal,
+    plan_vapi_template, rotate_vapi_credential, save_journal, seal_bundle, AwsCli,
+    DeploymentJournal, ExecutionPhase, SetupConfiguration, VapiResolvedInputs,
+};
 use clap::{Parser, Subcommand};
 use metrics_exporter_prometheus::PrometheusHandle;
 use rvoip_amazon_connect::ConnectScreenPopServer;
@@ -79,6 +84,11 @@ enum Command {
         #[command(subcommand)]
         command: RecipeCommand,
     },
+    /// Configure and administer the Vapi to Amazon Connect deployment.
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
     /// Probe the local liveness endpoint without loading configuration.
     Healthcheck {
         /// Local operations endpoint to probe.
@@ -90,6 +100,81 @@ enum Command {
         /// Per-operation network timeout in milliseconds.
         #[arg(long, default_value_t = 2_500)]
         timeout_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum SetupCommand {
+    /// List AWS CLI and SSO profiles available on this workstation.
+    Profiles,
+    /// Discover the AWS identity, active Connect instances, and public zones.
+    Discover {
+        #[arg(long)]
+        profile: String,
+        /// Limit discovery to one or more regions. By default all enabled regions are checked.
+        #[arg(long = "region")]
+        regions: Vec<String>,
+    },
+    /// Validate a human-readable setup YAML file and seal a .bridgefu bundle.
+    Generate {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify hashes and print a non-secret summary of a sealed bundle.
+    Inspect { bundle: PathBuf },
+    /// Export all reviewed source artifacts to a new or empty directory.
+    Export {
+        bundle: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Review a CloudFormation change set and optionally execute AWS then Vapi.
+    Apply {
+        bundle: PathBuf,
+        /// Execute after printing both the Vapi and CloudFormation plans.
+        #[arg(long)]
+        execute: bool,
+        /// Required with --execute; must equal the configured CloudFormation stack name.
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Read the Vapi private key from one line on stdin instead of a hidden terminal prompt.
+        #[arg(long)]
+        vapi_key_stdin: bool,
+        /// Reuse a previously reviewed CloudFormation change set by exact name.
+        #[arg(long)]
+        change_set_name: Option<String>,
+    },
+    /// Show the local resume state and current AWS stack status.
+    Status { bundle: PathBuf },
+    /// Rotate the AWS/Vapi webhook credential without changing the assistant.
+    RotateCredential {
+        bundle: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        confirm_assistant_id: Option<String>,
+        #[arg(long)]
+        vapi_key_stdin: bool,
+    },
+    /// Delete the exact Setup-created Vapi template, tool, and credential.
+    DeleteTemplate {
+        bundle: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        confirm_assistant_id: Option<String>,
+        #[arg(long)]
+        vapi_key_stdin: bool,
+    },
+    /// Remove the AWS stack while retaining the customized Vapi template.
+    Uninstall {
+        bundle: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        confirm: Option<String>,
     },
 }
 
@@ -228,6 +313,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Recipe { command } => run_recipe_command(command, &args.config),
+        Command::Setup { command } => run_setup_command(command),
         // Container liveness must work in a package-free runtime before a
         // config file or deployment secret is mounted. Dispatching before
         // constructing Tokio also keeps each frequent probe to one thread.
@@ -248,6 +334,453 @@ fn main() -> Result<()> {
                 .build()
                 .context("building the Bridgefu Tokio runtime")?;
             runtime.block_on(run(args))
+        }
+    }
+}
+
+fn run_setup_command(command: SetupCommand) -> Result<()> {
+    match command {
+        SetupCommand::Profiles => {
+            for profile in AwsCli.list_profiles()? {
+                println!("{profile}");
+            }
+            Ok(())
+        }
+        SetupCommand::Discover {
+            profile,
+            mut regions,
+        } => {
+            let aws = AwsCli;
+            let identity = aws.caller_identity(&profile)?;
+            if regions.is_empty() {
+                regions = aws.enabled_regions(&profile)?;
+            }
+            let instances = aws.connect_instances(&profile, &regions)?;
+            let zones = aws.public_hosted_zones(&profile)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "identity": identity,
+                    "connectInstances": instances,
+                    "publicHostedZones": zones,
+                }))?
+            );
+            Ok(())
+        }
+        SetupCommand::Generate { config, output } => {
+            let metadata = config
+                .metadata()
+                .with_context(|| format!("read setup configuration {}", config.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.len() <= 512 * 1024,
+                "setup configuration must be a bounded regular file"
+            );
+            let configuration: SetupConfiguration =
+                serde_yaml::from_slice(&std::fs::read(&config)?)
+                    .with_context(|| format!("parse setup configuration {}", config.display()))?;
+            let manifest = seal_bundle(&configuration, &output)?;
+            println!(
+                "sealed {}\nplan hash: {}",
+                output.display(),
+                manifest.bundle_sha256
+            );
+            Ok(())
+        }
+        SetupCommand::Inspect { bundle } => {
+            let inspection = inspect_bundle(&bundle)?;
+            let journal = load_journal(&bundle, &inspection.manifest)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "bundle": bundle,
+                    "planHash": inspection.manifest.bundle_sha256,
+                    "deploymentId": inspection.configuration.deployment_id,
+                    "stackName": inspection.configuration.stack_name,
+                    "awsAccount": inspection.configuration.aws.account_id,
+                    "region": inspection.configuration.aws.region,
+                    "connectInstance": inspection.configuration.connect.instance_arn,
+                    "targetFlow": inspection.configuration.connect.target_contact_flow_arn,
+                    "vapiAction": "create_new_template_assistant",
+                    "existingAssistantsModified": false,
+                    "screenPopFieldCount": inspection.configuration.screen_pop_fields.len(),
+                    "routingField": inspection.configuration.routing.as_ref().map(|routing| &routing.field_key),
+                    "reviewedRouteCount": inspection.configuration.routing.as_ref().map_or(0, |routing| routing.routes.len()),
+                    "journalPhase": journal.map(|item| item.phase),
+                    "containsSecrets": false,
+                }))?
+            );
+            Ok(())
+        }
+        SetupCommand::Export { bundle, output } => {
+            let manifest = export_bundle(&bundle, &output)?;
+            println!(
+                "exported plan {} to {}",
+                manifest.bundle_sha256,
+                output.display()
+            );
+            Ok(())
+        }
+        SetupCommand::Apply {
+            bundle,
+            execute,
+            confirm,
+            vapi_key_stdin,
+            change_set_name,
+        } => apply_setup_bundle(
+            &bundle,
+            execute,
+            confirm.as_deref(),
+            vapi_key_stdin,
+            change_set_name.as_deref(),
+        ),
+        SetupCommand::Status { bundle } => {
+            let inspection = inspect_bundle(&bundle)?;
+            let journal = load_journal(&bundle, &inspection.manifest)?;
+            if let Some(journal) = journal {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "planHash": journal.bundle_sha256,
+                        "phase": journal.phase,
+                        "updatedAt": journal.updated_at,
+                        "vapiTemplateAssistantId": journal.vapi_template.map(|state| state.assistant_id),
+                        "lastResultCategory": journal.last_result_category,
+                    }))?
+                );
+            } else {
+                println!("no execution has started for this sealed bundle");
+            }
+            let export = tempfile::tempdir()?;
+            export_bundle(&bundle, export.path())?;
+            let _profile = AwsProfileGuard::set(&inspection.configuration.aws.profile);
+            recipe_admin::status(
+                &export.path().join("aws/deployment-descriptor.yaml"),
+                recipe_admin::DeploymentProfile::Starter,
+            )
+        }
+        SetupCommand::RotateCredential {
+            bundle,
+            execute,
+            confirm_assistant_id,
+            vapi_key_stdin,
+        } => rotate_setup_credential(
+            &bundle,
+            execute,
+            confirm_assistant_id.as_deref(),
+            vapi_key_stdin,
+        ),
+        SetupCommand::DeleteTemplate {
+            bundle,
+            execute,
+            confirm_assistant_id,
+            vapi_key_stdin,
+        } => delete_setup_template(
+            &bundle,
+            execute,
+            confirm_assistant_id.as_deref(),
+            vapi_key_stdin,
+        ),
+        SetupCommand::Uninstall {
+            bundle,
+            execute,
+            confirm,
+        } => uninstall_setup_bundle(&bundle, execute, confirm.as_deref()),
+    }
+}
+
+fn apply_setup_bundle(
+    bundle: &std::path::Path,
+    execute: bool,
+    confirm: Option<&str>,
+    vapi_key_stdin: bool,
+    change_set_name: Option<&str>,
+) -> Result<()> {
+    let inspection = inspect_bundle(bundle)?;
+    if execute {
+        anyhow::ensure!(
+            confirm == Some(inspection.configuration.stack_name.as_str()),
+            "--confirm must exactly equal the configured stack name"
+        );
+    }
+    let mut journal = load_journal(bundle, &inspection.manifest)?
+        .unwrap_or_else(|| DeploymentJournal::reviewed(&inspection.manifest));
+    save_journal(bundle, &mut journal)?;
+
+    let vapi_key = if execute {
+        Some(read_vapi_key(vapi_key_stdin)?)
+    } else {
+        None
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build setup runtime")?;
+    let reviewed_vapi_plan = if let Some(key) = vapi_key.as_ref() {
+        let plan = runtime.block_on(plan_vapi_template(
+            &inspection.configuration,
+            key.as_str().to_owned(),
+            journal.vapi_template.as_ref(),
+        ))?;
+        println!("Vapi plan (masked):\n{}", plan.masked_diff);
+        Some(plan)
+    } else {
+        println!(
+            "Vapi plan: create one new Bridgefu template assistant; modify no existing assistant"
+        );
+        None
+    };
+
+    let export = tempfile::tempdir()?;
+    export_bundle(bundle, export.path())?;
+    let descriptor = export.path().join("aws/deployment-descriptor.yaml");
+    let _profile = AwsProfileGuard::set(&inspection.configuration.aws.profile);
+    recipe_admin::deploy(
+        &descriptor,
+        recipe_admin::DeploymentProfile::Starter,
+        execute,
+        confirm,
+        change_set_name,
+    )?;
+    if !execute {
+        return Ok(());
+    }
+
+    let outputs =
+        recipe_admin::stack_outputs(&descriptor, recipe_admin::DeploymentProfile::Starter)?;
+    let tool_url = outputs
+        .get("VapiToolUrl")
+        .context("deployed stack omitted VapiToolUrl")?
+        .to_owned();
+    let transfer_url = outputs
+        .get("VapiTransferUrl")
+        .context("deployed stack omitted VapiTransferUrl")?
+        .to_owned();
+    let webhook_reference = outputs
+        .get("VapiWebhookReference")
+        .context("deployed stack omitted VapiWebhookReference")?
+        .to_owned();
+    let identity_reference = outputs
+        .get("VapiIdentityReference")
+        .context("deployed stack omitted VapiIdentityReference")?
+        .to_owned();
+    journal.stack_outputs = outputs;
+    journal.phase = ExecutionPhase::AwsDeployed;
+    journal.last_result_category = Some("aws_deployed".into());
+    save_journal(bundle, &mut journal)?;
+
+    let webhook = AwsCli.secret_string(
+        &inspection.configuration.aws.profile,
+        &inspection.configuration.aws.region,
+        &webhook_reference,
+    )?;
+    let resolved = VapiResolvedInputs::new(tool_url, transfer_url, webhook)?;
+    let key = vapi_key.context("Vapi key was not available for execution")?;
+    let plan = reviewed_vapi_plan.context("Vapi plan was not reviewed")?;
+    let state = runtime.block_on(apply_vapi_template(
+        &inspection.configuration,
+        key.as_str().to_owned(),
+        &resolved,
+        &plan,
+        journal.vapi_template.as_ref(),
+    ))?;
+    println!("created Vapi template assistant: {}", state.assistant_id);
+    let assistant_id = state.assistant_id.clone();
+    let organization_id = state.organization_id.clone();
+    journal.vapi_template = Some(state);
+    journal.phase = ExecutionPhase::VapiTemplateCreated;
+    journal.last_result_category = Some("vapi_identity_binding_pending".into());
+    save_journal(bundle, &mut journal)?;
+    AwsCli.bind_vapi_identity(
+        &inspection.configuration.aws.profile,
+        &inspection.configuration.aws.region,
+        &identity_reference,
+        &organization_id,
+        &assistant_id,
+    )?;
+    journal.phase = ExecutionPhase::VapiIdentityBound;
+    journal.last_result_category = Some("vapi_identity_bound".into());
+    save_journal(bundle, &mut journal)?;
+    recipe_admin::doctor(&descriptor, recipe_admin::DeploymentProfile::Starter)?;
+    journal.phase = ExecutionPhase::Verified;
+    journal.last_result_category = Some("structural_verification_passed".into());
+    save_journal(bundle, &mut journal)?;
+    Ok(())
+}
+
+fn rotate_setup_credential(
+    bundle: &std::path::Path,
+    execute: bool,
+    confirm_assistant_id: Option<&str>,
+    vapi_key_stdin: bool,
+) -> Result<()> {
+    let inspection = inspect_bundle(bundle)?;
+    let mut journal = load_journal(bundle, &inspection.manifest)?
+        .context("this deployment has no execution journal")?;
+    let state = journal
+        .vapi_template
+        .as_ref()
+        .context("this deployment has no recorded Vapi template")?;
+    println!(
+        "plan: rotate only the Bridgefu webhook credential attached to assistant {}",
+        state.assistant_id
+    );
+    println!("the assistant, prompt, model, voice, tools, and customer data will not be changed");
+    if !execute {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        confirm_assistant_id == Some(state.assistant_id.as_str()),
+        "--confirm-assistant-id must exactly equal the recorded assistant ID"
+    );
+    let webhook_reference = journal
+        .stack_outputs
+        .get("VapiWebhookReference")
+        .context("deployment journal omitted VapiWebhookReference")?
+        .to_owned();
+    let key = read_vapi_key(vapi_key_stdin)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build credential rotation runtime")?;
+    let replacement = runtime.block_on(AwsCli.rotate_webhook_secret(
+        &inspection.configuration.aws.profile,
+        &inspection.configuration.aws.region,
+        &webhook_reference,
+    ))?;
+    let result = runtime.block_on(rotate_vapi_credential(
+        &inspection.configuration,
+        key.as_str().to_owned(),
+        state,
+        replacement.as_str(),
+    ));
+    if result.is_err() {
+        journal.last_result_category = Some("credential_rotation_vapi_pending".into());
+        save_journal(bundle, &mut journal)?;
+    }
+    result?;
+    journal.last_result_category = Some("credential_rotation_complete".into());
+    save_journal(bundle, &mut journal)?;
+    println!("webhook credential rotated and verified");
+    Ok(())
+}
+
+fn delete_setup_template(
+    bundle: &std::path::Path,
+    execute: bool,
+    confirm_assistant_id: Option<&str>,
+    vapi_key_stdin: bool,
+) -> Result<()> {
+    let inspection = inspect_bundle(bundle)?;
+    let mut journal = load_journal(bundle, &inspection.manifest)?
+        .context("this deployment has no execution journal")?;
+    let state = journal
+        .vapi_template
+        .as_ref()
+        .context("this deployment has no recorded Vapi template")?;
+    println!(
+        "plan: delete the exact Setup-created Vapi assistant {}, its Bridgefu tool, and credential",
+        state.assistant_id
+    );
+    println!("AWS resources and retained context will not be changed");
+    if !execute {
+        return Ok(());
+    }
+    let confirmation = confirm_assistant_id.context("--confirm-assistant-id is required")?;
+    anyhow::ensure!(
+        confirmation == state.assistant_id,
+        "--confirm-assistant-id must exactly equal the recorded assistant ID"
+    );
+    let key = read_vapi_key(vapi_key_stdin)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build Vapi deletion runtime")?;
+    runtime.block_on(delete_vapi_template(
+        &inspection.configuration,
+        key.as_str().to_owned(),
+        state,
+        confirmation,
+    ))?;
+    journal.phase = ExecutionPhase::VapiTemplateDeleted;
+    journal.last_result_category = Some("vapi_template_deleted".into());
+    save_journal(bundle, &mut journal)?;
+    println!("owned Vapi template resources deleted");
+    Ok(())
+}
+
+fn uninstall_setup_bundle(
+    bundle: &std::path::Path,
+    execute: bool,
+    confirm: Option<&str>,
+) -> Result<()> {
+    let inspection = inspect_bundle(bundle)?;
+    let mut journal = load_journal(bundle, &inspection.manifest)?
+        .context("this deployment has no execution journal")?;
+    println!(
+        "plan: remove AWS stack {}",
+        inspection.configuration.stack_name
+    );
+    println!("the generated Vapi template is retained by default so customer customizations are not destroyed");
+    println!("DynamoDB and audit retention follow the reviewed production stack policies");
+    if !execute {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        confirm == Some(inspection.configuration.stack_name.as_str()),
+        "--confirm must exactly equal the configured stack name"
+    );
+    let export = tempfile::tempdir()?;
+    export_bundle(bundle, export.path())?;
+    let descriptor = export.path().join("aws/deployment-descriptor.yaml");
+    let _profile = AwsProfileGuard::set(&inspection.configuration.aws.profile);
+    recipe_admin::uninstall_setup_production(
+        &descriptor,
+        recipe_admin::DeploymentProfile::Starter,
+        confirm.context("--confirm is required")?,
+    )?;
+    journal.phase = ExecutionPhase::AwsRemoved;
+    journal.last_result_category = Some("vapi_template_retained_aws_removed".into());
+    save_journal(bundle, &mut journal)?;
+    Ok(())
+}
+
+fn read_vapi_key(from_stdin: bool) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::{BufRead, Read};
+    let value = if from_stdin {
+        let mut value = String::new();
+        std::io::stdin().lock().take(4_097).read_line(&mut value)?;
+        while matches!(value.chars().last(), Some('\n' | '\r')) {
+            value.pop();
+        }
+        value
+    } else {
+        rpassword::prompt_password("Vapi private API key (kept in memory only): ")?
+    };
+    anyhow::ensure!(
+        (24..=4096).contains(&value.len()),
+        "Vapi API key is invalid"
+    );
+    Ok(zeroize::Zeroizing::new(value))
+}
+
+struct AwsProfileGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl AwsProfileGuard {
+    fn set(profile: &str) -> Self {
+        let previous = std::env::var_os("AWS_PROFILE");
+        std::env::set_var("AWS_PROFILE", profile);
+        Self { previous }
+    }
+}
+
+impl Drop for AwsProfileGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var("AWS_PROFILE", value);
+        } else {
+            std::env::remove_var("AWS_PROFILE");
         }
     }
 }
@@ -327,7 +860,14 @@ fn run_recipe_command(command: RecipeCommand, config_path: &std::path::Path) -> 
             let package = catalog.resolve(&selector)?;
             initialize_recipe_directory(&selector, package.manifest(), &output)?;
             println!("initialized {} in {}", selector, output.display());
-            println!("next: edit values.yaml, then run bridgefu recipe validate {selector} --values {}/values.yaml", output.display());
+            if selector == "builtin:vapi-amazon-connect-screen-pop@1" {
+                println!(
+                    "next: open {}/README.md for the AWS proof, production CloudFormation deployment, and operations path",
+                    output.display()
+                );
+            } else {
+                println!("next: edit values.yaml, then run bridgefu recipe validate {selector} --values {}/values.yaml", output.display());
+            }
             Ok(())
         }
         RecipeCommand::Explain { instance } => {
@@ -444,6 +984,11 @@ fn initialize_recipe_directory(
         .with_context(|| format!("writing {}/INPUTS.md", output.display()))?;
 
     if canonical {
+        std::fs::write(
+            output.join("README.md"),
+            include_str!("../recipes/vapi-amazon-connect-screen-pop/README.md"),
+        )
+        .with_context(|| format!("writing {}/README.md", output.display()))?;
         std::fs::write(
             output.join("bridgefu.yaml"),
             include_str!("../config/recipe-vapi-amazon-connect.example.yaml"),
@@ -1552,6 +2097,25 @@ mod tests {
                 command: RecipeCommand::Destroy { .. }
             })
         ));
+    }
+
+    #[test]
+    fn flagship_recipe_guide_is_setup_first_and_keeps_disposable_proof_secondary() {
+        let guide = include_str!("../recipes/vapi-amazon-connect-screen-pop/README.md");
+        for required in [
+            "## 1. Open Bridgefu Setup",
+            "## 2. Select AWS and Amazon Connect",
+            "## 3. Create the Vapi template",
+            "Existing assistants are not read or modified",
+            "**Reviewed routing**",
+            "## Maintainer: disposable full proof",
+            "release-maintainer test, not a prerequisite",
+        ] {
+            assert!(
+                guide.contains(required),
+                "flagship init guide is missing {required:?}"
+            );
+        }
     }
 
     #[test]

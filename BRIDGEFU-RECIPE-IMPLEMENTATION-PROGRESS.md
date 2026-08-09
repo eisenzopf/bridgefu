@@ -30,6 +30,29 @@
   and are not published in the repository. An expired deadline blocks paid
   phases for that execution but never blocks explicit inventory or teardown.
 
+## 2026-08-07 registry and CloudFront qualification refresh
+
+- Bridgefu now resolves all 25 rvoip packages at exactly `0.3.7` from
+  crates.io, with registry checksums and no Git, path, or Cargo patch override.
+- The 11 changes formerly carried in Bridgefu's local rvoip range were compared
+  with the published source. Ten are patch-equivalent; the no-MID primary-audio
+  change has the equivalent post-refactor implementation and focused regression
+  coverage. The later no-MID DTMF fix is also present and its wire tests pass.
+- Focused published-package regressions and Bridgefu's built TypeScript SDK to
+  generic-WSS Chromium qualification pass locally. The complete local
+  regression matrix is being rerun against the exact 0.3.7 lockfile.
+- Demo-site verification now binds and inspects the deployed CloudFront
+  distribution, ownership tags, zero-TTL cache policy, security response
+  policy, SigV4 origin access control, private S3 origin, redirect, exact
+  release assets and content types, public config, and missing-object behavior.
+  The protected Vapi browser flow loads deployed CloudFront assets and
+  intercepts only its one-run qualification config in memory.
+- The prior retained AWS execution had `enable_demo_site=false` and cannot
+  qualify this change. After local gates pass, it must be inventoried and
+  retired under its exact ledger, then a fresh demo-site-enabled execution must
+  complete smoke, full, lifecycle, second verification, evidence validation,
+  teardown, and retained zero-state proof.
+
 ## How to read this journal
 
 This is the implementation ledger for the plan in the project root. A local

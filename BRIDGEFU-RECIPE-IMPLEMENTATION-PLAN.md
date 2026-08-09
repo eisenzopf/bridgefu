@@ -2109,7 +2109,8 @@ Exit criteria:
 
 1. Browser WebRTC to Vapi assistant, then Amazon Connect or SIP contact center.
 2. SIP/RTP and SIPS/SRTP to interactive WebRTC and back.
-3. Resolve rvoip #54 before claiming complete WebRTC-destination DTMF.
+3. Keep the rvoip 0.3.7 generic-WSS Chromium regression green; it closes the
+   outbound-DTMF defect tracked as rvoip #54.
 4. Genesys WebRTC bridge on the roadmap.
 
 ### Phase 10: Google Cloud and web administration roadmap
@@ -2177,7 +2178,7 @@ Exit criteria:
 | Observability increases jitter | No per-packet logs/spans; asynchronous bounded aggregation outside media path |
 | PII leaks through logs/evidence | Fixed schema, redaction tests, synthetic test data, hashed identifiers |
 | Mutable/unpublished artifacts block one-click deployment | Publish signed immutable image/Lambda/template manifest before stack release |
-| Existing outbound WebRTC DTMF defect | Keep affected path preview/development until rvoip #54 is fixed and qualified |
+| Outbound WebRTC DTMF regression | Pin checksummed rvoip 0.3.7 and keep the exact generic-WSS Chromium qualification in the release gate |
 | Cross-cloud hosting adds audio latency | Same-region AWS default; GCP path remains roadmap until measured |
 | CloudFormation custom resource deletes unowned Vapi resources | Deterministic ownership metadata and verify-before-update/delete |
 | Root-account deployment authority | Use IAM Identity Center/assumed deployment role before implementation deployment |

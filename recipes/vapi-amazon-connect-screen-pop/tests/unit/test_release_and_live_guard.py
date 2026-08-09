@@ -9,6 +9,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -64,10 +65,8 @@ CfnLoader.add_multi_constructor("!", construct_cfn_tag)
 
 
 class ReleaseAndLiveGuardTests(unittest.TestCase):
-    def test_rvoip_workspace_backports_share_one_immutable_revision(self):
-        expected_revision = "874333e98a7c7417cfe62cd6244aa7ed29f4be0a"
-        expected_repository = "https://github.com/eisenzopf/rvoip.git"
-        expected_patches = {
+    def test_rvoip_release_is_exact_checksummed_and_registry_only(self):
+        expected_direct = {
             "rvoip-amazon-connect",
             "rvoip-auth-core",
             "rvoip-core",
@@ -81,31 +80,312 @@ class ReleaseAndLiveGuardTests(unittest.TestCase):
             "rvoip-webrtc-stack",
         }
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
-        patches = manifest["patch"]["crates-io"]
-        self.assertEqual(set(patches), expected_patches)
-        self.assertEqual(
-            set((patch["git"], patch["rev"]) for patch in patches.values()),
-            {(expected_repository, expected_revision)},
+        self.assertNotIn("patch", manifest)
+        direct = {
+            name
+            for name in manifest["dependencies"]
+            if name.startswith("rvoip-")
+        }
+        direct.update(
+            value.get("package", name) if isinstance(value, dict) else name
+            for name, value in manifest["dev-dependencies"].items()
+            if name.startswith("rvoip-")
+            or (isinstance(value, dict) and value.get("package", "").startswith("rvoip-"))
         )
+        self.assertEqual(direct, expected_direct)
+        for section in ("dependencies", "dev-dependencies"):
+            for name, value in manifest[section].items():
+                package = value.get("package", name) if isinstance(value, dict) else name
+                if package.startswith("rvoip-"):
+                    version = value["version"] if isinstance(value, dict) else value
+                    self.assertEqual(version, "=0.3.7")
 
         lockfile = tomllib.loads((ROOT / "Cargo.lock").read_text())
-        rvoip_packages = {
-            package["name"]: package
+        rvoip_packages = [
+            package
             for package in lockfile["package"]
             if package["name"].startswith("rvoip-")
-        }
-        self.assertTrue(rvoip_packages)
-        expected_source = (
-            f"git+{expected_repository}?rev={expected_revision}#{expected_revision}"
-        )
+        ]
+        self.assertEqual(len(rvoip_packages), 25)
+        self.assertEqual(len({package["name"] for package in rvoip_packages}), 25)
         self.assertTrue(
             all(
-                package["version"] == "0.3.5"
-                and package["source"] == expected_source
-                and "checksum" not in package
-                for package in rvoip_packages.values()
+                package["version"] == "0.3.7"
+                and package["source"].startswith("registry+")
+                and len(package.get("checksum", "")) == 64
+                for package in rvoip_packages
             )
         )
+
+    def test_demo_site_verification_binds_cloudfront_and_exact_release_assets(self):
+        execution_id = "bft-safe1"
+        site_host = "d123example.cloudfront.net"
+        site_url = f"https://{site_host}"
+        bucket = "bfu-123456789012-us-west-2-bft-safe1-site"
+        distribution_id = "E123EXAMPLE"
+        cache_policy_id = "cache-policy-id"
+        response_policy_id = "response-policy-id"
+        origin_access_control_id = "origin-access-control-id"
+        public_key = "pk_test_browser_safe"
+        assistant_id = "assistant-test"
+        release_revision = "c" * 64
+        files = {
+            "index.html": b"<h1>Bridgefu recipe test call</h1>",
+            "style.css": b"body { color: black; }",
+            "app.js": b"window.__BRIDGEFU_RECIPE_TEST__ = {};",
+            "app.js.LEGAL.txt": b"license",
+            "third-party-licenses.json": b"[]",
+        }
+        content_types = {
+            "index.html": "text/html; charset=utf-8",
+            "style.css": "text/css; charset=utf-8",
+            "app.js": "text/javascript; charset=utf-8",
+            "app.js.LEGAL.txt": "text/plain; charset=utf-8",
+            "third-party-licenses.json": "application/json; charset=utf-8",
+            "config.json": "application/json; charset=utf-8",
+        }
+        security_headers = {
+            "cache-control": "no-store",
+            "content-security-policy": (
+                "default-src 'self'; frame-ancestors 'none'; object-src 'none'"
+            ),
+            "strict-transport-security": (
+                "max-age=31536000; includeSubDomains; preload"
+            ),
+            "x-frame-options": "DENY",
+            "x-content-type-options": "nosniff",
+            "referrer-policy": "no-referrer",
+            "cross-origin-opener-policy": "same-origin",
+            "permissions-policy": "microphone=(self)",
+            "x-xss-protection": "1; mode=block",
+        }
+        distribution = {
+            "Distribution": {
+                "Id": distribution_id,
+                "ARN": (
+                    "arn:aws:cloudfront::123456789012:distribution/"
+                    f"{distribution_id}"
+                ),
+                "Status": "Deployed",
+                "DomainName": site_host,
+                "DistributionConfig": {
+                    "Enabled": True,
+                    "DefaultRootObject": "index.html",
+                    "HttpVersion": "http2and3",
+                    "IPV6Enabled": True,
+                    "PriceClass": "PriceClass_100",
+                    "Aliases": {"Quantity": 0},
+                    "Origins": {
+                        "Quantity": 1,
+                        "Items": [
+                            {
+                                "Id": "site",
+                                "DomainName": f"{bucket}.s3.us-west-2.amazonaws.com",
+                                "OriginAccessControlId": origin_access_control_id,
+                                "S3OriginConfig": {"OriginAccessIdentity": ""},
+                            }
+                        ],
+                    },
+                    "DefaultCacheBehavior": {
+                        "TargetOriginId": "site",
+                        "ViewerProtocolPolicy": "redirect-to-https",
+                        "Compress": True,
+                        "AllowedMethods": {
+                            "Quantity": 3,
+                            "Items": ["GET", "HEAD", "OPTIONS"],
+                            "CachedMethods": {
+                                "Quantity": 3,
+                                "Items": ["GET", "HEAD", "OPTIONS"],
+                            },
+                        },
+                        "CachePolicyId": cache_policy_id,
+                        "ResponseHeadersPolicyId": response_policy_id,
+                    },
+                },
+            }
+        }
+        cache_policy = {
+            "CachePolicyConfig": {
+                "Name": f"bridgefu-{execution_id}-demo-no-cache",
+                "DefaultTTL": 0,
+                "MaxTTL": 0,
+                "MinTTL": 0,
+                "ParametersInCacheKeyAndForwardedToOrigin": {
+                    "EnableAcceptEncodingBrotli": True,
+                    "EnableAcceptEncodingGzip": True,
+                    "CookiesConfig": {"CookieBehavior": "none"},
+                    "HeadersConfig": {"HeaderBehavior": "none"},
+                    "QueryStringsConfig": {"QueryStringBehavior": "none"},
+                },
+            }
+        }
+        response_policy = {
+            "ResponseHeadersPolicyConfig": {
+                "Name": f"bridgefu-{execution_id}-demo-security",
+                "SecurityHeadersConfig": {
+                    "ContentSecurityPolicy": {
+                        "Override": True,
+                        "ContentSecurityPolicy": (
+                            "default-src 'self'; frame-ancestors 'none'"
+                        ),
+                    },
+                    "ContentTypeOptions": {"Override": True},
+                    "FrameOptions": {"Override": True, "FrameOption": "DENY"},
+                    "ReferrerPolicy": {
+                        "Override": True,
+                        "ReferrerPolicy": "no-referrer",
+                    },
+                    "StrictTransportSecurity": {
+                        "Override": True,
+                        "AccessControlMaxAgeSec": 31_536_000,
+                        "IncludeSubdomains": True,
+                        "Preload": True,
+                    },
+                    "XSSProtection": {
+                        "Override": True,
+                        "Protection": True,
+                        "ModeBlock": True,
+                    },
+                },
+                "CustomHeadersConfig": {
+                    "Items": [
+                        {
+                            "Header": "Cross-Origin-Opener-Policy",
+                            "Value": "same-origin",
+                            "Override": True,
+                        },
+                        {
+                            "Header": "Permissions-Policy",
+                            "Value": "microphone=(self)",
+                            "Override": True,
+                        },
+                    ]
+                },
+            }
+        }
+        origin_access_control = {
+            "OriginAccessControlConfig": {
+                "Name": f"bridgefu-{execution_id}-demo-site",
+                "OriginAccessControlOriginType": "s3",
+                "SigningBehavior": "always",
+                "SigningProtocol": "sigv4",
+            }
+        }
+        tags = {
+            "Tags": {
+                "Items": [
+                    {"Key": "Project", "Value": "bridgefu-recipe"},
+                    {
+                        "Key": "ManagedBy",
+                        "Value": "bridgefu-cloudformation",
+                    },
+                    {"Key": "BridgefuExecutionId", "Value": execution_id},
+                    {"Key": "BridgefuRecipe", "Value": LIVE.RECIPE},
+                ]
+            }
+        }
+
+        def aws_response(command, **_kwargs):
+            operation = command[1]
+            return {
+                "get-distribution": distribution,
+                "list-tags-for-resource": tags,
+                "get-cache-policy-config": cache_policy,
+                "get-response-headers-policy-config": response_policy,
+                "get-origin-access-control-config": origin_access_control,
+            }[operation]
+
+        config = json.dumps(
+            {
+                "schema_version": 1,
+                "recipe": LIVE.RECIPE,
+                "vapi_public_key": public_key,
+                "vapi_assistant_id": assistant_id,
+                "release_revision": release_revision,
+            }
+        ).encode()
+
+        def http_response(url):
+            if url == f"https://{bucket}.s3.us-west-2.amazonaws.com/index.html":
+                return 403, {}, b"AccessDenied"
+            if url.endswith("/bridgefu-qualification-missing-object"):
+                return 404, {}, b"Not Found"
+            name = "index.html" if url == f"{site_url}/" else url.rsplit("/", 1)[1]
+            body = config if name == "config.json" else files[name]
+            return 200, {**security_headers, "content-type": content_types[name]}, body
+
+        ledger = {
+            "enable_demo_site": True,
+            "execution_id": execution_id,
+            "account_id": "123456789012",
+            "region": "us-west-2",
+            "demo_site_bucket": bucket,
+            "demo_site_public_key_sha256": hashlib.sha256(
+                public_key.encode()
+            ).hexdigest(),
+        }
+        nested_description = {
+            "Outputs": [
+                {"OutputKey": "TestSiteUrl", "OutputValue": site_url},
+                {"OutputKey": "DistributionId", "OutputValue": distribution_id},
+                {"OutputKey": "SiteBucketName", "OutputValue": bucket},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            bundle = state / "release/artifacts/demo-site/demo-site.zip"
+            bundle.parent.mkdir(parents=True)
+            with zipfile.ZipFile(bundle, "w") as archive:
+                for name, body in files.items():
+                    archive.writestr(name, body)
+            runtime_manifest = state / "release/artifacts/runtime/manifest.json"
+            runtime_manifest.parent.mkdir(parents=True)
+            runtime_manifest.write_text(
+                json.dumps({"artifact": {"sha256": release_revision}})
+            )
+            with (
+                mock.patch.object(
+                    LIVE, "ledger_path", return_value=state / "ledger.json"
+                ),
+                mock.patch.object(
+                    LIVE, "nested_stack_id", return_value="demo-stack-id"
+                ),
+                mock.patch.object(
+                    LIVE,
+                    "exact_nested_stack_description",
+                    return_value=nested_description,
+                ),
+                mock.patch.object(LIVE, "aws_json", side_effect=aws_response),
+                mock.patch.object(LIVE, "http_get", side_effect=http_response),
+                mock.patch.object(
+                    LIVE,
+                    "http_get_no_redirect",
+                    return_value=(301, {"location": f"{site_url}/"}, b""),
+                ),
+            ):
+                LIVE.verify_demo_site(
+                    ledger,
+                    {"SAFE": "1"},
+                    "application-stack-id",
+                    "application-nested-stack-id",
+                    {"DemoSiteUrl": site_url},
+                    assistant_id,
+                )
+                response_policy["ResponseHeadersPolicyConfig"][
+                    "CustomHeadersConfig"
+                ]["Items"][1]["Value"] = "microphone=()"
+                with self.assertRaisesRegex(
+                    LIVE.LiveTestError,
+                    "security response policy changed",
+                ):
+                    LIVE.verify_demo_site(
+                        ledger,
+                        {"SAFE": "1"},
+                        "application-stack-id",
+                        "application-nested-stack-id",
+                        {"DemoSiteUrl": site_url},
+                        assistant_id,
+                    )
 
     def test_deployed_recipe_stack_id_selects_and_validates_nested_application(self):
         root_stack_id = (

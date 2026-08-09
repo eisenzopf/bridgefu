@@ -41,7 +41,9 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -7957,25 +7959,313 @@ def http_get(url: str) -> tuple[int, dict[str, str], bytes]:
         return error.code, {}, error.read(1024)
 
 
+class _NoHttpRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_get_no_redirect(url: str) -> tuple[int, dict[str, str], bytes]:
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "accept": "text/html,*/*;q=0.1",
+            "user-agent": "bridgefu-qualification/1",
+        },
+    )
+    opener = urllib.request.build_opener(_NoHttpRedirect())
+    try:
+        with opener.open(request, timeout=20) as response:
+            return (
+                response.status,
+                {key.lower(): value for key, value in response.headers.items()},
+                response.read(1024),
+            )
+    except urllib.error.HTTPError as error:
+        return (
+            error.code,
+            {key.lower(): value for key, value in error.headers.items()},
+            error.read(1024),
+        )
+
+
+def require_demo_site_headers(headers: dict[str, str], asset: str) -> None:
+    csp = headers.get("content-security-policy", "")
+    hsts = headers.get("strict-transport-security", "").lower().replace(" ", "")
+    if (
+        "frame-ancestors 'none'" not in csp
+        or "object-src 'none'" not in csp
+        or headers.get("x-frame-options", "").upper() != "DENY"
+        or headers.get("x-content-type-options", "").lower() != "nosniff"
+        or headers.get("referrer-policy", "").lower() != "no-referrer"
+        or headers.get("cross-origin-opener-policy", "").lower() != "same-origin"
+        or headers.get("permissions-policy", "").replace(" ", "")
+        != "microphone=(self)"
+        or headers.get("x-xss-protection", "").lower().replace(" ", "")
+        != "1;mode=block"
+        or "max-age=31536000" not in hsts
+        or "includesubdomains" not in hsts
+        or "preload" not in hsts
+        or "no-store" not in headers.get("cache-control", "").lower()
+    ):
+        raise LiveTestError(f"CloudFront demo {asset} headers violate the contract")
+
+
 def verify_demo_site(
-    ledger: dict[str, Any], root_outputs: dict[str, str], assistant_id: str
+    ledger: dict[str, Any],
+    env: dict[str, str],
+    application_stack_id: str,
+    application_nested_stack_id: str,
+    root_outputs: dict[str, str],
+    assistant_id: str,
 ) -> None:
     if not ledger.get("enable_demo_site"):
         return
-    site_url = root_outputs.get("DemoSiteUrl", "")
-    if not site_url.startswith("https://"):
+    site_url = root_outputs.get("DemoSiteUrl", "").rstrip("/")
+    try:
+        parsed_site_url = urllib.parse.urlsplit(site_url)
+    except ValueError as error:
+        raise LiveTestError("the enabled demo site has an invalid URL") from error
+    if (
+        parsed_site_url.scheme != "https"
+        or parsed_site_url.username is not None
+        or parsed_site_url.password is not None
+        or parsed_site_url.port is not None
+        or parsed_site_url.hostname is None
+        or re.fullmatch(r"d[a-z0-9]+\.cloudfront\.net", parsed_site_url.hostname)
+        is None
+        or parsed_site_url.path
+        or parsed_site_url.query
+        or parsed_site_url.fragment
+    ):
         raise LiveTestError("the enabled demo site has no HTTPS stack output")
-    index_status, index_headers, index_body = http_get(site_url + "/")
-    if index_status != 200 or b"Bridgefu recipe test call" not in index_body:
-        raise LiveTestError("the CloudFront demo page is not readable")
-    security_policy = index_headers.get("content-security-policy", "")
-    if "frame-ancestors 'none'" not in security_policy:
-        raise LiveTestError(
-            "the CloudFront demo page is missing browser isolation headers"
+    demo_stack_id = nested_stack_id(
+        ledger, env, "DemoSite", application_nested_stack_id
+    )
+    demo_outputs = outputs(
+        exact_nested_stack_description(
+            ledger,
+            env,
+            demo_stack_id,
+            parent_stack_id=application_nested_stack_id,
+            root_stack_id=application_stack_id,
         )
-    config_status, _, config_body = http_get(site_url + "/config.json")
+    )
+    distribution_id = demo_outputs.get("DistributionId", "")
+    bucket_name = demo_outputs.get("SiteBucketName", "")
+    if (
+        demo_outputs.get("TestSiteUrl", "").rstrip("/") != site_url
+        or bucket_name != ledger.get("demo_site_bucket")
+        or re.fullmatch(r"[A-Z0-9]{8,32}", distribution_id) is None
+    ):
+        raise LiveTestError("the CloudFront demo outputs violate their exact binding")
+
+    distribution = aws_json(
+        ["cloudfront", "get-distribution", "--id", distribution_id], env=env
+    ).get("Distribution", {})
+    config = distribution.get("DistributionConfig", {})
+    origin_items = config.get("Origins", {}).get("Items", [])
+    behavior = config.get("DefaultCacheBehavior", {})
+    allowed = behavior.get("AllowedMethods", {})
+    cached = allowed.get("CachedMethods", {})
+    expected_origin = f"{bucket_name}.s3.{ledger['region']}.amazonaws.com"
+    if (
+        distribution.get("Id") != distribution_id
+        or distribution.get("Status") != "Deployed"
+        or distribution.get("DomainName") != parsed_site_url.hostname
+        or config.get("Enabled") is not True
+        or config.get("DefaultRootObject") != "index.html"
+        or config.get("HttpVersion") != "http2and3"
+        or config.get("IPV6Enabled") is not True
+        or config.get("PriceClass") != "PriceClass_100"
+        or config.get("Aliases", {}).get("Quantity") != 0
+        or config.get("Origins", {}).get("Quantity") != 1
+        or len(origin_items) != 1
+        or origin_items[0].get("Id") != "site"
+        or origin_items[0].get("DomainName") != expected_origin
+        or not origin_items[0].get("OriginAccessControlId")
+        or origin_items[0].get("S3OriginConfig", {}).get("OriginAccessIdentity")
+        != ""
+        or behavior.get("TargetOriginId") != "site"
+        or behavior.get("ViewerProtocolPolicy") != "redirect-to-https"
+        or behavior.get("Compress") is not True
+        or set(allowed.get("Items", [])) != {"GET", "HEAD", "OPTIONS"}
+        or allowed.get("Quantity") != 3
+        or set(cached.get("Items", [])) != {"GET", "HEAD", "OPTIONS"}
+        or cached.get("Quantity") != 3
+        or not behavior.get("CachePolicyId")
+        or not behavior.get("ResponseHeadersPolicyId")
+    ):
+        raise LiveTestError("the CloudFront distribution violates the reviewed contract")
+
+    tags = aws_json(
+        [
+            "cloudfront",
+            "list-tags-for-resource",
+            "--resource",
+            distribution.get("ARN", ""),
+        ],
+        env=env,
+    ).get("Tags", {}).get("Items", [])
+    tag_map = {item.get("Key"): item.get("Value") for item in tags}
+    if any(
+        tag_map.get(key) != value
+        for key, value in {
+            "Project": "bridgefu-recipe",
+            "ManagedBy": "bridgefu-cloudformation",
+            "BridgefuExecutionId": ledger["execution_id"],
+            "BridgefuRecipe": RECIPE,
+        }.items()
+    ):
+        raise LiveTestError("the CloudFront distribution ownership tags changed")
+
+    cache_policy = aws_json(
+        [
+            "cloudfront",
+            "get-cache-policy-config",
+            "--id",
+            behavior["CachePolicyId"],
+        ],
+        env=env,
+    ).get("CachePolicyConfig", {})
+    cache_parameters = cache_policy.get(
+        "ParametersInCacheKeyAndForwardedToOrigin", {}
+    )
+    if (
+        cache_policy.get("Name")
+        != f"bridgefu-{ledger['execution_id']}-demo-no-cache"
+        or any(cache_policy.get(name) != 0 for name in ("DefaultTTL", "MaxTTL", "MinTTL"))
+        or cache_parameters.get("EnableAcceptEncodingBrotli") is not True
+        or cache_parameters.get("EnableAcceptEncodingGzip") is not True
+        or cache_parameters.get("CookiesConfig", {}).get("CookieBehavior") != "none"
+        or cache_parameters.get("HeadersConfig", {}).get("HeaderBehavior") != "none"
+        or cache_parameters.get("QueryStringsConfig", {}).get("QueryStringBehavior")
+        != "none"
+    ):
+        raise LiveTestError("the CloudFront zero-TTL cache policy changed")
+
+    response_policy = aws_json(
+        [
+            "cloudfront",
+            "get-response-headers-policy-config",
+            "--id",
+            behavior["ResponseHeadersPolicyId"],
+        ],
+        env=env,
+    ).get("ResponseHeadersPolicyConfig", {})
+    security = response_policy.get("SecurityHeadersConfig", {})
+    custom_headers = {
+        item.get("Header", "").lower(): (item.get("Value"), item.get("Override"))
+        for item in response_policy.get("CustomHeadersConfig", {}).get("Items", [])
+    }
+    csp = security.get("ContentSecurityPolicy", {})
+    hsts = security.get("StrictTransportSecurity", {})
+    if (
+        response_policy.get("Name")
+        != f"bridgefu-{ledger['execution_id']}-demo-security"
+        or csp.get("Override") is not True
+        or "frame-ancestors 'none'" not in csp.get("ContentSecurityPolicy", "")
+        or security.get("ContentTypeOptions", {}).get("Override") is not True
+        or security.get("FrameOptions")
+        != {"Override": True, "FrameOption": "DENY"}
+        or security.get("ReferrerPolicy")
+        != {"Override": True, "ReferrerPolicy": "no-referrer"}
+        or hsts.get("Override") is not True
+        or hsts.get("AccessControlMaxAgeSec") != 31_536_000
+        or hsts.get("IncludeSubdomains") is not True
+        or hsts.get("Preload") is not True
+        or security.get("XSSProtection")
+        != {"Override": True, "Protection": True, "ModeBlock": True}
+        or custom_headers
+        != {
+            "cross-origin-opener-policy": ("same-origin", True),
+            "permissions-policy": ("microphone=(self)", True),
+        }
+    ):
+        raise LiveTestError("the CloudFront security response policy changed")
+
+    oac = aws_json(
+        [
+            "cloudfront",
+            "get-origin-access-control-config",
+            "--id",
+            origin_items[0]["OriginAccessControlId"],
+        ],
+        env=env,
+    ).get("OriginAccessControlConfig", {})
+    if (
+        oac.get("Name") != f"bridgefu-{ledger['execution_id']}-demo-site"
+        or oac.get("OriginAccessControlOriginType") != "s3"
+        or oac.get("SigningBehavior") != "always"
+        or oac.get("SigningProtocol") != "sigv4"
+    ):
+        raise LiveTestError("the CloudFront origin access control changed")
+
+    redirect_status, redirect_headers, _ = http_get_no_redirect(
+        f"http://{parsed_site_url.hostname}/"
+    )
+    if (
+        redirect_status != 301
+        or redirect_headers.get("location") != f"{site_url}/"
+    ):
+        raise LiveTestError("the CloudFront HTTP-to-HTTPS redirect changed")
+    origin_status, _, origin_body = http_get(f"https://{expected_origin}/index.html")
+    if origin_status != 403 or b"Bridgefu recipe test call" in origin_body:
+        raise LiveTestError("the S3 demo origin is not private")
+
+    bundle_path = (
+        ledger_path(ledger["execution_id"]).parent
+        / "release"
+        / "artifacts"
+        / "demo-site"
+        / "demo-site.zip"
+    )
+    if not bundle_path.is_file() or bundle_path.is_symlink():
+        raise LiveTestError("the reviewed demo-site bundle is unavailable")
+    try:
+        with zipfile.ZipFile(bundle_path) as archive:
+            names = set(archive.namelist())
+            expected_names = {
+                "index.html",
+                "style.css",
+                "app.js",
+                "app.js.LEGAL.txt",
+                "third-party-licenses.json",
+            }
+            if names != expected_names:
+                raise LiveTestError("the reviewed demo-site file set changed")
+            expected_assets = {name: archive.read(name) for name in names}
+    except (OSError, zipfile.BadZipFile) as error:
+        raise LiveTestError("the reviewed demo-site bundle is invalid") from error
+    content_types = {
+        "index.html": "text/html",
+        "style.css": "text/css",
+        "app.js": "text/javascript",
+        "app.js.LEGAL.txt": "text/plain",
+        "third-party-licenses.json": "application/json",
+    }
+    for name, expected_body in expected_assets.items():
+        path = "/" if name == "index.html" else f"/{name}"
+        status, headers, body = http_get(site_url + path)
+        if (
+            status != 200
+            or body != expected_body
+            or not headers.get("content-type", "").lower().startswith(content_types[name])
+        ):
+            raise LiveTestError(f"the CloudFront demo {name} differs from its release")
+        require_demo_site_headers(headers, name)
+    index_body = expected_assets["index.html"]
+    app_body = expected_assets["app.js"]
+    if (
+        b"Bridgefu recipe test call" not in index_body
+        or b"__BRIDGEFU_RECIPE_TEST__" not in app_body
+    ):
+        raise LiveTestError("the reviewed demo-site automation contract changed")
+
+    config_status, config_headers, config_body = http_get(site_url + "/config.json")
     if config_status != 200:
         raise LiveTestError("the CloudFront demo configuration is not readable")
+    require_demo_site_headers(config_headers, "config.json")
     try:
         config = json.loads(config_body)
     except (TypeError, ValueError) as error:
@@ -8009,9 +8299,11 @@ def verify_demo_site(
         raise LiveTestError(
             "the CloudFront demo configuration violates its public contract"
         )
-    app_status, _, app_body = http_get(site_url + "/app.js")
-    if app_status != 200 or b"__BRIDGEFU_RECIPE_TEST__" not in app_body:
-        raise LiveTestError("the CloudFront demo automation surface is unavailable")
+    missing_status, _, missing_body = http_get(
+        site_url + "/bridgefu-qualification-missing-object"
+    )
+    if missing_status not in {403, 404} or b"Bridgefu recipe test call" in missing_body:
+        raise LiveTestError("the CloudFront demo missing-object behavior changed")
 
 
 def secret_value(ledger: dict[str, Any], env: dict[str, str], arn: str) -> str:
@@ -8654,7 +8946,14 @@ def verify(args: argparse.Namespace) -> None:
         )
     )
     vapi = bind_deployed_vapi_resources(path, ledger, env)
-    verify_demo_site(ledger, root_outputs, vapi["AssistantId"])
+    verify_demo_site(
+        ledger,
+        env,
+        application_stack_id,
+        application_nested_stack_id,
+        root_outputs,
+        vapi["AssistantId"],
+    )
     webhook = secret_value(ledger, env, handoff["VapiWebhookSecretArn"])
     correlation_key = secret_value(ledger, env, handoff["CorrelationKeySecretArn"])
     synthetic = {

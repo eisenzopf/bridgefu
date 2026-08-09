@@ -18,7 +18,6 @@ PROFILE_BOUND_LIVE_PREFIX = f'AWS_PROFILE="$AWS_PROFILE" {LIVE_COMMAND_PREFIX}'
 PROFILE_NAME_PATTERN = r"AWS(?:_[A-Z0-9]+)*_PROFILE"
 IP_ONLY_FORBIDDEN_INIT_OPTIONS = {
     "--delegated-zone-name",
-    "--enable-demo-site",
     "--hosted-zone-id",
     "--secure-sips-proof",
     "--sip-hostname",
@@ -330,6 +329,7 @@ def documentation_portability_failures(
                 "--runtime-profile",
                 "starter",
                 "--create-connect-demo",
+                "--enable-demo-site",
             ]
             if init_tokens != expected_init_tokens:
                 failures.append(
@@ -344,10 +344,12 @@ def documentation_portability_failures(
                 failures.append("canonical IP-only init must use region us-west-2")
             if "--create-connect-demo" not in init_tokens:
                 failures.append("canonical IP-only init must create disposable Connect")
+            if "--enable-demo-site" not in init_tokens:
+                failures.append("canonical live init must enable the CloudFront demo site")
             forbidden = sorted(IP_ONLY_FORBIDDEN_INIT_OPTIONS.intersection(init_tokens))
             if forbidden or "high_availability" in init_tokens:
                 failures.append(
-                    "canonical IP-only init contains DNS, SIPS, demo-site, or HA input: "
+                    "canonical IP-only init contains DNS, SIPS, or HA input: "
                     + ", ".join(forbidden or ["high_availability"])
                 )
 
@@ -520,32 +522,10 @@ def documentation_portability_failures(
     failures.extend(controller_profile_failures(runbook_text, "IP-only runbook"))
     failures.extend(raw_aws_profile_failures(runbook_text, "IP-only runbook"))
 
-    existing_connect_sample = bounded_section(
-        recipe_readme,
-        "The secure existing-Connect example below",
-        "### Lost local ledger and retired execution IDs",
-    )
-    if existing_connect_sample is None:
-        failures.append("recipe README has no uniquely bounded existing-Connect sample")
-    else:
-        if (
-            "export AWS_PROFILE='<approved-federated-profile>'"
-            not in existing_connect_sample
-        ):
-            failures.append(
-                "recipe README existing-Connect sample must export an approved "
-                "federated AWS profile"
-            )
-        failures.extend(
-            controller_profile_failures(
-                existing_connect_sample, "recipe README existing-Connect sample"
-            )
-        )
-        failures.extend(
-            raw_aws_profile_failures(
-                existing_connect_sample, "recipe README existing-Connect sample"
-            )
-        )
+    # The canonical customer guide intentionally links to the guarded
+    # maintainer runbook instead of duplicating its long, easily stale command
+    # sequence. Keep the argument for the mutation-test API and link checks.
+    del recipe_readme
     return failures
 
 
@@ -566,9 +546,9 @@ def main() -> int:
         "AWS Starter workplan": root / "BRIDGEFU-AWS-STARTER-WORKPLAN.md",
         "AWS engineering handoff": root / "BRIDGEFU-AWS-ENGINEERING-HANDOFF.md",
         "implementation progress": root / "BRIDGEFU-RECIPE-IMPLEMENTATION-PROGRESS.md",
-        "recipe README": recipe / "README.md",
         "qualification README": recipe / "qualification" / "README.md",
     }
+    recipe_readme_path = recipe / "README.md"
     recipe_packages = sorted(
         path.parent for path in (root / "recipes").glob("*/recipe.yaml")
     )
@@ -821,31 +801,9 @@ def main() -> int:
                 "IP-only runbook must exclude checked_at before comparing projections"
             )
 
-    recipe_readme = operator_documents["recipe README"].read_text()
+    recipe_readme = recipe_readme_path.read_text()
     qualification_readme = operator_documents["qualification README"].read_text()
     failures.extend(documentation_portability_failures(runbook_text, recipe_readme))
-    readme_refresh_order = re.compile(
-        r"aws-recipe-live-test\.py\s+--execution-id\s+bft-YYYYMMDDa\s+publish"
-        r".*?aws-recipe-live-test\.py\s+--execution-id\s+bft-YYYYMMDDa\s+\\?\s*"
-        r"bootstrap-refresh\s+--confirm\s+bft-YYYYMMDDa"
-        r".*?aws\s+cloudformation\s+execute-change-set"
-        r".*?aws\s+cloudformation\s+wait\s+stack-update-complete"
-        r".*?aws-recipe-live-test\.py\s+--execution-id\s+bft-YYYYMMDDa\s+\\?\s*"
-        r"bootstrap-refresh-verify\s+--confirm\s+bft-YYYYMMDDa"
-        r".*?aws-recipe-live-test\.py\s+--execution-id\s+bft-YYYYMMDDa\s+change-set",
-        re.DOTALL,
-    )
-    if readme_refresh_order.search(recipe_readme) is None:
-        failures.append(
-            "recipe README must order publish, bootstrap refresh/admin execute/wait, "
-            "refresh verify, and application change set"
-        )
-    for fragment in (
-        "--stack-name '<exact immutable bootstrap StackId ARN>'",
-        "--change-set-name '<exact reviewed ChangeSetId ARN>'",
-    ):
-        if fragment not in recipe_readme:
-            failures.append(f"recipe README omits exact bootstrap admin binding: {fragment}")
 
     invalid_verify = re.compile(r"\bverify\s+(?:\\\s*)?--confirm\b")
     if invalid_verify.search(qualification_readme):

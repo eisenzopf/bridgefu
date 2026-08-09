@@ -27,6 +27,8 @@
   {"ParameterKey":"ConnectInstanceArn","ParameterValue":"arn:aws:connect:us-west-2:123456789012:instance/replace"},
   {"ParameterKey":"TargetContactFlowArn","ParameterValue":"arn:aws:connect:us-west-2:123456789012:instance/replace/contact-flow/replace"},
   {"ParameterKey":"VapiApiKeySecretArn","ParameterValue":"arn:aws:secretsmanager:us-west-2:123456789012:secret:replace"},
+  {"ParameterKey":"VapiModel","ParameterValue":"gpt-4.1-mini"},
+  {"ParameterKey":"VapiVoiceId","ParameterValue":"Elliot"},
   {"ParameterKey":"PublicHostedZoneId","ParameterValue":"none"},
   {"ParameterKey":"SipHostname","ParameterValue":"unused.bridgefu.invalid"},
   {"ParameterKey":"AlarmEmail","ParameterValue":""}

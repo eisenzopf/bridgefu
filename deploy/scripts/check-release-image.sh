@@ -129,7 +129,7 @@ if (
     or not isinstance(opus, dict)
     or opus.get("version") != "=0.2.2"
     or opus.get("features") != ["static"]
-    or qualification["dependencies"]["rvoip-sip"].get("version") != "=0.3.5"
+    or qualification["dependencies"]["rvoip-sip"].get("version") != "=0.3.7"
     or qualification["dependencies"]["rvoip-sip"].get("default-features") is not False
 ):
     raise SystemExit("qualification Cargo package lost its isolated dependency contract")
@@ -369,20 +369,15 @@ if not packages:
 invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
-    if package["version"] != "0.3.5"
-    or (
-        package.get("source")
-        != "git+https://github.com/eisenzopf/rvoip.git"
-        "?rev=c701081159a579d7bc5495f45ea9ae1bdc241d56"
-        "#c701081159a579d7bc5495f45ea9ae1bdc241d56"
-        if package["name"] == "rvoip-sip-dialog"
-        else not package.get("source", "").startswith("registry+")
-    )
+    if package["version"] != "0.3.7"
+    or not package.get("source", "").startswith("registry+")
+    or len(package.get("checksum", "")) != 64
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock differs from the reviewed rvoip 0.3.5 graph: {invalid}")
-if sum(package["name"] == "rvoip-sip-dialog" for package in packages) != 1:
-    raise SystemExit("Cargo.lock must contain the exact dialog backport once")
+    raise SystemExit(f"Cargo.lock differs from registry-only rvoip 0.3.7: {invalid}")
+names = [package["name"] for package in packages]
+if len(packages) != 25 or len(names) != len(set(names)):
+    raise SystemExit("Cargo.lock must contain 25 unique rvoip 0.3.7 packages")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -416,7 +411,7 @@ bash -n deploy.sh deploy/scripts/*.sh
 grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
 grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
 grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
-grep -Fq 'readonly RVOIP_VERSION=0.3.5' deploy.sh
+grep -Fq 'readonly RVOIP_VERSION=0.3.7' deploy.sh
 grep -Fq -- '--iidfile' deploy.sh
 grep -Fq '/etc/bridgefu/image.env' deploy.sh
 grep -Fq '/readyz' deploy.sh

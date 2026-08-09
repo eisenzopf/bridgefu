@@ -9,9 +9,9 @@ on the local machine; it does not satisfy a one-hour roadmap item.
 Bridgefu 0.9.0 is the first customer-preview release toward the 1.0 roadmap.
 Its Rust package, CLI, and OCI metadata use `0.9.0`; the TypeScript SDK remains
 independently versioned at `0.1.0`. The preview retains the exact crates.io
-rvoip 0.3.5 graph and discloses the generic-WSS outbound-DTMF limitation tracked
-as rvoip #54. It does not claim the still-open 1.0 TURN/public-NAT, fourth
-exact-Chromium destination, live-provider, cloud, or one-hour load gates.
+rvoip 0.3.7 graph. Its exact Chromium generic-WSS rerun closes the
+outbound-DTMF limitation tracked as rvoip #54. It does not claim the still-open
+1.0 TURN/public-NAT, live-provider, cloud, or one-hour load gates.
 
 An exact clean Bridgefu commit and the protected, non-published
 `linux/amd64,linux/arm64` OCI qualification artifact are the remaining 0.9.0
@@ -47,7 +47,7 @@ qualification. A new exact all-target count must be retained after every
 The ignored `qualification_media_graph` test creates two media graphs per call:
 PCMU to Opus and Opus to PCMU. Every source emits a canonical 20 ms frame. The
 harness retains the exact Bridgefu revision and dirty-worktree state, every
-locked rvoip 0.3.5 package plus its crates.io checksum, host data,
+locked rvoip 0.3.7 package plus its crates.io checksum, host data,
 frame/drop/transcode counts, a fixed-bucket p95 latency bound, and post-warmup
 RSS in a versioned JSON report.
 
@@ -461,14 +461,13 @@ cargo test -p bridgefu --test qualification_generic_wss \
   -- --exact --ignored --nocapture
 ```
 
-That case passes 1/1 against the temporary RTC path override used for
-validation. It proves
-the built TypeScript SDK keeps one browser peer stable through assistant hold,
+That case originally passed against a temporary RTC path override. Its current
+rerun passes 1/1 against locked crates.io rvoip 0.3.7 and proves the built
+TypeScript SDK keeps one browser peer stable through assistant hold,
 application-ready WSS promotion, full-duplex Opus, arbitrary DataChannels, RFC
-4733, both terminal directions, and exact cleanup. It is local-composite
-validation only, not evidence for the current locked rvoip 0.3.5 graph, stock
-Vapi `webCall`→SIP feasibility, real TURN traversal, split gateway/worker
-execution, or live infrastructure.
+4733, both terminal directions, and exact cleanup. It does not prove stock Vapi
+`webCall`→SIP feasibility, real TURN traversal, split gateway/worker execution,
+or live infrastructure.
 
 ### Built browser SDK in Chromium
 
@@ -540,15 +539,15 @@ real MediaGraph and requires an Opus/PT111 source, at least one Opus-to-PCMU
 transcode operation, and zero transcode errors, so a mislabeled PCMA payload
 cannot satisfy this qualification.
 
-The published-graph rerun on 2026-07-31 uses only the exact checksummed rvoip
-0.3.5 packages in `Cargo.lock`, Playwright 1.61.1, and its Bridgefu-local
+The current published-graph rerun uses only the exact checksummed rvoip
+0.3.7 packages in `Cargo.lock`, Playwright 1.61.1, and its Bridgefu-local
 Chromium installation. No reference tenant browser installation or Cargo path,
 Git, or patch override is used.
 
 | Destination | Exact built-SDK Chromium evidence |
 |---|---|
 | Generic SIP | `tests/qualification_browser_sdk.rs`: `built_typescript_sdk_reaches_named_sips_destination_in_real_chromium` passes 1/1. |
-| Generic WSS | **Blocked by rvoip #54.** Chromium-to-WSS DTMF works, the reverse event reaches the exact Bridgefu/rvoip-core destination binding, and rvoip reports a successful outbound send, but Chromium receives no new RTP packet before the deadline. The isolated result reproduces 3/3. |
+| Generic WSS | `tests/qualification_generic_wss.rs`: `built_typescript_sdk_hands_off_to_generic_wss_and_cleans_both_terminal_directions` passes 1/1 on 0.3.7 and internally runs both terminal variants, including reverse RFC 4733 delivery to Chromium. |
 | Amazon Connect | `direct_assistant_handoff::built_typescript_sdk_hands_off_to_amazon_and_cleans_both_terminal_directions` passes 1/1 and internally runs both terminal variants. |
 | Telnyx | `direct_assistant_handoff::built_typescript_sdk_hands_off_to_telnyx_and_cleans_both_terminal_directions` passes 1/1 and internally runs both terminal variants. |
 
@@ -558,29 +557,26 @@ binary 128/128, `call_execution_supervisor` 41/41, generic SIP 6/6,
 `private_forwarding` 7/7, and reference tenant 82/82. Strict
 all-target/all-feature Clippy passes with warnings denied. The TypeScript SDK
 passes 20/20 tests and its typecheck. The generic-WSS test continuously drains
-the real destination media receiver and independently asserts the DTMF event
-at Bridgefu's core boundary, so bounded receiver backpressure cannot explain
-the browser-side failure.
+the real destination media receiver, independently asserts the DTMF event at
+Bridgefu's core boundary, and now observes the outbound event in Chromium.
 
 The Bridgefu library suite was previously rerun after restoring the then-exact
 dependency and lock provenance: `cargo test --locked -p bridgefu --lib` passed
 328/328 against `1e5b7d4...`. This is historical evidence for that graph, not
-the current crates.io rvoip 0.3.5 package set.
+the historical crates.io rvoip 0.3.5 package set.
 
 The earlier four-pass exact Chromium matrix was run through the temporary local
 `../rtc/rtc` override. The candidate is six uncommitted files at base
 `1e5b7d4be6d94850694f2519f4c235d16c871d53`, with stable patch ID
 `478b7da63ea6d195f446a9abce4c56e62129a86e`. The temporary manifest overrides
 have since been removed: Bridgefu's current manifest and lockfile now resolve
-exact checksummed rvoip 0.3.5 packages from crates.io with no Git or path
+exact checksummed rvoip 0.3.7 packages from crates.io with no Git or path
 source. The historical results are therefore local-composite validation only,
 not release evidence for the published graph.
 
-This is substantial local all-in-one evidence, not Gate 7 completion. Three of
-the four exact Chromium destinations now pass against the published graph; the
-generic-WSS case remains blocked on
-[rvoip issue #54](https://github.com/eisenzopf/rvoip/issues/54) and must be
-rerun after an owner-reviewed published rvoip fix. Bridgefu does not carry a
+This is substantial local all-in-one evidence, not Gate 7 completion. All four
+exact Chromium destinations pass against published package graphs; the
+previously blocked generic-WSS case passes on 0.3.7. Bridgefu does not carry a
 local dependency patch. TURN-only/public-NAT, built-SDK split gateway/worker,
 stock Vapi transfer, live PBX/Amazon/Telnyx, process-restart, cloud, one-hour
 load, and deployed chaos evidence remain open.
@@ -593,7 +589,8 @@ Release-image evidence recorded on the same worktree:
   preflight.
 - The credential-free runtime smoke passes all nine role, lifecycle, private
   forwarding, durable call/media/context, and broadcast checks while recording
-  the exact 25-package registry-only rvoip 0.3.5 graph.
+  the exact 25-package registry-only rvoip graph. This image result predates
+  the 0.3.7 repin and must be rerun for the current candidate.
 - An earlier cold canonical `linux/arm64` image build succeeded. The resulting
   301 MB pre-retarget image reported Bridgefu 1.0.0 and rvoip 0.3.5, ran as
   `65532:65532`, retained SIGTERM and the `/livez` healthcheck, validated the
@@ -634,7 +631,7 @@ report path; otherwise a timestamped
 
 The v3 report deliberately separates two dependency scopes. Bridgefu child
 tests run with Bridgefu's committed `Cargo.lock`, and
-`bridgefu_locked_rvoip_graph` records the exact rvoip 0.3.5 packages and
+`bridgefu_locked_rvoip_graph` records the exact rvoip 0.3.7 packages and
 crates.io checksums in that application graph. rvoip child tests are selected
 from that locked metadata, but execute the published registry package source
 with `cargo test --locked --manifest-path ...`; that command uses the selected
