@@ -310,6 +310,7 @@ async fn run_named_sip_route_reference() {
             ("X-Correlation-Id".into(), "correlation_id".into()),
             ("X-Account-Tier".into(), "account_tier".into()),
         ]),
+        ..ContextPolicy::default()
     };
     let mut outbound_profiles = StaticOutboundProfileResolver::default();
     outbound_profiles.insert_sip(
@@ -842,6 +843,7 @@ async fn run_proxy_auth_reference() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -1227,6 +1229,7 @@ async fn run_destination_failure_reference(mode: DestinationFailureMode) {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -1458,6 +1461,7 @@ async fn run_provisional_cancel_reference() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,
@@ -1676,6 +1680,7 @@ async fn run_sips_digest_reference() {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }),
         None,
         None,

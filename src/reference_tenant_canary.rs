@@ -1,8 +1,14 @@
-//! Protected, false-by-default StandardCharter admission into the durable engine.
+//! Protected, false-by-default reference-tenant admission into the durable engine.
 //!
 //! The legacy Vapi-to-Amazon listener remains independent. This module only
 //! turns an authenticated `sip:<tenant>` admission into the same single-use
 //! attachment proof used by every other durable inbound leg.
+//!
+//! The neutral v2 idempotency namespace is an explicit preview migration
+//! boundary. Before enabling this canary against a durable store used by an
+//! earlier preview, disable canary admission, drain every call, wait the full
+//! 24-hour [`crate::call_engine::IDEMPOTENCY_RETENTION`] window, and only then
+//! enable the renamed canary. No earlier namespace is reconstructed here.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,7 +30,8 @@ use crate::call_service::{
     SipInitialContextMode,
 };
 
-const CANARY_IDEMPOTENCY_DOMAIN: &[u8] = b"bridgefu.standardcharter-canary.v1\0";
+const CANARY_IDEMPOTENCY_DOMAIN: &[u8] = b"bridgefu.reference-tenant-canary.v2\0";
+const CANARY_IDEMPOTENCY_KEY_PREFIX: &str = "reference-tenant-canary-v2.";
 const REQUIRED_SCOPE: &str = "sip:connect";
 const MAX_CANARY_PROFILE_BYTES: usize = 128;
 const MAX_CANARY_DISPLAY_BYTES: usize = 256;
@@ -32,7 +39,7 @@ const MAX_CORRELATION_BYTES: usize = 256;
 
 /// A protected route that can create one durable SIP-to-Amazon call.
 #[derive(Clone)]
-pub struct StandardCharterCanaryPolicy {
+pub struct ReferenceTenantCanaryPolicy {
     tenant: TenantId,
     trusted_subject: String,
     trusted_issuer: String,
@@ -44,10 +51,10 @@ pub struct StandardCharterCanaryPolicy {
     attribute_mapping: AttributeMapping,
 }
 
-impl fmt::Debug for StandardCharterCanaryPolicy {
+impl fmt::Debug for ReferenceTenantCanaryPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("StandardCharterCanaryPolicy")
+            .debug_struct("ReferenceTenantCanaryPolicy")
             .field("tenant", &self.tenant)
             .field("trusted_subject", &"[redacted]")
             .field("trusted_issuer", &"[redacted]")
@@ -62,27 +69,27 @@ impl fmt::Debug for StandardCharterCanaryPolicy {
 
 /// Safe configuration/admission failure. No signaling or credential value is retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum StandardCharterCanaryError {
-    #[error("invalid StandardCharter canary configuration")]
+pub enum ReferenceTenantCanaryError {
+    #[error("invalid ReferenceTenant canary configuration")]
     InvalidConfiguration,
-    #[error("StandardCharter canary admission rejected")]
+    #[error("ReferenceTenant canary admission rejected")]
     Rejected,
-    #[error("StandardCharter canary durable authority is unavailable")]
+    #[error("ReferenceTenant canary durable authority is unavailable")]
     Unavailable,
 }
 
 /// Result of inspecting an inbound routing hint.
 #[derive(Eq, PartialEq)]
-pub enum StandardCharterCanaryDecision {
+pub enum ReferenceTenantCanaryDecision {
     /// The hint is not the explicitly configured canary tenant. Ordinary
     /// single-use attachment-token processing must continue.
     NotApplicable,
     /// A durable call was created (or replayed byte-for-byte) and this is its
     /// derived single-use SIP attachment bearer.
-    Attachment(StandardCharterCanaryAttachment),
+    Attachment(ReferenceTenantCanaryAttachment),
 }
 
-impl fmt::Debug for StandardCharterCanaryDecision {
+impl fmt::Debug for ReferenceTenantCanaryDecision {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotApplicable => formatter.write_str("NotApplicable"),
@@ -93,12 +100,12 @@ impl fmt::Debug for StandardCharterCanaryDecision {
 
 /// Zeroizing owner for the derived two-minute attachment bearer.
 #[derive(Eq, PartialEq)]
-pub struct StandardCharterCanaryAttachment {
+pub struct ReferenceTenantCanaryAttachment {
     call_id: CallId,
     secret: String,
 }
 
-impl StandardCharterCanaryAttachment {
+impl ReferenceTenantCanaryAttachment {
     /// Durable call selected by the correlation-bound idempotency decision.
     ///
     /// Exposing the opaque call identifier lets diagnostics and tests join the
@@ -115,20 +122,20 @@ impl StandardCharterCanaryAttachment {
     }
 }
 
-impl fmt::Debug for StandardCharterCanaryAttachment {
+impl fmt::Debug for ReferenceTenantCanaryAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("StandardCharterCanaryAttachment([redacted])")
+        formatter.write_str("ReferenceTenantCanaryAttachment([redacted])")
     }
 }
 
-impl Drop for StandardCharterCanaryAttachment {
+impl Drop for ReferenceTenantCanaryAttachment {
     fn drop(&mut self) {
         self.secret.zeroize();
     }
 }
 
 /// Validated construction inputs kept separate from YAML representation.
-pub struct StandardCharterCanaryConfig {
+pub struct ReferenceTenantCanaryConfig {
     pub tenant: String,
     pub trusted_subject: String,
     pub trusted_issuer: String,
@@ -140,10 +147,10 @@ pub struct StandardCharterCanaryConfig {
     pub attribute_mapping: AttributeMapping,
 }
 
-impl StandardCharterCanaryPolicy {
-    pub fn new(config: StandardCharterCanaryConfig) -> Result<Self, StandardCharterCanaryError> {
+impl ReferenceTenantCanaryPolicy {
+    pub fn new(config: ReferenceTenantCanaryConfig) -> Result<Self, ReferenceTenantCanaryError> {
         let tenant = TenantId::parse(&config.tenant)
-            .map_err(|_| StandardCharterCanaryError::InvalidConfiguration)?;
+            .map_err(|_| ReferenceTenantCanaryError::InvalidConfiguration)?;
         if !bounded_identity(&config.trusted_subject, MAX_BEARER_SUBJECT_BYTES)
             || !bounded_identity(&config.trusted_issuer, MAX_BEARER_ISSUER_BYTES)
             || !bounded_text(&config.profile, MAX_CANARY_PROFILE_BYTES)
@@ -152,7 +159,7 @@ impl StandardCharterCanaryPolicy {
             || !bounded_text(&config.default_display_name, MAX_CANARY_DISPLAY_BYTES)
             || !valid_extension_header(&config.correlation_header)
         {
-            return Err(StandardCharterCanaryError::InvalidConfiguration);
+            return Err(ReferenceTenantCanaryError::InvalidConfiguration);
         }
         // Construction exercises the exact reusable Amazon boundary before a
         // listener can bind. Runtime calls create the same spec with attributes.
@@ -164,7 +171,7 @@ impl StandardCharterCanaryPolicy {
             config.default_display_name.clone(),
             None,
         )
-        .map_err(|_| StandardCharterCanaryError::InvalidConfiguration)?;
+        .map_err(|_| ReferenceTenantCanaryError::InvalidConfiguration)?;
         Ok(Self {
             tenant,
             trusted_subject: config.trusted_subject,
@@ -191,15 +198,15 @@ impl StandardCharterCanaryPolicy {
         routing_hint: &str,
         signaling_metadata: &[(String, String)],
         runtime: &CallServiceRuntime,
-    ) -> Result<StandardCharterCanaryDecision, StandardCharterCanaryError> {
+    ) -> Result<ReferenceTenantCanaryDecision, ReferenceTenantCanaryError> {
         if routing_hint != self.tenant.as_str() {
-            return Ok(StandardCharterCanaryDecision::NotApplicable);
+            return Ok(ReferenceTenantCanaryDecision::NotApplicable);
         }
         self.authorize(principal, runtime)?;
         let correlation = exact_header(signaling_metadata, &self.correlation_header)
-            .ok_or(StandardCharterCanaryError::Rejected)?;
+            .ok_or(ReferenceTenantCanaryError::Rejected)?;
         if !bounded_text(correlation, MAX_CORRELATION_BYTES) {
-            return Err(StandardCharterCanaryError::Rejected);
+            return Err(ReferenceTenantCanaryError::Rejected);
         }
 
         let mapped = self.attribute_mapping.translate(
@@ -210,7 +217,7 @@ impl StandardCharterCanaryPolicy {
         if mapped.dropped_for_size != 0
             || mapped.attributes.get("correlation_id").map(String::as_str) != Some(correlation)
         {
-            return Err(StandardCharterCanaryError::Rejected);
+            return Err(ReferenceTenantCanaryError::Rejected);
         }
         let amazon_start = AmazonConnectStartSpec::new(
             self.profile.clone(),
@@ -220,9 +227,9 @@ impl StandardCharterCanaryPolicy {
             self.default_display_name.clone(),
             None,
         )
-        .map_err(|_| StandardCharterCanaryError::Rejected)?;
+        .map_err(|_| ReferenceTenantCanaryError::Rejected)?;
         let api_principal = ApiPrincipal::new(principal.clone(), runtime.observation_time())
-            .map_err(|_| StandardCharterCanaryError::Rejected)?;
+            .map_err(|_| ReferenceTenantCanaryError::Rejected)?;
         let idempotency = canary_idempotency_key(self.tenant.as_str(), correlation)?;
         let created = runtime
             .service()
@@ -269,12 +276,12 @@ impl StandardCharterCanaryPolicy {
             .filter(|attachment| attachment.transport == AttachmentTransport::Sip);
         let token = tokens
             .next()
-            .ok_or(StandardCharterCanaryError::Unavailable)?;
+            .ok_or(ReferenceTenantCanaryError::Unavailable)?;
         if tokens.next().is_some() {
-            return Err(StandardCharterCanaryError::Unavailable);
+            return Err(ReferenceTenantCanaryError::Unavailable);
         }
-        Ok(StandardCharterCanaryDecision::Attachment(
-            StandardCharterCanaryAttachment {
+        Ok(ReferenceTenantCanaryDecision::Attachment(
+            ReferenceTenantCanaryAttachment {
                 call_id: created.value.call.call_id,
                 secret: token.into_token(),
             },
@@ -285,7 +292,7 @@ impl StandardCharterCanaryPolicy {
         &self,
         principal: &AuthenticatedPrincipal,
         runtime: &CallServiceRuntime,
-    ) -> Result<(), StandardCharterCanaryError> {
+    ) -> Result<(), ReferenceTenantCanaryError> {
         if principal.is_expired_at(runtime.observation_time())
             || principal.tenant.as_deref() != Some(self.tenant.as_str())
             || principal.subject != self.trusted_subject
@@ -293,7 +300,7 @@ impl StandardCharterCanaryPolicy {
             || !principal.has_scope(REQUIRED_SCOPE)
             || !principal.has_scope("calls:create")
         {
-            return Err(StandardCharterCanaryError::Rejected);
+            return Err(ReferenceTenantCanaryError::Rejected);
         }
         Ok(())
     }
@@ -311,26 +318,30 @@ fn exact_header<'a>(metadata: &'a [(String, String)], expected: &str) -> Option<
 fn canary_idempotency_key(
     tenant: &str,
     correlation: &str,
-) -> Result<IdempotencyKey, StandardCharterCanaryError> {
+) -> Result<IdempotencyKey, ReferenceTenantCanaryError> {
+    IdempotencyKey::parse(canary_idempotency_key_text(tenant, correlation))
+        .map_err(|_| ReferenceTenantCanaryError::InvalidConfiguration)
+}
+
+fn canary_idempotency_key_text(tenant: &str, correlation: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(CANARY_IDEMPOTENCY_DOMAIN);
     digest.update((tenant.len() as u32).to_be_bytes());
     digest.update(tenant.as_bytes());
     digest.update((correlation.len() as u32).to_be_bytes());
     digest.update(correlation.as_bytes());
-    IdempotencyKey::parse(format!(
-        "sc-canary-v1.{}",
+    format!(
+        "{CANARY_IDEMPOTENCY_KEY_PREFIX}{}",
         URL_SAFE_NO_PAD.encode(digest.finalize())
-    ))
-    .map_err(|_| StandardCharterCanaryError::InvalidConfiguration)
+    )
 }
 
-fn classify_service_error(error: CallServiceError) -> StandardCharterCanaryError {
+fn classify_service_error(error: CallServiceError) -> ReferenceTenantCanaryError {
     match error {
         CallServiceError::CapacityExceeded
         | CallServiceError::DependencyUnavailable
-        | CallServiceError::Repository(_) => StandardCharterCanaryError::Unavailable,
-        _ => StandardCharterCanaryError::Rejected,
+        | CallServiceError::Repository(_) => ReferenceTenantCanaryError::Unavailable,
+        _ => ReferenceTenantCanaryError::Rejected,
     }
 }
 
@@ -371,22 +382,29 @@ mod tests {
 
     #[test]
     fn idempotency_is_stable_and_tenant_bound_without_retaining_correlation() {
-        let left = format!(
-            "{:?}",
-            canary_idempotency_key("tenant-a", "private-corr").unwrap()
-        );
-        let same = format!(
-            "{:?}",
-            canary_idempotency_key("tenant-a", "private-corr").unwrap()
-        );
-        let other = format!(
-            "{:?}",
-            canary_idempotency_key("tenant-b", "private-corr").unwrap()
-        );
+        let left = canary_idempotency_key_text("tenant-a", "private-corr");
+        let same = canary_idempotency_key_text("tenant-a", "private-corr");
+        let other = canary_idempotency_key_text("tenant-b", "private-corr");
         assert_eq!(left, same);
-        assert_eq!(left, "IdempotencyKey([redacted])");
-        assert_eq!(other, "IdempotencyKey([redacted])");
+        assert_ne!(left, other);
+        assert!(left.starts_with(CANARY_IDEMPOTENCY_KEY_PREFIX));
+        assert_eq!(left.len(), CANARY_IDEMPOTENCY_KEY_PREFIX.len() + 43);
+        assert_eq!(
+            left,
+            "reference-tenant-canary-v2.bzhGm3KmFljmDqvEP_c--W1nLphK3GO1D_wmC59siG0"
+        );
         assert!(!left.contains("private-corr"));
+        assert!(!left.contains("tenant-a"));
+
+        let redacted = format!(
+            "{:?}",
+            canary_idempotency_key("tenant-a", "private-corr").unwrap()
+        );
+        assert_eq!(redacted, "IdempotencyKey([redacted])");
+        assert_eq!(
+            crate::call_engine::IDEMPOTENCY_RETENTION,
+            Duration::from_secs(24 * 60 * 60)
+        );
     }
 
     #[test]
@@ -403,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn durable_canary_replays_exactly_and_attachment_is_single_use() {
         let mut coordination = CallServiceCoordinationConfig::new(
-            DeploymentId::parse("standardcharter-canary-test").unwrap(),
+            DeploymentId::parse("reference-tenant-canary-test").unwrap(),
         );
         coordination.worker_lease_ttl = Duration::from_secs(300);
         coordination.worker_renew_interval = Duration::from_secs(100);
@@ -445,7 +463,7 @@ mod tests {
                 ephemeral_key: Jwk(serde_json::json!({"kty": "test"})),
             },
         };
-        let policy = StandardCharterCanaryPolicy::new(StandardCharterCanaryConfig {
+        let policy = ReferenceTenantCanaryPolicy::new(ReferenceTenantCanaryConfig {
             tenant: "banking".into(),
             trusted_subject: "trusted-vapi".into(),
             trusted_issuer: "vapi-test".into(),
@@ -473,8 +491,8 @@ mod tests {
             .await
             .unwrap();
         let (
-            StandardCharterCanaryDecision::Attachment(first),
-            StandardCharterCanaryDecision::Attachment(second),
+            ReferenceTenantCanaryDecision::Attachment(first),
+            ReferenceTenantCanaryDecision::Attachment(second),
         ) = (first, second)
         else {
             panic!("configured route must return an attachment")
@@ -482,7 +500,7 @@ mod tests {
         assert_eq!(first, second, "exact replay derives the same bearer");
         assert_eq!(
             format!("{first:?}"),
-            "StandardCharterCanaryAttachment([redacted])"
+            "ReferenceTenantCanaryAttachment([redacted])"
         );
         let first = first.into_secret();
         let second = second.into_secret();
@@ -517,7 +535,7 @@ mod tests {
                 .admit(&foreign, "banking", &metadata, &runtime)
                 .await
                 .unwrap_err(),
-            StandardCharterCanaryError::Rejected
+            ReferenceTenantCanaryError::Rejected
         );
         assert_eq!(
             policy
@@ -539,7 +557,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-            StandardCharterCanaryError::Rejected
+            ReferenceTenantCanaryError::Rejected
         );
     }
 }

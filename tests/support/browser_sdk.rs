@@ -80,6 +80,13 @@ pub enum BrowserTerminalSide {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum BrowserScenarioPath {
+    Handoff,
+    Direct,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum BrowserDtmfSemantics {
     SourceToDestination,
     BidirectionalMediaPlane,
@@ -107,6 +114,7 @@ impl BrowserTerminalSide {
 #[serde(rename_all = "camelCase")]
 pub struct BrowserScenario {
     pub name: String,
+    pub path: BrowserScenarioPath,
     pub destination_boundary: BrowserDestinationBoundary,
     pub context_semantics: BrowserContextSemantics,
     pub dtmf_semantics: BrowserDtmfSemantics,
@@ -133,6 +141,7 @@ impl BrowserScenario {
     ) -> Self {
         Self {
             name: name.into(),
+            path: BrowserScenarioPath::Handoff,
             destination_boundary,
             context_semantics,
             dtmf_semantics,
@@ -145,6 +154,32 @@ impl BrowserScenario {
             assistant_context_correlation_id: "chromium-browser-later-context".into(),
             final_context_correlation_id: "chromium-browser-final-context".into(),
             assistant_dtmf_digits: "6".into(),
+            destination_dtmf_digits: "5".into(),
+            expected_remote_context_correlation_id: None,
+            expected_remote_message: None,
+        }
+    }
+
+    pub fn direct(
+        name: impl Into<String>,
+        correlation_id: impl Into<String>,
+        destination_boundary: BrowserDestinationBoundary,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            path: BrowserScenarioPath::Direct,
+            destination_boundary,
+            context_semantics: BrowserContextSemantics::InitialOnly,
+            dtmf_semantics: BrowserDtmfSemantics::SourceToDestination,
+            terminal_side: BrowserTerminalSide::Browser,
+            initial_correlation_id: correlation_id.into(),
+            initial_metadata: std::collections::BTreeMap::from([
+                ("account_tier".into(), "gold".into()),
+                ("must_not_forward".into(), "private-browser-value".into()),
+            ]),
+            assistant_context_correlation_id: String::new(),
+            final_context_correlation_id: String::new(),
+            assistant_dtmf_digits: String::new(),
             destination_dtmf_digits: "5".into(),
             expected_remote_context_correlation_id: None,
             expected_remote_message: None,
@@ -364,6 +399,12 @@ async fn index() -> Html<&'static str> {
     ))
 }
 
+async fn direct_index() -> Html<&'static str> {
+    Html(include_str!(
+        "../../sdk/typescript/test/browser-direct-qualification.html"
+    ))
+}
+
 async fn attachment(State(state): State<BrowserHttpState>) -> Json<Value> {
     Json((*state.fixture).clone())
 }
@@ -482,6 +523,11 @@ impl BrowserSdkController {
         let destination_verified_flag = Arc::new(AtomicBool::new(false));
         let diagnostics = Arc::new(Mutex::new(None));
         let phases = Arc::new(Mutex::new(Vec::new()));
+        let browser_path = if fixture["scenario"]["path"].as_str() == Some("direct") {
+            "/direct"
+        } else {
+            "/"
+        };
         let state = BrowserHttpState {
             fixture: Arc::new(fixture),
             initial_destination_ready: Arc::clone(&initial_destination_ready),
@@ -498,6 +544,7 @@ impl BrowserSdkController {
                 listener,
                 Router::new()
                     .route("/", get(index))
+                    .route("/direct", get(direct_index))
                     .route("/attachment", get(attachment))
                     .route("/destination-ready", get(destination_ready))
                     .route("/destination-verified", get(destination_verified))
@@ -517,7 +564,7 @@ impl BrowserSdkController {
             .arg(sdk.join("test/browser-qualification-driver.mjs"))
             .env(
                 "BRIDGEFU_BROWSER_QUALIFICATION_URL",
-                format!("http://localhost:{}/", address.port()),
+                format!("http://localhost:{}{}", address.port(), browser_path),
             )
             .env("PLAYWRIGHT_BROWSERS_PATH", "0")
             .stdout(Stdio::piped())

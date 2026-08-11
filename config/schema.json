@@ -3,8 +3,28 @@
   "$id": "https://bridgefu.dev/schema/config-v1.json",
   "title": "Bridgefu configuration v1",
   "type": "object",
-  "required": ["aws", "sip"],
   "$defs": {
+    "recipeSelection": {
+      "type": "object",
+      "required": ["use"],
+      "properties": {
+        "use": {
+          "type": "string",
+          "pattern": "^(builtin|external):[a-z0-9][a-z0-9_-]*@[1-9][0-9]*$"
+        },
+        "with": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9][a-z0-9_-]*$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "mapping": {
       "type": "object",
       "properties": {
@@ -23,6 +43,10 @@
       "properties": {
         "instance_id": { "type": "string", "minLength": 1 },
         "contact_flow_id": { "type": "string", "minLength": 1 },
+        "routing_only": {
+          "type": "boolean",
+          "description": "Non-Amazon routing namespace; recipe projectors set this internally."
+        },
         "default_display_name": { "type": "string" },
         "mapping": { "$ref": "#/$defs/mapping" }
       },
@@ -240,6 +264,101 @@
       },
       "additionalProperties": false
     },
+    "sipIngressProfile": {
+      "type": "object",
+      "required": [
+        "tenant_id",
+        "principal_subject",
+        "issuer",
+        "scopes",
+        "trusted_signaling_cidrs",
+        "security"
+      ],
+      "properties": {
+        "tenant_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "principal_subject": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9:._*-]+$" }
+        },
+        "trusted_signaling_cidrs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 3, "maxLength": 64 }
+        },
+        "security": { "enum": ["sips_srtp", "sips_optional_srtp", "sip_rtp"] },
+        "tls": { "$ref": "#/$defs/profileTlsIdentity" },
+        "digest": {
+          "type": "object",
+          "required": ["realm", "username", "password"],
+          "properties": {
+            "realm": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "username": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "password": { "$ref": "#/$defs/secretRef" }
+          },
+          "additionalProperties": false
+        },
+        "mtls_peer_ca_certificates": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "mtls_leaf_certificate_sha256_fingerprints": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+        },
+        "codecs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["pcmu", "pcma", "opus"] }
+        }
+      },
+      "dependentRequired": {
+        "mtls_peer_ca_certificates": ["mtls_leaf_certificate_sha256_fingerprints"],
+        "mtls_leaf_certificate_sha256_fingerprints": ["mtls_peer_ca_certificates"]
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "security": { "const": "sips_srtp" } },
+            "required": ["security"]
+          },
+          "then": { "required": ["tls"] }
+        },
+        {
+          "if": {
+            "properties": { "security": { "const": "sips_optional_srtp" } },
+            "required": ["security"]
+          },
+          "then": { "required": ["tls"] }
+        },
+        {
+          "if": {
+            "properties": { "security": { "const": "sip_rtp" } },
+            "required": ["security"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["tls"] },
+                { "required": ["mtls_peer_ca_certificates"] },
+                { "required": ["mtls_leaf_certificate_sha256_fingerprints"] }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
     "sipProfile": {
       "type": "object",
       "required": ["allowed_targets", "from_uri"],
@@ -427,6 +546,17 @@
       "type": "object",
       "properties": {
         "udp_bind": { "type": "string", "minLength": 1 },
+        "udp_port_range": {
+          "type": "object",
+          "required": ["bind_ip", "port_start", "port_end"],
+          "properties": {
+            "bind_ip": { "type": "string", "format": "ip-address" },
+            "port_start": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "port_end": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "additionalProperties": false,
+          "description": "Inclusive bounded ICE/media UDP range shared by browser and Amazon Connect peers."
+        },
         "audio_codecs": {
           "type": "array",
           "minItems": 1,
@@ -455,7 +585,7 @@
       },
       "additionalProperties": false
     },
-    "standardCharterCanary": {
+    "referenceTenantCanary": {
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
@@ -475,6 +605,65 @@
   },
   "properties": {
     "config_version": { "const": 1 },
+    "recipe_catalog": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "recipes": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/recipeSelection" }
+    },
+    "edge": {
+      "type": "object",
+      "properties": {
+        "public_host": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "media_public_addr": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sip_tls": {
+          "type": "object",
+          "required": ["certificate_chain", "private_key"],
+          "properties": {
+            "bind": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "advertised_addr": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "certificate_chain": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "private_key": { "$ref": "#/$defs/secretRef" },
+            "client_ca_certificate": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "require_client_certificate": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "sip_rtp": {
+          "type": "object",
+          "properties": {
+            "bind": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "advertised_addr": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "legacy_vapi_connect": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] }
+      },
+      "additionalProperties": false
+    },
     "aws": {
       "type": "object",
       "required": ["region"],
@@ -736,6 +925,16 @@
                 "type": "string",
                 "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$"
               },
+              "sip_ingress_profile": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$"
+              },
+              "required_sip_correlation_header": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 128,
+                "pattern": "^[Xx]-[A-Za-z0-9_-]+$"
+              },
               "webrtc_ingress_profile": {
                 "type": "string",
                 "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$"
@@ -790,7 +989,7 @@
           "properties": {
             "sip_uri_template": {
               "type": "string",
-              "pattern": "^sips:\\{token\\}@[^\\s]+$"
+              "pattern": "^sips?:\\{token\\}@[^\\s]+$"
             },
             "webrtc": {
               "type": "object",
@@ -816,6 +1015,12 @@
       "maxProperties": 256,
       "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
       "additionalProperties": { "$ref": "#/$defs/vapiIngressProfile" }
+    },
+    "sip_ingress_profiles": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,255}$" },
+      "additionalProperties": { "$ref": "#/$defs/sipIngressProfile" }
     },
     "sip_profiles": {
       "type": "object",
@@ -1021,7 +1226,7 @@
         "webrtc_whip_bind": { "type": "string" },
         "sip": { "$ref": "#/$defs/genericSipNetworking" },
         "webrtc": { "$ref": "#/$defs/genericWebRtcNetworking" },
-        "standardcharter_canary": { "$ref": "#/$defs/standardCharterCanary" },
+        "reference_tenant_canary": { "$ref": "#/$defs/referenceTenantCanary" },
         "bearer_token": {
           "type": "string",
           "deprecated": true,
@@ -1166,6 +1371,17 @@
             "pattern": "^[Xx]-[A-Za-z0-9_-]{1,126}$"
           },
           "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_.-]+$"
+          }
+        },
+        "allow_metadata_keys": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 128,

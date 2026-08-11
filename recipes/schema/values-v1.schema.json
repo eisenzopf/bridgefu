@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/schema/recipe-values-v1.json",
+  "title": "Bridgefu Recipe values v1",
+  "type": "object",
+  "maxProperties": 64,
+  "propertyNames": {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 128,
+    "pattern": "^[a-z0-9][a-z0-9_-]*$"
+  }
+}

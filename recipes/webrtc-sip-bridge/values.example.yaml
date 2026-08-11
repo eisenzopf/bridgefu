@@ -1,0 +1,10 @@
+webrtc_signaling_uri: wss://bridgefu.example.com/webrtc
+sip_target_uri: sips:agents@sbc.example.com:5061;transport=tls
+sip_from_uri: sips:bridgefu@bridgefu.example.com
+sip_outbound_proxy: sips:sbc.example.com:5061;lr
+sip_security: sips_srtp
+# Uncomment all applicable Digest fields together. Keep the password in a
+# secret reference, never in this file.
+# sip_digest_realm: sbc.example.com
+# sip_digest_username: bridgefu
+# sip_digest_password: env:BRIDGEFU_SIP_DIGEST_PASSWORD

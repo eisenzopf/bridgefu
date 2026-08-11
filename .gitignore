@@ -2,10 +2,27 @@
 /target
 /tests/moq-browser-e2e/node_modules
 /tests/moq-browser-e2e/dist
+node_modules/
 
 # Python validation/runtime-smoke bytecode
 __pycache__/
 *.py[cod]
+/.pytest_cache/
+/.ruff_cache/
+/.venv/
+
+# Local coverage output
+/.coverage
+/.coverage.*
+/coverage.xml
+/htmlcov/
+
+# Local agent/editor and operating-system metadata
+/.claude/worktrees/
+/tmp/
+/.tmp/
+*.tmp
+.DS_Store
 
 # Logs
 *.log
@@ -32,13 +49,25 @@ __pycache__/
 # provider plugin cache (huge), crash logs, or your real tfvars.
 terraform/.terraform/
 /deploy/terraform/*/.terraform/
+.terraform/
 *.tfstate
 *.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
 crash.log
 .vscode
 crash.*.log
 terraform/terraform.tfvars
 # Keep .terraform.lock.hcl tracked (provider pinning) and tfvars.example tracked.
+
+# Generated deployment archives
+/deploy/*.tar.gz
+
+# Output from the repository README's recipe-init walkthrough. It contains
+# operator-filled deployment values and must never become repository source.
+/bridgefu-vapi-connect/
 
 # NOTE: Cargo.lock IS committed — bridgefu is a binary and we want reproducible
 # builds (deploy.sh ships it; the Dockerfile relies on it for the MSRV-pinned tree).

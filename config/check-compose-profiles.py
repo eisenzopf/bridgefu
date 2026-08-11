@@ -36,7 +36,7 @@ PLACEHOLDERS = {
 }
 
 SUCCESS_CASES = (
-    ("standardcharter", "standardcharter"),
+    ("reference-tenant", "reference-tenant"),
     ("generic", "generic"),
     ("telnyx", "telnyx"),
     ("uctp", "uctp"),

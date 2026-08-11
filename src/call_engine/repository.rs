@@ -577,6 +577,10 @@ pub struct AttachmentCandidate {
     pub(crate) expires_at: DateTime<Utc>,
     pub(crate) expected_principal: PrincipalFingerprint,
     pub(crate) expected_version: AggregateVersion,
+    /// Immutable SIP correlation requirement captured from the same durable
+    /// execution-plan snapshot as this attachment inspection. The values are
+    /// intentionally private and omitted from diagnostics.
+    pub(crate) required_sip_correlation: Option<(String, String)>,
 }
 
 impl AttachmentCandidate {
@@ -622,6 +626,15 @@ impl AttachmentCandidate {
         self.expires_at
     }
 
+    /// Exact SIP header and value that must corroborate the server-owned call
+    /// context before this candidate can be consumed.
+    #[must_use]
+    pub(crate) fn required_sip_correlation(&self) -> Option<(&str, &str)> {
+        self.required_sip_correlation
+            .as_ref()
+            .map(|(header, value)| (header.as_str(), value.as_str()))
+    }
+
     pub(crate) const fn expected_version(&self) -> AggregateVersion {
         self.expected_version
     }
@@ -644,6 +657,10 @@ impl fmt::Debug for AttachmentCandidate {
             .field("expires_at", &self.expires_at)
             .field("expected_principal", &"[redacted]")
             .field("expected_version", &self.expected_version)
+            .field(
+                "required_sip_correlation_present",
+                &self.required_sip_correlation.is_some(),
+            )
             .finish()
     }
 }

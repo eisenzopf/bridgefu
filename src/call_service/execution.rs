@@ -73,8 +73,11 @@ use crate::private_egress::{
 use crate::private_egress_stream::{
     PrivateEgressStreamAdmission, PrivateEgressWorkerConnection, PrivateEgressWorkerRuntime,
 };
-use crate::standardcharter_canary::{
-    StandardCharterCanaryDecision, StandardCharterCanaryError, StandardCharterCanaryPolicy,
+use crate::recipe_admission::{
+    RecipeSipAdmissionCatalog, RecipeSipAdmissionDecision, RecipeSipAdmissionError,
+};
+use crate::reference_tenant_canary::{
+    ReferenceTenantCanaryDecision, ReferenceTenantCanaryError, ReferenceTenantCanaryPolicy,
 };
 
 use super::{
@@ -280,7 +283,7 @@ impl CallExecutionSupervisor {
         .await
     }
 
-    /// Installs every executor plus the optional protected StandardCharter
+    /// Installs every executor plus the optional protected ReferenceTenant
     /// canary. Existing constructors always pass `None`, preserving the
     /// frozen listener and attachment-token behavior exactly.
     #[allow(clippy::too_many_arguments)]
@@ -290,7 +293,7 @@ impl CallExecutionSupervisor {
         provider_executor: Arc<dyn ProviderLegExecutor>,
         amazon_connect: Option<Arc<AmazonConnectAdapter>>,
         context_policy: Arc<ContextPolicy>,
-        standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+        reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
         admission_capacity: usize,
         setup_timeout: Duration,
     ) -> Result<Self, CallExecutionError> {
@@ -300,7 +303,7 @@ impl CallExecutionSupervisor {
             provider_executor,
             amazon_connect,
             context_policy,
-            standardcharter_canary,
+            reference_tenant_canary,
             None,
             admission_capacity,
             setup_timeout,
@@ -318,7 +321,7 @@ impl CallExecutionSupervisor {
         provider_executor: Arc<dyn ProviderLegExecutor>,
         amazon_connect: Option<Arc<AmazonConnectAdapter>>,
         context_policy: Arc<ContextPolicy>,
-        standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+        reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
         broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
         admission_capacity: usize,
         setup_timeout: Duration,
@@ -329,7 +332,7 @@ impl CallExecutionSupervisor {
             provider_executor,
             amazon_connect,
             context_policy,
-            standardcharter_canary,
+            reference_tenant_canary,
             broadcast_authority,
             Arc::new(DisabledOutboundProfileResolver),
             admission_capacity,
@@ -350,7 +353,7 @@ impl CallExecutionSupervisor {
         provider_executor: Arc<dyn ProviderLegExecutor>,
         amazon_connect: Option<Arc<AmazonConnectAdapter>>,
         context_policy: Arc<ContextPolicy>,
-        standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+        reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
         broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
         outbound_profiles: Arc<dyn OutboundProfileResolver>,
         admission_capacity: usize,
@@ -362,7 +365,7 @@ impl CallExecutionSupervisor {
             provider_executor,
             amazon_connect,
             context_policy,
-            standardcharter_canary,
+            reference_tenant_canary,
             broadcast_authority,
             outbound_profiles,
             None,
@@ -383,7 +386,42 @@ impl CallExecutionSupervisor {
         provider_executor: Arc<dyn ProviderLegExecutor>,
         amazon_connect: Option<Arc<AmazonConnectAdapter>>,
         context_policy: Arc<ContextPolicy>,
-        standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+        reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+        broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
+        outbound_profiles: Arc<dyn OutboundProfileResolver>,
+        private_egress: Option<Arc<PrivateEgressWorkerRuntime>>,
+        admission_capacity: usize,
+        setup_timeout: Duration,
+    ) -> Result<Self, CallExecutionError> {
+        Self::install_with_leg_executors_context_canary_recipe_broadcast_profiles_and_private_egress(
+            orchestrator,
+            call_runtime,
+            provider_executor,
+            amazon_connect,
+            context_policy,
+            reference_tenant_canary,
+            None,
+            broadcast_authority,
+            outbound_profiles,
+            private_egress,
+            admission_capacity,
+            setup_timeout,
+        )
+        .await
+    }
+
+    /// All-in-one recipe constructor that additionally installs the exact
+    /// stable SIP URI catalog. Existing callers pass no catalog through the
+    /// compatibility constructor above and preserve managed-token behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_with_leg_executors_context_canary_recipe_broadcast_profiles_and_private_egress(
+        orchestrator: Arc<Orchestrator>,
+        call_runtime: Arc<CallServiceRuntime>,
+        provider_executor: Arc<dyn ProviderLegExecutor>,
+        amazon_connect: Option<Arc<AmazonConnectAdapter>>,
+        context_policy: Arc<ContextPolicy>,
+        reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+        recipe_sip_admissions: Option<Arc<RecipeSipAdmissionCatalog>>,
         broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
         outbound_profiles: Arc<dyn OutboundProfileResolver>,
         private_egress: Option<Arc<PrivateEgressWorkerRuntime>>,
@@ -437,7 +475,8 @@ impl CallExecutionSupervisor {
             provider_executor,
             amazon_connect,
             context_policy,
-            standardcharter_canary,
+            reference_tenant_canary,
+            recipe_sip_admissions,
             broadcast_authority,
             outbound_profiles,
             private_egress,
@@ -1269,7 +1308,8 @@ async fn run_supervisor(
     provider_executor: Arc<dyn ProviderLegExecutor>,
     amazon_connect: Option<Arc<AmazonConnectAdapter>>,
     context_policy: Arc<ContextPolicy>,
-    standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+    reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+    recipe_sip_admissions: Option<Arc<RecipeSipAdmissionCatalog>>,
     broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
     outbound_profiles: Arc<dyn OutboundProfileResolver>,
     private_egress: Option<Arc<PrivateEgressWorkerRuntime>>,
@@ -1740,7 +1780,8 @@ async fn run_supervisor(
                     continue;
                 };
                 let runtime = Arc::clone(&runtime);
-                let standardcharter_canary = standardcharter_canary.clone();
+                let reference_tenant_canary = reference_tenant_canary.clone();
+                let recipe_sip_admissions = recipe_sip_admissions.clone();
                 let broadcast_authority = broadcast_authority.clone();
                 let private_egress = private_egress.clone();
                 let connection_id = admission.connection_id().clone();
@@ -1749,7 +1790,8 @@ async fn run_supervisor(
                     match AssertUnwindSafe(Box::pin(prove_admission(
                         admission,
                         runtime,
-                        standardcharter_canary,
+                        reference_tenant_canary,
+                        recipe_sip_admissions,
                         broadcast_authority,
                         private_egress,
                         setup_timeout,
@@ -2027,7 +2069,8 @@ async fn claim_durable_work(runtime: Arc<CallServiceRuntime>) -> WorkClaimBatch 
 async fn prove_admission(
     admission: InboundAdmission,
     runtime: Arc<CallServiceRuntime>,
-    standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+    reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+    recipe_sip_admissions: Option<Arc<RecipeSipAdmissionCatalog>>,
     broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
     private_egress: Option<Arc<PrivateEgressWorkerRuntime>>,
     setup_timeout: Duration,
@@ -2036,7 +2079,8 @@ async fn prove_admission(
     let proven = prove_admission_inner(
         admission,
         runtime,
-        standardcharter_canary,
+        reference_tenant_canary,
+        recipe_sip_admissions,
         broadcast_authority,
         private_egress,
         setup_timeout,
@@ -2052,7 +2096,8 @@ async fn prove_admission(
 async fn prove_admission_inner(
     mut admission: InboundAdmission,
     runtime: Arc<CallServiceRuntime>,
-    standardcharter_canary: Option<Arc<StandardCharterCanaryPolicy>>,
+    reference_tenant_canary: Option<Arc<ReferenceTenantCanaryPolicy>>,
+    recipe_sip_admissions: Option<Arc<RecipeSipAdmissionCatalog>>,
     broadcast_authority: Option<Arc<WorkerBroadcastSubscriptionAuthority>>,
     private_egress: Option<Arc<PrivateEgressWorkerRuntime>>,
     setup_timeout: Duration,
@@ -2236,33 +2281,36 @@ async fn prove_admission_inner(
             return None;
         }
     };
+    let mut stable_recipe_applied = false;
     if transport == Transport::Sip {
-        if let (Some(policy), Some(presented_hint)) =
-            (standardcharter_canary.as_ref(), routing_token.as_deref())
+        if let (Some(catalog), Some(presented_hint)) =
+            (recipe_sip_admissions.as_ref(), routing_token.as_deref())
         {
             let mut runtime_health = runtime.subscribe_supervisor_health();
-            let canary = tokio::time::timeout_at(
+            let recipe = tokio::time::timeout_at(
                 setup_deadline,
-                policy.admit(
+                catalog.admit(
                     &principal,
                     presented_hint,
                     &signaling_metadata,
+                    &connection_id,
                     runtime.as_ref(),
                 ),
             );
-            match await_while_runtime_owned(canary, &mut runtime_health).await {
-                Ok(Ok(Ok(StandardCharterCanaryDecision::NotApplicable))) => {}
-                Ok(Ok(Ok(StandardCharterCanaryDecision::Attachment(token)))) => {
+            match await_while_runtime_owned(recipe, &mut runtime_health).await {
+                Ok(Ok(Ok(RecipeSipAdmissionDecision::NotApplicable))) => {}
+                Ok(Ok(Ok(RecipeSipAdmissionDecision::Attachment(token)))) => {
                     routing_token = Some(token.into_secret());
+                    stable_recipe_applied = true;
                     metrics::counter!(
-                        "bridgefu_standardcharter_canary_admission_total",
+                        "bridgefu_recipe_sip_admission_total",
                         "result" => "created_or_replayed"
                     )
                     .increment(1);
                 }
-                Ok(Ok(Err(StandardCharterCanaryError::Rejected))) => {
+                Ok(Ok(Err(RecipeSipAdmissionError::Rejected))) => {
                     metrics::counter!(
-                        "bridgefu_standardcharter_canary_admission_total",
+                        "bridgefu_recipe_sip_admission_total",
                         "result" => "rejected"
                     )
                     .increment(1);
@@ -2270,18 +2318,68 @@ async fn prove_admission_inner(
                     return None;
                 }
                 Ok(Ok(Err(
-                    StandardCharterCanaryError::Unavailable
-                    | StandardCharterCanaryError::InvalidConfiguration,
+                    RecipeSipAdmissionError::Unavailable
+                    | RecipeSipAdmissionError::InvalidConfiguration,
                 )))
                 | Ok(Err(_))
                 | Err(()) => {
                     metrics::counter!(
-                        "bridgefu_standardcharter_canary_admission_total",
+                        "bridgefu_recipe_sip_admission_total",
                         "result" => "unavailable"
                     )
                     .increment(1);
                     let _ = admission.reject(RejectReason::ServerError).await;
                     return None;
+                }
+            }
+        }
+        if !stable_recipe_applied {
+            if let (Some(policy), Some(presented_hint)) =
+                (reference_tenant_canary.as_ref(), routing_token.as_deref())
+            {
+                let mut runtime_health = runtime.subscribe_supervisor_health();
+                let canary = tokio::time::timeout_at(
+                    setup_deadline,
+                    policy.admit(
+                        &principal,
+                        presented_hint,
+                        &signaling_metadata,
+                        runtime.as_ref(),
+                    ),
+                );
+                match await_while_runtime_owned(canary, &mut runtime_health).await {
+                    Ok(Ok(Ok(ReferenceTenantCanaryDecision::NotApplicable))) => {}
+                    Ok(Ok(Ok(ReferenceTenantCanaryDecision::Attachment(token)))) => {
+                        routing_token = Some(token.into_secret());
+                        metrics::counter!(
+                            "bridgefu_reference_tenant_canary_admission_total",
+                            "result" => "created_or_replayed"
+                        )
+                        .increment(1);
+                    }
+                    Ok(Ok(Err(ReferenceTenantCanaryError::Rejected))) => {
+                        metrics::counter!(
+                            "bridgefu_reference_tenant_canary_admission_total",
+                            "result" => "rejected"
+                        )
+                        .increment(1);
+                        let _ = admission.reject(RejectReason::Forbidden).await;
+                        return None;
+                    }
+                    Ok(Ok(Err(
+                        ReferenceTenantCanaryError::Unavailable
+                        | ReferenceTenantCanaryError::InvalidConfiguration,
+                    )))
+                    | Ok(Err(_))
+                    | Err(()) => {
+                        metrics::counter!(
+                            "bridgefu_reference_tenant_canary_admission_total",
+                            "result" => "unavailable"
+                        )
+                        .increment(1);
+                        let _ = admission.reject(RejectReason::ServerError).await;
+                        return None;
+                    }
                 }
             }
         }
@@ -2292,7 +2390,8 @@ async fn prove_admission_inner(
         attachment_transport,
         runtime.worker().lease,
         connection_id,
-    );
+    )
+    .with_signaling_metadata(signaling_metadata.clone());
     let mut runtime_health = runtime.subscribe_supervisor_health();
     let service = runtime.service();
     let consume =

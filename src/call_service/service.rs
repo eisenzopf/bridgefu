@@ -607,7 +607,7 @@ impl AttachmentPrincipalResolver for SamePrincipalAttachmentResolver {
 #[derive(Clone, Default)]
 pub struct ConfiguredAttachmentPrincipalResolver {
     providers: BTreeMap<(String, String), (ProviderKind, AuthenticatedPrincipal)>,
-    vapi_ingress: BTreeMap<(String, String, String), AuthenticatedPrincipal>,
+    sip_ingress: BTreeMap<(String, NamedProfileKind, String, String), AuthenticatedPrincipal>,
 }
 
 impl ConfiguredAttachmentPrincipalResolver {
@@ -636,14 +636,40 @@ impl ConfiguredAttachmentPrincipalResolver {
     /// listener's trusted-CIDR or verified-mTLS projection.
     #[must_use]
     pub fn with_vapi_ingress(
-        mut self,
+        self,
         profile_id: impl Into<String>,
         revision: impl Into<String>,
         principal: AuthenticatedPrincipal,
     ) -> Self {
+        self.with_sip_ingress(
+            NamedProfileKind::VapiIngress,
+            profile_id,
+            revision,
+            principal,
+        )
+    }
+
+    /// Adds one provider-neutral SIP ingress identity. Only ingress profile
+    /// kinds are accepted; destination profile kinds remain fail-closed.
+    #[must_use]
+    pub fn with_sip_ingress(
+        mut self,
+        kind: NamedProfileKind,
+        profile_id: impl Into<String>,
+        revision: impl Into<String>,
+        principal: AuthenticatedPrincipal,
+    ) -> Self {
+        if !matches!(
+            kind,
+            NamedProfileKind::VapiIngress | NamedProfileKind::SipIngress
+        ) {
+            return self;
+        }
         let tenant = principal.tenant.clone().unwrap_or_default();
-        self.vapi_ingress
-            .insert((tenant, profile_id.into(), revision.into()), principal);
+        self.sip_ingress.insert(
+            (tenant, kind, profile_id.into(), revision.into()),
+            principal,
+        );
         self
     }
 }
@@ -653,7 +679,7 @@ impl fmt::Debug for ConfiguredAttachmentPrincipalResolver {
         formatter
             .debug_struct("ConfiguredAttachmentPrincipalResolver")
             .field("provider_count", &self.providers.len())
-            .field("vapi_ingress_count", &self.vapi_ingress.len())
+            .field("sip_ingress_count", &self.sip_ingress.len())
             .finish()
     }
 }
@@ -698,13 +724,19 @@ impl AttachmentPrincipalResolver for ConfiguredAttachmentPrincipalResolver {
             let Some(binding) = ingress.next() else {
                 return Ok(None);
             };
-            if ingress.next().is_some() || binding.kind() != NamedProfileKind::VapiIngress {
+            if ingress.next().is_some()
+                || !matches!(
+                    binding.kind(),
+                    NamedProfileKind::VapiIngress | NamedProfileKind::SipIngress
+                )
+            {
                 return Ok(None);
             }
             return Ok(self
-                .vapi_ingress
+                .sip_ingress
                 .get(&(
                     request.tenant.as_str().to_owned(),
+                    binding.kind(),
                     binding.profile_id().to_owned(),
                     binding.revision().to_owned(),
                 ))
@@ -890,6 +922,10 @@ pub struct InboundAttachmentRequest {
     transport: AttachmentTransport,
     worker: WorkerLease,
     connection_id: ConnectionId,
+    /// Duplicate-preserving, bounded SIP metadata captured by the signaling
+    /// adapter. Values remain private and are used only for durable route
+    /// context corroboration.
+    signaling_metadata: Vec<(String, String)>,
 }
 
 impl InboundAttachmentRequest {
@@ -908,7 +944,15 @@ impl InboundAttachmentRequest {
             transport,
             worker,
             connection_id,
+            signaling_metadata: Vec::new(),
         }
+    }
+
+    /// Adds the duplicate-preserving SIP metadata captured at admission.
+    #[must_use]
+    pub fn with_signaling_metadata(mut self, metadata: Vec<(String, String)>) -> Self {
+        self.signaling_metadata = metadata;
+        self
     }
 }
 
@@ -924,6 +968,7 @@ impl fmt::Debug for InboundAttachmentRequest {
             .field("transport", &self.transport)
             .field("worker", &self.worker)
             .field("connection_id", &self.connection_id)
+            .field("signaling_metadata_count", &self.signaling_metadata.len())
             .finish()
     }
 }
@@ -934,6 +979,70 @@ impl Drop for InboundAttachmentRequest {
             token.zeroize();
         }
     }
+}
+
+const MAX_INBOUND_SIGNALING_METADATA_ENTRIES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SipInviteCorrelationEvidence {
+    correlation_fingerprint: String,
+    header_name: String,
+    header_count: usize,
+}
+
+/// Corroborates the actual duplicate-preserving SIP INVITE metadata against
+/// the immutable context selected by the authenticated control plane. This is
+/// deliberately evaluated after opaque attachment inspection but before the
+/// atomic consume, so a bad header never spends the token or authorizes the
+/// destination leg.
+#[cfg(test)]
+fn validate_required_sip_correlation(
+    required: Option<(&str, &str)>,
+    transport: AttachmentTransport,
+    signaling_metadata: &[(String, String)],
+) -> Result<(), InboundAttachmentError> {
+    verified_sip_invite_correlation(required, transport, signaling_metadata).map(drop)
+}
+
+fn verified_sip_invite_correlation(
+    required: Option<(&str, &str)>,
+    transport: AttachmentTransport,
+    signaling_metadata: &[(String, String)],
+) -> Result<Option<SipInviteCorrelationEvidence>, InboundAttachmentError> {
+    if transport != AttachmentTransport::Sip {
+        return Ok(None);
+    }
+    let Some((required_header, expected)) = required else {
+        return Ok(None);
+    };
+    if expected.is_empty() {
+        return Err(InboundAttachmentError::ProofRejected);
+    }
+    if signaling_metadata.len() > MAX_INBOUND_SIGNALING_METADATA_ENTRIES {
+        return Err(InboundAttachmentError::ProofRejected);
+    }
+    let presented = signaling_metadata
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(required_header))
+        .collect::<Vec<_>>();
+    let (_, value) = presented
+        .first()
+        .ok_or(InboundAttachmentError::ProofRejected)?;
+    if presented.len() != 1
+        || value.is_empty()
+        || value.len() > 512
+        || value.contains(['\r', '\n', '\0'])
+        || value != expected
+    {
+        return Err(InboundAttachmentError::ProofRejected);
+    }
+    let correlation_fingerprint = crate::sip_security_evidence::correlation_fingerprint(expected)
+        .ok_or(InboundAttachmentError::ProofRejected)?;
+    Ok(Some(SipInviteCorrelationEvidence {
+        correlation_fingerprint,
+        header_name: required_header.to_ascii_lowercase(),
+        header_count: presented.len(),
+    }))
 }
 
 /// Successful atomic attachment consumption and signaling transition.
@@ -1067,6 +1176,12 @@ impl CallService {
                 .await
                 .map_err(map_inbound_attachment_repository_error)?;
 
+            let sip_invite_evidence = verified_sip_invite_correlation(
+                candidate.required_sip_correlation(),
+                request.transport,
+                &request.signaling_metadata,
+            )?;
+
             // The inspection await is an attacker-controlled delay at a remote
             // database boundary. Never reuse its pre-await time observation.
             let consume_at = self.clock.now();
@@ -1107,6 +1222,15 @@ impl CallService {
                 .await
             {
                 Ok(consumed) => {
+                    if let Some(evidence) = sip_invite_evidence {
+                        tracing::info!(
+                            event = "bridgefu_sip_invite_evidence",
+                            correlation_fingerprint = %evidence.correlation_fingerprint,
+                            header_name = %evidence.header_name,
+                            header_count = evidence.header_count,
+                            "verified duplicate-preserving SIP INVITE correlation header"
+                        );
+                    }
                     return Ok(InboundAttachmentResult {
                         binding: consumed.binding,
                         commit: consumed.commit,
@@ -2432,6 +2556,10 @@ fn create_transcript(legs: &[RequestedLeg; 2]) -> CanonicalRequestTranscript {
 fn push_named_route(transcript: &mut CanonicalRequestTranscript, binding: &NamedRouteBinding) {
     transcript.push_str("bridgefu.named-route.v1");
     transcript.push_str(binding.route_id());
+    if let Some(header) = binding.required_sip_correlation_header() {
+        transcript.push_str("required_sip_correlation_header_v1");
+        transcript.push_str(header);
+    }
     match binding.context() {
         Some(context) => {
             transcript.push_str("context");
@@ -2475,6 +2603,7 @@ fn push_replacement_route(
         });
         transcript.push_str(match profile.kind() {
             NamedProfileKind::VapiIngress => "vapi_ingress",
+            NamedProfileKind::SipIngress => "sip_ingress",
             NamedProfileKind::Sip => "sip",
             NamedProfileKind::WebRtc => "webrtc",
             NamedProfileKind::AmazonConnect => "amazon_connect",
@@ -3215,6 +3344,56 @@ mod tests {
             PrincipalFingerprint::new([0x53; 32]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn required_sip_correlation_is_exact_duplicate_free_and_preconsume() {
+        let required = Some(("X-Correlation-Id", "bf1_expected-opaque-id"));
+        assert!(validate_required_sip_correlation(
+            required,
+            AttachmentTransport::Sip,
+            &[("x-correlation-id".into(), "bf1_expected-opaque-id".into())],
+        )
+        .is_ok());
+        for rejected in [
+            Vec::new(),
+            vec![("X-Correlation-Id".into(), "bf1_wrong".into())],
+            vec![(
+                "X-Correlation-Id".into(),
+                "bf1_expected-opaque-id\r\nX-Evil: injected".into(),
+            )],
+            vec![
+                ("X-Correlation-Id".into(), "bf1_expected-opaque-id".into()),
+                ("x-correlation-id".into(), "bf1_expected-opaque-id".into()),
+            ],
+        ] {
+            assert_eq!(
+                validate_required_sip_correlation(required, AttachmentTransport::Sip, &rejected,),
+                Err(InboundAttachmentError::ProofRejected)
+            );
+        }
+        assert!(
+            validate_required_sip_correlation(required, AttachmentTransport::WebRtc, &[],).is_ok()
+        );
+        assert!(NamedRouteBinding::new("support", None)
+            .unwrap()
+            .with_required_sip_correlation_header("X-Correlation-Id")
+            .is_err());
+
+        let evidence = verified_sip_invite_correlation(
+            required,
+            AttachmentTransport::Sip,
+            &[("x-correlation-id".into(), "bf1_expected-opaque-id".into())],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence.header_name, "x-correlation-id");
+        assert_eq!(evidence.header_count, 1);
+        assert_eq!(evidence.correlation_fingerprint.len(), 12);
+        assert!(evidence
+            .correlation_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
     }
 
     #[tokio::test]
@@ -5435,6 +5614,111 @@ mod tests {
                 .await,
             Err(InboundAttachmentError::ProofRejected)
         );
+    }
+
+    #[tokio::test]
+    async fn named_sip_correlation_rejections_do_not_consume_the_attachment() {
+        const REVISION: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let repository = Arc::new(MemoryRepository::new());
+        let clock = Arc::new(TestClock::new(at(0)));
+        let worker = repository
+            .register_worker(RegisterWorker {
+                worker_id: WorkerId::new(),
+                max_calls: 4,
+                capabilities: test_worker_capabilities(),
+                at: at(0),
+                lease_ttl: std::time::Duration::from_secs(300),
+            })
+            .await
+            .unwrap()
+            .lease;
+        let mut ingress = authenticated_principal("tenant-a", "recipe-sip-edge", None);
+        ingress.issuer = Some("bridgefu:recipe-catalog".into());
+        let resolver = ConfiguredAttachmentPrincipalResolver::new().with_sip_ingress(
+            NamedProfileKind::SipIngress,
+            "recipe-support-sip-ingress",
+            REVISION,
+            ingress.clone(),
+        );
+        let service = CallService::new(
+            repository,
+            Arc::new(FixedWorkerPlacement::new(worker)),
+            Arc::new(resolver),
+            CallServiceCrypto::new(vec![0x61; 32]).unwrap(),
+            clock.clone(),
+            CallTimeoutPolicy::default(),
+        );
+        let route = NamedRouteBinding::new_with_profiles(
+            "support",
+            Some(crate::call_service::NamedRouteCallContext {
+                correlation_id: "bf1_expected-opaque-id".into(),
+                metadata: BTreeMap::new(),
+            }),
+            vec![NamedProfileBinding::new(
+                NamedProfileRole::Ingress,
+                NamedProfileKind::SipIngress,
+                "recipe-support-sip-ingress",
+                REVISION,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .with_required_sip_correlation_header("X-Correlation-Id")
+        .unwrap();
+        let mut created = service
+            .create_named_route_call(
+                &principal("tenant-a"),
+                &IdempotencyKey::parse("named-sip-correlation").unwrap(),
+                generic_input(),
+                route,
+            )
+            .await
+            .unwrap();
+        let (call_id, _, token, _) = take_first_attachment(&mut created);
+        clock.set(at(1));
+
+        for metadata in [
+            Vec::new(),
+            vec![("X-Correlation-Id".into(), "bf1_wrong".into())],
+            vec![
+                ("X-Correlation-Id".into(), "bf1_expected-opaque-id".into()),
+                ("x-correlation-id".into(), "bf1_expected-opaque-id".into()),
+            ],
+        ] {
+            assert_eq!(
+                service
+                    .consume_inbound_attachment(
+                        InboundAttachmentRequest::new(
+                            ingress.clone(),
+                            Some(token.clone()),
+                            AttachmentTransport::Sip,
+                            worker,
+                            ConnectionId::new(),
+                        )
+                        .with_signaling_metadata(metadata),
+                    )
+                    .await,
+                Err(InboundAttachmentError::ProofRejected)
+            );
+        }
+
+        let consumed = service
+            .consume_inbound_attachment(
+                InboundAttachmentRequest::new(
+                    ingress,
+                    Some(token),
+                    AttachmentTransport::Sip,
+                    worker,
+                    ConnectionId::new(),
+                )
+                .with_signaling_metadata(vec![(
+                    "X-Correlation-Id".into(),
+                    "bf1_expected-opaque-id".into(),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(consumed.commit.call.aggregate.id(), call_id);
     }
 
     #[tokio::test]

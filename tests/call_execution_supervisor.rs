@@ -14,10 +14,11 @@ use bridgefu::call_engine::{
     ProviderReferenceRole, SignalingInitiator, TenantId, WorkerId,
 };
 use bridgefu::call_service::{
-    build_call_service_runtime, parse_presented_attachment_token, CallExecutionSupervisor,
-    CallMutationInput, CallRepositoryBackendConfig, CallServiceCoordinationConfig,
-    CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy,
-    ConfiguredAttachmentPrincipalResolver, CreateCallInput, DisabledProviderLegExecutor,
+    build_call_service_runtime, parse_presented_attachment_token, AmazonConnectEndpointConfig,
+    AmazonConnectStartSpec, CallExecutionSupervisor, CallMutationInput,
+    CallRepositoryBackendConfig, CallServiceCoordinationConfig, CallServiceRuntime,
+    CallServiceRuntimeConfig, CallTimeoutPolicy, ConfiguredAttachmentPrincipalResolver,
+    CreateCallInput, DisabledOutboundProfileResolver, DisabledProviderLegExecutor,
     ExternalReferenceValue, IdempotencyKey, InboundAttachmentRequest, LegEndpointConfig,
     NamedProfileBinding, NamedProfileKind, NamedProfileRole, NamedRouteBinding,
     NamedRouteCallContext, ProviderConnectDestinationRequest, ProviderDialClientState,
@@ -37,15 +38,18 @@ use bridgefu::coordination::{
 use bridgefu::gateway_attachment::{GatewayAttachmentResolver, WorkerAttachmentAdmissionResponse};
 use bridgefu::gateway_forwarding::PRIVATE_FORWARD_SCOPE;
 use bridgefu::handoff_status::{HandoffStatusEnvelope, HandoffStatusKind, HANDOFF_STATUS_LABEL};
-use bridgefu::standardcharter_canary::{
-    StandardCharterCanaryConfig, StandardCharterCanaryDecision, StandardCharterCanaryPolicy,
+use bridgefu::recipe_admission::{
+    RecipeSipAdmissionCatalog, RecipeSipAdmissionDecision, RecipeSipAdmissionRoute,
+};
+use bridgefu::reference_tenant_canary::{
+    ReferenceTenantCanaryConfig, ReferenceTenantCanaryDecision, ReferenceTenantCanaryPolicy,
 };
 use chrono::Utc;
 use rvoip_amazon_connect::{
     AmazonConnectAdapter, AttributeMapping, ConnectConfig, ConnectContactStarter,
     ConnectMediaCloseOutcome, ConnectMediaConnectOptions, ConnectMediaConnector,
-    ConnectMediaHealth, ConnectMediaSession, ConnectMediaTerminalCause, ConnectionData,
-    MediaPlacement, StartContactRequest, StopContactRequest, UnmappedPolicy,
+    ConnectMediaHealth, ConnectMediaSession, ConnectMediaTerminalCause, ConnectProfileId,
+    ConnectionData, MediaPlacement, StartContactRequest, StopContactRequest, UnmappedPolicy,
 };
 use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod};
 use rvoip_core::{
@@ -145,17 +149,17 @@ fn principal() -> ApiPrincipal {
     .unwrap()
 }
 
-fn standardcharter_canary_policy() -> Arc<StandardCharterCanaryPolicy> {
+fn reference_tenant_canary_policy() -> Arc<ReferenceTenantCanaryPolicy> {
     Arc::new(
-        StandardCharterCanaryPolicy::new(StandardCharterCanaryConfig {
+        ReferenceTenantCanaryPolicy::new(ReferenceTenantCanaryConfig {
             tenant: "execution-tenant".into(),
             trusted_subject: "execution-owner".into(),
             trusted_issuer: "execution-test".into(),
             correlation_header: "X-Correlation-Id".into(),
             profile: "default".into(),
-            instance_id: "standardcharter-canary-instance".into(),
-            contact_flow_id: "standardcharter-canary-flow".into(),
-            default_display_name: "StandardCharter canary caller".into(),
+            instance_id: "reference-tenant-canary-instance".into(),
+            contact_flow_id: "reference-tenant-canary-flow".into(),
+            default_display_name: "ReferenceTenant canary caller".into(),
             attribute_mapping: AttributeMapping::default()
                 .with_unmapped(UnmappedPolicy::Drop)
                 .rename("X-Correlation-Id", "correlation_id")
@@ -165,7 +169,7 @@ fn standardcharter_canary_policy() -> Arc<StandardCharterCanaryPolicy> {
     )
 }
 
-fn standardcharter_canary_metadata(correlation: &str) -> Vec<(String, String)> {
+fn reference_tenant_canary_metadata(correlation: &str) -> Vec<(String, String)> {
     vec![
         ("X-Correlation-Id".into(), correlation.into()),
         ("X-Vapi-Call-Id".into(), "vapi-call-canary-77".into()),
@@ -176,7 +180,88 @@ fn standardcharter_canary_metadata(correlation: &str) -> Vec<(String, String)> {
     ]
 }
 
-async fn assert_standardcharter_wire_invite_rejected(
+fn stable_recipe_principal() -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        subject: "stable-recipe-sbc".into(),
+        tenant: Some("execution-tenant".into()),
+        scopes: vec!["calls:create".into(), "sip:connect".into()],
+        issuer: Some("bridgefu:recipe-catalog".into()),
+        expires_at: None,
+        method: AuthenticationMethod::ApiKey,
+        assurance: IdentityAssurance::Pseudonymous {
+            ephemeral_key: Jwk(serde_json::json!({
+                "kty": "bridgefu-sip-ingress-profile",
+                "profile_id": "recipe-execution-tenant-sip-ingress"
+            })),
+        },
+    }
+}
+
+fn stable_recipe_catalog(principal: AuthenticatedPrincipal) -> Arc<RecipeSipAdmissionCatalog> {
+    let ingress = NamedProfileBinding::new(
+        NamedProfileRole::Ingress,
+        NamedProfileKind::SipIngress,
+        "recipe-execution-tenant-sip-ingress",
+        "a".repeat(64),
+    )
+    .unwrap();
+    let destination = NamedProfileBinding::new(
+        NamedProfileRole::Destination,
+        NamedProfileKind::AmazonConnect,
+        "recipe-execution-tenant-amazon",
+        "b".repeat(64),
+    )
+    .unwrap();
+    let start = AmazonConnectStartSpec::new(
+        "recipe-execution-tenant-amazon",
+        "stable-recipe-instance",
+        "stable-recipe-flow",
+        BTreeMap::from([("bridgefu_recipe".into(), "stable-test".into())]),
+        "Stable recipe caller",
+        None,
+    )
+    .unwrap();
+    Arc::new(
+        RecipeSipAdmissionCatalog::new([RecipeSipAdmissionRoute {
+            uri_user: "stable-support".into(),
+            recipe_instance: "execution-tenant".into(),
+            route_id: "stable-support".into(),
+            expected_principal: principal,
+            profiles: vec![ingress, destination],
+            required_correlation_header: Some("X-Correlation-Id".into()),
+            destination: RequestedLeg {
+                direction: LegDirection::Outbound,
+                signaling_initiator: Some(SignalingInitiator::Bridgefu),
+                media_flow: MediaFlow::SendReceive,
+                endpoint: LegEndpointConfig::AmazonConnect(AmazonConnectEndpointConfig {
+                    instance_id: "stable-recipe-instance".into(),
+                    contact_flow_id: "stable-recipe-flow".into(),
+                }),
+                amazon_connect_start: Some(start),
+            },
+        }])
+        .unwrap(),
+    )
+}
+
+async fn build_stable_recipe_runtime(principal: AuthenticatedPrincipal) -> Arc<CallServiceRuntime> {
+    let mut config = runtime_config(CallRepositoryBackendConfig::Memory, WorkerId::new());
+    config.max_calls = 2;
+    config.worker_capabilities = BTreeSet::from(["sip".into(), "amazon_connect".into()]);
+    let resolver = ConfiguredAttachmentPrincipalResolver::new().with_sip_ingress(
+        NamedProfileKind::SipIngress,
+        "recipe-execution-tenant-sip-ingress",
+        "a".repeat(64),
+        principal,
+    );
+    Arc::new(
+        build_call_service_runtime(config, Arc::new(resolver), Arc::new(SystemCallServiceClock))
+            .await
+            .unwrap(),
+    )
+}
+
+async fn assert_reference_tenant_wire_invite_rejected(
     caller: &Arc<UnifiedCoordinator>,
     caller_address: SocketAddr,
     listener: SocketAddr,
@@ -466,16 +551,16 @@ impl ConnectContactStarter for CanaryConnectStarter {
     ) -> rvoip_amazon_connect::Result<ConnectionData> {
         self.starts.lock().unwrap().push(request);
         Ok(ConnectionData {
-            contact_id: "standardcharter-canary-contact".into(),
-            participant_id: "standardcharter-canary-participant".into(),
-            participant_token: "standardcharter-canary-participant-token".into(),
-            meeting_id: "standardcharter-canary-meeting".into(),
+            contact_id: "reference-tenant-canary-contact".into(),
+            participant_id: "reference-tenant-canary-participant".into(),
+            participant_token: "reference-tenant-canary-participant-token".into(),
+            meeting_id: "reference-tenant-canary-meeting".into(),
             media_region: "us-west-2".into(),
-            attendee_id: "standardcharter-canary-attendee".into(),
-            join_token: "standardcharter-canary-join-token".into(),
+            attendee_id: "reference-tenant-canary-attendee".into(),
+            join_token: "reference-tenant-canary-join-token".into(),
             media_placement: MediaPlacement {
-                signaling_url: "wss://localhost.invalid/standardcharter-canary".into(),
-                audio_host_url: "https://localhost.invalid/standardcharter-canary-audio".into(),
+                signaling_url: "wss://localhost.invalid/reference-tenant-canary".into(),
+                audio_host_url: "https://localhost.invalid/reference-tenant-canary-audio".into(),
                 ..MediaPlacement::default()
             },
         })
@@ -2148,7 +2233,7 @@ async fn wait_for_rejection_count(adapter: &LifecycleTestAdapter, expected: usiz
     .expect("canary admission rejection was not delivered");
 }
 
-async fn build_standardcharter_canary_runtime(
+async fn build_reference_tenant_canary_runtime(
     backend: CallRepositoryBackendConfig,
     worker_id: WorkerId,
 ) -> Arc<CallServiceRuntime> {
@@ -2166,7 +2251,7 @@ async fn build_standardcharter_canary_runtime(
     )
 }
 
-fn build_standardcharter_canary_amazon() -> (
+fn build_reference_tenant_canary_amazon() -> (
     Arc<CanaryConnectStarter>,
     Arc<CanaryConnectMediaSession>,
     Arc<AmazonConnectAdapter>,
@@ -2177,26 +2262,188 @@ fn build_standardcharter_canary_amazon() -> (
     let connector: Arc<dyn ConnectMediaConnector> = Arc::new(CanaryConnectMediaConnector {
         session: Arc::clone(&media),
     });
-    let adapter = AmazonConnectAdapter::builder(
+    let mut builder = AmazonConnectAdapter::builder(
         ConnectConfig::new(
-            "unused-legacy-standardcharter-instance",
-            "unused-legacy-standardcharter-flow",
+            "unused-legacy-reference-tenant-instance",
+            "unused-legacy-reference-tenant-flow",
         ),
-        starter_trait,
+        Arc::clone(&starter_trait),
     )
-    .with_media_connector(connector)
-    .build();
+    .with_media_connector(connector);
+    builder
+        .register_profile(
+            ConnectProfileId::new("recipe-execution-tenant-amazon").unwrap(),
+            starter_trait,
+        )
+        .unwrap();
+    let adapter = builder.build();
     (starter, media, adapter)
 }
 
 #[tokio::test]
-async fn standardcharter_canary_replays_into_generic_engine_bridges_media_and_drains() {
+async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
+    let owner = stable_recipe_principal();
+    let runtime = build_stable_recipe_runtime(owner.clone()).await;
+    let catalog = stable_recipe_catalog(owner.clone());
+    let orchestrator = Orchestrator::new(CoreConfig::default());
+    let (starter, media, amazon) = build_reference_tenant_canary_amazon();
+    let context_policy = ContextPolicy {
+        allow_headers: BTreeMap::from([("X-Correlation-Id".into(), "correlation_id".into())]),
+        allow_metadata_keys: BTreeSet::new(),
+    };
+    let supervisor = CallExecutionSupervisor::install_with_leg_executors_context_canary_recipe_broadcast_profiles_and_private_egress(
+        Arc::clone(&orchestrator),
+        Arc::clone(&runtime),
+        Arc::new(DisabledProviderLegExecutor),
+        Some(Arc::clone(&amazon)),
+        Arc::new(context_policy),
+        None,
+        Some(Arc::clone(&catalog)),
+        None,
+        Arc::new(DisabledOutboundProfileResolver),
+        None,
+        8,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let sip = LifecycleTestAdapter::new(Transport::Sip);
+    orchestrator
+        .register(Arc::clone(&sip) as Arc<dyn ConnectionAdapter>)
+        .unwrap();
+    orchestrator
+        .register(Arc::clone(&amazon) as Arc<dyn ConnectionAdapter>)
+        .unwrap();
+
+    let connection_id = ConnectionId::new();
+    let metadata = vec![("X-Correlation-Id".into(), "bf1_stable-context-77".into())];
+    // Observe the deterministic durable call ID without exposing the bearer
+    // to the signaling fixture. The supervisor replays this exact operation
+    // from the fixed URI and consumes the internal proof itself.
+    let observed = catalog
+        .admit(
+            &owner,
+            "stable-support",
+            &metadata,
+            &connection_id,
+            runtime.as_ref(),
+        )
+        .await
+        .unwrap();
+    let RecipeSipAdmissionDecision::Attachment(observed) = observed else {
+        panic!("configured stable URI must create a durable named-route call")
+    };
+    let call_id = observed.call_id();
+    drop(observed);
+
+    let sip_stream = sip.prepare_inbound_with_codec_and_metadata(
+        connection_id.clone(),
+        &owner,
+        "stable-support".into(),
+        AcceptEvents::Connected,
+        codec("pcmu", 8_000, 1),
+        InboundSignalingMetadata::new(metadata.clone()).unwrap(),
+    );
+    let mut sip_output = sip_stream.take_output();
+    let mut amazon_output = media.stream.take_output();
+    sip.announce_inbound(connection_id.clone(), owner.clone())
+        .await;
+    wait_for_accepted(&sip, &connection_id).await;
+    let active = wait_for_call(&runtime, call_id, |stored| {
+        stored.call.aggregate.state() == CallState::Active
+    })
+    .await;
+    let route = active.plan.named_route().expect("durable recipe route");
+    assert_eq!(route.route_id(), "stable-support");
+    assert_eq!(route.profiles().len(), 2);
+    assert_eq!(
+        route
+            .context()
+            .map(|context| context.correlation_id.as_str()),
+        Some("bf1_stable-context-77")
+    );
+    assert_eq!(
+        route.required_sip_correlation_header(),
+        Some("X-Correlation-Id")
+    );
+    wait_for_active_bridge_count(&orchestrator, 1).await;
+
+    {
+        let starts = starter.starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].instance_id, "stable-recipe-instance");
+        assert_eq!(starts[0].contact_flow_id, "stable-recipe-flow");
+        assert_eq!(
+            starts[0]
+                .attributes
+                .get("correlation_id")
+                .map(String::as_str),
+            Some("bf1_stable-context-77")
+        );
+        assert_eq!(
+            starts[0]
+                .attributes
+                .get("bridgefu_recipe")
+                .map(String::as_str),
+            Some("stable-test")
+        );
+    }
+
+    let pcmu = vec![0xff; 160];
+    sip_stream
+        .inject(sip_stream.frame(pcmu.clone(), 80_000, 0))
+        .await
+        .unwrap();
+    let opus = receive_media(&mut amazon_output).await;
+    assert_eq!(opus.payload_type, Some(111));
+    media.stream.inject(opus).await.unwrap();
+    assert_eq!(receive_media(&mut sip_output).await.payload_type, Some(0));
+
+    // Duplicate correlation headers fail before a second route call can be
+    // reserved or an Amazon contact can be started.
+    let duplicate_connection = ConnectionId::new();
+    let duplicate_metadata: Vec<(String, String)> = vec![
+        ("X-Correlation-Id".into(), "bf1_stable-context-78".into()),
+        ("x-correlation-id".into(), "bf1_stable-context-78".into()),
+    ];
+    sip.prepare_inbound_with_codec_and_metadata(
+        duplicate_connection.clone(),
+        &owner,
+        "stable-support".into(),
+        AcceptEvents::Connected,
+        codec("pcmu", 8_000, 1),
+        InboundSignalingMetadata::new(duplicate_metadata).unwrap(),
+    );
+    sip.announce_inbound(duplicate_connection.clone(), owner)
+        .await;
+    wait_for_rejection_count(&sip, 1).await;
+    assert!(!sip.route_is_live(&duplicate_connection));
+    assert_eq!(starter.starts.lock().unwrap().len(), 1);
+
+    sip.remote_end(connection_id).await;
+    wait_for_call(&runtime, call_id, |stored| {
+        stored.call.aggregate.state().is_terminal()
+    })
+    .await;
+    media.wait_closed().await;
+    wait_for_active_bridge_count(&orchestrator, 0).await;
+    wait_for_source_shutdown(&sip_stream, sip_stream.frame(pcmu, 80_160, 0)).await;
+    assert_eq!(starter.stops.lock().unwrap().len(), 1);
+    assert_eq!(media.closes.load(Ordering::Acquire), 1);
+    assert_eq!(amazon.metrics().active_sessions, 0);
+    assert_eq!(amazon.pending_cleanup_count(), 0);
+
+    stop_harness(supervisor, orchestrator).await;
+}
+
+#[tokio::test]
+async fn reference_tenant_canary_replays_into_generic_engine_bridges_media_and_drains() {
     let runtime =
-        build_standardcharter_canary_runtime(CallRepositoryBackendConfig::Memory, WorkerId::new())
+        build_reference_tenant_canary_runtime(CallRepositoryBackendConfig::Memory, WorkerId::new())
             .await;
     let orchestrator = Orchestrator::new(CoreConfig::default());
-    let policy = standardcharter_canary_policy();
-    let (starter, media, amazon) = build_standardcharter_canary_amazon();
+    let policy = reference_tenant_canary_policy();
+    let (starter, media, amazon) = build_reference_tenant_canary_amazon();
     let supervisor = CallExecutionSupervisor::install_with_leg_executors_context_and_canary_policy(
         Arc::clone(&orchestrator),
         Arc::clone(&runtime),
@@ -2218,7 +2465,7 @@ async fn standardcharter_canary_replays_into_generic_engine_bridges_media_and_dr
         .unwrap();
 
     let owner = principal().authenticated().clone();
-    let metadata = standardcharter_canary_metadata("+14155550199");
+    let metadata = reference_tenant_canary_metadata("+14155550199");
     // Observe the durable authority without handing its bearer to the SIP
     // fixture. The actual inbound route below supplies only `sip:<tenant>` and
     // the allowlisted Vapi headers, forcing the listener path to replay the
@@ -2227,7 +2474,7 @@ async fn standardcharter_canary_replays_into_generic_engine_bridges_media_and_dr
         .admit(&owner, "execution-tenant", &metadata, runtime.as_ref())
         .await
         .unwrap();
-    let StandardCharterCanaryDecision::Attachment(observed) = observed else {
+    let ReferenceTenantCanaryDecision::Attachment(observed) = observed else {
         panic!("configured canary route must create a durable call")
     };
     let call_id = observed.call_id();
@@ -2260,8 +2507,8 @@ async fn standardcharter_canary_replays_into_generic_engine_bridges_media_and_dr
         let starts = starter.starts.lock().unwrap();
         assert_eq!(starts.len(), 1, "exact replay starts one Connect contact");
         let request = &starts[0];
-        assert_eq!(request.instance_id, "standardcharter-canary-instance");
-        assert_eq!(request.contact_flow_id, "standardcharter-canary-flow");
+        assert_eq!(request.instance_id, "reference-tenant-canary-instance");
+        assert_eq!(request.contact_flow_id, "reference-tenant-canary-flow");
         assert_eq!(
             request.attributes.get("correlation_id").map(String::as_str),
             Some("+14155550199")
@@ -2382,13 +2629,13 @@ async fn standardcharter_canary_replays_into_generic_engine_bridges_media_and_dr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_exactly() {
+async fn authenticated_reference_tenant_canary_crosses_real_sip_rtp_and_drains_exactly() {
     let runtime =
-        build_standardcharter_canary_runtime(CallRepositoryBackendConfig::Memory, WorkerId::new())
+        build_reference_tenant_canary_runtime(CallRepositoryBackendConfig::Memory, WorkerId::new())
             .await;
     let orchestrator = Orchestrator::new(CoreConfig::default());
-    let policy = standardcharter_canary_policy();
-    let (starter, media, amazon) = build_standardcharter_canary_amazon();
+    let policy = reference_tenant_canary_policy();
+    let (starter, media, amazon) = build_reference_tenant_canary_amazon();
     let supervisor = CallExecutionSupervisor::install_with_leg_executors_context_and_canary_policy(
         Arc::clone(&orchestrator),
         Arc::clone(&runtime),
@@ -2414,7 +2661,7 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
             owner.clone(),
         );
     let mut listener_config =
-        SipConfig::local("bridgefu-standardcharter-canary-wire", sip_address.port());
+        SipConfig::local("bridgefu-reference-tenant-canary-wire", sip_address.port());
     listener_config.offered_codecs = vec![0, 101];
     let sip_coordinator =
         UnifiedCoordinator::new_with_listener_auth(listener_config, listener_policy)
@@ -2441,7 +2688,7 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
         .expect("reserved Vapi caller address");
     drop(caller_reservation);
     let mut caller_config = SipConfig::local(
-        "bridgefu-standardcharter-canary-vapi",
+        "bridgefu-reference-tenant-canary-vapi",
         caller_address.port(),
     );
     caller_config.offered_codecs = vec![0, 101];
@@ -2480,12 +2727,12 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
         .admit(
             &owner,
             "execution-tenant",
-            &standardcharter_canary_metadata(correlation),
+            &reference_tenant_canary_metadata(correlation),
             runtime.as_ref(),
         )
         .await
         .expect("byte-equivalent canary decision replays durably");
-    let StandardCharterCanaryDecision::Attachment(observed) = observed else {
+    let ReferenceTenantCanaryDecision::Attachment(observed) = observed else {
         panic!("configured wire canary must resolve its durable call")
     };
     let call_id = observed.call_id();
@@ -2525,8 +2772,8 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
         let starts = starter.starts.lock().unwrap();
         assert_eq!(starts.len(), 1, "one durable admission starts one contact");
         let request = &starts[0];
-        assert_eq!(request.instance_id, "standardcharter-canary-instance");
-        assert_eq!(request.contact_flow_id, "standardcharter-canary-flow");
+        assert_eq!(request.instance_id, "reference-tenant-canary-instance");
+        assert_eq!(request.contact_flow_id, "reference-tenant-canary-flow");
         assert_eq!(
             request.attributes.get("correlation_id").map(String::as_str),
             Some(correlation)
@@ -2584,7 +2831,7 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
     // A second INVITE with the exact correlation cannot reuse the consumed
     // bearer. Metadata drift and a route for another tenant fail before any
     // additional Connect or media I/O.
-    assert_standardcharter_wire_invite_rejected(
+    assert_reference_tenant_wire_invite_rejected(
         &caller,
         caller_address,
         sip_address,
@@ -2593,7 +2840,7 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
         vapi_call_id,
     )
     .await;
-    assert_standardcharter_wire_invite_rejected(
+    assert_reference_tenant_wire_invite_rejected(
         &caller,
         caller_address,
         sip_address,
@@ -2602,7 +2849,7 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
         "metadata-drift-must-fail",
     )
     .await;
-    assert_standardcharter_wire_invite_rejected(
+    assert_reference_tenant_wire_invite_rejected(
         &caller,
         caller_address,
         sip_address,
@@ -2647,18 +2894,18 @@ async fn authenticated_standardcharter_canary_crosses_real_sip_rtp_and_drains_ex
 }
 
 #[tokio::test]
-async fn standardcharter_canary_sqlite_restart_fails_closed_without_connect_io() {
+async fn reference_tenant_canary_sqlite_restart_fails_closed_without_connect_io() {
     let path = std::env::temp_dir().join(format!(
-        "bridgefu-standardcharter-canary-crash-{}.sqlite",
+        "bridgefu-reference-tenant-canary-crash-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
     let url = format!("sqlite://{}", path.display());
     let worker_id = WorkerId::from_str("00000000-0000-4000-8000-0000000000c7").unwrap();
-    let policy = standardcharter_canary_policy();
+    let policy = reference_tenant_canary_policy();
     let owner = principal().authenticated().clone();
-    let metadata = standardcharter_canary_metadata("crash-before-attachment");
+    let metadata = reference_tenant_canary_metadata("crash-before-attachment");
 
-    let first = build_standardcharter_canary_runtime(
+    let first = build_reference_tenant_canary_runtime(
         CallRepositoryBackendConfig::Sqlite {
             database_url: url.clone(),
         },
@@ -2670,7 +2917,7 @@ async fn standardcharter_canary_sqlite_restart_fails_closed_without_connect_io()
         .admit(&owner, "execution-tenant", &metadata, first.as_ref())
         .await
         .unwrap();
-    let StandardCharterCanaryDecision::Attachment(created) = created else {
+    let ReferenceTenantCanaryDecision::Attachment(created) = created else {
         panic!("configured canary route must persist before the crash barrier")
     };
     let call_id = created.call_id();
@@ -2678,7 +2925,7 @@ async fn standardcharter_canary_sqlite_restart_fails_closed_without_connect_io()
     let first = Arc::into_inner(first).expect("first runtime has no external owners");
     first.shutdown(Duration::from_secs(2)).await.unwrap();
 
-    let second = build_standardcharter_canary_runtime(
+    let second = build_reference_tenant_canary_runtime(
         CallRepositoryBackendConfig::Sqlite {
             database_url: url.clone(),
         },
@@ -2687,7 +2934,7 @@ async fn standardcharter_canary_sqlite_restart_fails_closed_without_connect_io()
     .await;
     assert!(second.worker().lease.fence > first_fence);
     let orchestrator = Orchestrator::new(CoreConfig::default());
-    let (starter, _media, amazon) = build_standardcharter_canary_amazon();
+    let (starter, _media, amazon) = build_reference_tenant_canary_amazon();
     let supervisor = CallExecutionSupervisor::install_with_leg_executors_context_and_canary_policy(
         Arc::clone(&orchestrator),
         Arc::clone(&second),
@@ -3901,6 +4148,7 @@ async fn required_context_is_owned_persisted_and_applied_before_the_first_sip_in
             ("X-Account-Tier".into(), "account_tier".into()),
             ("X-Correlation-Id".into(), "correlation_id".into()),
         ]),
+        ..ContextPolicy::default()
     };
     let (runtime, orchestrator, supervisor, sip, webrtc) =
         execution_harness_with_context(1, policy, Duration::from_secs(5)).await;
@@ -4004,6 +4252,7 @@ async fn named_route_server_context_is_applied_after_attach_without_browser_data
             ("X-Bridgefu_Handoff_Token".into(), "handoff_token".into()),
             ("X-Correlation-Id".into(), "correlation_id".into()),
         ]),
+        ..ContextPolicy::default()
     };
     let (runtime, orchestrator, supervisor, sip, webrtc) =
         execution_harness_with_context(1, policy, Duration::from_secs(5)).await;
@@ -4147,6 +4396,7 @@ async fn inbound_sip_context_reaches_the_peer_data_channel_and_later_messages_br
             ("X-Account-Tier".into(), "account_tier".into()),
             ("X-Correlation-Id".into(), "correlation_id".into()),
         ]),
+        ..ContextPolicy::default()
     };
     let (runtime, orchestrator, supervisor, sip, webrtc) =
         execution_harness_with_context(1, policy, Duration::from_secs(5)).await;

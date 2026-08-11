@@ -1,4 +1,4 @@
-//! Bounded, short-lived evidence for the StandardCharter screen-pop path.
+//! Bounded, short-lived evidence for the ReferenceTenant screen-pop path.
 //!
 //! The store deliberately keeps the raw correlation id only as its private
 //! lookup key. Public snapshots contain a truncated SHA-256 fingerprint and a finite set
@@ -430,7 +430,7 @@ pub fn spawn_lifecycle_ingest(
 }
 
 /// Map and record one rvoip lifecycle event. This is also the deterministic
-/// seam used by the StandardCharter diagnostics contract test.
+/// seam used by the ReferenceTenant diagnostics contract test.
 pub fn record_lifecycle_event(
     store: &ScreenPopEvidenceStore,
     event: ScreenPopLifecycleEvent,
@@ -464,6 +464,13 @@ pub fn record_lifecycle_event(
                 "result" => "recorded"
             )
             .increment(1);
+            tracing::info!(
+                event = "bridgefu_screen_pop_lifecycle",
+                stage = stage_label,
+                correlation_fingerprint = %fingerprint(correlation_id),
+                occurred_at = %event.occurred_at,
+                "screen-pop lifecycle evidence recorded"
+            );
             LifecycleRecordResult::Recorded
         }
         Err(error) => {
@@ -779,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn rvoip_lifecycle_feed_matches_standardcharter_diagnostics_contract() {
+    fn rvoip_lifecycle_feed_matches_reference_tenant_diagnostics_contract() {
         let clock = ManualClock::new();
         let store = store(clock, Duration::from_secs(60), 4);
         let correlation = "+14155550199";

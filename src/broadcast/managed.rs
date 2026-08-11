@@ -1250,6 +1250,7 @@ mod shape_tests {
         const CANARY: &str = "event-binding-canary\r\nAuthorization: exposed";
         let context_policy = ContextPolicy {
             allow_headers: BTreeMap::from([("X-Bridgefu-Event".into(), "broadcast_event".into())]),
+            ..ContextPolicy::default()
         };
         let policy =
             SanitizedContextEventPolicy::new("broadcast_event", 1, 1, 1, &context_policy).unwrap();
@@ -1824,6 +1825,7 @@ mod shape_tests {
 
         let context_policy = ContextPolicy {
             allow_headers: BTreeMap::from([("X-Bridgefu-Event".into(), "broadcast_event".into())]),
+            ..ContextPolicy::default()
         };
         let policy =
             SanitizedContextEventPolicy::new("broadcast_event", 8, 8, 1, &context_policy).unwrap();

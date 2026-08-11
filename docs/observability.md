@@ -40,7 +40,8 @@ Labels listed below are the complete Bridgefu-owned label set for each metric.
 | `bridgefu_auth_failures_total` | counter | `surface` | Authentication failures by fixed ingress surface. |
 | `bridgefu_call_operations_total` | counter | `operation`, `result` | Durable call create/hangup/transfer/DTMF outcomes. |
 | `bridgefu_attachment_admission_total` | counter | `result` | Single-use attachment consumption. |
-| `bridgefu_standardcharter_canary_admission_total` | counter | `result` | Protected canary route decisions. |
+| `bridgefu_recipe_sip_admission_total` | counter | `result` | Exact stable-URI recipe admission (`created_or_replayed`, `rejected`, or `unavailable`). |
+| `bridgefu_reference_tenant_canary_admission_total` | counter | `result` | Protected canary route decisions. |
 | `bridgefu_transfer_status_total` | counter | `transport`, `result` | Transport transfer progress and terminal status. |
 | `bridgefu_operational_ephemeral_total` | counter | `kind` | Non-durable adapter event classes. |
 | `bridgefu_context_data_messages_total` | counter | `result`, `reason` | Bound DataChannel/context forwarding decisions. |

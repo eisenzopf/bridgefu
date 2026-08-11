@@ -1,0 +1,6 @@
+sip_signaling_cidrs:
+  - 198.51.100.0/24
+sip_security: sips_srtp
+webrtc_signaling_uri: wss://agents.example.com/signaling
+# Optional. Keep the token in a secret reference, never in this file.
+# webrtc_bearer_token: env:BRIDGEFU_WEBRTC_DESTINATION_TOKEN
