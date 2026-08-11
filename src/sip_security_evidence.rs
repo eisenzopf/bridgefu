@@ -1,10 +1,12 @@
-//! Redacted, per-leg SIPS/SDES-SRTP runtime evidence.
+//! Redacted, per-leg SIPS media-security runtime evidence.
 //!
 //! The observer joins three independent transport-owned facts for an inbound
 //! Vapi destination leg: a TLS-bound, duplicate-preserving correlation header;
-//! the typed called URI's `sips` scheme; the peer's `RTP/SAVP` SDP offer; and
-//! rvoip's typed media-security/established lifecycle. It emits one structured
-//! event only after every fact is present.
+//! the typed called URI's `sips` scheme; the peer's typed audio SDP profile;
+//! and rvoip's media-security/established lifecycle. It emits one structured
+//! event only after every required fact is present. Strict SDES-SRTP and the
+//! explicit TLS-with-optional-SRTP compatibility posture are distinguished in
+//! the event rather than inferred by release tooling.
 //! Raw SIP targets, addresses, SDP, correlation values, and SDES keys are never
 //! retained in the tracker or written to the event. The temporary trace join
 //! hashes the SIP Call-ID before using it as an in-memory map key.
@@ -41,10 +43,9 @@ const MAX_EVIDENCE_CAPACITY: usize = 16_384;
 /// Invalid local construction input for the evidence observer.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SipSecurityEvidenceConfigError {
-    /// Evidence with a fixed SIPS/SRTP contract cannot run on an insecure
-    /// listener posture.
-    #[error("SIP security evidence requires a TLS listener and mandatory SRTP")]
-    InsecureStack,
+    /// Evidence cannot run without TLS signaling and SRTP negotiation support.
+    #[error("SIP security evidence requires a TLS listener that offers SRTP")]
+    UnsupportedStack,
     /// The correlation header name is not a bounded SIP token.
     #[error("invalid SIP security-evidence correlation header")]
     InvalidCorrelationHeader,
@@ -58,6 +59,7 @@ pub enum SipSecurityEvidenceConfigError {
 pub struct SipSecurityEvidencePolicy {
     correlation_header: Arc<str>,
     capacity: usize,
+    allow_plain_rtp: bool,
 }
 
 impl fmt::Debug for SipSecurityEvidencePolicy {
@@ -66,13 +68,14 @@ impl fmt::Debug for SipSecurityEvidencePolicy {
             .debug_struct("SipSecurityEvidencePolicy")
             .field("correlation_header_configured", &true)
             .field("capacity", &self.capacity)
+            .field("allow_plain_rtp", &self.allow_plain_rtp)
             .finish()
     }
 }
 
 impl SipSecurityEvidencePolicy {
     /// Enable the minimum production-safe SIP trace needed to prove the
-    /// transport of an accepted secure leg.
+    /// transport and media-security posture of an accepted SIPS leg.
     ///
     /// The installed redactor replaces the configured correlation value with
     /// its existing 12-hex SHA-256 fingerprint, redacts every other sensitive
@@ -83,8 +86,8 @@ impl SipSecurityEvidencePolicy {
         correlation_header: &str,
         capacity: usize,
     ) -> Result<Self, SipSecurityEvidenceConfigError> {
-        if stack.tls_bind_addr.is_none() || !stack.offer_srtp || !stack.srtp_required {
-            return Err(SipSecurityEvidenceConfigError::InsecureStack);
+        if stack.tls_bind_addr.is_none() || !stack.offer_srtp {
+            return Err(SipSecurityEvidenceConfigError::UnsupportedStack);
         }
         if !valid_header_name(correlation_header) {
             return Err(SipSecurityEvidenceConfigError::InvalidCorrelationHeader);
@@ -96,6 +99,7 @@ impl SipSecurityEvidencePolicy {
         let policy = Self {
             correlation_header: Arc::from(correlation_header.to_ascii_lowercase()),
             capacity,
+            allow_plain_rtp: !stack.srtp_required,
         };
         stack.trace_redaction = Some(Arc::new(SecurityEvidenceTraceRedactor {
             correlation_header: Arc::clone(&policy.correlation_header),
@@ -241,7 +245,7 @@ struct TransportEvidence {
 struct CallEvidence {
     transport: Option<TransportEvidence>,
     called_uri_sips: bool,
-    sdp_offer_rtp_savp: bool,
+    sdp_offer: Option<EvidenceMediaProfile>,
     media: Option<MediaEvidence>,
     answered: bool,
     emitted: bool,
@@ -251,6 +255,12 @@ struct CallEvidence {
 struct MediaEvidence {
     suite: EvidenceMediaSuite,
     contexts_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceMediaProfile {
+    RtpAvp,
+    RtpSavp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,7 +289,10 @@ impl EvidenceMediaSuite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletedEvidence {
     correlation_fingerprint: String,
+    media_profile: &'static str,
+    media_keying: &'static str,
     media_suite: &'static str,
+    srtp_contexts_installed: bool,
 }
 
 impl CompletedEvidence {
@@ -290,14 +303,14 @@ impl CompletedEvidence {
             leg = "vapi-to-bridgefu",
             uri_scheme = "sips",
             signaling_transport = "tls",
-            media_profile = "RTP/SAVP",
-            media_keying = "SDES-SRTP",
+            media_profile = self.media_profile,
+            media_keying = self.media_keying,
             media_suite = self.media_suite,
-            inbound_srtp_context_installed = true,
-            outbound_srtp_context_installed = true,
+            inbound_srtp_context_installed = self.srtp_contexts_installed,
+            outbound_srtp_context_installed = self.srtp_contexts_installed,
             answered = true,
             redacted = true,
-            "accepted secure Vapi destination leg"
+            "accepted Vapi destination leg"
         );
     }
 }
@@ -326,7 +339,7 @@ impl EvidenceTracker {
             } => {
                 let call = self.call_mut(call_id.clone());
                 call.called_uri_sips = called_uri_is_sips(&to);
-                call.sdp_offer_rtp_savp = sdp.as_deref().is_some_and(sdp_has_audio_rtp_savp);
+                call.sdp_offer = sdp.as_deref().and_then(sdp_audio_profile);
                 self.complete(&call_id)
             }
             Event::MediaSecurityNegotiated {
@@ -410,24 +423,35 @@ impl EvidenceTracker {
     }
 
     fn complete(&mut self, call_id: &SessionId) -> Option<CompletedEvidence> {
+        let allow_plain_rtp = self.policy.allow_plain_rtp;
         let call = self.calls.get_mut(call_id)?;
-        if call.emitted
-            || !call.called_uri_sips
-            || !call.sdp_offer_rtp_savp
-            || !call.answered
-            || !call.media.is_some_and(|media| media.contexts_installed)
-        {
+        if call.emitted || !call.called_uri_sips || !call.answered {
             return None;
         }
         let transport = call.transport.as_ref()?;
         if transport.correlation_header_count != 1 {
             return None;
         }
-        let media = call.media?;
+        let (media_profile, media_keying, media_suite, srtp_contexts_installed) = match call
+            .sdp_offer?
+        {
+            EvidenceMediaProfile::RtpSavp => {
+                let media = call.media?;
+                if !media.contexts_installed {
+                    return None;
+                }
+                ("RTP/SAVP", "SDES-SRTP", media.suite.as_str(), true)
+            }
+            EvidenceMediaProfile::RtpAvp if allow_plain_rtp => ("RTP/AVP", "none", "none", false),
+            EvidenceMediaProfile::RtpAvp => return None,
+        };
         call.emitted = true;
         Some(CompletedEvidence {
             correlation_fingerprint: transport.correlation_fingerprint.clone(),
-            media_suite: media.suite.as_str(),
+            media_profile,
+            media_keying,
+            media_suite,
+            srtp_contexts_installed,
         })
     }
 }
@@ -547,16 +571,25 @@ fn sip_call_binding_fingerprint(value: &str) -> Option<String> {
     Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn sdp_has_audio_rtp_savp(sdp: &str) -> bool {
-    sdp.lines().any(|line| {
+fn sdp_audio_profile(sdp: &str) -> Option<EvidenceMediaProfile> {
+    sdp.lines().find_map(|line| {
         let mut fields = line.trim_end_matches('\r').split_ascii_whitespace();
-        fields
+        if !fields
             .next()
             .is_some_and(|media| media.eq_ignore_ascii_case("m=audio"))
-            && fields.next().is_some()
-            && fields
-                .next()
-                .is_some_and(|profile| profile.eq_ignore_ascii_case("RTP/SAVP"))
+            || fields.next().is_none()
+        {
+            return None;
+        }
+        match fields.next()? {
+            profile if profile.eq_ignore_ascii_case("RTP/SAVP") => {
+                Some(EvidenceMediaProfile::RtpSavp)
+            }
+            profile if profile.eq_ignore_ascii_case("RTP/AVP") => {
+                Some(EvidenceMediaProfile::RtpAvp)
+            }
+            _ => None,
+        }
     })
 }
 
@@ -598,6 +631,14 @@ mod tests {
         SipSecurityEvidencePolicy {
             correlation_header: Arc::from("x-correlation-id"),
             capacity: MIN_EVIDENCE_CAPACITY,
+            allow_plain_rtp: false,
+        }
+    }
+
+    fn optional_policy() -> SipSecurityEvidencePolicy {
+        SipSecurityEvidencePolicy {
+            allow_plain_rtp: true,
+            ..policy()
         }
     }
 
@@ -692,19 +733,25 @@ mod tests {
     }
 
     #[test]
-    fn installation_requires_secure_stack_and_overrides_verbatim_trace_policy() {
+    fn installation_requires_tls_with_srtp_support_and_records_optional_policy() {
         let mut stack = rvoip_sip::Config::local("security-evidence", 5060);
         assert!(matches!(
             SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64),
-            Err(SipSecurityEvidenceConfigError::InsecureStack)
+            Err(SipSecurityEvidenceConfigError::UnsupportedStack)
         ));
 
         stack.tls_bind_addr = Some("127.0.0.1:5061".parse().unwrap());
         stack.offer_srtp = true;
-        stack.srtp_required = true;
+        stack.srtp_required = false;
         stack.trace_redaction = Some(Arc::new(rvoip_sip::PassthroughRedactor));
-        SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64)
-            .expect("secure evidence policy");
+        let optional = SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64)
+            .expect("SIPS optional-SRTP evidence policy");
+        assert!(optional.allow_plain_rtp);
+
+        stack.srtp_required = true;
+        let strict = SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64)
+            .expect("strict SIPS/SRTP evidence policy");
+        assert!(!strict.allow_plain_rtp);
 
         assert!(stack.sip_trace.enabled);
         assert!(stack.sip_trace.redact_sensitive_headers);
@@ -752,11 +799,36 @@ mod tests {
                 completed[0],
                 CompletedEvidence {
                     correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    media_profile: "RTP/SAVP",
+                    media_keying: "SDES-SRTP",
                     media_suite: "AES_CM_128_HMAC_SHA1_80",
+                    srtp_contexts_installed: true,
                 }
             );
             assert!(tracker.observe(established()).is_none());
         }
+    }
+
+    #[test]
+    fn optional_policy_emits_exact_plain_rtp_posture_only_after_answer() {
+        let mut tracker = EvidenceTracker::new(optional_policy());
+        for event in [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming("RTP/AVP"),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
+        assert_eq!(
+            tracker.observe(established()),
+            Some(CompletedEvidence {
+                correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                media_profile: "RTP/AVP",
+                media_keying: "none",
+                media_suite: "none",
+                srtp_contexts_installed: false,
+            })
+        );
+        assert!(tracker.observe(established()).is_none());
     }
 
     #[test]
@@ -902,15 +974,28 @@ mod tests {
 
     #[test]
     fn directional_context_fields_project_only_from_rvoip_send_receive_invariant() {
-        let source = include_str!("sip_security_evidence.rs");
-        let emit = source
-            .split("    fn emit(&self) {")
-            .nth(1)
-            .and_then(|tail| tail.split("\n    }\n").next())
-            .expect("structured evidence emitter");
-        assert!(emit.contains("inbound_srtp_context_installed = true"));
-        assert!(emit.contains("outbound_srtp_context_installed = true"));
-        assert!(source.contains("media.contexts_installed"));
+        let mut strict = EvidenceTracker::new(policy());
+        let strict = [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming("RTP/SAVP"),
+            media(true),
+            established(),
+        ]
+        .into_iter()
+        .find_map(|event| strict.observe(event))
+        .expect("strict evidence");
+        assert!(strict.srtp_contexts_installed);
+
+        let mut optional = EvidenceTracker::new(optional_policy());
+        let optional = [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming("RTP/AVP"),
+            established(),
+        ]
+        .into_iter()
+        .find_map(|event| optional.observe(event))
+        .expect("plain compatibility evidence");
+        assert!(!optional.srtp_contexts_installed);
     }
 
     #[test]
@@ -921,7 +1006,10 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             CompletedEvidence {
                 correlation_fingerprint: fingerprint.clone(),
+                media_profile: "RTP/SAVP",
+                media_keying: "SDES-SRTP",
                 media_suite: "AES_CM_128_HMAC_SHA1_80",
+                srtp_contexts_installed: true,
             }
             .emit();
         });
@@ -959,12 +1047,48 @@ mod tests {
         assert_eq!(fields["outbound_srtp_context_installed"], true);
         assert_eq!(fields["answered"], true);
         assert_eq!(fields["redacted"], true);
-        assert_eq!(fields["message"], "accepted secure Vapi destination leg");
+        assert_eq!(fields["message"], "accepted Vapi destination leg");
         let serialized = serde_json::to_string(fields).unwrap();
         assert!(!serialized.contains(SECRET_CORRELATION));
         assert!(!serialized.contains("inline:"));
         assert!(!serialized.contains("192.0.2.1"));
         assert!(!serialized.contains("198.51.100.2"));
+    }
+
+    #[test]
+    fn structured_plain_rtp_event_is_explicit_and_secret_safe() {
+        let capture = FieldCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let fingerprint = correlation_fingerprint(SECRET_CORRELATION).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            CompletedEvidence {
+                correlation_fingerprint: fingerprint.clone(),
+                media_profile: "RTP/AVP",
+                media_keying: "none",
+                media_suite: "none",
+                srtp_contexts_installed: false,
+            }
+            .emit();
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let fields = &events[0];
+        assert_eq!(fields["event"], VAPI_DESTINATION_SECURITY_EVENT);
+        assert_eq!(fields["correlation_fingerprint"], fingerprint);
+        assert_eq!(fields["uri_scheme"], "sips");
+        assert_eq!(fields["signaling_transport"], "tls");
+        assert_eq!(fields["media_profile"], "RTP/AVP");
+        assert_eq!(fields["media_keying"], "none");
+        assert_eq!(fields["media_suite"], "none");
+        assert_eq!(fields["inbound_srtp_context_installed"], false);
+        assert_eq!(fields["outbound_srtp_context_installed"], false);
+        assert_eq!(fields["answered"], true);
+        assert_eq!(fields["redacted"], true);
+        assert_eq!(fields["message"], "accepted Vapi destination leg");
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(!serialized.contains(SECRET_CORRELATION));
+        assert!(!serialized.contains("inline:"));
     }
 
     #[test]

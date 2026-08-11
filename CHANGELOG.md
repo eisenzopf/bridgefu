@@ -14,9 +14,10 @@
 - Added an explicit DNS `sips:` Contact for secure recipe UAS responses so a
   2xx ACK remains on the secure dialog route with rvoip 0.3.7. Bridgefu keeps
   the explicit `;transport=tls` route contract used by deployed integrations.
-- Added redacted runtime evidence for fully established strict SIPS/SDES-SRTP
-  ingress without logging raw SDP, SIP URIs, keys, addresses, or correlation
-  IDs.
+- Added redacted runtime evidence for the exact media-security posture of a
+  fully established SIPS ingress leg. Strict SDES-SRTP and the explicit
+  RTP/AVP compatibility fallback are distinguishable without logging raw SDP,
+  SIP URIs, keys, addresses, or correlation IDs.
 
 ## Unreleased — Bridgefu 0.9.0 customer-preview candidate
 
