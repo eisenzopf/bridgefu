@@ -128,23 +128,21 @@ impl GenericBridgeRuntime {
         let correlation_header = correlation_headers
             .next()
             .filter(|_| correlation_headers.next().is_none());
-        let sip_security_evidence_policy = if sip_stack_config.offer_srtp
-            && sip_stack_config.srtp_required
-            && sip_stack_config.tls_bind_addr.is_some()
-        {
-            correlation_header
-                .map(|correlation_header| {
-                    SipSecurityEvidencePolicy::install(
-                        &mut sip_stack_config,
-                        correlation_header,
-                        admission_capacity.saturating_mul(4),
-                    )
-                    .context("configuring redacted secure SIP evidence")
-                })
-                .transpose()?
-        } else {
-            None
-        };
+        let sip_security_evidence_policy =
+            if sip_stack_config.offer_srtp && sip_stack_config.tls_bind_addr.is_some() {
+                correlation_header
+                    .map(|correlation_header| {
+                        SipSecurityEvidencePolicy::install(
+                            &mut sip_stack_config,
+                            correlation_header,
+                            admission_capacity.saturating_mul(4),
+                        )
+                        .context("configuring redacted SIPS media-security evidence")
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
         let inbound_context_policy = sip_inbound_context_policy(context_policy)?;
         let webrtc_auth = Arc::new(
             AuthCoreHook::new(webrtc_bearer_validator)
@@ -211,24 +209,25 @@ impl GenericBridgeRuntime {
             }
         };
         let sip_security_evidence = match sip_security_evidence_policy {
-            Some(policy) => match SipSecurityEvidenceMonitor::start(coordinator.as_ref(), policy)
-                .await
-            {
-                Ok(observer) => Some(observer),
-                Err(error) => {
-                    rollback_failed_startup(
-                        execution,
-                        Some(Arc::clone(&coordinator)),
-                        None,
-                        None,
-                        Arc::clone(&orchestrator),
-                        Arc::clone(&amazon_connect),
-                        setup_timeout,
-                    )
-                    .await;
-                    return Err(error).context("starting redacted secure SIP evidence observer");
+            Some(policy) => {
+                match SipSecurityEvidenceMonitor::start(coordinator.as_ref(), policy).await {
+                    Ok(observer) => Some(observer),
+                    Err(error) => {
+                        rollback_failed_startup(
+                            execution,
+                            Some(Arc::clone(&coordinator)),
+                            None,
+                            None,
+                            Arc::clone(&orchestrator),
+                            Arc::clone(&amazon_connect),
+                            setup_timeout,
+                        )
+                        .await;
+                        return Err(error)
+                            .context("starting redacted SIPS media-security evidence observer");
+                    }
                 }
-            },
+            }
             None => None,
         };
         let sip_adapter = match SipAdapter::new_with_inbound_context_policy(
