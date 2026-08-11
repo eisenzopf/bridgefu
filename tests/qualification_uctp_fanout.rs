@@ -12,9 +12,9 @@ use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use qualification_support::{
     bounded_environment_u64, bounded_environment_usize, current_rss_bytes, git_revision,
-    host_evidence, memory_growth_percent, prometheus_counter_sum, rvoip_registry_evidence,
+    host_evidence, memory_growth_percent, prometheus_counter_sum, rvoip_lock_evidence,
     write_report, HostEvidence, LatencyHistogram, QualificationMode, RevisionEvidence,
-    RvoipRegistryEvidence,
+    RvoipLockEvidence,
 };
 use rvoip_core::broadcast::{BroadcastPublisher, BroadcastTransport};
 use rvoip_core::ids::StreamId;
@@ -86,7 +86,7 @@ struct UctpQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RvoipRegistryEvidence,
+    rvoip: RvoipLockEvidence,
     host: HostEvidence,
     transport: BroadcastTransport,
     protocol_version: String,
@@ -246,7 +246,7 @@ async fn qualifies_uctp_direct_fanout() {
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: rvoip_registry_evidence(&manifest_dir),
+        rvoip: rvoip_lock_evidence(&manifest_dir),
         host: host_evidence(),
         transport: descriptor.transport,
         protocol_version: descriptor.protocol_version,

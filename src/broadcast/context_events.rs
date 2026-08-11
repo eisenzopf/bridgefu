@@ -160,6 +160,7 @@ mod tests {
                 ("X-Bridgefu-Event".into(), "broadcast_event".into()),
                 ("X-Correlation-Id".into(), "correlation_id".into()),
             ]),
+            ..ContextPolicy::default()
         }
     }
 

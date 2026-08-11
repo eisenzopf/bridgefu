@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy one explicitly reviewed Bridgefu source revision to the legacy EC2
 # host-mode service. The committed Cargo.lock pins the crates.io-hosted rvoip
-# 0.3.5 graph; no sibling source checkout participates in the build.
+# 0.3.7 graph; no sibling source checkout participates in the build.
 set -euo pipefail
 
 : "${INSTANCE_IP:?set INSTANCE_IP to the disposable target host}"
@@ -13,7 +13,7 @@ set -euo pipefail
 SSH_USER="${SSH_USER:-ec2-user}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/bridgefu-releases}"
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-readonly RVOIP_VERSION=0.3.5
+readonly RVOIP_VERSION=0.3.7
 
 if [[ ! "$INSTANCE_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "INSTANCE_IP must be an IPv4 address or DNS hostname" >&2

@@ -717,7 +717,10 @@ pub struct NamedRouteCallContext {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NamedProfileKind {
+    /// Preserved Vapi-specific ingress profile identity.
     VapiIngress,
+    /// Provider-neutral SIP/SIPS ingress profile identity used by recipes.
+    SipIngress,
     Sip,
     WebRtc,
     AmazonConnect,
@@ -842,6 +845,10 @@ pub struct NamedRouteBinding {
     context: Option<NamedRouteCallContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiles: Vec<NamedProfileBinding>,
+    /// Exact SIP header that must appear once and match `context.correlation_id`
+    /// before a public SIP attachment can be consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_sip_correlation_header: Option<String>,
 }
 
 impl fmt::Debug for NamedRouteBinding {
@@ -851,6 +858,10 @@ impl fmt::Debug for NamedRouteBinding {
             .field("route_id", &self.route_id)
             .field("context_present", &self.context.is_some())
             .field("profile_count", &self.profiles.len())
+            .field(
+                "required_sip_correlation_header",
+                &self.required_sip_correlation_header,
+            )
             .finish()
     }
 }
@@ -866,6 +877,7 @@ impl NamedRouteBinding {
             route_id: route_id.into(),
             context,
             profiles: Vec::new(),
+            required_sip_correlation_header: None,
         };
         binding.validate()?;
         Ok(binding)
@@ -882,9 +894,22 @@ impl NamedRouteBinding {
             route_id: route_id.into(),
             context,
             profiles,
+            required_sip_correlation_header: None,
         };
         binding.validate()?;
         Ok(binding)
+    }
+
+    /// Requires one exact, duplicate-free SIP correlation header whose value
+    /// matches the server-owned route context. The requirement is persisted
+    /// with the immutable route snapshot and therefore survives restart.
+    pub fn with_required_sip_correlation_header(
+        mut self,
+        header: impl Into<String>,
+    ) -> Result<Self, RepositoryError> {
+        self.required_sip_correlation_header = Some(header.into());
+        self.validate()?;
+        Ok(self)
     }
 
     #[must_use]
@@ -900,6 +925,11 @@ impl NamedRouteBinding {
     #[must_use]
     pub fn profiles(&self) -> &[NamedProfileBinding] {
         &self.profiles
+    }
+
+    #[must_use]
+    pub fn required_sip_correlation_header(&self) -> Option<&str> {
+        self.required_sip_correlation_header.as_deref()
     }
 
     pub(crate) fn validate(&self) -> Result<(), RepositoryError> {
@@ -918,6 +948,19 @@ impl NamedRouteBinding {
         }
         if let Some(context) = &self.context {
             context.validate()?;
+        }
+        if let Some(header) = &self.required_sip_correlation_header {
+            let valid_header = self.context.is_some()
+                && (header.starts_with("X-") || header.starts_with("x-"))
+                && header.len() <= 128
+                && header
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+            if !valid_header {
+                return Err(RepositoryError::InvalidInput(
+                    "invalid required SIP correlation header",
+                ));
+            }
         }
         let mut identities = BTreeSet::new();
         for profile in &self.profiles {
@@ -946,7 +989,7 @@ impl NamedRouteBinding {
                 "replacement route snapshot does not match the selected route ID",
             ));
         }
-        if self.context.is_some() {
+        if self.context.is_some() || self.required_sip_correlation_header.is_some() {
             return Err(RepositoryError::InvalidInput(
                 "replacement route snapshot must not carry new call context",
             ));

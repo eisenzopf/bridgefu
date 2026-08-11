@@ -15,13 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "config" / "schema.json"
 EXAMPLE_PATH = ROOT / "config" / "bridgefu.example.yaml"
 COMPATIBILITY_FIXTURES = sorted((ROOT / "config" / "fixtures").glob("config-v*.yaml"))
-STANDARDCHARTER_CONFIG = (
-    ROOT / "config" / "fixtures" / "standardcharter-managed-routes.yaml"
+REFERENCE_TENANT_CONFIG = (
+    ROOT / "config" / "fixtures" / "reference-tenant-managed-routes.yaml"
 )
-STANDARDCHARTER_ENV = (
-    ROOT / "config" / "fixtures" / "standardcharter-managed-routes.env"
+REFERENCE_TENANT_ENV = (
+    ROOT / "config" / "fixtures" / "reference-tenant-managed-routes.env"
 )
-EXPECTED_STANDARDCHARTER_ROUTES = (
+EXPECTED_REFERENCE_TENANT_ROUTES = (
     "amazon-connect",
     "generic-sip",
     "telnyx",
@@ -83,34 +83,34 @@ def assert_env_secret(instance: dict[str, object], *path: object) -> None:
         raise AssertionError(f"paired fixture secret {path!r} must use env:VARIABLE")
 
 
-def validate_standardcharter_pair(
+def validate_reference_tenant_pair(
     validator: Draft202012Validator,
 ) -> None:
-    bridgefu = yaml.safe_load(STANDARDCHARTER_CONFIG.read_text(encoding="utf-8"))
+    bridgefu = yaml.safe_load(REFERENCE_TENANT_CONFIG.read_text(encoding="utf-8"))
     validator.validate(bridgefu)
-    standardcharter = parse_env_fixture(STANDARDCHARTER_ENV)
+    reference_tenant = parse_env_fixture(REFERENCE_TENANT_ENV)
 
     routes = nested(bridgefu, "api", "routes")
     if not isinstance(routes, dict):
         raise AssertionError("paired Bridgefu fixture has no named-route catalog")
-    if tuple(routes) != EXPECTED_STANDARDCHARTER_ROUTES:
+    if tuple(routes) != EXPECTED_REFERENCE_TENANT_ROUTES:
         raise AssertionError(
             "paired Bridgefu fixture route order/IDs do not match the product contract"
         )
     configured_routes = tuple(
         route.strip()
-        for route in standardcharter.get("BRIDGEFU_ROUTE_IDS", "").split(",")
+        for route in reference_tenant.get("BRIDGEFU_ROUTE_IDS", "").split(",")
         if route.strip()
     )
-    if configured_routes != EXPECTED_STANDARDCHARTER_ROUTES:
-        raise AssertionError("paired StandardCharter route IDs do not match Bridgefu")
-    if standardcharter.get("BRIDGEFU_DEFAULT_ROUTE_ID") != "amazon-connect":
+    if configured_routes != EXPECTED_REFERENCE_TENANT_ROUTES:
+        raise AssertionError("paired reference-tenant route IDs do not match Bridgefu")
+    if reference_tenant.get("BRIDGEFU_DEFAULT_ROUTE_ID") != "amazon-connect":
         raise AssertionError("paired default route must remain amazon-connect")
-    if standardcharter.get("BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED") != "true":
+    if reference_tenant.get("BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED") != "true":
         raise AssertionError("paired migration fixture must explicitly scope Amazon rollback")
-    if not standardcharter.get("CONNECT_TRANSFER_SIP_URI", "").startswith("sips:"):
+    if not reference_tenant.get("CONNECT_TRANSFER_SIP_URI", "").startswith("sips:"):
         raise AssertionError("paired Amazon rollback fixture must use SIPS")
-    bearer_ref = standardcharter.get("BRIDGEFU_API_BEARER_TOKEN_REF", "")
+    bearer_ref = reference_tenant.get("BRIDGEFU_API_BEARER_TOKEN_REF", "")
     if not bearer_ref.startswith("env:"):
         raise AssertionError("StandardCharter control bearer must remain a secret reference")
 
@@ -160,7 +160,7 @@ def validate_standardcharter_pair(
             "BRIDGEFU_DEFAULT_ROUTE_ID",
             "BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED",
         ):
-            if deployed.get(key) != standardcharter.get(key):
+            if deployed.get(key) != reference_tenant.get(key):
                 raise AssertionError(
                     f"StandardCharter example drifted from paired fixture key {key}"
                 )
@@ -177,7 +177,7 @@ def main() -> None:
     for fixture_path in COMPATIBILITY_FIXTURES:
         fixture = yaml.safe_load(fixture_path.read_text(encoding="utf-8"))
         validator.validate(fixture)
-    validate_standardcharter_pair(validator)
+    validate_reference_tenant_pair(validator)
 
     unknown_top = copy.deepcopy(example)
     unknown_top["unknown_top_level"] = True
@@ -255,7 +255,7 @@ def main() -> None:
 
     print(
         "Bridgefu config schema, compatibility/deployment fixtures, paired "
-        "StandardCharter routes, and strict negative fixtures are valid"
+        "reference-tenant routes, and strict negative fixtures are valid"
     )
 
 

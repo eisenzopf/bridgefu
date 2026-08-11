@@ -1,5 +1,5 @@
 # Non-secret, schema-valid deployment fixture paired with
-# standardcharter-managed-routes.env. All addresses use reserved example ranges
+# reference-tenant-managed-routes.env. All addresses use reserved example ranges
 # or .test names; every credential is an env: reference.
 config_version: 1
 
@@ -14,7 +14,7 @@ sip:
 
 default_tenant: null
 tenants:
-  standardcharter:
+  reference-tenant:
     instance_id: 00000000-0000-4000-8000-000000000101
     contact_flow_id: 00000000-0000-4000-8000-000000000102
     default_display_name: Vapi caller
@@ -32,8 +32,8 @@ runtime:
 
 persistence:
   backend: sqlite
-  database_url: sqlite:///var/lib/bridgefu/standardcharter.db
-  deployment_id: standardcharter
+  database_url: sqlite:///var/lib/bridgefu/reference-tenant.db
+  deployment_id: reference-tenant
   worker_lease_ttl_secs: 30
   worker_renew_interval_secs: 10
   worker_capabilities:
@@ -48,7 +48,7 @@ api:
   enabled: true
   bearer_token: env:BRIDGEFU_API_TOKEN
   control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
-  static_tenant: standardcharter
+  static_tenant: reference-tenant
   route_attachments:
     sip_uri_template: sips:{token}@bridgefu.example.test:5061;transport=tls
     webrtc:
@@ -60,13 +60,13 @@ api:
           credential: env:BRIDGEFU_TURN_PASSWORD
   routes:
     amazon-connect:
-      tenant_id: standardcharter
+      tenant_id: reference-tenant
       ingress: [sip, webrtc]
       vapi_ingress_profile: vapi-production
       webrtc_ingress_profile: browser-public
       destination_profile:
         type: amazon_connect
-        profile_id: standardcharter-connect
+        profile_id: reference-tenant-connect
       destination:
         direction: outbound
         signaling_initiator: bridgefu
@@ -77,15 +77,15 @@ api:
             instance_id: 00000000-0000-4000-8000-000000000101
             contact_flow_id: 00000000-0000-4000-8000-000000000102
         amazon_connect_start:
-          profile: standardcharter-connect
+          profile: reference-tenant-connect
           instance_id: 00000000-0000-4000-8000-000000000101
           contact_flow_id: 00000000-0000-4000-8000-000000000102
           attributes:
             integration: bridgefu
           display_name: Vapi caller
-          description: StandardCharter managed handoff
+          description: ReferenceTenant managed handoff
     generic-sip:
-      tenant_id: standardcharter
+      tenant_id: reference-tenant
       ingress: [sip, webrtc]
       vapi_ingress_profile: vapi-production
       webrtc_ingress_profile: browser-public
@@ -102,13 +102,13 @@ api:
             uri: sips:agents@sbc.example.test:5061;transport=tls
             initial_context: required
     telnyx:
-      tenant_id: standardcharter
+      tenant_id: reference-tenant
       ingress: [sip, webrtc]
       vapi_ingress_profile: vapi-production
       webrtc_ingress_profile: browser-public
       destination_profile:
         type: telnyx
-        profile_id: standardcharter-telnyx
+        profile_id: reference-tenant-telnyx
       destination:
         direction: outbound
         signaling_initiator: bridgefu
@@ -117,10 +117,10 @@ api:
           type: provider
           config:
             provider: telnyx
-            account_profile: standardcharter-telnyx
+            account_profile: reference-tenant-telnyx
             destination: "+15555550100"
     generic-wss:
-      tenant_id: standardcharter
+      tenant_id: reference-tenant
       ingress: [sip, webrtc]
       vapi_ingress_profile: vapi-production
       webrtc_ingress_profile: browser-public
@@ -138,7 +138,7 @@ api:
 
 vapi_ingress_profiles:
   vapi-production:
-    tenant_id: standardcharter
+    tenant_id: reference-tenant
     principal_subject: vapi-transfer-edge
     issuer: vapi-managed
     scopes: [calls:create]
@@ -227,9 +227,9 @@ generic_bridge:
 
 providers:
   telnyx:
-    account_profile: standardcharter-telnyx
+    account_profile: reference-tenant-telnyx
     api_key: env:TELNYX_API_KEY
-    connection_id: standardcharter-test-connection
+    connection_id: reference-tenant-test-connection
     webhook_public_key: env:TELNYX_WEBHOOK_PUBLIC_KEY
     from: "+15555550101"
     media_sip_authority: bridgefu.example.test:5061

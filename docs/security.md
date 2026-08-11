@@ -70,7 +70,7 @@ as a tenant boundary.
   must use that exact value. Version-one plans migrated without this field stay
   readable for inspection and teardown but fail closed for outbound work; no
   runtime identity is inferred as a replacement.
-- The optional StandardCharter durable canary is false by default and lives on
+- The optional reference tenant durable canary is false by default and lives on
   the separate generic SIP listener. Startup binds it to one configured tenant,
   one exact subject/issuer, required SIP/create scopes, and a correlation
   header explicitly mapped to Amazon `correlation_id`. Its correlation-derived

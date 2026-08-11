@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bridgefu.dev/schema/recipe-v1.json",
+  "title": "Bridgefu Recipe manifest v1",
+  "type": "object",
+  "required": ["api_version", "kind", "metadata", "spec"],
+  "properties": {
+    "api_version": { "const": "bridgefu.dev/recipe/v1" },
+    "kind": { "const": "bridge_recipe" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "version", "title", "support"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "version": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "support": {
+          "enum": ["supported", "preview", "development", "custom", "experimental", "roadmap"]
+        },
+        "description": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "inputs": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/input" }
+    },
+    "spec": { "$ref": "#/$defs/spec" },
+    "deployments": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": {
+        "type": "object",
+        "maxProperties": 16,
+        "propertyNames": { "$ref": "#/$defs/identifier" },
+        "additionalProperties": { "$ref": "#/$defs/packagePath" }
+      }
+    },
+    "assets": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/packagePath" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+    },
+    "packagePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "input": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": ["string", "boolean", "integer", "enum", "cidr_list", "aws_arn", "aws_connect_resource_id", "secret_ref"]
+        },
+        "required": { "type": "boolean" },
+        "default": true,
+        "values": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "description": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "inputRef": {
+      "type": "object",
+      "required": ["$input"],
+      "properties": {
+        "$input": { "$ref": "#/$defs/identifier" }
+      },
+      "additionalProperties": false
+    },
+    "stringOrInput": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 2048 },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "optionalStringOrInput": {
+      "oneOf": [
+        { "type": "string", "maxLength": 2048 },
+        { "type": "null" },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "booleanOrInput": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "stringArrayOrInput": {
+      "oneOf": [
+        {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "codecArrayOrInput": {
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["pcmu", "pcma", "opus"] }
+        },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "sipSecurityOrInput": {
+      "oneOf": [
+        { "enum": ["sips_srtp", "sips_optional_srtp", "sip_rtp"] },
+        { "$ref": "#/$defs/inputRef" }
+      ]
+    },
+    "spec": {
+      "type": "object",
+      "required": ["bridges"],
+      "properties": {
+        "bridges": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 16,
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/bridge" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "bridge": {
+      "type": "object",
+      "required": ["source", "destination"],
+      "properties": {
+        "source": { "$ref": "#/$defs/endpoint" },
+        "destination": { "$ref": "#/$defs/endpoint" },
+        "context": { "$ref": "#/$defs/context" }
+      },
+      "additionalProperties": false
+    },
+    "endpoint": {
+      "oneOf": [
+        { "$ref": "#/$defs/sipEndpoint" },
+        { "$ref": "#/$defs/webrtcEndpoint" },
+        { "$ref": "#/$defs/amazonConnectEndpoint" }
+      ]
+    },
+    "sipEndpoint": {
+      "type": "object",
+      "required": ["type", "security"],
+      "properties": {
+        "type": { "const": "sip" },
+        "security": { "$ref": "#/$defs/sipSecurityOrInput" },
+        "admission": { "$ref": "#/$defs/sipAdmission" },
+        "target_uri": { "$ref": "#/$defs/optionalStringOrInput" },
+        "from_uri": { "$ref": "#/$defs/optionalStringOrInput" },
+        "outbound_proxy": { "$ref": "#/$defs/optionalStringOrInput" },
+        "auth": { "$ref": "#/$defs/sipAuth" },
+        "tls_roots": { "$ref": "#/$defs/stringArrayOrInput" },
+        "codecs": { "$ref": "#/$defs/codecArrayOrInput" },
+        "metadata_keys": { "$ref": "#/$defs/stringArrayOrInput" }
+      },
+      "additionalProperties": false
+    },
+    "sipAdmission": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "oneOf": [
+            { "enum": ["managed_attachment", "stable_uri"] },
+            { "$ref": "#/$defs/inputRef" }
+          ]
+        },
+        "trusted_cidrs": { "$ref": "#/$defs/stringArrayOrInput" },
+        "uri_user": { "$ref": "#/$defs/optionalStringOrInput" }
+      },
+      "additionalProperties": false
+    },
+    "sipAuth": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "digest" },
+            "realm": { "$ref": "#/$defs/optionalStringOrInput" },
+            "username": { "$ref": "#/$defs/optionalStringOrInput" },
+            "password_ref": { "$ref": "#/$defs/optionalStringOrInput" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "bearer" },
+            "token_ref": { "$ref": "#/$defs/optionalStringOrInput" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "webrtcEndpoint": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "webrtc" },
+        "signaling_uri": { "$ref": "#/$defs/optionalStringOrInput" },
+        "bearer_token_ref": { "$ref": "#/$defs/optionalStringOrInput" },
+        "tls_roots": { "$ref": "#/$defs/stringArrayOrInput" },
+        "codecs": { "$ref": "#/$defs/codecArrayOrInput" },
+        "data_channels": { "$ref": "#/$defs/booleanOrInput" }
+      },
+      "additionalProperties": false
+    },
+    "amazonConnectEndpoint": {
+      "type": "object",
+      "required": ["type", "media", "instance_arn", "contact_flow_id"],
+      "properties": {
+        "type": { "const": "amazon_connect" },
+        "media": {
+          "oneOf": [
+            { "const": "webrtc" },
+            { "$ref": "#/$defs/inputRef" }
+          ]
+        },
+        "instance_arn": { "$ref": "#/$defs/stringOrInput" },
+        "contact_flow_id": { "$ref": "#/$defs/stringOrInput" },
+        "context_metadata_keys": { "$ref": "#/$defs/stringArrayOrInput" }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "required": ["correlation"],
+      "properties": {
+        "correlation": {
+          "type": "object",
+          "required": ["required", "from_sip_header", "to_amazon_attribute", "format"],
+          "properties": {
+            "required": { "$ref": "#/$defs/booleanOrInput" },
+            "from_sip_header": { "$ref": "#/$defs/stringOrInput" },
+            "to_amazon_attribute": { "$ref": "#/$defs/stringOrInput" },
+            "format": {
+              "oneOf": [
+                { "const": "opaque_id_v1" },
+                { "$ref": "#/$defs/inputRef" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

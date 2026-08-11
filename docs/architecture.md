@@ -5,7 +5,7 @@ state machines, authentication primitives, media streams, transcoding,
 WebRTC, UCTP/QUIC, and MOQT live in rvoip; Bridgefu owns tenant routing,
 provider APIs, safe metadata policy, admission, HTTP control, and deployment.
 
-The current runtime has two independent SIP listeners so StandardCharter is
+The current runtime has two independent SIP listeners so the reference tenant is
 never put at risk by generic routing changes:
 
 - Port 5060 (default) is the preserved Vapi → Amazon Connect screen-pop path.
@@ -16,7 +16,7 @@ never put at risk by generic routing changes:
   conversion.
 
 The generic listener has one deliberately narrow exception for migration
-testing. `generic_bridge.standardcharter_canary` is disabled by default and may
+testing. `generic_bridge.reference_tenant_canary` is disabled by default and may
 name exactly one configured/static-auth tenant. Only that tenant's exact
 authenticated subject and issuer, `sip:connect` plus `calls:create` scopes, and
 one allowlisted `X-Correlation-Id` can atomically create/replay a durable

@@ -610,6 +610,7 @@ mod tests {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
                 ("X-Large-A".into(), "large_a".into()),
                 ("X-Large-B".into(), "large_b".into()),
             ]),
+            ..ContextPolicy::default()
         };
         assert_eq!(
             ProviderDialClientState::new(

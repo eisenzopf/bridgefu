@@ -28,8 +28,8 @@ mapping:
 default_tenant: null
 tenants:
   banking:
-    instance_id: instance-standardcharter-test
-    contact_flow_id: flow-standardcharter-test
+    instance_id: instance-reference-tenant-test
+    contact_flow_id: flow-reference-tenant-test
     default_display_name: Vapi caller
 
 runtime:

@@ -1,8 +1,26 @@
 # Migration to the v1 configuration
 
-Existing StandardCharter configuration remains valid. Additive defaults keep
-the legacy `aws`, `sip`, `contact`, `mapping`, `tenants`, and `observability`
-blocks unchanged.
+Existing reference-tenant configuration remains valid except for the preview
+canary neutral-label migration below. Additive defaults keep the legacy `aws`,
+`sip`, `contact`, `mapping`, `tenants`, and `observability` blocks unchanged.
+
+## Preview canary neutral-label migration
+
+This cleanup intentionally renames the preview canary config key and metric,
+observer schema IDs, Compose and GitHub identifiers, secret names, scripts and
+fixtures, and the public Rust module and types. Strict v1 configuration accepts
+`generic_bridge.reference_tenant_canary` only; it does not alias or accept the
+retired canary field. Before rollout, update configuration, automation,
+dashboards and alerts, evidence collectors, deployment secrets, imports, and
+operational commands together. Mixing old and new surface names is unsupported.
+
+The canary's durable idempotency namespace also advances to v2. A fresh
+installation may use v2 directly. If a durable store ever ran an earlier
+preview canary, first disable canary admission, drain all canary calls and
+pending cleanup, and leave it disabled for the full 24-hour idempotency
+retention window. Then deploy the renamed configuration while still disabled
+and re-enable it only after verification. This boundary prevents one logical
+request from being created once under each namespace.
 
 1. Add `config_version: 1`.
 2. Set `api.bearer_token`, `api.control_hmac_key` (at least 32 bytes), and

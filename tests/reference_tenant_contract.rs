@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Hermetic regression for the production StandardCharter handoff contract.
+//! Hermetic regression for the production ReferenceTenant handoff contract.
 //!
 //! These tests enter through a real localhost SIP listener. Amazon's control
 //! plane and Chime media session are replaced at rvoip's public injection
@@ -44,10 +44,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
-const GOLDEN_CONFIG: &str = include_str!("fixtures/standardcharter-golden.yaml");
-const VAPI_INVITE: &str = include_str!("fixtures/standardcharter-vapi-invite.sip");
-const CALL_ID: &str = "standardcharter-golden@127.0.0.1";
-const CONTACT_ID: &str = "contact-standardcharter-hermetic";
+const GOLDEN_CONFIG: &str = include_str!("fixtures/reference-tenant-golden.yaml");
+const VAPI_INVITE: &str = include_str!("fixtures/reference-tenant-vapi-invite.sip");
+const CALL_ID: &str = "reference-tenant-golden@127.0.0.1";
+const CONTACT_ID: &str = "contact-reference-tenant-hermetic";
 
 struct CapturingStarter {
     captured: Mutex<Option<oneshot::Sender<StartContactRequest>>>,
@@ -65,12 +65,12 @@ impl ConnectContactStarter for CapturingStarter {
         }
         Ok(ConnectionData {
             contact_id: CONTACT_ID.into(),
-            participant_id: "participant-standardcharter".into(),
-            participant_token: "participant-token-standardcharter".into(),
-            meeting_id: "meeting-standardcharter".into(),
+            participant_id: "participant-reference-tenant".into(),
+            participant_token: "participant-token-reference-tenant".into(),
+            meeting_id: "meeting-reference-tenant".into(),
             media_region: "us-west-2".into(),
-            attendee_id: "attendee-standardcharter".into(),
-            join_token: "join-token-standardcharter".into(),
+            attendee_id: "attendee-reference-tenant".into(),
+            join_token: "join-token-reference-tenant".into(),
             media_placement: MediaPlacement {
                 signaling_url: "wss://localhost.invalid/signaling".into(),
                 audio_host_url: "https://localhost.invalid/audio".into(),
@@ -368,11 +368,11 @@ where
         .thread_stack_size(2 * 1024 * 1024)
         .enable_all()
         .build()
-        .expect("two MiB StandardCharter regression runtime");
+        .expect("two MiB ReferenceTenant regression runtime");
     let task = runtime.spawn(scenario);
     runtime
         .block_on(task)
-        .expect("StandardCharter scenario completed on a two MiB worker stack");
+        .expect("ReferenceTenant scenario completed on a two MiB worker stack");
 }
 
 fn render_invite(server_port: u16, client_port: u16, media_port: u16) -> Vec<u8> {
@@ -447,7 +447,7 @@ async fn receive_through_200(client: &UdpSocket) -> Vec<String> {
 async fn send_ack(call: &EstablishedCall) {
     let ack = format!(
         "ACK {} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-standardcharter-ack;rport\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-reference-tenant-ack;rport\r\n\
          Max-Forwards: 70\r\n\
          From: \"Vapi caller\" <sip:vapi@127.0.0.1:{}>;tag=vapi-golden\r\n\
          To: {}\r\n\
@@ -543,8 +543,8 @@ async fn establish_call() -> EstablishedCall {
         .await
         .expect("StartWebRTCContact was invoked before the test deadline")
         .expect("capture sender stayed alive");
-    assert_eq!(request.instance_id, "instance-standardcharter-test");
-    assert_eq!(request.contact_flow_id, "flow-standardcharter-test");
+    assert_eq!(request.instance_id, "instance-reference-tenant-test");
+    assert_eq!(request.contact_flow_id, "flow-reference-tenant-test");
     assert!(
         request.display_name.to_ascii_lowercase().contains("vapi"),
         "SIP From identity is preserved for the agent display name: {}",
@@ -727,7 +727,7 @@ async fn assert_pcmu_opus_round_trip(call: &mut EstablishedCall) {
 async fn send_vapi_bye(call: &EstablishedCall) {
     let bye = format!(
         "BYE {} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-standardcharter-bye;rport\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-reference-tenant-bye;rport\r\n\
          Max-Forwards: 70\r\n\
          From: \"Vapi caller\" <sip:vapi@127.0.0.1:{}>;tag=vapi-golden\r\n\
          To: {}\r\n\
@@ -811,7 +811,7 @@ async fn receive_server_bye_and_respond(call: &EstablishedCall) {
 }
 
 fn assert_stop_request(request: &StopContactRequest) {
-    assert_eq!(request.instance_id, "instance-standardcharter-test");
+    assert_eq!(request.instance_id, "instance-reference-tenant-test");
     assert_eq!(request.contact_id, CONTACT_ID);
 }
 

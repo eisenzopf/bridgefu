@@ -25,7 +25,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TIMEOUT_SECONDS = 600
 OUTPUT_LIMIT = 2 * 1024 * 1024
-RVOIP_RELEASE_VERSION = "0.3.5"
+RVOIP_RELEASE_VERSION = "0.3.7"
 REQUIRED_RVOIP_PACKAGES = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -281,7 +281,7 @@ def locked_dependency_state(lock_path: Path) -> dict[str, object]:
     ]
     if invalid:
         raise SystemExit(
-            "Cargo.lock contains non-registry, non-0.3.5, or unchecked rvoip "
+            "Cargo.lock contains non-registry, non-0.3.7, or unchecked rvoip "
             f"packages: {invalid}"
         )
 

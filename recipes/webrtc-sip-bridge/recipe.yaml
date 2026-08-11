@@ -1,0 +1,68 @@
+api_version: bridgefu.dev/recipe/v1
+kind: bridge_recipe
+
+metadata:
+  name: webrtc-sip-bridge
+  version: 1
+  title: Browser WebRTC to SIP contact center
+  support: preview
+  description: >-
+    Accepts one-use interactive WebRTC attachments and originates a fixed,
+    server-owned SIP/RTP or SIPS/SRTP destination.
+
+inputs:
+  webrtc_signaling_uri:
+    type: string
+    required: true
+    description: Public credential-free WSS attachment endpoint served by Bridgefu.
+  sip_target_uri:
+    type: string
+    required: true
+    description: Fixed contact-center SIP or SIPS destination; callers never select it.
+  sip_from_uri:
+    type: string
+    required: true
+    description: Fixed Bridgefu From URI accepted by the destination.
+  sip_outbound_proxy:
+    type: string
+    description: Optional credential-free SIP/SIPS outbound proxy URI.
+  sip_security:
+    type: enum
+    values: [sips_srtp, sips_optional_srtp, sip_rtp]
+    default: sips_srtp
+    description: SIPS/SRTP is the production default; SIP/RTP is compatibility-only.
+  sip_digest_realm:
+    type: string
+    description: Optional Digest realm; omit together with username/password for no auth.
+  sip_digest_username:
+    type: string
+    description: Optional Digest username; requires sip_digest_password.
+  sip_digest_password:
+    type: secret_ref
+    description: Optional env, absolute file, or Secrets Manager reference; never a raw secret.
+
+spec:
+  bridges:
+    support:
+      source:
+        type: webrtc
+        signaling_uri: {$input: webrtc_signaling_uri}
+        codecs: [opus, pcmu, pcma]
+        data_channels: true
+      destination:
+        type: sip
+        security: {$input: sip_security}
+        target_uri: {$input: sip_target_uri}
+        from_uri: {$input: sip_from_uri}
+        outbound_proxy: {$input: sip_outbound_proxy}
+        auth:
+          type: digest
+          realm: {$input: sip_digest_realm}
+          username: {$input: sip_digest_username}
+          password_ref: {$input: sip_digest_password}
+        codecs: [opus, pcmu, pcma]
+        metadata_keys: [correlation_id]
+
+assets:
+  documentation: README.md
+  values_example: values.example.yaml

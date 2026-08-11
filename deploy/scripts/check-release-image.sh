@@ -114,10 +114,10 @@ grep -Eq '^STOPSIGNAL SIGTERM$' "$dockerfile"
 grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" "$dockerfile"
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.5"' "$dockerfile"
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.7"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" deploy/vapi-feasibility/Dockerfile
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' deploy/vapi-feasibility/Dockerfile
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.5"' deploy/vapi-feasibility/Dockerfile
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.7"' deploy/vapi-feasibility/Dockerfile
 grep -Eq 'dockerfile: deploy/Dockerfile' compose.yaml
 if grep -Eq 'additional_contexts:' compose.yaml deploy/vapi-feasibility/compose.local.yaml; then
   echo "Compose must build from the Bridgefu context alone" >&2
@@ -302,11 +302,11 @@ if not packages:
 invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
-    if package["version"] != "0.3.5"
+    if package["version"] != "0.3.7"
     or not package.get("source", "").startswith("registry+")
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.5 rvoip packages: {invalid}")
+    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.7 rvoip packages: {invalid}")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -340,7 +340,7 @@ bash -n deploy.sh deploy/scripts/*.sh
 grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
 grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
 grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
-grep -Fq 'readonly RVOIP_VERSION=0.3.5' deploy.sh
+grep -Fq 'readonly RVOIP_VERSION=0.3.7' deploy.sh
 grep -Fq -- '--iidfile' deploy.sh
 grep -Fq '/etc/bridgefu/image.env' deploy.sh
 grep -Fq '/readyz' deploy.sh

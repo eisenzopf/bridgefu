@@ -63,7 +63,7 @@ client advertises in its SDP — a private/NAT address — so audio won't return
 Running on the instance removes NAT entirely.
 
 ```bash
-ssh -i ~/.ssh/bridgefu ec2-user@35.80.105.73
+ssh -i ~/.ssh/bridgefu ec2-user@203.0.113.10
 ```
 
 ---
@@ -125,7 +125,7 @@ To change the hold time (default 30 s in the scenario) add `-d 30000`.
 ## What to watch — tail the gateway logs in a second SSH session
 
 ```bash
-ssh -i ~/.ssh/bridgefu ec2-user@35.80.105.73 'sudo journalctl -u bridgefu -f'
+ssh -i ~/.ssh/bridgefu ec2-user@203.0.113.10 'sudo journalctl -u bridgefu -f'
 ```
 
 A successful run should show, in order (PRD §9.3):

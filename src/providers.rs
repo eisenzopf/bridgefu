@@ -2678,6 +2678,7 @@ mod tests {
                 ("X-Correlation-Id".into(), "correlation_id".into()),
                 ("X-Account-Tier".into(), "account_tier".into()),
             ]),
+            ..ContextPolicy::default()
         };
         let media_client_state = ProviderDialClientState::new(
             &start_context,

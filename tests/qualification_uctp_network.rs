@@ -21,9 +21,9 @@ use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use qualification_support::{
     bounded_environment_u64, bounded_environment_usize, current_rss_bytes, git_revision,
-    host_evidence, memory_growth_percent, prometheus_counter_sum, rvoip_registry_evidence,
+    host_evidence, memory_growth_percent, prometheus_counter_sum, rvoip_lock_evidence,
     write_report, HostEvidence, LatencyHistogram, QualificationMode, RevisionEvidence,
-    RvoipRegistryEvidence,
+    RvoipLockEvidence,
 };
 use rvoip_auth_core::BearerValidator;
 use rvoip_core::adapter::{
@@ -132,7 +132,7 @@ struct UctpNetworkQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RvoipRegistryEvidence,
+    rvoip: RvoipLockEvidence,
     host: HostEvidence,
     transport: &'static str,
     protocol_version: &'static str,
@@ -891,7 +891,7 @@ async fn qualifies_authenticated_uctp_network_fanout() {
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: rvoip_registry_evidence(&manifest_dir),
+        rvoip: rvoip_lock_evidence(&manifest_dir),
         host: host_evidence(),
         transport: "raw-quic",
         protocol_version: UCTP_QUIC_PROTOCOL_VERSION,

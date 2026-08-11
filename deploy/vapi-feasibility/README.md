@@ -1,7 +1,7 @@
 # Vapi feasibility observer fixture
 
 This disposable binary closes the local infrastructure gap in
-StandardCharter's owner-gated stock Vapi `webCall` → SIP test. It uses
+the reference tenant's owner-gated stock Vapi `webCall` → SIP test. It uses
 `rvoip-sip` for SIP, RTP, TLS, SDES-SRTP, RFC 4733, audio, and teardown. The
 HTTP layer only exposes authenticated, bounded qualification operations; it is
 not part of Bridgefu's public administration API.
@@ -42,7 +42,7 @@ docker compose -f deploy/vapi-feasibility/compose.local.yaml up --build
 ```
 
 Local mode intentionally uses loopback HTTP and UDP SIP so it can run without
-public certificates. It is not accepted by StandardCharter's live harness.
+public certificates. It is not accepted by the reference tenant's live harness.
 
 ## Deployment boundary
 
@@ -71,5 +71,5 @@ SIP destinations, missing TLS files, optional SRTP, partial Bridgefu settings,
 short/shared tokens, undersized media ranges, and missing correlation-header
 policy. It never probes Vapi, Bridgefu, or a cloud during validation.
 
-Do not run the live StandardCharter workflow, create provider resources, or
+Do not run the live reference tenant workflow, create provider resources, or
 publish this image without the project owner's explicit authorization.

@@ -1,7 +1,7 @@
 # Deployment assets
 
 `deploy/Dockerfile` is the canonical release image definition. It resolves the
-exact crates.io `rvoip` 0.3.5 package set from the committed `Cargo.lock`; no
+exact crates.io `rvoip` 0.3.7 package set from the committed `Cargo.lock`; no
 separate rvoip checkout or named build context is required. The image runs as
 UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
 bases are pinned to multi-platform manifest digests. Builder packages come from
@@ -61,7 +61,7 @@ Only one edge profile should be active at a time because each binds the same
 SIP, WebRTC, API, and QUIC ports:
 
 ```sh
-docker compose --profile standardcharter config --quiet
+docker compose --profile reference-tenant config --quiet
 docker compose --profile generic config --quiet
 docker compose --profile telnyx config --quiet
 docker compose --profile uctp config --quiet
@@ -113,7 +113,7 @@ Telnyx additionally requires `TELNYX_API_KEY`, `TELNYX_WEBHOOK_PUBLIC_KEY`,
 `TELNYX_MEDIA_SIP_PASSWORD`. `TELNYX_MEDIA_SIP_USERNAME` defaults to
 `telnyx-media`; realm and transport default to `bridgefu` and `UDP`. The API
 key, webhook key, and media password remain `env:` references in the effective
-Bridgefu configuration. StandardCharter requires a real configuration path in
+Bridgefu configuration. The reference tenant requires a real configuration path in
 `BRIDGEFU_CONFIG` and the normal AWS credential chain. The generic profile
 starts Coturn and requires explicit TURN credentials and an advertised address
 outside loopback.
@@ -215,7 +215,7 @@ systemctl enable --now bridgefu
 `deploy.sh` packages Bridgefu source with `git archive`; it requires and
 verifies an exact `BRIDGEFU_REVISION`, expands it into a new remote release
 directory, and runs `cargo build --locked` inside the canonical image. The
-exact rvoip 0.3.5 inputs come from crates.io and are verified against the
+exact rvoip 0.3.7 inputs come from crates.io and are verified against the
 checksums in the committed `Cargo.lock`; `RVOIP_DIR` and `RVOIP_REVISION` are
 not deployment inputs. The Docker build captures an immutable local image ID in
 `/etc/bridgefu/image.env`, then requires `/readyz` and `/livez`; a failed check

@@ -13,9 +13,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
-pub const COORDINATED_RVOIP_VERSION: &str = "0.3.5";
+pub const COORDINATED_RVOIP_VERSION: &str = "0.3.7";
 const LATENCY_MAX_US: u64 = 1_000_000;
-pub const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub const APPROVED_RVOIP_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -75,11 +75,11 @@ pub struct CargoPackageEvidence {
     name: String,
     version: String,
     source: String,
-    checksum: String,
+    checksum: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RvoipRegistryEvidence {
+pub struct RvoipLockEvidence {
     release_version: &'static str,
     lockfile: &'static str,
     packages: Vec<CargoPackageEvidence>,
@@ -223,7 +223,7 @@ pub fn git_revision(path: &Path) -> RevisionEvidence {
     }
 }
 
-pub fn rvoip_registry_evidence(manifest_dir: &Path) -> RvoipRegistryEvidence {
+pub fn rvoip_lock_evidence(manifest_dir: &Path) -> RvoipLockEvidence {
     let lockfile = fs::read_to_string(manifest_dir.join("Cargo.lock"))
         .expect("read Bridgefu Cargo.lock for rvoip dependency evidence");
     let mut packages = parse_lock_packages(&lockfile)
@@ -237,21 +237,18 @@ pub fn rvoip_registry_evidence(manifest_dir: &Path) -> RvoipRegistryEvidence {
             );
             assert_eq!(
                 package.source.as_deref(),
-                Some(CRATES_IO_REGISTRY_SOURCE),
-                "{} must resolve from the crates.io registry",
+                Some(APPROVED_RVOIP_SOURCE),
+                "{} must resolve from its approved immutable source",
                 package.name
             );
             let checksum = package
                 .checksum
-                .filter(|checksum| {
-                    checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-                .unwrap_or_else(|| panic!("{} must have a Cargo.lock checksum", package.name));
+                .expect("crates.io rvoip packages must carry a lockfile checksum");
             CargoPackageEvidence {
                 name: package.name,
                 version: package.version,
-                source: package.source.expect("validated registry source"),
-                checksum,
+                source: package.source.expect("validated immutable source"),
+                checksum: Some(checksum),
             }
         })
         .collect::<Vec<_>>();
@@ -273,7 +270,7 @@ pub fn rvoip_registry_evidence(manifest_dir: &Path) -> RvoipRegistryEvidence {
         );
     }
 
-    RvoipRegistryEvidence {
+    RvoipLockEvidence {
         release_version: COORDINATED_RVOIP_VERSION,
         lockfile: "Cargo.lock",
         packages,
@@ -407,13 +404,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_evidence_uses_the_coordinated_checked_release() {
-        let evidence = rvoip_registry_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert_eq!(evidence.release_version, "0.3.5");
-        assert!(evidence.packages.iter().all(|package| {
-            package.version == "0.3.5"
-                && package.source == CRATES_IO_REGISTRY_SOURCE
-                && package.checksum.len() == 64
-        }));
+    fn lock_evidence_uses_the_coordinated_crates_io_release() {
+        let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert_eq!(evidence.release_version, "0.3.7");
+        assert!(evidence
+            .packages
+            .iter()
+            .all(|package| package.version == "0.3.7"
+                && package.source == APPROVED_RVOIP_SOURCE
+                && package.checksum.is_some()));
     }
 }

@@ -19,9 +19,8 @@ use futures_util::future::join_all;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use qualification_support::{
     bounded_environment_u64, bounded_environment_usize, current_rss_bytes, git_revision,
-    host_evidence, memory_growth_percent, prometheus_counter_sum_with_label,
-    rvoip_registry_evidence, write_report, HostEvidence, QualificationMode, RevisionEvidence,
-    RvoipRegistryEvidence,
+    host_evidence, memory_growth_percent, prometheus_counter_sum_with_label, rvoip_lock_evidence,
+    write_report, HostEvidence, QualificationMode, RevisionEvidence, RvoipLockEvidence,
 };
 use rvoip_auth_core::{BearerAuthError, BearerValidator, ValidatedBearer};
 use rvoip_core::broadcast::{
@@ -209,7 +208,7 @@ struct MoqtQualificationReport {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     bridgefu: RevisionEvidence,
-    rvoip: RvoipRegistryEvidence,
+    rvoip: RvoipLockEvidence,
     host: HostEvidence,
     transport: BroadcastTransport,
     protocol: MoqProtocolVersion,
@@ -704,7 +703,7 @@ async fn qualifies_moqt_origin_through_relay() {
         started_at,
         finished_at: Utc::now(),
         bridgefu: git_revision(&manifest_dir),
-        rvoip: rvoip_registry_evidence(&manifest_dir),
+        rvoip: rvoip_lock_evidence(&manifest_dir),
         host: host_evidence(),
         transport: descriptor.transport,
         protocol: publisher.protocol_version(),

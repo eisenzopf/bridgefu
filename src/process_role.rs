@@ -671,6 +671,7 @@ pub fn preflight(config: &Config) -> std::result::Result<RolePlan, RolePreflight
             if !config.generic_bridge.sip.allow_cleartext_bearer
                 && config.generic_bridge.sip.digest.is_none()
                 && config.providers.telnyx.is_none()
+                && !config.has_projected_sip_ingress_identity()
             {
                 return Err(RolePreflightError::GatewaySipAuthenticationMissing);
             }
@@ -2783,6 +2784,9 @@ sip: {advertised_ip: 127.0.0.1, media_public_ip: 127.0.0.1}
                 amazon_connect_start: None,
             },
             vapi_ingress_profile: None,
+            sip_ingress_profile: None,
+            required_sip_correlation_header: None,
+            recipe_sip_admission: None,
             webrtc_ingress_profile: Some("browser-primary".into()),
             destination_profile: Some(crate::config::RouteDestinationProfileRef::Telnyx {
                 profile_id: "telnyx-primary".into(),
@@ -2805,6 +2809,7 @@ sip: {advertised_ip: 127.0.0.1, media_public_ip: 127.0.0.1}
                 .unwrap(),
             ],
             context_metadata_allowlist: None,
+            context_required: false,
             capability_policy: crate::config::NamedRouteCapabilityPolicy::default(),
         }
     }
