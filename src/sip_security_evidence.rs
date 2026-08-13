@@ -244,11 +244,26 @@ struct TransportEvidence {
 #[derive(Default)]
 struct CallEvidence {
     transport: Option<TransportEvidence>,
-    called_uri_sips: bool,
+    called_uri_scheme: Option<EvidenceUriScheme>,
     sdp_offer: Option<EvidenceMediaProfile>,
     media: Option<MediaEvidence>,
     answered: bool,
     emitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceUriScheme {
+    Sip,
+    Sips,
+}
+
+impl EvidenceUriScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sip => "sip",
+            Self::Sips => "sips",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,6 +304,7 @@ impl EvidenceMediaSuite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletedEvidence {
     correlation_fingerprint: String,
+    uri_scheme: &'static str,
     media_profile: &'static str,
     media_keying: &'static str,
     media_suite: &'static str,
@@ -301,7 +317,7 @@ impl CompletedEvidence {
             event = VAPI_DESTINATION_SECURITY_EVENT,
             correlation_fingerprint = %self.correlation_fingerprint,
             leg = "vapi-to-bridgefu",
-            uri_scheme = "sips",
+            uri_scheme = self.uri_scheme,
             signaling_transport = "tls",
             media_profile = self.media_profile,
             media_keying = self.media_keying,
@@ -338,7 +354,7 @@ impl EvidenceTracker {
                 call_id, to, sdp, ..
             } => {
                 let call = self.call_mut(call_id.clone());
-                call.called_uri_sips = called_uri_is_sips(&to);
+                call.called_uri_scheme = called_uri_scheme(&to);
                 call.sdp_offer = sdp.as_deref().and_then(sdp_audio_profile);
                 self.complete(&call_id)
             }
@@ -425,7 +441,11 @@ impl EvidenceTracker {
     fn complete(&mut self, call_id: &SessionId) -> Option<CompletedEvidence> {
         let allow_plain_rtp = self.policy.allow_plain_rtp;
         let call = self.calls.get_mut(call_id)?;
-        if call.emitted || !call.called_uri_sips || !call.answered {
+        if call.emitted || !call.answered {
+            return None;
+        }
+        let uri_scheme = call.called_uri_scheme?;
+        if uri_scheme == EvidenceUriScheme::Sip && !allow_plain_rtp {
             return None;
         }
         let transport = call.transport.as_ref()?;
@@ -448,6 +468,7 @@ impl EvidenceTracker {
         call.emitted = true;
         Some(CompletedEvidence {
             correlation_fingerprint: transport.correlation_fingerprint.clone(),
+            uri_scheme: uri_scheme.as_str(),
             media_profile,
             media_keying,
             media_suite,
@@ -593,26 +614,31 @@ fn sdp_audio_profile(sdp: &str) -> Option<EvidenceMediaProfile> {
     })
 }
 
-fn called_uri_is_sips(value: &str) -> bool {
+fn called_uri_scheme(value: &str) -> Option<EvidenceUriScheme> {
     if value.is_empty() || value.len() > MAX_CALLED_URI_BYTES || value.contains(['\r', '\n', '\0'])
     {
-        return false;
+        return None;
     }
     if let Some(open) = value.rfind('<') {
         let tail = &value[open + 1..];
-        let Some(close) = tail.find('>') else {
-            return false;
-        };
+        let close = tail.find('>')?;
         if tail[close + 1..].contains(['<', '>']) {
-            return false;
+            return None;
         }
-        return tail[..close]
-            .parse::<Uri>()
-            .is_ok_and(|uri| matches!(uri.scheme(), Scheme::Sips));
+        return tail[..close].parse::<Uri>().ok().and_then(uri_scheme);
     }
     value
         .parse::<Address>()
-        .is_ok_and(|address| matches!(address.uri.scheme(), Scheme::Sips))
+        .ok()
+        .and_then(|address| uri_scheme(address.uri))
+}
+
+fn uri_scheme(uri: Uri) -> Option<EvidenceUriScheme> {
+    match uri.scheme() {
+        Scheme::Sip => Some(EvidenceUriScheme::Sip),
+        Scheme::Sips => Some(EvidenceUriScheme::Sips),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -799,6 +825,7 @@ mod tests {
                 completed[0],
                 CompletedEvidence {
                     correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    uri_scheme: "sips",
                     media_profile: "RTP/SAVP",
                     media_keying: "SDES-SRTP",
                     media_suite: "AES_CM_128_HMAC_SHA1_80",
@@ -814,7 +841,7 @@ mod tests {
         let mut tracker = EvidenceTracker::new(optional_policy());
         for event in [
             trace("TLS", &fingerprint_header(), Some(session())),
-            incoming("RTP/AVP"),
+            incoming_with_scheme("sip", "RTP/AVP"),
         ] {
             assert!(tracker.observe(event).is_none());
         }
@@ -822,6 +849,7 @@ mod tests {
             tracker.observe(established()),
             Some(CompletedEvidence {
                 correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                uri_scheme: "sip",
                 media_profile: "RTP/AVP",
                 media_keying: "none",
                 media_suite: "none",
@@ -829,6 +857,19 @@ mod tests {
             })
         );
         assert!(tracker.observe(established()).is_none());
+    }
+
+    #[test]
+    fn strict_policy_rejects_plain_sip_request_uri_even_with_secure_media() {
+        let mut tracker = EvidenceTracker::new(policy());
+        for event in [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming_with_scheme("sip", "RTP/SAVP"),
+            media(true),
+            established(),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
     }
 
     #[test]
@@ -960,16 +1001,22 @@ mod tests {
 
     #[test]
     fn called_uri_scheme_is_parsed_without_retaining_the_uri() {
-        assert!(called_uri_is_sips(
-            "\"Bridgefu destination\" <SIPS:route@example.test>;tag=opaque"
-        ));
-        assert!(!called_uri_is_sips("<sip:route@example.test>"));
-        assert!(!called_uri_is_sips(
-            "\"sips:misleading-display-name\" <sip:route@example.test>"
-        ));
-        assert!(!called_uri_is_sips(
-            "sips:not a valid address\r\nInjected: value"
-        ));
+        assert_eq!(
+            called_uri_scheme("\"Bridgefu destination\" <SIPS:route@example.test>;tag=opaque"),
+            Some(EvidenceUriScheme::Sips)
+        );
+        assert_eq!(
+            called_uri_scheme("<sip:route@example.test>"),
+            Some(EvidenceUriScheme::Sip)
+        );
+        assert_eq!(
+            called_uri_scheme("\"sips:misleading-display-name\" <sip:route@example.test>"),
+            Some(EvidenceUriScheme::Sip)
+        );
+        assert_eq!(
+            called_uri_scheme("sips:not a valid address\r\nInjected: value"),
+            None
+        );
     }
 
     #[test]
@@ -1006,6 +1053,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             CompletedEvidence {
                 correlation_fingerprint: fingerprint.clone(),
+                uri_scheme: "sips",
                 media_profile: "RTP/SAVP",
                 media_keying: "SDES-SRTP",
                 media_suite: "AES_CM_128_HMAC_SHA1_80",
@@ -1063,6 +1111,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             CompletedEvidence {
                 correlation_fingerprint: fingerprint.clone(),
+                uri_scheme: "sip",
                 media_profile: "RTP/AVP",
                 media_keying: "none",
                 media_suite: "none",
@@ -1076,7 +1125,7 @@ mod tests {
         let fields = &events[0];
         assert_eq!(fields["event"], VAPI_DESTINATION_SECURITY_EVENT);
         assert_eq!(fields["correlation_fingerprint"], fingerprint);
-        assert_eq!(fields["uri_scheme"], "sips");
+        assert_eq!(fields["uri_scheme"], "sip");
         assert_eq!(fields["signaling_transport"], "tls");
         assert_eq!(fields["media_profile"], "RTP/AVP");
         assert_eq!(fields["media_keying"], "none");
