@@ -840,6 +840,34 @@ async fn memory_repository_shared_conformance() {
 async fn sqlite_repository_shared_conformance_and_schema() {
     let (url, path) = sqlite_database("conformance");
     let repository = SqliteRepository::connect(&url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
+            .to_ascii_lowercase(),
+        "wal"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap(),
+        1,
+        "standalone SQLite uses NORMAL synchronization with WAL"
+    );
+    let held_connection = repository.pool().acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), repository.pool().acquire())
+            .await
+            .is_err(),
+        "standalone SQLite must serialize access through one pooled connection"
+    );
+    drop(held_connection);
+    tokio::time::timeout(Duration::from_secs(1), repository.pool().acquire())
+        .await
+        .expect("the serialized SQLite connection was not returned to the pool")
+        .unwrap();
     assert_required_sqlite_tables(&repository).await;
     let reconnected = SqliteRepository::connect(&url).await.unwrap();
     assert_required_sqlite_tables(&reconnected).await;

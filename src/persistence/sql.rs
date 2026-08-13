@@ -25,7 +25,9 @@ use chrono::{DateTime, Utc};
 use rvoip_core::ids::ConnectionId;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{Executor, Row};
 
 use crate::call_engine::{
@@ -171,9 +173,17 @@ impl SqliteRepository {
             .map_err(|_| RepositoryError::Unavailable)?
             .create_if_missing(true)
             .foreign_keys(true)
+            // Standalone Bridgefu has one authoritative SQLite writer. WAL
+            // keeps health/read probes from blocking that writer, while one
+            // pooled connection serializes repository mutations before they
+            // enter SQLite instead of letting several connections contend in
+            // SQLite's busy handler. The latter can starve the worker-lease
+            // renewal behind routine media-deadline traffic.
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30));
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            .max_connections(1)
             .after_connect(|connection, _| {
                 Box::pin(async move {
                     connection.execute("PRAGMA foreign_keys = ON").await?;
