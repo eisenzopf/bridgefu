@@ -1796,13 +1796,16 @@ impl Config {
             let revision = rvoip_sip::SipProfileRevision::new(revision)
                 .map_err(|_| anyhow!("named SIP profile produced an invalid revision"))?;
 
-            // Clone operational tuning and NAT/media advertisement from the
-            // public stack, but bind an independent signaling endpoint and
-            // remove every inbound TLS-listener credential from the child.
+            // Clone operational tuning, the RTP bind, and NAT/media
+            // advertisement from the public stack, but bind an independent
+            // signaling endpoint and remove every inbound TLS-listener
+            // credential from the child. Config::local_ip belongs to RTP
+            // allocation, not SIP signaling: resetting it to the loopback
+            // child bind makes Linux reject sends to a public media peer with
+            // EINVAL while the SDP still advertises the public address.
             let child_name = format!("{name}-egress-{}", offset + 1);
             let isolated = rvoip_sip::Config::on(&child_name, bind.ip(), 0);
             let mut stack = base.clone();
-            stack.local_ip = isolated.local_ip;
             stack.sip_port = isolated.sip_port;
             stack.bind_addr = isolated.bind_addr;
             stack.local_uri = isolated.local_uri;
@@ -8259,6 +8262,19 @@ private_forwarding:
             .unwrap();
         assert_eq!(sip.bind_addr.ip().to_string(), "127.0.0.1");
         assert_eq!(sip.local_ip.to_string(), "0.0.0.0");
+        let egress = config
+            .sip_egress_profile_configs(
+                "webrtc-sip-public-media",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0].stack.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(egress[0].stack.local_ip.to_string(), "0.0.0.0");
+        assert_eq!(
+            egress[0].stack.media_public_addr.unwrap().to_string(),
+            "192.0.2.20:0"
+        );
         assert_eq!(
             config
                 .context
@@ -9644,6 +9660,12 @@ generic_bridge:
             .sip_egress_profile_configs("isolated-profile-test", bind)
             .unwrap();
         assert_eq!(profiles.len(), 2);
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.stack.bind_addr.ip().is_loopback()));
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.stack.local_ip == listener.local_ip));
         let pcma = profiles
             .iter()
             .find(|profile| profile.stack.offered_codecs == [8, 101])
