@@ -542,10 +542,24 @@ test("runs rvoip WSS/peer lifecycle, media, DataMessages, context, DTMF, and cle
     connection_id: "server-connection-1",
     candidate: JSON.stringify({ candidate: "candidate:2", sdpMid: "0" }),
   });
+  socket.receive({
+    type: "ice-candidate",
+    connection_id: "server-connection-1",
+    candidate: JSON.stringify({
+      candidate: "candidate:3",
+      sdpMid: "",
+      sdpMLineIndex: 0,
+    }),
+  });
   socket.receive({ type: "ice-complete", connection_id: "server-connection-1" });
-  await waitFor(() => peer.remoteCandidates.length === 2, "remote ICE");
+  await waitFor(() => peer.remoteCandidates.length === 3, "remote ICE");
   assert.equal(peer.remoteCandidates[0].candidate, "candidate:2");
-  assert.equal(peer.remoteCandidates[1], null);
+  assert.equal(peer.remoteCandidates[0].sdpMid, "0");
+  assert.deepEqual(peer.remoteCandidates[1], {
+    candidate: "candidate:3",
+    sdpMLineIndex: 0,
+  });
+  assert.equal(peer.remoteCandidates[2], null);
 
   await client.disconnect();
   assert.equal(client.state, "closed");
