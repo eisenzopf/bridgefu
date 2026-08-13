@@ -8079,7 +8079,11 @@ fn context_to_amazon_attributes(
         attributes.insert("correlation_id".into(), envelope.correlation_id.clone());
     }
     for (key, value) in &envelope.metadata {
-        if policy.allows_metadata_key(key).map_err(|_| ())? {
+        // The handoff token authenticates the temporary Vapi SIP leg. It is
+        // intentionally eligible for that SIP header projection, but it is a
+        // private control value rather than customer screen-pop data and must
+        // never become an Amazon Connect contact attribute.
+        if key != "handoff_token" && policy.allows_metadata_key(key).map_err(|_| ())? {
             attributes.insert(key.clone(), value.clone());
         }
     }
@@ -12114,57 +12118,73 @@ async fn execute_start_leg_replacement(
     }
 
     let replacement_context = if replacement_uses_initial_context(&endpoint) {
-        match runtime
-            .service_repository()
-            .load_replacement_initial_context(ReplacementInitialContextLookup {
-                tenant_id: meta.tenant_id.clone(),
-                call_id: meta.call_id,
-                target_leg_id: leg_id,
-                previous_binding_generation,
-                pending_binding_generation,
-            })
-            .await
-        {
-            Ok(Some(context)) => {
-                let envelope = match serde_json::from_slice::<ContextEnvelope>(&context.envelope) {
-                    Ok(envelope)
-                        if envelope
-                            .validate_binding(
-                                meta.tenant_id.as_str(),
-                                &meta.call_id.to_string(),
-                                &context.source_leg_id.to_string(),
-                            )
-                            .is_ok() =>
-                    {
-                        envelope
-                    }
-                    _ => {
-                        return Ok(ReplacementStartExecution::rejected(
-                            deadline_generation,
-                            pending_binding_generation,
-                            "replacement_context_ownership_invalid",
-                            "the retained initial context no longer owns this call",
-                            false,
-                        ));
-                    }
-                };
-                metrics::counter!(
-                    "bridgefu_initial_context_total",
-                    "result" => "carried",
-                    "reason" => match &endpoint {
-                        super::LegEndpointConfig::Sip(_) => "replacement_sip",
-                        super::LegEndpointConfig::AmazonConnect(_) => "replacement_amazon",
-                        _ => "replacement_other",
-                    }
-                )
-                .increment(1);
-                Some(envelope)
+        let server_owned = match named_route_context_envelope(stored, leg_id) {
+            Ok(context) => context,
+            Err(()) => {
+                return Ok(ReplacementStartExecution::rejected(
+                    deadline_generation,
+                    pending_binding_generation,
+                    "replacement_context_ownership_invalid",
+                    "the server-owned replacement context is invalid",
+                    false,
+                ));
             }
-            Ok(None) => None,
-            Err(RepositoryError::StaleClaim | RepositoryError::NotFound) => {
-                return Err(RepositoryError::StaleClaim);
-            }
-            Err(error) => return Err(error),
+        };
+        match server_owned {
+            Some(envelope) => Some(envelope),
+            None => match runtime
+                .service_repository()
+                .load_replacement_initial_context(ReplacementInitialContextLookup {
+                    tenant_id: meta.tenant_id.clone(),
+                    call_id: meta.call_id,
+                    target_leg_id: leg_id,
+                    previous_binding_generation,
+                    pending_binding_generation,
+                })
+                .await
+            {
+                Ok(Some(context)) => {
+                    let envelope =
+                        match serde_json::from_slice::<ContextEnvelope>(&context.envelope) {
+                            Ok(envelope)
+                                if envelope
+                                    .validate_binding(
+                                        meta.tenant_id.as_str(),
+                                        &meta.call_id.to_string(),
+                                        &context.source_leg_id.to_string(),
+                                    )
+                                    .is_ok() =>
+                            {
+                                envelope
+                            }
+                            _ => {
+                                return Ok(ReplacementStartExecution::rejected(
+                                    deadline_generation,
+                                    pending_binding_generation,
+                                    "replacement_context_ownership_invalid",
+                                    "the retained initial context no longer owns this call",
+                                    false,
+                                ));
+                            }
+                        };
+                    metrics::counter!(
+                        "bridgefu_initial_context_total",
+                        "result" => "carried",
+                        "reason" => match &endpoint {
+                            super::LegEndpointConfig::Sip(_) => "replacement_sip",
+                            super::LegEndpointConfig::AmazonConnect(_) => "replacement_amazon",
+                            _ => "replacement_other",
+                        }
+                    )
+                    .increment(1);
+                    Some(envelope)
+                }
+                Ok(None) => None,
+                Err(RepositoryError::StaleClaim | RepositoryError::NotFound) => {
+                    return Err(RepositoryError::StaleClaim);
+                }
+                Err(error) => return Err(error),
+            },
         }
     } else {
         None

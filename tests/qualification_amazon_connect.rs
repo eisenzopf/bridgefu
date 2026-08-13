@@ -22,7 +22,8 @@ use bridgefu::call_service::{
     CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy, CreateCallInput,
     DisabledOutboundProfileResolver, DisabledProviderLegExecutor, IdempotencyKey,
     LegEndpointConfig, NamedProfileBinding, NamedProfileKind, NamedProfileRole, NamedRouteBinding,
-    RequestedLeg, SamePrincipalAttachmentResolver, SystemCallServiceClock, WebRtcEndpointConfig,
+    NamedRouteCallContext, RequestedLeg, SamePrincipalAttachmentResolver, SystemCallServiceClock,
+    WebRtcEndpointConfig,
 };
 use bridgefu::context::{ContextEnvelope, ContextPolicy};
 use bridgefu::coordination::DeploymentId;
@@ -1464,6 +1465,7 @@ mod direct_assistant_handoff {
             SipInboundContextPolicy::new([
                 "X-Correlation-Id",
                 "X-Account-Tier",
+                "X-Bridgefu_Handoff_Token",
                 "X-Unmapped-Private",
             ])
             .unwrap(),
@@ -1712,6 +1714,10 @@ mod direct_assistant_handoff {
                 allow_headers: BTreeMap::from([
                     ("X-Correlation-Id".into(), "correlation_id".into()),
                     ("X-Account-Tier".into(), "account_tier".into()),
+                    (
+                        "X-Bridgefu_Handoff_Token".into(),
+                        "handoff_token".into(),
+                    ),
                 ]),
                 ..ContextPolicy::default()
             }),
@@ -1794,10 +1800,10 @@ mod direct_assistant_handoff {
         }
     }
 
-    fn assistant_route_binding() -> NamedRouteBinding {
+    fn assistant_route_binding(context: Option<NamedRouteCallContext>) -> NamedRouteBinding {
         NamedRouteBinding::new_with_profiles(
             "direct-vapi-assistant",
-            None,
+            context,
             vec![NamedProfileBinding::new(
                 NamedProfileRole::Destination,
                 NamedProfileKind::Sip,
@@ -1866,6 +1872,7 @@ mod direct_assistant_handoff {
         harness: &mut HandoffHarness,
         idempotency: &str,
         correlation_id: &str,
+        server_owned_context: bool,
     ) -> LiveAssistantCall {
         let endpoint = format!(
             "sips:vapi-assistant@localhost:{};transport=tls",
@@ -1878,7 +1885,13 @@ mod direct_assistant_handoff {
                 &principal(),
                 &IdempotencyKey::parse(idempotency).unwrap(),
                 assistant_route_input(endpoint),
-                assistant_route_binding(),
+                assistant_route_binding(server_owned_context.then(|| NamedRouteCallContext {
+                    correlation_id: correlation_id.to_owned(),
+                    metadata: BTreeMap::from([
+                        ("account_tier".into(), "gold".into()),
+                        ("handoff_token".into(), "private-direct-token".into()),
+                    ]),
+                })),
             )
             .await
             .unwrap();
@@ -1928,49 +1941,62 @@ mod direct_assistant_handoff {
         .unwrap()
         .connection
         .id;
-        bounded(
-            "Amazon handoff browser WSS activation",
-            browser.activate_outbound(browser_connection.clone()),
-        )
-        .await
-        .unwrap();
-        assert!(browser.is_connection_live(&browser_connection));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), async {
-                loop {
-                    match harness.assistant.events.recv().await {
-                        Some(AdapterEvent::InboundConnection { .. }) => return,
-                        Some(_) => {}
-                        None => panic!("assistant events ended before initial context"),
-                    }
-                }
-            })
+        let pending_browser_activation = if server_owned_context {
+            let activation_browser = Arc::clone(&browser);
+            let activation_connection = browser_connection.clone();
+            Some(tokio::spawn(async move {
+                bounded(
+                    "Amazon handoff browser WSS activation",
+                    activation_browser.activate_outbound(activation_connection),
+                )
+                .await
+            }))
+        } else {
+            bounded(
+                "Amazon handoff browser WSS activation",
+                browser.activate_outbound(browser_connection.clone()),
+            )
             .await
-            .is_err(),
-            "required browser context did not gate the assistant INVITE"
-        );
+            .unwrap();
+            assert!(browser.is_connection_live(&browser_connection));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), async {
+                    loop {
+                        match harness.assistant.events.recv().await {
+                            Some(AdapterEvent::InboundConnection { .. }) => return,
+                            Some(_) => {}
+                            None => panic!("assistant events ended before initial context"),
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "required browser context did not gate the assistant INVITE"
+            );
 
-        let mut context = ContextEnvelope::new(
-            correlation_id,
-            TENANT,
-            call_id.to_string(),
-            source_leg_id.to_string(),
-        );
-        context
-            .metadata
-            .insert("account_tier".into(), "gold".into());
-        context
-            .metadata
-            .insert("must_not_forward".into(), "private-browser-value".into());
-        bounded(
-            "Amazon handoff initial browser context",
-            browser.send_data_message(
-                browser_connection.clone(),
-                context.to_data_message().unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
+            let mut context = ContextEnvelope::new(
+                correlation_id,
+                TENANT,
+                call_id.to_string(),
+                source_leg_id.to_string(),
+            );
+            context
+                .metadata
+                .insert("account_tier".into(), "gold".into());
+            context
+                .metadata
+                .insert("must_not_forward".into(), "private-browser-value".into());
+            bounded(
+                "Amazon handoff initial browser context",
+                browser.send_data_message(
+                    browser_connection.clone(),
+                    context.to_data_message().unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            None
+        };
 
         let assistant_connection = next_inbound(&mut harness.assistant.events).await;
         let inbound = harness
@@ -1992,6 +2018,17 @@ mod direct_assistant_handoff {
                 .collect::<Vec<_>>(),
             ["gold"]
         );
+        assert_eq!(
+            inbound
+                .metadata()
+                .values("X-Bridgefu_Handoff_Token")
+                .collect::<Vec<_>>(),
+            if server_owned_context {
+                vec!["private-direct-token"]
+            } else {
+                Vec::new()
+            }
+        );
         assert!(inbound
             .metadata()
             .values("X-Unmapped-Private")
@@ -2012,6 +2049,10 @@ mod direct_assistant_handoff {
         )
         .await
         .unwrap();
+        if let Some(activation) = pending_browser_activation {
+            activation.await.unwrap().unwrap();
+            assert!(browser.is_connection_live(&browser_connection));
+        }
         wait_for_call(&harness.runtime, call_id, |stored| {
             stored.call.aggregate.state() == CallState::Active
         })
@@ -2325,6 +2366,7 @@ mod direct_assistant_handoff {
             &mut harness,
             &format!("amazon-handoff-{suffix}-call"),
             &correlation_id,
+            matches!(terminal, TerminalSide::Browser),
         )
         .await;
         let source_binding = current_inbound_binding(&harness.runtime, call.call_id).await;
@@ -2562,9 +2604,13 @@ mod direct_assistant_handoff {
         let mut harness =
             setup_handoff_harness(AMAZON_REJECT_PROFILE, selected_starter, connector).await;
         let correlation_id = "direct-handoff-amazon-rejected";
-        let mut call =
-            establish_assistant_call(&mut harness, "amazon-handoff-rejected-call", correlation_id)
-                .await;
+        let mut call = establish_assistant_call(
+            &mut harness,
+            "amazon-handoff-rejected-call",
+            correlation_id,
+            false,
+        )
+        .await;
         let source_binding = current_inbound_binding(&harness.runtime, call.call_id).await;
         let (destination_leg_id, assistant_generation, assistant_server_connection) =
             current_outbound_binding(&harness.runtime, call.call_id).await;
@@ -2700,7 +2746,7 @@ mod direct_assistant_handoff {
                     "sips:vapi-assistant@localhost:{};transport=tls",
                     harness.assistant.tls_address.port()
                 )),
-                assistant_route_binding(),
+                assistant_route_binding(None),
             )
             .await
             .unwrap();
