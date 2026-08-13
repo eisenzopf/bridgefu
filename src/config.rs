@@ -795,11 +795,23 @@ impl GenericSipNetworkCfg {
             );
         }
         if let Some(address) = &self.media_public_addr {
-            config = config.with_media_public_addr(
-                address
-                    .parse()
-                    .map_err(|_| anyhow!("invalid generic SIP media public address"))?,
-            );
+            let media_public_addr = address
+                .parse::<SocketAddr>()
+                .map_err(|_| anyhow!("invalid generic SIP media public address"))?;
+            config = config.with_media_public_addr(media_public_addr);
+            // rvoip uses Config::local_ip for RTP socket allocation, while
+            // Config::bind_addr owns the clear SIP listener. Secure recipes
+            // intentionally keep that clear listener on loopback, but a
+            // loopback-bound RTP socket cannot send to or receive from the
+            // advertised public media address (Linux sendto returns EINVAL).
+            // Preserve the loopback signaling listener and bind media on the
+            // matching wildcard family whenever public media is advertised.
+            if bind.ip().is_loopback() && !media_public_addr.ip().is_loopback() {
+                config.local_ip = match media_public_addr.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                };
+            }
         }
         config.stun_server.clone_from(&self.stun_server);
         if let Some(tls) = &self.secure_listener {
@@ -7743,6 +7755,8 @@ recipes:
             sip.contact_uri.as_deref(),
             Some("sips:bridgefu@sip.recipe.example:5061;transport=tls")
         );
+        assert_eq!(sip.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(sip.local_ip.to_string(), "0.0.0.0");
         assert!(sip.offer_srtp);
         assert!(sip.srtp_required);
         let debug = format!("{:?}", config.generic_bridge.sip);
@@ -8237,6 +8251,14 @@ private_forwarding:
             config.generic_bridge.sip.media_public_addr.as_deref(),
             Some("192.0.2.20:0")
         );
+        let (sip, _) = config
+            .generic_sip_stack_config(
+                "webrtc-sip-public-media",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(sip.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(sip.local_ip.to_string(), "0.0.0.0");
         assert_eq!(
             config
                 .context
