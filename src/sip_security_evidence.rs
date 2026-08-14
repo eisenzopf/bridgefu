@@ -37,6 +37,7 @@ pub const VAPI_SOURCE_SECURITY_EVENT: &str = "bridgefu_vapi_source_security_evid
 
 const FINGERPRINT_PREFIX: &str = "bridgefu-fingerprint:";
 const URI_SCHEME_PREFIX: &str = "bridgefu-uri-scheme:";
+const INCOMPLETE_EVIDENCE_EVENT: &str = "bridgefu_vapi_security_evidence_incomplete";
 const CORRELATION_FINGERPRINT_HEX_BYTES: usize = 12;
 const MAX_CORRELATION_BYTES: usize = 512;
 const MAX_HEADER_NAME_BYTES: usize = 128;
@@ -434,6 +435,7 @@ impl EvidenceTracker {
             }
             Event::CallEnded { .. } | Event::CallFailed { .. } | Event::CallCancelled { .. } => {
                 if let Some(call_id) = call_id {
+                    self.emit_incomplete_source_evidence(&call_id);
                     self.calls.remove(&call_id);
                 }
                 None
@@ -504,6 +506,52 @@ impl EvidenceTracker {
         self.calls
             .get_mut(&call_id)
             .expect("bounded call insertion retains the requested key")
+    }
+
+    fn emit_incomplete_source_evidence(&self, call_id: &SessionId) {
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let source_leg = call.leg == Some(EvidenceLeg::BridgefuToVapi)
+            || call
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.leg == EvidenceLeg::BridgefuToVapi);
+        if call.emitted || !source_leg {
+            return;
+        }
+        let uri_scheme = call
+            .called_uri_scheme
+            .map(EvidenceUriScheme::as_str)
+            .unwrap_or("absent");
+        let sdp_offer_profile = match call.sdp_offer {
+            Some(EvidenceMediaProfile::RtpAvp) => "RTP/AVP",
+            Some(EvidenceMediaProfile::RtpSavp) => "RTP/SAVP",
+            None => "absent",
+        };
+        let media_keying = if call.media.is_some() {
+            "SDES-SRTP"
+        } else {
+            "absent"
+        };
+        let contexts_installed = call.media.is_some_and(|media| media.contexts_installed);
+        tracing::warn!(
+            event = INCOMPLETE_EVIDENCE_EVENT,
+            leg = EvidenceLeg::BridgefuToVapi.as_str(),
+            transport_observed = call.transport.is_some(),
+            single_correlation_header = call
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.correlation_header_count == 1),
+            uri_scheme,
+            sdp_offer_profile,
+            media_keying,
+            contexts_installed,
+            answered = call.answered,
+            leg_conflict = call.leg_conflict,
+            redacted = true,
+            "incomplete Bridgefu Vapi source-leg security evidence"
+        );
     }
 
     fn complete(&mut self, call_id: &SessionId) -> Option<CompletedEvidence> {
@@ -858,6 +906,13 @@ mod tests {
         }
     }
 
+    fn ended() -> Event {
+        Event::CallEnded {
+            call_id: session(),
+            reason: "test teardown".to_owned(),
+        }
+    }
+
     fn fingerprint_header() -> String {
         format!(
             "X-Correlation-Id: {FINGERPRINT_PREFIX}{}\r\n",
@@ -1056,6 +1111,62 @@ mod tests {
                 leg: EvidenceLeg::BridgefuToVapi,
             })
         );
+    }
+
+    #[test]
+    fn incomplete_outbound_evidence_reports_only_closed_missing_facts() {
+        let capture = FieldCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut tracker = EvidenceTracker::new(optional_policy());
+            assert!(tracker
+                .observe(outbound_trace("TLS", "sip", Some(session())))
+                .is_none());
+            assert!(tracker.observe(answered("RTP/AVP")).is_none());
+            assert!(tracker.observe(ended()).is_none());
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let fields = &events[0];
+        assert_eq!(
+            fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "answered".to_owned(),
+                "contexts_installed".to_owned(),
+                "event".to_owned(),
+                "leg".to_owned(),
+                "leg_conflict".to_owned(),
+                "media_keying".to_owned(),
+                "message".to_owned(),
+                "redacted".to_owned(),
+                "sdp_offer_profile".to_owned(),
+                "single_correlation_header".to_owned(),
+                "transport_observed".to_owned(),
+                "uri_scheme".to_owned(),
+            ])
+        );
+        assert_eq!(fields["event"], INCOMPLETE_EVIDENCE_EVENT);
+        assert_eq!(fields["leg"], "bridgefu-to-vapi");
+        assert_eq!(fields["transport_observed"], true);
+        assert_eq!(fields["single_correlation_header"], true);
+        assert_eq!(fields["uri_scheme"], "sip");
+        assert_eq!(fields["sdp_offer_profile"], "RTP/AVP");
+        assert_eq!(fields["media_keying"], "absent");
+        assert_eq!(fields["contexts_installed"], false);
+        assert_eq!(fields["answered"], false);
+        assert_eq!(fields["leg_conflict"], false);
+        assert_eq!(fields["redacted"], true);
+        assert_eq!(
+            fields["message"],
+            "incomplete Bridgefu Vapi source-leg security evidence"
+        );
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(!serialized.contains(SECRET_CORRELATION));
+        assert!(!serialized.contains("wire-call"));
+        assert!(!serialized.contains("192.0.2.1"));
+        assert!(!serialized.contains("198.51.100.2"));
+        assert!(!serialized.contains("inline:"));
     }
 
     #[test]
