@@ -7,14 +7,14 @@ use std::time::Duration;
 use bridgefu::call_engine::{
     AttachmentConsume, AttachmentId, AttachmentIssue, AttachmentLookup, AttachmentPurpose,
     AttachmentTokenDigest, AttachmentTransport, BindProviderReference, BindingGeneration,
-    CallAggregate, CallCommand, CallRepository, CommandCommit, CommandCommitOutcome, CommandId,
-    CreateCall, CreateCallOutcome, DeadlineKind, EffectIntent, IdempotencyKeyDigest, LegDirection,
-    LegKind, LegSpec, LegState, OutboxCompletion, PrincipalFingerprint, ProviderAccountKey,
-    ProviderCallId, ProviderEventCommit, ProviderEventDigest, ProviderEventInput,
-    ProviderEventOutcome, ProviderEventState, ProviderEventTarget, ProviderPayloadDigest,
-    ProviderReferenceRole, RegisterWorker, RepositoryError, RequestDigest, StoredCall, TenantId,
-    TerminalProviderEventAcknowledge, TerminalProviderEventAcknowledgeOutcome, WorkerId,
-    WorkerLease, WorkerSnapshot,
+    CallAggregate, CallCommand, CallId, CallRepository, CommandCommit, CommandCommitOutcome,
+    CommandId, CreateCall, CreateCallOutcome, DeadlineKind, EffectIntent, IdempotencyKeyDigest,
+    LegDirection, LegKind, LegSpec, LegState, OutboxCompletion, PrincipalFingerprint,
+    ProviderAccountKey, ProviderCallId, ProviderEventCommit, ProviderEventDigest,
+    ProviderEventInput, ProviderEventOutcome, ProviderEventState, ProviderEventTarget,
+    ProviderPayloadDigest, ProviderReferenceRole, RegisterWorker, RepositoryError, RequestDigest,
+    StoredCall, TenantId, TerminalProviderEventAcknowledge,
+    TerminalProviderEventAcknowledgeOutcome, WorkerId, WorkerLease, WorkerSnapshot,
 };
 use bridgefu::call_service::{
     CallExecutionPlan, CallServiceRepository, EffectResultOutcome, EffectResultReconciliation,
@@ -857,17 +857,11 @@ async fn sqlite_repository_shared_conformance_and_schema() {
         "standalone SQLite uses NORMAL synchronization with WAL"
     );
     let held_connection = repository.pool().acquire().await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), repository.pool().acquire())
-            .await
-            .is_err(),
-        "standalone SQLite must serialize access through one pooled connection"
-    );
-    drop(held_connection);
     tokio::time::timeout(Duration::from_secs(1), repository.pool().acquire())
         .await
-        .expect("the serialized SQLite connection was not returned to the pool")
+        .expect("WAL readers must not queue behind one occupied connection")
         .unwrap();
+    drop(held_connection);
     assert_required_sqlite_tables(&repository).await;
     let reconnected = SqliteRepository::connect(&url).await.unwrap();
     assert_required_sqlite_tables(&reconnected).await;
@@ -887,6 +881,77 @@ async fn sqlite_repository_shared_conformance_and_schema() {
         sqlite_idempotency_count(&repository, "expired-idempotency").await,
         1
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sqlite_empty_work_claims_skip_settled_history_but_validate_worker_fence() {
+    let (url, path) = sqlite_database("empty-claim-fast-path");
+    let repository = SqliteRepository::connect(&url).await.unwrap();
+    let worker_id = WorkerId::new();
+    let current = repository
+        .register_worker(RegisterWorker {
+            worker_id,
+            max_calls: 2,
+            capabilities: BTreeSet::from(["sip".to_owned(), "webrtc".to_owned()]),
+            at: at(0),
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await
+        .unwrap()
+        .lease;
+
+    // A settled row is irrelevant to every empty work claim. Deliberately
+    // make its JSON unreadable so this test proves the indexed materialized
+    // predicates did not rebuild retained history.
+    sqlx::query(
+        "INSERT INTO calls(call_id, tenant_id, aggregate_version, call_state, body) VALUES (?, ?, 1, 'ended', 'not-json')",
+    )
+    .bind(CallId::new().to_string())
+    .bind("settled-history")
+    .execute(repository.pool())
+    .await
+    .unwrap();
+
+    assert!(repository
+        .claim_outbox(current, at(1), Duration::from_secs(30), 64)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(repository
+        .claim_control_effects(current, at(1), Duration::from_secs(30), 64)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(repository
+        .claim_provider_events(current, at(1), Duration::from_secs(30), 64)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(repository
+        .claim_due_deadlines(current, at(1), Duration::from_secs(30), 64)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(repository
+        .claim_restart_calls(current, at(1), 64)
+        .await
+        .unwrap()
+        .is_empty());
+
+    sqlx::query("UPDATE workers SET fence = fence + 1 WHERE worker_id = ?")
+        .bind(worker_id.to_string())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .claim_outbox(current, at(3), Duration::from_secs(30), 64)
+            .await
+            .unwrap_err(),
+        RepositoryError::StaleWorkerFence
+    );
+
     let _ = std::fs::remove_file(path);
 }
 
