@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 
 use bridgefu::gateway_native_ingress::SipEgressProfileConfig;
 use bridgefu::recipe_admission::RecipeSipAdmissionCatalog;
+use bridgefu::sip_security_evidence::{SipSecurityEvidenceMonitor, SipSecurityEvidencePolicy};
 
 use crate::config::{GenericBridgeCfg, RuntimeCfg};
 use crate::context::ContextPolicy;
@@ -40,6 +41,7 @@ const WEBSOCKET_ATTACHMENT_PREFIX: &str = "bridgefu.attach.";
 pub struct GenericBridgeRuntime {
     orchestrator: Arc<Orchestrator>,
     sip: Arc<ProfiledSipAdapter>,
+    sip_security_evidence: Mutex<Option<SipSecurityEvidenceMonitor>>,
     webrtc: Mutex<Option<WebRtcServer>>,
     execution: Mutex<Option<CallExecutionSupervisor>>,
     amazon_connect: Arc<AmazonConnectAdapter>,
@@ -118,7 +120,32 @@ impl GenericBridgeRuntime {
             .webrtc_stack_config()
             .context("configuring generic WebRTC ICE/DTLS networking")?;
         rtc_config.max_concurrent_sessions = admission_capacity;
-        let (sip_stack_config, sip_nat_config) = sip_stack;
+        let (mut sip_stack_config, sip_nat_config) = sip_stack;
+        let mut correlation_headers = context_policy
+            .allow_headers
+            .iter()
+            .filter_map(|(header, key)| (key == "correlation_id").then_some(header.as_str()));
+        let correlation_header = correlation_headers
+            .next()
+            .filter(|_| correlation_headers.next().is_none());
+        let sip_security_evidence_policy = if sip_stack_config.offer_srtp
+            && sip_stack_config.srtp_required
+            && sip_stack_config.tls_bind_addr.is_some()
+        {
+            correlation_header
+                .map(|correlation_header| {
+                    SipSecurityEvidencePolicy::install(
+                        &mut sip_stack_config,
+                        correlation_header,
+                        admission_capacity.saturating_mul(4),
+                    )
+                    .context("configuring redacted secure SIP evidence")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let inbound_context_policy = sip_inbound_context_policy(context_policy)?;
         let webrtc_auth = Arc::new(
             AuthCoreHook::new(webrtc_bearer_validator)
                 .try_with_session_hint_subprotocol_prefix(WEBSOCKET_ATTACHMENT_PREFIX)
@@ -183,7 +210,27 @@ impl GenericBridgeRuntime {
                 return Err(error).context("starting authenticated generic SIP coordinator");
             }
         };
-        let inbound_context_policy = sip_inbound_context_policy(context_policy)?;
+        let sip_security_evidence = match sip_security_evidence_policy {
+            Some(policy) => match SipSecurityEvidenceMonitor::start(coordinator.as_ref(), policy)
+                .await
+            {
+                Ok(observer) => Some(observer),
+                Err(error) => {
+                    rollback_failed_startup(
+                        execution,
+                        Some(Arc::clone(&coordinator)),
+                        None,
+                        None,
+                        Arc::clone(&orchestrator),
+                        Arc::clone(&amazon_connect),
+                        setup_timeout,
+                    )
+                    .await;
+                    return Err(error).context("starting redacted secure SIP evidence observer");
+                }
+            },
+            None => None,
+        };
         let sip_adapter = match SipAdapter::new_with_inbound_context_policy(
             Arc::clone(&coordinator),
             inbound_context_policy,
@@ -339,6 +386,7 @@ impl GenericBridgeRuntime {
         Ok(Arc::new(Self {
             orchestrator,
             sip,
+            sip_security_evidence: Mutex::new(sip_security_evidence),
             webrtc: Mutex::new(Some(webrtc)),
             execution: Mutex::new(Some(execution)),
             amazon_connect,
@@ -375,6 +423,9 @@ impl GenericBridgeRuntime {
         .is_err()
         {
             tracing::warn!("public signaling listeners exceeded the shutdown deadline");
+        }
+        if let Some(observer) = self.sip_security_evidence.lock().await.take() {
+            observer.shutdown(shutdown_budget(deadline_at)).await;
         }
         // Keep the correctness receiver alive through listener teardown, then
         // stop its actors before aborting rvoip normalization tasks. Reversing

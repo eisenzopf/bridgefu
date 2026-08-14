@@ -1,0 +1,1025 @@
+//! Redacted, per-leg SIPS/SDES-SRTP runtime evidence.
+//!
+//! The observer joins three independent transport-owned facts for an inbound
+//! Vapi destination leg: a TLS-bound, duplicate-preserving correlation header;
+//! the typed called URI's `sips` scheme; the peer's `RTP/SAVP` SDP offer; and
+//! rvoip's typed media-security/established lifecycle. It emits one structured
+//! event only after every fact is present.
+//! Raw SIP targets, addresses, SDP, correlation values, and SDES keys are never
+//! retained in the tracker or written to the event. The temporary trace join
+//! hashes the SIP Call-ID before using it as an in-memory map key.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use rvoip_sip::{
+    BodyRedactionDecision, DefaultTraceRedactor, Event, MediaSecurityKeying, MediaSecurityProfile,
+    RedactionDecision, SessionId, SipTrace, SipTraceConfig, SipTraceDirection, TraceRedactor,
+    UnifiedCoordinator,
+};
+use rvoip_sip_core::types::address::Address;
+use rvoip_sip_core::types::sdp::CryptoSuite;
+use rvoip_sip_core::types::uri::{Scheme, Uri};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+/// Stable structured-event name consumed by release qualification.
+pub const VAPI_DESTINATION_SECURITY_EVENT: &str = "bridgefu_vapi_destination_security_evidence";
+
+const FINGERPRINT_PREFIX: &str = "bridgefu-fingerprint:";
+const CORRELATION_FINGERPRINT_HEX_BYTES: usize = 12;
+const MAX_CORRELATION_BYTES: usize = 512;
+const MAX_HEADER_NAME_BYTES: usize = 128;
+const MAX_CALLED_URI_BYTES: usize = 2_048;
+const MIN_EVIDENCE_CAPACITY: usize = 64;
+const MAX_EVIDENCE_CAPACITY: usize = 16_384;
+
+/// Invalid local construction input for the evidence observer.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SipSecurityEvidenceConfigError {
+    /// Evidence with a fixed SIPS/SRTP contract cannot run on an insecure
+    /// listener posture.
+    #[error("SIP security evidence requires a TLS listener and mandatory SRTP")]
+    InsecureStack,
+    /// The correlation header name is not a bounded SIP token.
+    #[error("invalid SIP security-evidence correlation header")]
+    InvalidCorrelationHeader,
+    /// A zero capacity cannot bound retained in-flight observations.
+    #[error("SIP security-evidence capacity must be nonzero")]
+    InvalidCapacity,
+}
+
+/// Immutable, secret-free policy shared by the trace redactor and observer.
+#[derive(Clone)]
+pub struct SipSecurityEvidencePolicy {
+    correlation_header: Arc<str>,
+    capacity: usize,
+}
+
+impl fmt::Debug for SipSecurityEvidencePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SipSecurityEvidencePolicy")
+            .field("correlation_header_configured", &true)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl SipSecurityEvidencePolicy {
+    /// Enable the minimum production-safe SIP trace needed to prove the
+    /// transport of an accepted secure leg.
+    ///
+    /// The installed redactor replaces the configured correlation value with
+    /// its existing 12-hex SHA-256 fingerprint, redacts every other sensitive
+    /// header through rvoip's default policy, and drops every message body.
+    /// The wire message is never modified.
+    pub fn install(
+        stack: &mut rvoip_sip::Config,
+        correlation_header: &str,
+        capacity: usize,
+    ) -> Result<Self, SipSecurityEvidenceConfigError> {
+        if stack.tls_bind_addr.is_none() || !stack.offer_srtp || !stack.srtp_required {
+            return Err(SipSecurityEvidenceConfigError::InsecureStack);
+        }
+        if !valid_header_name(correlation_header) {
+            return Err(SipSecurityEvidenceConfigError::InvalidCorrelationHeader);
+        }
+        if capacity == 0 {
+            return Err(SipSecurityEvidenceConfigError::InvalidCapacity);
+        }
+        let capacity = capacity.clamp(MIN_EVIDENCE_CAPACITY, MAX_EVIDENCE_CAPACITY);
+        let policy = Self {
+            correlation_header: Arc::from(correlation_header.to_ascii_lowercase()),
+            capacity,
+        };
+        stack.trace_redaction = Some(Arc::new(SecurityEvidenceTraceRedactor {
+            correlation_header: Arc::clone(&policy.correlation_header),
+        }));
+        stack.sip_trace = SipTraceConfig {
+            enabled: true,
+            capacity,
+            redact_sensitive_headers: true,
+            include_body: false,
+        };
+        Ok(policy)
+    }
+}
+
+/// Owned observer task. Dropping it aborts observation but never affects SIP.
+pub struct SipSecurityEvidenceMonitor {
+    cancel: watch::Sender<bool>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for SipSecurityEvidenceMonitor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SipSecurityEvidenceMonitor")
+            .field(
+                "running",
+                &self.task.lock().is_ok_and(|task| task.is_some()),
+            )
+            .finish()
+    }
+}
+
+impl SipSecurityEvidenceMonitor {
+    /// Subscribe to the coordinator's observational event stream and start a
+    /// bounded, best-effort evidence join. The observer has no signaling or
+    /// media control authority.
+    pub async fn start(
+        coordinator: &UnifiedCoordinator,
+        policy: SipSecurityEvidencePolicy,
+    ) -> rvoip_sip::Result<Self> {
+        let mut events = coordinator.events().await?;
+        let (cancel, mut cancelled) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut tracker = EvidenceTracker::new(policy);
+            loop {
+                tokio::select! {
+                    changed = cancelled.changed() => {
+                        if changed.is_err() || *cancelled.borrow() {
+                            break;
+                        }
+                    }
+                    event = events.next() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        if let Some(evidence) = tracker.observe(event) {
+                            evidence.emit();
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            cancel,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    /// Stop and join the observer without extending the caller's deadline.
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.cancel.send_replace(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut task) = task else {
+            return;
+        };
+        if tokio::time::timeout(timeout, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SipSecurityEvidenceMonitor {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SecurityEvidenceTraceRedactor {
+    correlation_header: Arc<str>,
+}
+
+impl fmt::Debug for SecurityEvidenceTraceRedactor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecurityEvidenceTraceRedactor")
+            .field("correlation_header_configured", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TraceRedactor for SecurityEvidenceTraceRedactor {
+    fn redact(&self, header: &rvoip_sip::HeaderName, value: &str) -> RedactionDecision {
+        if header
+            .as_str()
+            .eq_ignore_ascii_case(self.correlation_header.as_ref())
+        {
+            return correlation_fingerprint(value).map_or_else(
+                || RedactionDecision::Redact("<redacted>".to_owned()),
+                |fingerprint| {
+                    RedactionDecision::Redact(format!("{FINGERPRINT_PREFIX}{fingerprint}"))
+                },
+            );
+        }
+        DefaultTraceRedactor.redact(header, value)
+    }
+
+    fn redact_body(&self, _content_type: Option<&str>) -> BodyRedactionDecision {
+        BodyRedactionDecision::Drop
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TransportEvidence {
+    correlation_fingerprint: String,
+    correlation_header_count: usize,
+}
+
+#[derive(Default)]
+struct CallEvidence {
+    transport: Option<TransportEvidence>,
+    called_uri_sips: bool,
+    sdp_offer_rtp_savp: bool,
+    media: Option<MediaEvidence>,
+    answered: bool,
+    emitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MediaEvidence {
+    suite: EvidenceMediaSuite,
+    contexts_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceMediaSuite {
+    AesCm128HmacSha1_80,
+    AesCm128HmacSha1_32,
+}
+
+impl EvidenceMediaSuite {
+    fn from_negotiated(suite: CryptoSuite) -> Option<Self> {
+        match suite {
+            CryptoSuite::AesCm128HmacSha1_80 => Some(Self::AesCm128HmacSha1_80),
+            CryptoSuite::AesCm128HmacSha1_32 => Some(Self::AesCm128HmacSha1_32),
+            CryptoSuite::AesCm256HmacSha1_80 | CryptoSuite::AesCm256HmacSha1_32 => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AesCm128HmacSha1_80 => "AES_CM_128_HMAC_SHA1_80",
+            Self::AesCm128HmacSha1_32 => "AES_CM_128_HMAC_SHA1_32",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedEvidence {
+    correlation_fingerprint: String,
+    media_suite: &'static str,
+}
+
+impl CompletedEvidence {
+    fn emit(&self) {
+        tracing::info!(
+            event = VAPI_DESTINATION_SECURITY_EVENT,
+            correlation_fingerprint = %self.correlation_fingerprint,
+            leg = "vapi-to-bridgefu",
+            uri_scheme = "sips",
+            signaling_transport = "tls",
+            media_profile = "RTP/SAVP",
+            media_keying = "SDES-SRTP",
+            media_suite = self.media_suite,
+            inbound_srtp_context_installed = true,
+            outbound_srtp_context_installed = true,
+            answered = true,
+            redacted = true,
+            "accepted secure Vapi destination leg"
+        );
+    }
+}
+
+struct EvidenceTracker {
+    policy: SipSecurityEvidencePolicy,
+    pending_by_call_fingerprint: HashMap<String, TransportEvidence>,
+    calls: HashMap<SessionId, CallEvidence>,
+}
+
+impl EvidenceTracker {
+    fn new(policy: SipSecurityEvidencePolicy) -> Self {
+        Self {
+            policy,
+            pending_by_call_fingerprint: HashMap::new(),
+            calls: HashMap::new(),
+        }
+    }
+
+    fn observe(&mut self, event: Event) -> Option<CompletedEvidence> {
+        let call_id = event.call_id().cloned();
+        match event {
+            Event::SipTrace(trace) => self.observe_trace(trace),
+            Event::IncomingCall {
+                call_id, to, sdp, ..
+            } => {
+                let call = self.call_mut(call_id.clone());
+                call.called_uri_sips = called_uri_is_sips(&to);
+                call.sdp_offer_rtp_savp = sdp.as_deref().is_some_and(sdp_has_audio_rtp_savp);
+                self.complete(&call_id)
+            }
+            Event::MediaSecurityNegotiated {
+                call_id,
+                keying,
+                suite,
+                profile,
+                contexts_installed,
+            } => {
+                if keying == MediaSecurityKeying::Sdes && profile == MediaSecurityProfile::RtpSavp {
+                    self.call_mut(call_id.clone()).media =
+                        EvidenceMediaSuite::from_negotiated(suite).map(|suite| MediaEvidence {
+                            suite,
+                            contexts_installed,
+                        });
+                }
+                self.complete(&call_id)
+            }
+            Event::CallEstablished { call_id } => {
+                self.call_mut(call_id.clone()).answered = true;
+                self.complete(&call_id)
+            }
+            Event::CallEnded { .. } | Event::CallFailed { .. } | Event::CallCancelled { .. } => {
+                if let Some(call_id) = call_id {
+                    self.calls.remove(&call_id);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn observe_trace(&mut self, trace: SipTrace) -> Option<CompletedEvidence> {
+        let initial_invite = trace.direction == SipTraceDirection::Inbound
+            && trace
+                .start_line
+                .split_ascii_whitespace()
+                .next()
+                .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"));
+        let trace_evidence = if initial_invite
+            && !trace.truncated
+            && trace.redacted
+            && trace.transport.eq_ignore_ascii_case("TLS")
+        {
+            extract_transport_evidence(&trace.raw_message, self.policy.correlation_header.as_ref())
+        } else {
+            None
+        };
+
+        let call_fingerprint = trace
+            .sip_call_id
+            .as_deref()
+            .and_then(sip_call_binding_fingerprint);
+        if let (Some(call_fingerprint), Some(evidence)) =
+            (call_fingerprint.as_ref(), trace_evidence.clone())
+        {
+            insert_bounded(
+                &mut self.pending_by_call_fingerprint,
+                call_fingerprint.clone(),
+                evidence,
+                self.policy.capacity,
+            );
+        }
+
+        let session_id = trace.session_id?;
+        let pending = call_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| self.pending_by_call_fingerprint.remove(fingerprint));
+        let evidence = trace_evidence.or(pending);
+        if let Some(evidence) = evidence {
+            self.call_mut(session_id.clone()).transport = Some(evidence);
+        }
+        self.complete(&session_id)
+    }
+
+    fn call_mut(&mut self, call_id: SessionId) -> &mut CallEvidence {
+        insert_default_bounded(&mut self.calls, call_id.clone(), self.policy.capacity);
+        self.calls
+            .get_mut(&call_id)
+            .expect("bounded call insertion retains the requested key")
+    }
+
+    fn complete(&mut self, call_id: &SessionId) -> Option<CompletedEvidence> {
+        let call = self.calls.get_mut(call_id)?;
+        if call.emitted
+            || !call.called_uri_sips
+            || !call.sdp_offer_rtp_savp
+            || !call.answered
+            || !call.media.is_some_and(|media| media.contexts_installed)
+        {
+            return None;
+        }
+        let transport = call.transport.as_ref()?;
+        if transport.correlation_header_count != 1 {
+            return None;
+        }
+        let media = call.media?;
+        call.emitted = true;
+        Some(CompletedEvidence {
+            correlation_fingerprint: transport.correlation_fingerprint.clone(),
+            media_suite: media.suite.as_str(),
+        })
+    }
+}
+
+fn insert_bounded<K, V>(map: &mut HashMap<K, V>, key: K, value: V, capacity: usize)
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    if !map.contains_key(&key) && map.len() >= capacity {
+        if let Some(evicted) = map.keys().next().cloned() {
+            map.remove(&evicted);
+        }
+    }
+    map.insert(key, value);
+}
+
+fn insert_default_bounded<K, V>(map: &mut HashMap<K, V>, key: K, capacity: usize)
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Default,
+{
+    if map.contains_key(&key) {
+        return;
+    }
+    if map.len() >= capacity {
+        if let Some(evicted) = map.keys().next().cloned() {
+            map.remove(&evicted);
+        }
+    }
+    map.insert(key, V::default());
+}
+
+fn extract_transport_evidence(raw_message: &str, header_name: &str) -> Option<TransportEvidence> {
+    let mut values = Vec::new();
+    let mut correlation_continuation = false;
+    for line in raw_message.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if correlation_continuation {
+                return None;
+            }
+            continue;
+        }
+        let (name, value) = line.split_once(':')?;
+        correlation_continuation = name.trim().eq_ignore_ascii_case(header_name);
+        if correlation_continuation {
+            values.push(value.trim());
+        }
+    }
+    if values.len() != 1 {
+        return None;
+    }
+    let fingerprint = values[0].strip_prefix(FINGERPRINT_PREFIX)?;
+    if fingerprint.len() != CORRELATION_FINGERPRINT_HEX_BYTES
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(TransportEvidence {
+        correlation_fingerprint: fingerprint.to_owned(),
+        correlation_header_count: values.len(),
+    })
+}
+
+/// Existing secret-safe correlation identifier shared with SIP admission
+/// evidence. Keeping the implementation here prevents qualification and
+/// durable admission logs from drifting to different hashes.
+pub(crate) fn correlation_fingerprint(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > MAX_CORRELATION_BYTES || value.contains(['\r', '\n', '\0'])
+    {
+        return None;
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    Some(
+        digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn valid_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HEADER_NAME_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn sip_call_binding_fingerprint(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 512 || value.contains(['\r', '\n', '\0']) {
+        return None;
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sdp_has_audio_rtp_savp(sdp: &str) -> bool {
+    sdp.lines().any(|line| {
+        let mut fields = line.trim_end_matches('\r').split_ascii_whitespace();
+        fields
+            .next()
+            .is_some_and(|media| media.eq_ignore_ascii_case("m=audio"))
+            && fields.next().is_some()
+            && fields
+                .next()
+                .is_some_and(|profile| profile.eq_ignore_ascii_case("RTP/SAVP"))
+    })
+}
+
+fn called_uri_is_sips(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_CALLED_URI_BYTES || value.contains(['\r', '\n', '\0'])
+    {
+        return false;
+    }
+    if let Some(open) = value.rfind('<') {
+        let tail = &value[open + 1..];
+        let Some(close) = tail.find('>') else {
+            return false;
+        };
+        if tail[close + 1..].contains(['<', '>']) {
+            return false;
+        }
+        return tail[..close]
+            .parse::<Uri>()
+            .is_ok_and(|uri| matches!(uri.scheme(), Scheme::Sips));
+    }
+    value
+        .parse::<Address>()
+        .is_ok_and(|address| matches!(address.uri.scheme(), Scheme::Sips))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event as TracingEvent, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+    use tracing_subscriber::{Layer, Registry};
+
+    const SECRET_CORRELATION: &str = "bf1_do-not-log-this-correlation";
+
+    fn policy() -> SipSecurityEvidencePolicy {
+        SipSecurityEvidencePolicy {
+            correlation_header: Arc::from("x-correlation-id"),
+            capacity: MIN_EVIDENCE_CAPACITY,
+        }
+    }
+
+    fn session() -> SessionId {
+        SessionId("security-evidence-session".to_owned())
+    }
+
+    fn trace(transport: &str, header_lines: &str, session_id: Option<SessionId>) -> Event {
+        Event::SipTrace(SipTrace {
+            direction: SipTraceDirection::Inbound,
+            transport: transport.to_owned(),
+            local_addr: "192.0.2.1:5061".to_owned(),
+            remote_addr: "198.51.100.2:40000".to_owned(),
+            timestamp_unix_millis: 1,
+            start_line: "INVITE <redacted-request-uri> SIP/2.0".to_owned(),
+            sip_call_id: Some("wire-call-id".to_owned()),
+            session_id,
+            raw_message: format!(
+                "INVITE <redacted-request-uri> SIP/2.0\r\nCall-ID: wire-call-id\r\n{header_lines}\r\n"
+            ),
+            original_len: 1_024,
+            truncated: false,
+            redacted: true,
+        })
+    }
+
+    fn incoming(sdp_profile: &str) -> Event {
+        incoming_with_scheme("sips", sdp_profile)
+    }
+
+    fn incoming_with_scheme(uri_scheme: &str, sdp_profile: &str) -> Event {
+        Event::IncomingCall {
+            call_id: session(),
+            from: "[redacted]".to_owned(),
+            to: format!("<{uri_scheme}:bridgefu@example.test>"),
+            sdp: Some(format!(
+                "v=0\r\nm=audio 49170 {sdp_profile} 0 101\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:never-retained\r\n"
+            )),
+        }
+    }
+
+    fn media(contexts_installed: bool) -> Event {
+        media_with_suite(CryptoSuite::AesCm128HmacSha1_80, contexts_installed)
+    }
+
+    fn media_with_suite(suite: CryptoSuite, contexts_installed: bool) -> Event {
+        Event::MediaSecurityNegotiated {
+            call_id: session(),
+            keying: MediaSecurityKeying::Sdes,
+            suite,
+            profile: MediaSecurityProfile::RtpSavp,
+            contexts_installed,
+        }
+    }
+
+    fn established() -> Event {
+        Event::CallEstablished { call_id: session() }
+    }
+
+    fn fingerprint_header() -> String {
+        format!(
+            "X-Correlation-Id: {FINGERPRINT_PREFIX}{}\r\n",
+            correlation_fingerprint(SECRET_CORRELATION).unwrap()
+        )
+    }
+
+    #[test]
+    fn redactor_keeps_only_the_existing_fingerprint_and_drops_sdp() {
+        let redactor = SecurityEvidenceTraceRedactor {
+            correlation_header: Arc::from("x-correlation-id"),
+        };
+        let header =
+            rvoip_sip::HeaderName::from_str("X-Correlation-Id").expect("valid extension header");
+        let decision = redactor.redact(&header, SECRET_CORRELATION);
+        let rendered = match decision {
+            RedactionDecision::Redact(rendered) => rendered,
+            _ => panic!("correlation header must be replaced"),
+        };
+        assert_eq!(
+            rendered,
+            format!(
+                "{FINGERPRINT_PREFIX}{}",
+                correlation_fingerprint(SECRET_CORRELATION).unwrap()
+            )
+        );
+        assert!(!rendered.contains(SECRET_CORRELATION));
+        assert_eq!(
+            redactor.redact_body(Some("application/sdp")),
+            BodyRedactionDecision::Drop
+        );
+        assert!(!redactor.allows_verbatim_trace());
+    }
+
+    #[test]
+    fn installation_requires_secure_stack_and_overrides_verbatim_trace_policy() {
+        let mut stack = rvoip_sip::Config::local("security-evidence", 5060);
+        assert!(matches!(
+            SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64),
+            Err(SipSecurityEvidenceConfigError::InsecureStack)
+        ));
+
+        stack.tls_bind_addr = Some("127.0.0.1:5061".parse().unwrap());
+        stack.offer_srtp = true;
+        stack.srtp_required = true;
+        stack.trace_redaction = Some(Arc::new(rvoip_sip::PassthroughRedactor));
+        SipSecurityEvidencePolicy::install(&mut stack, "X-Correlation-Id", 64)
+            .expect("secure evidence policy");
+
+        assert!(stack.sip_trace.enabled);
+        assert!(stack.sip_trace.redact_sensitive_headers);
+        assert!(!stack.sip_trace.include_body);
+        let authorization = rvoip_sip::HeaderName::from_str("Authorization").unwrap();
+        assert!(matches!(
+            stack
+                .trace_redaction
+                .as_ref()
+                .unwrap()
+                .redact(&authorization, "secret"),
+            RedactionDecision::Redact(_)
+        ));
+        assert!(!stack
+            .trace_redaction
+            .as_ref()
+            .unwrap()
+            .allows_verbatim_trace());
+    }
+
+    #[test]
+    fn exact_secure_facts_emit_once_in_any_lifecycle_order() {
+        let orders = [
+            vec![
+                trace("TLS", &fingerprint_header(), Some(session())),
+                incoming("RTP/SAVP"),
+                media(true),
+                established(),
+            ],
+            vec![
+                established(),
+                media(true),
+                incoming("RTP/SAVP"),
+                trace("tls", &fingerprint_header(), Some(session())),
+            ],
+        ];
+        for events in orders {
+            let mut tracker = EvidenceTracker::new(policy());
+            let completed = events
+                .into_iter()
+                .filter_map(|event| tracker.observe(event))
+                .collect::<Vec<_>>();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(
+                completed[0],
+                CompletedEvidence {
+                    correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    media_suite: "AES_CM_128_HMAC_SHA1_80",
+                }
+            );
+            assert!(tracker.observe(established()).is_none());
+        }
+    }
+
+    #[test]
+    fn call_id_late_binding_joins_transport_trace_without_raw_values() {
+        let mut tracker = EvidenceTracker::new(policy());
+        assert!(tracker
+            .observe(trace("TLS", &fingerprint_header(), None))
+            .is_none());
+        assert_eq!(tracker.pending_by_call_fingerprint.len(), 1);
+        assert!(!tracker
+            .pending_by_call_fingerprint
+            .contains_key("wire-call-id"));
+        assert!(tracker
+            .observe(Event::SipTrace(SipTrace {
+                direction: SipTraceDirection::Outbound,
+                transport: "TLS".to_owned(),
+                local_addr: "[not-retained]".to_owned(),
+                remote_addr: "[not-retained]".to_owned(),
+                timestamp_unix_millis: 2,
+                start_line: "SIP/2.0 180 <redacted-reason>".to_owned(),
+                sip_call_id: Some("wire-call-id".to_owned()),
+                session_id: Some(session()),
+                raw_message: "SIP/2.0 180 <redacted-reason>\r\nCall-ID: wire-call-id\r\n\r\n"
+                    .to_owned(),
+                original_len: 128,
+                truncated: false,
+                redacted: true,
+            }))
+            .is_none());
+        assert!(tracker.observe(incoming("RTP/SAVP")).is_none());
+        assert!(tracker.observe(media(true)).is_none());
+        let completed = tracker.observe(established()).expect("complete evidence");
+        assert_eq!(
+            completed.correlation_fingerprint,
+            correlation_fingerprint(SECRET_CORRELATION).unwrap()
+        );
+        assert!(!completed
+            .correlation_fingerprint
+            .contains(SECRET_CORRELATION));
+        assert!(tracker.pending_by_call_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn clear_or_incomplete_security_never_emits() {
+        let cases = [
+            trace("UDP", &fingerprint_header(), Some(session())),
+            trace(
+                "TLS",
+                &format!("{}{}", fingerprint_header(), fingerprint_header()),
+                Some(session()),
+            ),
+        ];
+        for rejected_trace in cases {
+            let mut tracker = EvidenceTracker::new(policy());
+            for event in [
+                rejected_trace,
+                incoming("RTP/SAVP"),
+                media(true),
+                established(),
+            ] {
+                assert!(tracker.observe(event).is_none());
+            }
+        }
+
+        let folded_correlation = format!(
+            "{} {FINGERPRINT_PREFIX}continuation\r\n",
+            fingerprint_header()
+        );
+        let mut tracker = EvidenceTracker::new(policy());
+        for event in [
+            trace("TLS", &folded_correlation, Some(session())),
+            incoming("RTP/SAVP"),
+            media(true),
+            established(),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
+
+        for (profile, contexts) in [("RTP/AVP", true), ("RTP/SAVP", false)] {
+            let mut tracker = EvidenceTracker::new(policy());
+            for event in [
+                trace("TLS", &fingerprint_header(), Some(session())),
+                incoming(profile),
+                media(contexts),
+                established(),
+            ] {
+                assert!(tracker.observe(event).is_none());
+            }
+        }
+
+        let mut tracker = EvidenceTracker::new(policy());
+        for event in [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming_with_scheme("sip", "RTP/SAVP"),
+            media(true),
+            established(),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
+
+        let mut tracker = EvidenceTracker::new(policy());
+        for event in [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming("RTP/SAVP"),
+            media_with_suite(CryptoSuite::AesCm256HmacSha1_80, true),
+            established(),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
+    }
+
+    #[test]
+    fn supported_media_suite_vocabulary_is_exact() {
+        assert_eq!(
+            EvidenceMediaSuite::from_negotiated(CryptoSuite::AesCm128HmacSha1_80)
+                .unwrap()
+                .as_str(),
+            "AES_CM_128_HMAC_SHA1_80"
+        );
+        assert_eq!(
+            EvidenceMediaSuite::from_negotiated(CryptoSuite::AesCm128HmacSha1_32)
+                .unwrap()
+                .as_str(),
+            "AES_CM_128_HMAC_SHA1_32"
+        );
+        assert!(EvidenceMediaSuite::from_negotiated(CryptoSuite::AesCm256HmacSha1_80).is_none());
+        assert!(EvidenceMediaSuite::from_negotiated(CryptoSuite::AesCm256HmacSha1_32).is_none());
+    }
+
+    #[test]
+    fn called_uri_scheme_is_parsed_without_retaining_the_uri() {
+        assert!(called_uri_is_sips(
+            "\"Bridgefu destination\" <SIPS:route@example.test>;tag=opaque"
+        ));
+        assert!(!called_uri_is_sips("<sip:route@example.test>"));
+        assert!(!called_uri_is_sips(
+            "\"sips:misleading-display-name\" <sip:route@example.test>"
+        ));
+        assert!(!called_uri_is_sips(
+            "sips:not a valid address\r\nInjected: value"
+        ));
+    }
+
+    #[test]
+    fn directional_context_fields_project_only_from_rvoip_send_receive_invariant() {
+        let source = include_str!("sip_security_evidence.rs");
+        let emit = source
+            .split("    fn emit(&self) {")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }\n").next())
+            .expect("structured evidence emitter");
+        assert!(emit.contains("inbound_srtp_context_installed = true"));
+        assert!(emit.contains("outbound_srtp_context_installed = true"));
+        assert!(source.contains("media.contexts_installed"));
+    }
+
+    #[test]
+    fn structured_event_contract_is_exact_and_contains_no_private_input() {
+        let capture = FieldCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let fingerprint = correlation_fingerprint(SECRET_CORRELATION).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            CompletedEvidence {
+                correlation_fingerprint: fingerprint.clone(),
+                media_suite: "AES_CM_128_HMAC_SHA1_80",
+            }
+            .emit();
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let fields = &events[0];
+        assert_eq!(
+            fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "answered".to_owned(),
+                "correlation_fingerprint".to_owned(),
+                "event".to_owned(),
+                "inbound_srtp_context_installed".to_owned(),
+                "leg".to_owned(),
+                "media_keying".to_owned(),
+                "media_profile".to_owned(),
+                "media_suite".to_owned(),
+                "message".to_owned(),
+                "outbound_srtp_context_installed".to_owned(),
+                "redacted".to_owned(),
+                "signaling_transport".to_owned(),
+                "uri_scheme".to_owned(),
+            ])
+        );
+        assert_eq!(fields["event"], VAPI_DESTINATION_SECURITY_EVENT);
+        assert_eq!(fields["correlation_fingerprint"], fingerprint);
+        assert_eq!(fields["leg"], "vapi-to-bridgefu");
+        assert_eq!(fields["uri_scheme"], "sips");
+        assert_eq!(fields["signaling_transport"], "tls");
+        assert_eq!(fields["media_profile"], "RTP/SAVP");
+        assert_eq!(fields["media_keying"], "SDES-SRTP");
+        assert_eq!(fields["media_suite"], "AES_CM_128_HMAC_SHA1_80");
+        assert_eq!(fields["inbound_srtp_context_installed"], true);
+        assert_eq!(fields["outbound_srtp_context_installed"], true);
+        assert_eq!(fields["answered"], true);
+        assert_eq!(fields["redacted"], true);
+        assert_eq!(fields["message"], "accepted secure Vapi destination leg");
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(!serialized.contains(SECRET_CORRELATION));
+        assert!(!serialized.contains("inline:"));
+        assert!(!serialized.contains("192.0.2.1"));
+        assert!(!serialized.contains("198.51.100.2"));
+    }
+
+    #[test]
+    fn tracker_state_is_bounded_and_terminal_calls_are_removed() {
+        let mut policy = policy();
+        policy.capacity = 2;
+        let mut tracker = EvidenceTracker::new(policy);
+        for id in ["a", "b", "c"] {
+            tracker.observe(Event::IncomingCall {
+                call_id: SessionId(id.to_owned()),
+                from: String::new(),
+                to: String::new(),
+                sdp: None,
+            });
+        }
+        assert_eq!(tracker.calls.len(), 2);
+        tracker.observe(Event::CallFailed {
+            call_id: SessionId("c".to_owned()),
+            status_code: 488,
+            reason: "[redacted]".to_owned(),
+        });
+        assert!(!tracker.calls.contains_key(&SessionId("c".to_owned())));
+    }
+
+    #[derive(Clone, Default)]
+    struct FieldCapture(Arc<Mutex<Vec<BTreeMap<String, Value>>>>);
+
+    impl<S> Layer<S> for FieldCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &TracingEvent<'_>, _context: LayerContext<'_, S>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut BTreeMap<String, Value>);
+
+    impl Visit for FieldVisitor<'_> {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.insert(field.name().to_owned(), Value::Bool(value));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .insert(field.name().to_owned(), Value::String(value.to_owned()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0
+                .insert(field.name().to_owned(), Value::String(format!("{value:?}")));
+        }
+    }
+
+    use std::str::FromStr;
+}

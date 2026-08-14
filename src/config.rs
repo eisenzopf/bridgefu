@@ -352,6 +352,12 @@ pub struct GenericSipNetworkCfg {
     /// A route may advertise `sips:` only when this listener is configured.
     #[serde(default)]
     pub secure_listener: Option<GenericSipSecureListenerCfg>,
+    /// Runtime-only Contact owned by a compiled secure-ingress recipe. rvoip
+    /// 0.3.7 otherwise falls back to a `sip:` Contact even for an initial
+    /// SIPS dialog, which can misroute the 2xx ACK. Expert generic SIP
+    /// configurations keep rvoip's existing Contact derivation.
+    #[serde(skip)]
+    recipe_contact_uri: Option<RecipeSipContactUri>,
     /// SDES-SRTP posture for the inbound/default SIP child. Named outbound
     /// profiles run in independently configured rvoip children.
     #[serde(default = "default_generic_sip_srtp")]
@@ -362,6 +368,33 @@ pub struct GenericSipNetworkCfg {
     pub rtp_port_end: u16,
     #[serde(default)]
     pub symmetric_rtp: GenericSymmetricRtpCfg,
+}
+
+#[derive(Clone)]
+struct RecipeSipContactUri(String);
+
+impl RecipeSipContactUri {
+    fn sips_dns(public_host: &str, port: u16) -> Result<Self> {
+        validate_recipe_public_dns_name(public_host)?;
+        if port == 0 {
+            return Err(anyhow!(
+                "secure recipe Contact requires a nonzero SIP TLS port"
+            ));
+        }
+        Ok(Self(format!(
+            "sips:bridgefu@{public_host}:{port};transport=tls"
+        )))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RecipeSipContactUri {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[redacted]")
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -733,6 +766,13 @@ impl GenericSipNetworkCfg {
                 ));
             }
         }
+        if self.recipe_contact_uri.is_some()
+            && (self.secure_listener.is_none() || self.srtp != ProfileSrtpPolicy::Required)
+        {
+            return Err(anyhow!(
+                "a secure recipe Contact requires the recipe SIPS/SRTP listener posture"
+            ));
+        }
         self.symmetric_rtp
             .policy()
             .validate()
@@ -799,6 +839,9 @@ impl GenericSipNetworkCfg {
                     config.verify_optional_tls_client_certificate(client_ca.clone())
                 };
             }
+        }
+        if let Some(contact_uri) = &self.recipe_contact_uri {
+            config.contact_uri = Some(contact_uri.expose().to_owned());
         }
         config.offer_srtp = self.srtp != ProfileSrtpPolicy::Disabled;
         config.srtp_required = self.srtp == ProfileSrtpPolicy::Required;
@@ -3464,6 +3507,34 @@ fn validate_recipe_public_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_recipe_public_dns_name(host: &str) -> Result<()> {
+    validate_recipe_public_host(host)?;
+    let parsed = url::Url::parse(&format!("https://{host}/"))
+        .map_err(|_| anyhow!("edge.public_host must be a bounded DNS name"))?;
+    if !matches!(parsed.host(), Some(url::Host::Domain(_)))
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(anyhow!(
+            "edge.public_host must be a bounded DNS name for sips_srtp recipes"
+        ));
+    }
+    Ok(())
+}
+
 fn connect_instance_id(instance_arn: &str, configured_region: &str) -> Result<String> {
     let fields = instance_arn.splitn(6, ':').collect::<Vec<_>>();
     if fields.len() != 6
@@ -4273,6 +4344,8 @@ impl Config {
                 if tls_bind.port() == 0 {
                     return Err(anyhow!("edge.sip_tls.bind must use a nonzero port"));
                 }
+                let recipe_contact_uri =
+                    RecipeSipContactUri::sips_dns(&self.edge.public_host, tls_bind.port())?;
                 validate_profile_path(
                     &edge_tls.certificate_chain,
                     "edge.sip_tls.certificate_chain",
@@ -4314,6 +4387,7 @@ impl Config {
                     ));
                 }
                 self.generic_bridge.sip.srtp = ProfileSrtpPolicy::Required;
+                self.generic_bridge.sip.recipe_contact_uri = Some(recipe_contact_uri);
                 // The rvoip stack always owns a clear listener. Keep it on
                 // loopback/ephemeral in the secure posture so CIDR admission
                 // cannot be reused over clear SIP.
@@ -4355,6 +4429,7 @@ impl Config {
                     ));
                 }
                 self.generic_bridge.sip.secure_listener = None;
+                self.generic_bridge.sip.recipe_contact_uri = None;
                 self.generic_bridge.sip.srtp = ProfileSrtpPolicy::Disabled;
                 self.generic_bridge.sip_bind = edge_rtp.bind.clone();
                 self.generic_bridge.sip.advertised_addr = edge_rtp.advertised_addr.clone();
@@ -4957,6 +5032,8 @@ impl Config {
                 if tls_bind.port() == 0 {
                     return Err(anyhow!("edge.sip_tls.bind must use a nonzero port"));
                 }
+                let recipe_contact_uri =
+                    RecipeSipContactUri::sips_dns(&self.edge.public_host, tls_bind.port())?;
                 if edge_tls.client_ca_certificate.is_some() {
                     return Err(anyhow!(
                         "recipe CIDR admission cannot assign identity from a client CA; use an explicit expert mTLS profile"
@@ -4994,6 +5071,7 @@ impl Config {
                     ));
                 }
                 self.generic_bridge.sip.srtp = ProfileSrtpPolicy::Required;
+                self.generic_bridge.sip.recipe_contact_uri = Some(recipe_contact_uri);
                 self.generic_bridge.sip_bind = "127.0.0.1:0".to_owned();
                 self.generic_bridge.sip.advertised_addr = None;
                 (
@@ -5031,6 +5109,7 @@ impl Config {
                     ));
                 }
                 self.generic_bridge.sip.secure_listener = None;
+                self.generic_bridge.sip.recipe_contact_uri = None;
                 self.generic_bridge.sip.srtp = ProfileSrtpPolicy::Disabled;
                 self.generic_bridge.sip_bind = edge_rtp.bind.clone();
                 self.generic_bridge.sip.advertised_addr = edge_rtp.advertised_addr.clone();
@@ -7410,6 +7489,7 @@ impl Default for GenericSipNetworkCfg {
             media_public_addr: None,
             stun_server: None,
             secure_listener: None,
+            recipe_contact_uri: None,
             srtp: default_generic_sip_srtp(),
             rtp_port_start: default_generic_rtp_port_start(),
             rtp_port_end: default_generic_rtp_port_end(),
@@ -7601,6 +7681,19 @@ recipes:
             config.api.route_attachments.sip_uri_template.as_deref(),
             Some("sips:{token}@sip.recipe.example:5061;transport=tls")
         );
+        let (sip, _) = config
+            .generic_sip_stack_config(
+                "secure-recipe-contact",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            sip.contact_uri.as_deref(),
+            Some("sips:bridgefu@sip.recipe.example:5061;transport=tls")
+        );
+        let debug = format!("{:?}", config.generic_bridge.sip);
+        assert!(!debug.contains("sips:bridgefu@sip.recipe.example:5061;transport=tls"));
+        assert!(debug.contains("recipe_contact_uri: Some([redacted])"));
         assert_eq!(
             config.context.allow_headers.get("X-Correlation-Id"),
             Some(&"correlation_id".to_owned())
@@ -7633,6 +7726,98 @@ recipes:
             tenant.contact_flow_id,
             "22222222-2222-2222-2222-222222222222"
         );
+    }
+
+    #[tokio::test]
+    async fn secure_recipe_contact_is_emitted_on_the_rvoip_uas_200_wire_response() {
+        use rvoip_sip_core::{HeaderName, Message, Method, TypedHeader};
+        use tokio::net::UdpSocket;
+
+        const EXPECTED_CONTACT: &str = "sips:bridgefu@sip.recipe.example:5061;transport=tls";
+
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let uas_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let mut config: Config = serde_yaml::from_str(RECIPE_ONLY).unwrap();
+        config.apply_recipes().unwrap();
+        config.validate().unwrap();
+        let (mut sip, _) = config
+            .generic_sip_stack_config("secure-recipe-contact-wire", uas_addr)
+            .unwrap();
+        assert_eq!(sip.contact_uri.as_deref(), Some(EXPECTED_CONTACT));
+
+        // The response renderer is transport-independent. Keep the exact
+        // recipe-owned Contact while using a signaling-only UDP listener so
+        // this regression remains hermetic and needs no private key material.
+        sip.sip_tls_mode = rvoip_sip::SipTlsMode::Disabled;
+        sip.tls_bind_addr = None;
+        sip.tls_advertised_addr = None;
+        sip.tls_cert_path = None;
+        sip.tls_key_path = None;
+        sip.offer_srtp = false;
+        sip.srtp_required = false;
+        sip.media_mode = rvoip_sip::MediaMode::SignalingOnly { sdp_rtp_port: 9 };
+        sip.auto_180_ringing = false;
+        sip.fast_auto_accept_incoming_calls = true;
+
+        let coordinator = rvoip_sip::UnifiedCoordinator::new(sip).await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let invite = format!(
+            "INVITE sip:bridgefu@{uas_addr} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-contact-wire;rport\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sip:probe@{client_addr}>;tag=contact-wire\r\n\
+             To: <sip:bridgefu@{uas_addr}>\r\n\
+             Call-ID: bridgefu-secure-contact-wire@example.test\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:probe@{client_addr}>\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        client.send_to(invite.as_bytes(), uas_addr).await.unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut packet = vec![0_u8; 65_535];
+            loop {
+                let (length, _) = client.recv_from(&mut packet).await.unwrap();
+                let Ok(Message::Response(response)) =
+                    rvoip_sip_core::parse_message(&packet[..length])
+                else {
+                    continue;
+                };
+                if response.status_code() >= 200
+                    && response
+                        .cseq()
+                        .is_some_and(|cseq| cseq.method() == &Method::Invite)
+                {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("rvoip UAS did not emit a final INVITE response");
+
+        assert_eq!(response.status_code(), 200);
+        let TypedHeader::Contact(contact) = response
+            .header(&HeaderName::Contact)
+            .expect("rvoip UAS 200 must contain Contact")
+        else {
+            panic!("rvoip UAS 200 Contact was not typed");
+        };
+        assert_eq!(
+            contact
+                .address()
+                .expect("one Contact address")
+                .uri
+                .to_string(),
+            EXPECTED_CONTACT
+        );
+
+        coordinator
+            .shutdown_gracefully(Some(Duration::ZERO))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -7771,6 +7956,19 @@ private_forwarding:
         );
         assert_eq!(config.generic_bridge.sip.srtp, ProfileSrtpPolicy::Disabled);
         assert!(config.generic_bridge.sip.secure_listener.is_none());
+        let (sip, _) = config
+            .generic_sip_stack_config(
+                "plain-recipe-contact",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert!(sip.contact_uri.is_none());
+        assert_eq!(
+            sip.sip_advertised_addr.unwrap().to_string(),
+            "192.0.2.10:5060"
+        );
+        assert!(!sip.offer_srtp);
+        assert!(!sip.srtp_required);
         assert_eq!(
             config
                 .sip_ingress_profiles
@@ -7779,6 +7977,24 @@ private_forwarding:
                 .security,
             SipIngressSecurity::SipRtp
         );
+    }
+
+    #[test]
+    fn secure_recipe_contact_requires_dns_while_plain_recipe_retains_ip_support() {
+        let secure = RECIPE_ONLY.replace("sip.recipe.example", "192.0.2.10");
+        let mut config: Config = serde_yaml::from_str(&secure).unwrap();
+        let error = config.apply_recipes().unwrap_err().to_string();
+        assert!(error.contains("bounded DNS name for sips_srtp recipes"));
+
+        let clear = secure
+            .replace(
+                "  sip_tls:\n    bind: 127.0.0.1:5061\n    advertised_addr: 192.0.2.10:5061\n    certificate_chain: /run/bridgefu/tls/fullchain.pem\n    private_key: /run/bridgefu/tls/private-key.pem\n",
+                "  sip_rtp:\n    bind: 127.0.0.1:5060\n    advertised_addr: 192.0.2.10:5060\n",
+            )
+            .replace("sip_security: sips_srtp", "sip_security: sip_rtp");
+        let mut config: Config = serde_yaml::from_str(&clear).unwrap();
+        config.apply_recipes().unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

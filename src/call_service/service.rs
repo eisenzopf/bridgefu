@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use rvoip_auth_core::AuthenticatedPrincipal;
 use rvoip_core::ids::ConnectionId;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -1037,11 +1036,8 @@ fn verified_sip_invite_correlation(
     {
         return Err(InboundAttachmentError::ProofRejected);
     }
-    let digest = Sha256::digest(expected.as_bytes());
-    let correlation_fingerprint = digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let correlation_fingerprint = crate::sip_security_evidence::correlation_fingerprint(expected)
+        .ok_or(InboundAttachmentError::ProofRejected)?;
     Ok(Some(SipInviteCorrelationEvidence {
         correlation_fingerprint,
         header_name: required_header.to_ascii_lowercase(),

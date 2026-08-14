@@ -32,3 +32,4 @@ pub mod recipes;
 pub mod reference_tenant_canary;
 pub mod secret_ref;
 pub mod signaling_token;
+pub mod sip_security_evidence;

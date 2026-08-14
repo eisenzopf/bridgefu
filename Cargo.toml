@@ -34,6 +34,7 @@ rvoip-redis = { version = "=0.3.7", features = ["moq"] }
 rvoip-quic = "=0.3.7"
 rvoip-uctp = "=0.3.7"
 rvoip-sip = { version = "=0.3.7", features = ["opus"] }
+rvoip-sip-core = "=0.3.7"
 rvoip-webrtc = { version = "=0.3.7", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
 telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
