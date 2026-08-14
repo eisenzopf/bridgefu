@@ -91,7 +91,9 @@ impl SipSecurityEvidencePolicy {
         correlation_header: &str,
         capacity: usize,
     ) -> Result<Self, SipSecurityEvidenceConfigError> {
-        if stack.tls_bind_addr.is_none() || !stack.offer_srtp {
+        let tls_capable = stack.tls_bind_addr.is_some()
+            || matches!(stack.sip_tls_mode, rvoip_sip::SipTlsMode::ClientOnly);
+        if !tls_capable || !stack.offer_srtp {
             return Err(SipSecurityEvidenceConfigError::UnsupportedStack);
         }
         if !valid_header_name(correlation_header) {
@@ -411,6 +413,10 @@ impl EvidenceTracker {
                 let call = self.call_mut(call_id.clone());
                 set_leg(call, EvidenceLeg::BridgefuToVapi);
                 call.sdp_offer = sdp.as_deref().and_then(sdp_audio_profile);
+                // For a UAC, rvoip publishes CallAnswered only after the
+                // successful 2xx path has written ACK. This is the outbound
+                // counterpart to the UAS CallEstablished event.
+                call.answered = true;
                 self.complete(&call_id)
             }
             Event::MediaSecurityNegotiated {
@@ -993,6 +999,25 @@ mod tests {
     }
 
     #[test]
+    fn installation_accepts_client_only_tls_egress_with_srtp_support() {
+        let mut stack = rvoip_sip::Config::local("security-evidence-egress", 0);
+        stack.sip_tls_mode = rvoip_sip::SipTlsMode::ClientOnly;
+        stack.offer_srtp = true;
+        stack.srtp_required = false;
+
+        let policy = SipSecurityEvidencePolicy::install(
+            &mut stack,
+            "X-Correlation-Id",
+            MIN_EVIDENCE_CAPACITY,
+        )
+        .expect("client-only TLS/SRTP egress evidence policy");
+
+        assert!(policy.allow_plain_rtp);
+        assert!(stack.sip_trace.enabled);
+        assert!(!stack.sip_trace.include_body);
+    }
+
+    #[test]
     fn exact_secure_facts_emit_once_in_any_lifecycle_order() {
         let orders = [
             vec![
@@ -1056,16 +1081,14 @@ mod tests {
     }
 
     #[test]
-    fn outbound_optional_vapi_leg_requires_tls_scheme_answer_and_established() {
+    fn outbound_optional_vapi_leg_requires_tls_scheme_and_uac_answer() {
         let orders = [
             vec![
                 outbound_trace("TLS", "sips", Some(session())),
                 answered("RTP/AVP"),
-                established(),
             ],
             vec![
                 answered("RTP/AVP"),
-                established(),
                 outbound_trace("TLS", "sips", Some(session())),
             ],
         ];
@@ -1091,26 +1114,35 @@ mod tests {
 
     #[test]
     fn outbound_strict_vapi_leg_requires_typed_sdes_contexts() {
-        let mut tracker = EvidenceTracker::new(policy());
-        for event in [
-            outbound_trace("TLS", "sips", Some(session())),
-            answered("RTP/SAVP"),
-            media(true),
+        for events in [
+            vec![
+                outbound_trace("TLS", "sips", Some(session())),
+                answered("RTP/SAVP"),
+                media(true),
+            ],
+            vec![
+                outbound_trace("TLS", "sips", Some(session())),
+                media(true),
+                answered("RTP/SAVP"),
+            ],
         ] {
-            assert!(tracker.observe(event).is_none());
+            let mut tracker = EvidenceTracker::new(policy());
+            assert_eq!(
+                events
+                    .into_iter()
+                    .filter_map(|event| tracker.observe(event))
+                    .collect::<Vec<_>>(),
+                vec![CompletedEvidence {
+                    correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    uri_scheme: "sips",
+                    media_profile: "RTP/SAVP",
+                    media_keying: "SDES-SRTP",
+                    media_suite: "AES_CM_128_HMAC_SHA1_80",
+                    srtp_contexts_installed: true,
+                    leg: EvidenceLeg::BridgefuToVapi,
+                }]
+            );
         }
-        assert_eq!(
-            tracker.observe(established()),
-            Some(CompletedEvidence {
-                correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
-                uri_scheme: "sips",
-                media_profile: "RTP/SAVP",
-                media_keying: "SDES-SRTP",
-                media_suite: "AES_CM_128_HMAC_SHA1_80",
-                srtp_contexts_installed: true,
-                leg: EvidenceLeg::BridgefuToVapi,
-            })
-        );
     }
 
     #[test]
@@ -1122,7 +1154,6 @@ mod tests {
             assert!(tracker
                 .observe(outbound_trace("TLS", "sip", Some(session())))
                 .is_none());
-            assert!(tracker.observe(answered("RTP/AVP")).is_none());
             assert!(tracker.observe(ended()).is_none());
         });
 
@@ -1151,7 +1182,7 @@ mod tests {
         assert_eq!(fields["transport_observed"], true);
         assert_eq!(fields["single_correlation_header"], true);
         assert_eq!(fields["uri_scheme"], "sip");
-        assert_eq!(fields["sdp_offer_profile"], "RTP/AVP");
+        assert_eq!(fields["sdp_offer_profile"], "absent");
         assert_eq!(fields["media_keying"], "absent");
         assert_eq!(fields["contexts_installed"], false);
         assert_eq!(fields["answered"], false);

@@ -41,7 +41,7 @@ const WEBSOCKET_ATTACHMENT_PREFIX: &str = "bridgefu.attach.";
 pub struct GenericBridgeRuntime {
     orchestrator: Arc<Orchestrator>,
     sip: Arc<ProfiledSipAdapter>,
-    sip_security_evidence: Mutex<Option<SipSecurityEvidenceMonitor>>,
+    sip_security_evidence: Mutex<Vec<SipSecurityEvidenceMonitor>>,
     webrtc: Mutex<Option<WebRtcServer>>,
     execution: Mutex<Option<CallExecutionSupervisor>>,
     amazon_connect: Arc<AmazonConnectAdapter>,
@@ -208,10 +208,10 @@ impl GenericBridgeRuntime {
                 return Err(error).context("starting authenticated generic SIP coordinator");
             }
         };
-        let sip_security_evidence = match sip_security_evidence_policy {
+        let mut sip_security_evidence = match sip_security_evidence_policy {
             Some(policy) => {
                 match SipSecurityEvidenceMonitor::start(coordinator.as_ref(), policy).await {
-                    Ok(observer) => Some(observer),
+                    Ok(observer) => vec![observer],
                     Err(error) => {
                         rollback_failed_startup(
                             execution,
@@ -228,7 +228,7 @@ impl GenericBridgeRuntime {
                     }
                 }
             }
-            None => None,
+            None => Vec::new(),
         };
         let sip_adapter = match SipAdapter::new_with_inbound_context_policy(
             Arc::clone(&coordinator),
@@ -251,10 +251,19 @@ impl GenericBridgeRuntime {
                 return Err(error).context("starting generic SIP adapter");
             }
         };
-        let sip = match build_profiled_sip_adapter(sip_adapter, sip_egress_profiles, setup_timeout)
-            .await
+        let sip = match build_profiled_sip_adapter(
+            sip_adapter,
+            sip_egress_profiles,
+            setup_timeout,
+            correlation_header,
+            admission_capacity.saturating_mul(4),
+        )
+        .await
         {
-            Ok(adapter) => adapter,
+            Ok((adapter, mut profile_observers)) => {
+                sip_security_evidence.append(&mut profile_observers);
+                adapter
+            }
             Err(error) => {
                 rollback_failed_startup(
                     execution,
@@ -423,7 +432,8 @@ impl GenericBridgeRuntime {
         {
             tracing::warn!("public signaling listeners exceeded the shutdown deadline");
         }
-        if let Some(observer) = self.sip_security_evidence.lock().await.take() {
+        let observers = std::mem::take(&mut *self.sip_security_evidence.lock().await);
+        for observer in observers {
             observer.shutdown(shutdown_budget(deadline_at)).await;
         }
         // Keep the correctness receiver alive through listener teardown, then
@@ -467,9 +477,26 @@ async fn build_profiled_sip_adapter(
     default: Arc<SipAdapter>,
     profiles: Vec<SipEgressProfileConfig>,
     timeout: Duration,
-) -> Result<Arc<ProfiledSipAdapter>> {
-    let mut registrations = Vec::with_capacity(profiles.len());
-    for profile in profiles {
+    correlation_header: Option<&str>,
+    evidence_capacity: usize,
+) -> Result<(Arc<ProfiledSipAdapter>, Vec<SipSecurityEvidenceMonitor>)> {
+    let mut registrations: Vec<SipEgressProfileRegistration> = Vec::with_capacity(profiles.len());
+    let mut observers = Vec::with_capacity(profiles.len());
+    for mut profile in profiles {
+        let evidence_policy = if profile.stack.offer_srtp {
+            correlation_header
+                .map(|header| {
+                    SipSecurityEvidencePolicy::install(
+                        &mut profile.stack,
+                        header,
+                        evidence_capacity,
+                    )
+                    .context("configuring named SIP egress security evidence")
+                })
+                .transpose()?
+        } else {
+            None
+        };
         match SipEgressProfileRegistration::from_config_and_nat(
             profile.revision,
             profile.stack,
@@ -479,8 +506,33 @@ async fn build_profiled_sip_adapter(
         )
         .await
         {
-            Ok(registration) => registrations.push(registration),
+            Ok(registration) => {
+                if let Some(policy) = evidence_policy {
+                    match SipSecurityEvidenceMonitor::start(
+                        registration.coordinator().as_ref(),
+                        policy,
+                    )
+                    .await
+                    {
+                        Ok(observer) => observers.push(observer),
+                        Err(error) => {
+                            let _ = registration.shutdown(timeout).await;
+                            for observer in observers {
+                                observer.shutdown(timeout).await;
+                            }
+                            for registration in registrations {
+                                let _ = registration.shutdown(timeout).await;
+                            }
+                            return Err(anyhow!(error));
+                        }
+                    }
+                }
+                registrations.push(registration);
+            }
             Err(error) => {
+                for observer in observers {
+                    observer.shutdown(timeout).await;
+                }
                 for registration in registrations {
                     let _ = registration.shutdown(timeout).await;
                 }
@@ -488,7 +540,15 @@ async fn build_profiled_sip_adapter(
             }
         }
     }
-    ProfiledSipAdapter::new(default, registrations).map_err(|error| anyhow!(error))
+    match ProfiledSipAdapter::new(default, registrations) {
+        Ok(adapter) => Ok((adapter, observers)),
+        Err(error) => {
+            for observer in observers {
+                observer.shutdown(timeout).await;
+            }
+            Err(anyhow!(error))
+        }
+    }
 }
 
 async fn rollback_failed_startup(
@@ -605,5 +665,40 @@ mod tests {
             ..ContextPolicy::default()
         };
         assert!(sip_inbound_context_policy(&context).is_err());
+    }
+
+    #[tokio::test]
+    async fn named_tls_srtp_profile_installs_its_own_security_observer() {
+        let default = SipAdapter::from_config(rvoip_sip::Config::local("default", 0))
+            .await
+            .expect("default SIP adapter");
+        let mut stack = rvoip_sip::Config::local("observed-egress", 0);
+        stack.sip_tls_mode = rvoip_sip::SipTlsMode::ClientOnly;
+        stack.contact_uri = Some("sips:bridgefu@example.test;transport=tls".into());
+        stack.offer_srtp = true;
+        stack.srtp_required = false;
+        let profile = SipEgressProfileConfig {
+            revision: rvoip_sip::SipProfileRevision::new("a".repeat(64)).expect("profile revision"),
+            stack,
+            nat: SipNatConfig::default(),
+            allowed_initial_headers: vec!["X-Correlation-Id".into()],
+            sip_message: false,
+        };
+
+        let (adapter, observers) = build_profiled_sip_adapter(
+            default,
+            vec![profile],
+            Duration::from_secs(2),
+            Some("X-Correlation-Id"),
+            64,
+        )
+        .await
+        .expect("profiled adapter with security observer");
+
+        assert_eq!(observers.len(), 1);
+        adapter.drain(Duration::from_secs(2)).await.unwrap();
+        for observer in observers {
+            observer.shutdown(Duration::from_secs(2)).await;
+        }
     }
 }
