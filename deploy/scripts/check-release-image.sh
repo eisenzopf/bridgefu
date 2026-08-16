@@ -114,10 +114,10 @@ grep -Eq '^STOPSIGNAL SIGTERM$' "$dockerfile"
 grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" "$dockerfile"
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.7"' "$dockerfile"
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.8"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" deploy/vapi-feasibility/Dockerfile
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' deploy/vapi-feasibility/Dockerfile
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.7"' deploy/vapi-feasibility/Dockerfile
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.8"' deploy/vapi-feasibility/Dockerfile
 grep -Eq 'dockerfile: deploy/Dockerfile' compose.yaml
 if grep -Eq 'additional_contexts:' compose.yaml deploy/vapi-feasibility/compose.local.yaml; then
   echo "Compose must build from the Bridgefu context alone" >&2
