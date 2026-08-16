@@ -184,7 +184,7 @@ environment-protected workflow for execution.
 ## Evidence and ownership
 
 For a live qualification record, retain the workflow URL, immutable Bridgefu
-revision, Cargo.lock digest, exact rvoip 0.3.7 package/checksum evidence,
+revision, Cargo.lock digest, exact rvoip 0.3.8 package/checksum evidence,
 approval reference, redacted artifact digest, AWS account fingerprint, and
 result. Never retain tokens, phone numbers, raw correlations, SIP headers, call
 payloads, or Vapi response bodies.

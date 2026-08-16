@@ -16,16 +16,16 @@ publish = false
 # Bridgefu consumes the coordinated rvoip release from crates.io. Exact
 # component versions keep the signaling/media type graph aligned and make
 # Cargo.lock the complete reproducible dependency input.
-rvoip-amazon-connect = { version = "=0.3.7", features = ["server", "aws-control"] }
-rvoip-auth-core = "=0.3.7"
-rvoip-core = "=0.3.7"
-rvoip-moq = { version = "=0.3.7", features = ["relay-runtime"] }
-rvoip-redis = { version = "=0.3.7", features = ["moq"] }
-rvoip-quic = "=0.3.7"
-rvoip-uctp = "=0.3.7"
-rvoip-sip = { version = "=0.3.7", features = ["opus"] }
-rvoip-sip-core = "=0.3.7"
-rvoip-webrtc = { version = "=0.3.7", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
+rvoip-amazon-connect = { version = "=0.3.8", features = ["server", "aws-control"] }
+rvoip-auth-core = "=0.3.8"
+rvoip-core = "=0.3.8"
+rvoip-moq = { version = "=0.3.8", features = ["relay-runtime"] }
+rvoip-redis = { version = "=0.3.8", features = ["moq"] }
+rvoip-quic = "=0.3.8"
+rvoip-uctp = "=0.3.8"
+rvoip-sip = { version = "=0.3.8", features = ["opus"] }
+rvoip-sip-core = "=0.3.8"
+rvoip-webrtc = { version = "=0.3.8", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
 telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -72,10 +72,10 @@ metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
 [dev-dependencies]
-rvoip-media-core = { version = "=0.3.7", features = ["opus"] }
+rvoip-media-core = { version = "=0.3.8", features = ["opus"] }
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
-webrtc = { package = "rvoip-webrtc-stack", version = "=0.3.7" }
+webrtc = { package = "rvoip-webrtc-stack", version = "=0.3.8" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are

@@ -1286,6 +1286,10 @@ mod shape_tests {
             clock_rate_hz: 48_000,
             channels: 1,
             fmtp: None,
+            // The registry records the canonical codec before a transport
+            // negotiation assigns its dynamic RTP payload type. Emitted Opus
+            // frames below carry the concrete test payload type separately.
+            payload_type: None,
         }
     }
 
@@ -1295,6 +1299,11 @@ mod shape_tests {
             clock_rate_hz: 8_000,
             channels: 1,
             fmtp: None,
+            payload_type: match name.to_ascii_lowercase().as_str() {
+                "pcmu" | "g.711-mu" => Some(0),
+                "pcma" | "g.711-a" => Some(8),
+                _ => None,
+            },
         }
     }
 

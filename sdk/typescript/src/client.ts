@@ -608,7 +608,23 @@ export class BridgefuWebRtcClient {
         if (!isRecord(candidate) || typeof candidate.candidate !== "string") {
           throw new BridgefuWebRtcError("protocol-error", "invalid remote ICE candidate JSON");
         }
-        await this.peer?.addIceCandidate(candidate as unknown as RTCIceCandidateInit);
+        let candidateInit = candidate as unknown as RTCIceCandidateInit;
+        // rvoip-rtc 0.3.8 emits an empty sdpMid together with a valid m-line
+        // index for trickled candidates. An empty MID names no media section;
+        // Chromium accepts the promise but does not form a candidate pair.
+        // Remove only that invalid empty selector and retain the explicit
+        // m-line index. Non-empty MIDs and candidates without a valid index are
+        // never rewritten.
+        if (
+          candidate.sdpMid === "" &&
+          Number.isInteger(candidate.sdpMLineIndex) &&
+          Number(candidate.sdpMLineIndex) >= 0 &&
+          Number(candidate.sdpMLineIndex) <= 65_535
+        ) {
+          const { sdpMid: _invalidEmptyMid, ...indexedCandidate } = candidate;
+          candidateInit = indexedCandidate as unknown as RTCIceCandidateInit;
+        }
+        await this.peer?.addIceCandidate(candidateInit);
         break;
       }
       case "ice-complete":

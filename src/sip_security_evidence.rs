@@ -1,12 +1,13 @@
 //! Redacted, per-leg SIPS media-security runtime evidence.
 //!
-//! The observer joins three independent transport-owned facts for an inbound
-//! Vapi destination leg: a TLS-bound, duplicate-preserving correlation header;
-//! the typed called URI's `sips` scheme; the peer's typed audio SDP profile;
-//! and rvoip's media-security/established lifecycle. It emits one structured
-//! event only after every required fact is present. Strict SDES-SRTP and the
-//! explicit TLS-with-optional-SRTP compatibility posture are distinguished in
-//! the event rather than inferred by release tooling.
+//! The observer joins independent transport-owned facts for both inbound Vapi
+//! destination legs and outbound Bridgefu-to-Vapi source legs: a TLS-bound,
+//! duplicate-preserving correlation header; a URI-scheme-only classification
+//! of the `To` header; the peer's typed audio SDP profile; and rvoip's
+//! media-security/established lifecycle. It emits one structured event only
+//! after every required fact is present. Strict SDES-SRTP and the explicit
+//! TLS-with-optional-SRTP compatibility posture are distinguished in the event
+//! rather than inferred by release tooling.
 //! Raw SIP targets, addresses, SDP, correlation values, and SDES keys are never
 //! retained in the tracker or written to the event. The temporary trace join
 //! hashes the SIP Call-ID before using it as an in-memory map key.
@@ -31,8 +32,12 @@ use tokio::task::JoinHandle;
 
 /// Stable structured-event name consumed by release qualification.
 pub const VAPI_DESTINATION_SECURITY_EVENT: &str = "bridgefu_vapi_destination_security_evidence";
+/// Stable structured-event name for Bridgefu-originated Vapi SIP legs.
+pub const VAPI_SOURCE_SECURITY_EVENT: &str = "bridgefu_vapi_source_security_evidence";
 
 const FINGERPRINT_PREFIX: &str = "bridgefu-fingerprint:";
+const URI_SCHEME_PREFIX: &str = "bridgefu-uri-scheme:";
+const INCOMPLETE_EVIDENCE_EVENT: &str = "bridgefu_vapi_security_evidence_incomplete";
 const CORRELATION_FINGERPRINT_HEX_BYTES: usize = 12;
 const MAX_CORRELATION_BYTES: usize = 512;
 const MAX_HEADER_NAME_BYTES: usize = 128;
@@ -86,7 +91,9 @@ impl SipSecurityEvidencePolicy {
         correlation_header: &str,
         capacity: usize,
     ) -> Result<Self, SipSecurityEvidenceConfigError> {
-        if stack.tls_bind_addr.is_none() || !stack.offer_srtp {
+        let tls_capable = stack.tls_bind_addr.is_some()
+            || matches!(stack.sip_tls_mode, rvoip_sip::SipTlsMode::ClientOnly);
+        if !tls_capable || !stack.offer_srtp {
             return Err(SipSecurityEvidenceConfigError::UnsupportedStack);
         }
         if !valid_header_name(correlation_header) {
@@ -227,6 +234,14 @@ impl TraceRedactor for SecurityEvidenceTraceRedactor {
                 },
             );
         }
+        if header.as_str().eq_ignore_ascii_case("to") {
+            return called_uri_scheme(value).map_or_else(
+                || RedactionDecision::Redact("<redacted>".to_owned()),
+                |scheme| {
+                    RedactionDecision::Redact(format!("{URI_SCHEME_PREFIX}{}", scheme.as_str()))
+                },
+            );
+        }
         DefaultTraceRedactor.redact(header, value)
     }
 
@@ -239,16 +254,64 @@ impl TraceRedactor for SecurityEvidenceTraceRedactor {
 struct TransportEvidence {
     correlation_fingerprint: String,
     correlation_header_count: usize,
+    called_uri_scheme: Option<EvidenceUriScheme>,
+    leg: EvidenceLeg,
 }
 
 #[derive(Default)]
 struct CallEvidence {
     transport: Option<TransportEvidence>,
-    called_uri_sips: bool,
+    leg: Option<EvidenceLeg>,
+    leg_conflict: bool,
+    called_uri_scheme: Option<EvidenceUriScheme>,
     sdp_offer: Option<EvidenceMediaProfile>,
     media: Option<MediaEvidence>,
     answered: bool,
     emitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceUriScheme {
+    Sip,
+    Sips,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceLeg {
+    VapiToBridgefu,
+    BridgefuToVapi,
+}
+
+impl EvidenceLeg {
+    fn event(self) -> &'static str {
+        match self {
+            Self::VapiToBridgefu => VAPI_DESTINATION_SECURITY_EVENT,
+            Self::BridgefuToVapi => VAPI_SOURCE_SECURITY_EVENT,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::VapiToBridgefu => "vapi-to-bridgefu",
+            Self::BridgefuToVapi => "bridgefu-to-vapi",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::VapiToBridgefu => "accepted Vapi destination leg",
+            Self::BridgefuToVapi => "established Bridgefu Vapi source leg",
+        }
+    }
+}
+
+impl EvidenceUriScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sip => "sip",
+            Self::Sips => "sips",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,19 +352,21 @@ impl EvidenceMediaSuite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletedEvidence {
     correlation_fingerprint: String,
+    uri_scheme: &'static str,
     media_profile: &'static str,
     media_keying: &'static str,
     media_suite: &'static str,
     srtp_contexts_installed: bool,
+    leg: EvidenceLeg,
 }
 
 impl CompletedEvidence {
     fn emit(&self) {
         tracing::info!(
-            event = VAPI_DESTINATION_SECURITY_EVENT,
+            event = self.leg.event(),
             correlation_fingerprint = %self.correlation_fingerprint,
-            leg = "vapi-to-bridgefu",
-            uri_scheme = "sips",
+            leg = self.leg.as_str(),
+            uri_scheme = self.uri_scheme,
             signaling_transport = "tls",
             media_profile = self.media_profile,
             media_keying = self.media_keying,
@@ -310,7 +375,8 @@ impl CompletedEvidence {
             outbound_srtp_context_installed = self.srtp_contexts_installed,
             answered = true,
             redacted = true,
-            "accepted Vapi destination leg"
+            "{}",
+            self.leg.message()
         );
     }
 }
@@ -338,8 +404,19 @@ impl EvidenceTracker {
                 call_id, to, sdp, ..
             } => {
                 let call = self.call_mut(call_id.clone());
-                call.called_uri_sips = called_uri_is_sips(&to);
+                set_leg(call, EvidenceLeg::VapiToBridgefu);
+                call.called_uri_scheme = called_uri_scheme(&to);
                 call.sdp_offer = sdp.as_deref().and_then(sdp_audio_profile);
+                self.complete(&call_id)
+            }
+            Event::CallAnswered { call_id, sdp } => {
+                let call = self.call_mut(call_id.clone());
+                set_leg(call, EvidenceLeg::BridgefuToVapi);
+                call.sdp_offer = sdp.as_deref().and_then(sdp_audio_profile);
+                // For a UAC, rvoip publishes CallAnswered only after the
+                // successful 2xx path has written ACK. This is the outbound
+                // counterpart to the UAS CallEstablished event.
+                call.answered = true;
                 self.complete(&call_id)
             }
             Event::MediaSecurityNegotiated {
@@ -364,6 +441,7 @@ impl EvidenceTracker {
             }
             Event::CallEnded { .. } | Event::CallFailed { .. } | Event::CallCancelled { .. } => {
                 if let Some(call_id) = call_id {
+                    self.emit_incomplete_source_evidence(&call_id);
                     self.calls.remove(&call_id);
                 }
                 None
@@ -373,18 +451,27 @@ impl EvidenceTracker {
     }
 
     fn observe_trace(&mut self, trace: SipTrace) -> Option<CompletedEvidence> {
-        let initial_invite = trace.direction == SipTraceDirection::Inbound
-            && trace
-                .start_line
-                .split_ascii_whitespace()
-                .next()
-                .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"));
+        let initial_invite = matches!(
+            trace.direction,
+            SipTraceDirection::Inbound | SipTraceDirection::Outbound
+        ) && trace
+            .start_line
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"));
         let trace_evidence = if initial_invite
             && !trace.truncated
             && trace.redacted
             && trace.transport.eq_ignore_ascii_case("TLS")
         {
-            extract_transport_evidence(&trace.raw_message, self.policy.correlation_header.as_ref())
+            extract_transport_evidence(
+                &trace.raw_message,
+                self.policy.correlation_header.as_ref(),
+                match trace.direction {
+                    SipTraceDirection::Inbound => EvidenceLeg::VapiToBridgefu,
+                    SipTraceDirection::Outbound => EvidenceLeg::BridgefuToVapi,
+                },
+            )
         } else {
             None
         };
@@ -410,7 +497,12 @@ impl EvidenceTracker {
             .and_then(|fingerprint| self.pending_by_call_fingerprint.remove(fingerprint));
         let evidence = trace_evidence.or(pending);
         if let Some(evidence) = evidence {
-            self.call_mut(session_id.clone()).transport = Some(evidence);
+            let call = self.call_mut(session_id.clone());
+            set_leg(call, evidence.leg);
+            if evidence.leg == EvidenceLeg::BridgefuToVapi {
+                call.called_uri_scheme = evidence.called_uri_scheme;
+            }
+            call.transport = Some(evidence);
         }
         self.complete(&session_id)
     }
@@ -422,10 +514,61 @@ impl EvidenceTracker {
             .expect("bounded call insertion retains the requested key")
     }
 
+    fn emit_incomplete_source_evidence(&self, call_id: &SessionId) {
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let source_leg = call.leg == Some(EvidenceLeg::BridgefuToVapi)
+            || call
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.leg == EvidenceLeg::BridgefuToVapi);
+        if call.emitted || !source_leg {
+            return;
+        }
+        let uri_scheme = call
+            .called_uri_scheme
+            .map(EvidenceUriScheme::as_str)
+            .unwrap_or("absent");
+        let sdp_offer_profile = match call.sdp_offer {
+            Some(EvidenceMediaProfile::RtpAvp) => "RTP/AVP",
+            Some(EvidenceMediaProfile::RtpSavp) => "RTP/SAVP",
+            None => "absent",
+        };
+        let media_keying = if call.media.is_some() {
+            "SDES-SRTP"
+        } else {
+            "absent"
+        };
+        let contexts_installed = call.media.is_some_and(|media| media.contexts_installed);
+        tracing::warn!(
+            event = INCOMPLETE_EVIDENCE_EVENT,
+            leg = EvidenceLeg::BridgefuToVapi.as_str(),
+            transport_observed = call.transport.is_some(),
+            single_correlation_header = call
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.correlation_header_count == 1),
+            uri_scheme,
+            sdp_offer_profile,
+            media_keying,
+            contexts_installed,
+            answered = call.answered,
+            leg_conflict = call.leg_conflict,
+            redacted = true,
+            "incomplete Bridgefu Vapi source-leg security evidence"
+        );
+    }
+
     fn complete(&mut self, call_id: &SessionId) -> Option<CompletedEvidence> {
         let allow_plain_rtp = self.policy.allow_plain_rtp;
         let call = self.calls.get_mut(call_id)?;
-        if call.emitted || !call.called_uri_sips || !call.answered {
+        if call.emitted || !call.answered || call.leg_conflict {
+            return None;
+        }
+        let uri_scheme = call.called_uri_scheme?;
+        let leg = call.leg?;
+        if uri_scheme == EvidenceUriScheme::Sip && !allow_plain_rtp {
             return None;
         }
         let transport = call.transport.as_ref()?;
@@ -448,10 +591,12 @@ impl EvidenceTracker {
         call.emitted = true;
         Some(CompletedEvidence {
             correlation_fingerprint: transport.correlation_fingerprint.clone(),
+            uri_scheme: uri_scheme.as_str(),
             media_profile,
             media_keying,
             media_suite,
             srtp_contexts_installed,
+            leg,
         })
     }
 }
@@ -484,9 +629,22 @@ where
     map.insert(key, V::default());
 }
 
-fn extract_transport_evidence(raw_message: &str, header_name: &str) -> Option<TransportEvidence> {
+fn set_leg(call: &mut CallEvidence, leg: EvidenceLeg) {
+    if call.leg.is_some_and(|existing| existing != leg) {
+        call.leg_conflict = true;
+    } else {
+        call.leg = Some(leg);
+    }
+}
+
+fn extract_transport_evidence(
+    raw_message: &str,
+    header_name: &str,
+    leg: EvidenceLeg,
+) -> Option<TransportEvidence> {
     let mut values = Vec::new();
     let mut correlation_continuation = false;
+    let mut uri_schemes = Vec::new();
     for line in raw_message.lines().skip(1) {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
@@ -503,6 +661,14 @@ fn extract_transport_evidence(raw_message: &str, header_name: &str) -> Option<Tr
         if correlation_continuation {
             values.push(value.trim());
         }
+        if name.trim().eq_ignore_ascii_case("to") {
+            uri_schemes.push(
+                value
+                    .trim()
+                    .strip_prefix(URI_SCHEME_PREFIX)
+                    .and_then(classified_uri_scheme),
+            );
+        }
     }
     if values.len() != 1 {
         return None;
@@ -518,7 +684,21 @@ fn extract_transport_evidence(raw_message: &str, header_name: &str) -> Option<Tr
     Some(TransportEvidence {
         correlation_fingerprint: fingerprint.to_owned(),
         correlation_header_count: values.len(),
+        called_uri_scheme: if uri_schemes.len() == 1 {
+            uri_schemes[0]
+        } else {
+            None
+        },
+        leg,
     })
+}
+
+fn classified_uri_scheme(value: &str) -> Option<EvidenceUriScheme> {
+    match value {
+        "sip" => Some(EvidenceUriScheme::Sip),
+        "sips" => Some(EvidenceUriScheme::Sips),
+        _ => None,
+    }
 }
 
 /// Existing secret-safe correlation identifier shared with SIP admission
@@ -593,26 +773,31 @@ fn sdp_audio_profile(sdp: &str) -> Option<EvidenceMediaProfile> {
     })
 }
 
-fn called_uri_is_sips(value: &str) -> bool {
+fn called_uri_scheme(value: &str) -> Option<EvidenceUriScheme> {
     if value.is_empty() || value.len() > MAX_CALLED_URI_BYTES || value.contains(['\r', '\n', '\0'])
     {
-        return false;
+        return None;
     }
     if let Some(open) = value.rfind('<') {
         let tail = &value[open + 1..];
-        let Some(close) = tail.find('>') else {
-            return false;
-        };
+        let close = tail.find('>')?;
         if tail[close + 1..].contains(['<', '>']) {
-            return false;
+            return None;
         }
-        return tail[..close]
-            .parse::<Uri>()
-            .is_ok_and(|uri| matches!(uri.scheme(), Scheme::Sips));
+        return tail[..close].parse::<Uri>().ok().and_then(uri_scheme);
     }
     value
         .parse::<Address>()
-        .is_ok_and(|address| matches!(address.uri.scheme(), Scheme::Sips))
+        .ok()
+        .and_then(|address| uri_scheme(address.uri))
+}
+
+fn uri_scheme(uri: Uri) -> Option<EvidenceUriScheme> {
+    match uri.scheme() {
+        Scheme::Sip => Some(EvidenceUriScheme::Sip),
+        Scheme::Sips => Some(EvidenceUriScheme::Sips),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +850,26 @@ mod tests {
         })
     }
 
+    fn outbound_trace(transport: &str, uri_scheme: &str, session_id: Option<SessionId>) -> Event {
+        Event::SipTrace(SipTrace {
+            direction: SipTraceDirection::Outbound,
+            transport: transport.to_owned(),
+            local_addr: "192.0.2.1:5061".to_owned(),
+            remote_addr: "198.51.100.2:5061".to_owned(),
+            timestamp_unix_millis: 1,
+            start_line: "INVITE <redacted-request-uri> SIP/2.0".to_owned(),
+            sip_call_id: Some("outbound-wire-call-id".to_owned()),
+            session_id,
+            raw_message: format!(
+                "INVITE <redacted-request-uri> SIP/2.0\r\nCall-ID: outbound-wire-call-id\r\nTo: {URI_SCHEME_PREFIX}{uri_scheme}\r\n{}\r\n",
+                fingerprint_header()
+            ),
+            original_len: 1_024,
+            truncated: false,
+            redacted: true,
+        })
+    }
+
     fn incoming(sdp_profile: &str) -> Event {
         incoming_with_scheme("sips", sdp_profile)
     }
@@ -696,6 +901,22 @@ mod tests {
 
     fn established() -> Event {
         Event::CallEstablished { call_id: session() }
+    }
+
+    fn answered(sdp_profile: &str) -> Event {
+        Event::CallAnswered {
+            call_id: session(),
+            sdp: Some(format!(
+                "v=0\r\nm=audio 49170 {sdp_profile} 0 101\r\na=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:never-retained\r\n"
+            )),
+        }
+    }
+
+    fn ended() -> Event {
+        Event::CallEnded {
+            call_id: session(),
+            reason: "test teardown".to_owned(),
+        }
     }
 
     fn fingerprint_header() -> String {
@@ -730,6 +951,11 @@ mod tests {
             BodyRedactionDecision::Drop
         );
         assert!(!redactor.allows_verbatim_trace());
+        let to = rvoip_sip::HeaderName::from_str("To").expect("valid To header");
+        assert_eq!(
+            redactor.redact(&to, "\"Private user\" <sips:secret@example.test>"),
+            RedactionDecision::Redact(format!("{URI_SCHEME_PREFIX}sips"))
+        );
     }
 
     #[test]
@@ -773,6 +999,25 @@ mod tests {
     }
 
     #[test]
+    fn installation_accepts_client_only_tls_egress_with_srtp_support() {
+        let mut stack = rvoip_sip::Config::local("security-evidence-egress", 0);
+        stack.sip_tls_mode = rvoip_sip::SipTlsMode::ClientOnly;
+        stack.offer_srtp = true;
+        stack.srtp_required = false;
+
+        let policy = SipSecurityEvidencePolicy::install(
+            &mut stack,
+            "X-Correlation-Id",
+            MIN_EVIDENCE_CAPACITY,
+        )
+        .expect("client-only TLS/SRTP egress evidence policy");
+
+        assert!(policy.allow_plain_rtp);
+        assert!(stack.sip_trace.enabled);
+        assert!(!stack.sip_trace.include_body);
+    }
+
+    #[test]
     fn exact_secure_facts_emit_once_in_any_lifecycle_order() {
         let orders = [
             vec![
@@ -799,10 +1044,12 @@ mod tests {
                 completed[0],
                 CompletedEvidence {
                     correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    uri_scheme: "sips",
                     media_profile: "RTP/SAVP",
                     media_keying: "SDES-SRTP",
                     media_suite: "AES_CM_128_HMAC_SHA1_80",
                     srtp_contexts_installed: true,
+                    leg: EvidenceLeg::VapiToBridgefu,
                 }
             );
             assert!(tracker.observe(established()).is_none());
@@ -814,7 +1061,7 @@ mod tests {
         let mut tracker = EvidenceTracker::new(optional_policy());
         for event in [
             trace("TLS", &fingerprint_header(), Some(session())),
-            incoming("RTP/AVP"),
+            incoming_with_scheme("sip", "RTP/AVP"),
         ] {
             assert!(tracker.observe(event).is_none());
         }
@@ -822,13 +1069,148 @@ mod tests {
             tracker.observe(established()),
             Some(CompletedEvidence {
                 correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                uri_scheme: "sip",
                 media_profile: "RTP/AVP",
                 media_keying: "none",
                 media_suite: "none",
                 srtp_contexts_installed: false,
+                leg: EvidenceLeg::VapiToBridgefu,
             })
         );
         assert!(tracker.observe(established()).is_none());
+    }
+
+    #[test]
+    fn outbound_optional_vapi_leg_requires_tls_scheme_and_uac_answer() {
+        let orders = [
+            vec![
+                outbound_trace("TLS", "sips", Some(session())),
+                answered("RTP/AVP"),
+            ],
+            vec![
+                answered("RTP/AVP"),
+                outbound_trace("TLS", "sips", Some(session())),
+            ],
+        ];
+        for events in orders {
+            let mut tracker = EvidenceTracker::new(optional_policy());
+            assert_eq!(
+                events
+                    .into_iter()
+                    .filter_map(|event| tracker.observe(event))
+                    .collect::<Vec<_>>(),
+                vec![CompletedEvidence {
+                    correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    uri_scheme: "sips",
+                    media_profile: "RTP/AVP",
+                    media_keying: "none",
+                    media_suite: "none",
+                    srtp_contexts_installed: false,
+                    leg: EvidenceLeg::BridgefuToVapi,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_strict_vapi_leg_requires_typed_sdes_contexts() {
+        for events in [
+            vec![
+                outbound_trace("TLS", "sips", Some(session())),
+                answered("RTP/SAVP"),
+                media(true),
+            ],
+            vec![
+                outbound_trace("TLS", "sips", Some(session())),
+                media(true),
+                answered("RTP/SAVP"),
+            ],
+        ] {
+            let mut tracker = EvidenceTracker::new(policy());
+            assert_eq!(
+                events
+                    .into_iter()
+                    .filter_map(|event| tracker.observe(event))
+                    .collect::<Vec<_>>(),
+                vec![CompletedEvidence {
+                    correlation_fingerprint: correlation_fingerprint(SECRET_CORRELATION).unwrap(),
+                    uri_scheme: "sips",
+                    media_profile: "RTP/SAVP",
+                    media_keying: "SDES-SRTP",
+                    media_suite: "AES_CM_128_HMAC_SHA1_80",
+                    srtp_contexts_installed: true,
+                    leg: EvidenceLeg::BridgefuToVapi,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_outbound_evidence_reports_only_closed_missing_facts() {
+        let capture = FieldCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut tracker = EvidenceTracker::new(optional_policy());
+            assert!(tracker
+                .observe(outbound_trace("TLS", "sip", Some(session())))
+                .is_none());
+            assert!(tracker.observe(ended()).is_none());
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let fields = &events[0];
+        assert_eq!(
+            fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "answered".to_owned(),
+                "contexts_installed".to_owned(),
+                "event".to_owned(),
+                "leg".to_owned(),
+                "leg_conflict".to_owned(),
+                "media_keying".to_owned(),
+                "message".to_owned(),
+                "redacted".to_owned(),
+                "sdp_offer_profile".to_owned(),
+                "single_correlation_header".to_owned(),
+                "transport_observed".to_owned(),
+                "uri_scheme".to_owned(),
+            ])
+        );
+        assert_eq!(fields["event"], INCOMPLETE_EVIDENCE_EVENT);
+        assert_eq!(fields["leg"], "bridgefu-to-vapi");
+        assert_eq!(fields["transport_observed"], true);
+        assert_eq!(fields["single_correlation_header"], true);
+        assert_eq!(fields["uri_scheme"], "sip");
+        assert_eq!(fields["sdp_offer_profile"], "absent");
+        assert_eq!(fields["media_keying"], "absent");
+        assert_eq!(fields["contexts_installed"], false);
+        assert_eq!(fields["answered"], false);
+        assert_eq!(fields["leg_conflict"], false);
+        assert_eq!(fields["redacted"], true);
+        assert_eq!(
+            fields["message"],
+            "incomplete Bridgefu Vapi source-leg security evidence"
+        );
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(!serialized.contains(SECRET_CORRELATION));
+        assert!(!serialized.contains("wire-call"));
+        assert!(!serialized.contains("192.0.2.1"));
+        assert!(!serialized.contains("198.51.100.2"));
+        assert!(!serialized.contains("inline:"));
+    }
+
+    #[test]
+    fn strict_policy_rejects_plain_sip_request_uri_even_with_secure_media() {
+        let mut tracker = EvidenceTracker::new(policy());
+        for event in [
+            trace("TLS", &fingerprint_header(), Some(session())),
+            incoming_with_scheme("sip", "RTP/SAVP"),
+            media(true),
+            established(),
+        ] {
+            assert!(tracker.observe(event).is_none());
+        }
     }
 
     #[test]
@@ -960,16 +1342,22 @@ mod tests {
 
     #[test]
     fn called_uri_scheme_is_parsed_without_retaining_the_uri() {
-        assert!(called_uri_is_sips(
-            "\"Bridgefu destination\" <SIPS:route@example.test>;tag=opaque"
-        ));
-        assert!(!called_uri_is_sips("<sip:route@example.test>"));
-        assert!(!called_uri_is_sips(
-            "\"sips:misleading-display-name\" <sip:route@example.test>"
-        ));
-        assert!(!called_uri_is_sips(
-            "sips:not a valid address\r\nInjected: value"
-        ));
+        assert_eq!(
+            called_uri_scheme("\"Bridgefu destination\" <SIPS:route@example.test>;tag=opaque"),
+            Some(EvidenceUriScheme::Sips)
+        );
+        assert_eq!(
+            called_uri_scheme("<sip:route@example.test>"),
+            Some(EvidenceUriScheme::Sip)
+        );
+        assert_eq!(
+            called_uri_scheme("\"sips:misleading-display-name\" <sip:route@example.test>"),
+            Some(EvidenceUriScheme::Sip)
+        );
+        assert_eq!(
+            called_uri_scheme("sips:not a valid address\r\nInjected: value"),
+            None
+        );
     }
 
     #[test]
@@ -1006,10 +1394,12 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             CompletedEvidence {
                 correlation_fingerprint: fingerprint.clone(),
+                uri_scheme: "sips",
                 media_profile: "RTP/SAVP",
                 media_keying: "SDES-SRTP",
                 media_suite: "AES_CM_128_HMAC_SHA1_80",
                 srtp_contexts_installed: true,
+                leg: EvidenceLeg::VapiToBridgefu,
             }
             .emit();
         });
@@ -1056,6 +1446,47 @@ mod tests {
     }
 
     #[test]
+    fn outbound_structured_event_contract_is_exact_and_contains_no_private_input() {
+        let capture = FieldCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let fingerprint = correlation_fingerprint(SECRET_CORRELATION).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            CompletedEvidence {
+                correlation_fingerprint: fingerprint.clone(),
+                uri_scheme: "sips",
+                media_profile: "RTP/AVP",
+                media_keying: "none",
+                media_suite: "none",
+                srtp_contexts_installed: false,
+                leg: EvidenceLeg::BridgefuToVapi,
+            }
+            .emit();
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let fields = &events[0];
+        assert_eq!(fields["event"], VAPI_SOURCE_SECURITY_EVENT);
+        assert_eq!(fields["correlation_fingerprint"], fingerprint);
+        assert_eq!(fields["leg"], "bridgefu-to-vapi");
+        assert_eq!(fields["uri_scheme"], "sips");
+        assert_eq!(fields["signaling_transport"], "tls");
+        assert_eq!(fields["media_profile"], "RTP/AVP");
+        assert_eq!(fields["media_keying"], "none");
+        assert_eq!(fields["media_suite"], "none");
+        assert_eq!(fields["inbound_srtp_context_installed"], false);
+        assert_eq!(fields["outbound_srtp_context_installed"], false);
+        assert_eq!(fields["answered"], true);
+        assert_eq!(fields["redacted"], true);
+        assert_eq!(fields["message"], "established Bridgefu Vapi source leg");
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(!serialized.contains(SECRET_CORRELATION));
+        assert!(!serialized.contains("inline:"));
+        assert!(!serialized.contains("192.0.2.1"));
+        assert!(!serialized.contains("198.51.100.2"));
+    }
+
+    #[test]
     fn structured_plain_rtp_event_is_explicit_and_secret_safe() {
         let capture = FieldCapture::default();
         let subscriber = Registry::default().with(capture.clone());
@@ -1063,10 +1494,12 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             CompletedEvidence {
                 correlation_fingerprint: fingerprint.clone(),
+                uri_scheme: "sip",
                 media_profile: "RTP/AVP",
                 media_keying: "none",
                 media_suite: "none",
                 srtp_contexts_installed: false,
+                leg: EvidenceLeg::VapiToBridgefu,
             }
             .emit();
         });
@@ -1076,7 +1509,7 @@ mod tests {
         let fields = &events[0];
         assert_eq!(fields["event"], VAPI_DESTINATION_SECURITY_EVENT);
         assert_eq!(fields["correlation_fingerprint"], fingerprint);
-        assert_eq!(fields["uri_scheme"], "sips");
+        assert_eq!(fields["uri_scheme"], "sip");
         assert_eq!(fields["signaling_transport"], "tls");
         assert_eq!(fields["media_profile"], "RTP/AVP");
         assert_eq!(fields["media_keying"], "none");

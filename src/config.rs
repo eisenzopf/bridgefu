@@ -352,10 +352,10 @@ pub struct GenericSipNetworkCfg {
     /// A route may advertise `sips:` only when this listener is configured.
     #[serde(default)]
     pub secure_listener: Option<GenericSipSecureListenerCfg>,
-    /// Runtime-only Contact owned by a compiled secure-ingress recipe. rvoip
-    /// 0.3.7 otherwise falls back to a `sip:` Contact even for an initial
-    /// SIPS dialog, which can misroute the 2xx ACK. Expert generic SIP
-    /// configurations keep rvoip's existing Contact derivation.
+    /// Runtime-only Contact owned by a compiled secure-ingress recipe. This
+    /// keeps the deployed public identity and explicit `;transport=tls`
+    /// contract stable; expert generic SIP configurations keep rvoip 0.3.8's
+    /// secure-dialog-aware Contact derivation.
     #[serde(skip)]
     recipe_contact_uri: Option<RecipeSipContactUri>,
     /// SDES-SRTP posture for the inbound/default SIP child. Named outbound
@@ -795,11 +795,23 @@ impl GenericSipNetworkCfg {
             );
         }
         if let Some(address) = &self.media_public_addr {
-            config = config.with_media_public_addr(
-                address
-                    .parse()
-                    .map_err(|_| anyhow!("invalid generic SIP media public address"))?,
-            );
+            let media_public_addr = address
+                .parse::<SocketAddr>()
+                .map_err(|_| anyhow!("invalid generic SIP media public address"))?;
+            config = config.with_media_public_addr(media_public_addr);
+            // rvoip uses Config::local_ip for RTP socket allocation, while
+            // Config::bind_addr owns the clear SIP listener. Secure recipes
+            // intentionally keep that clear listener on loopback, but a
+            // loopback-bound RTP socket cannot send to or receive from the
+            // advertised public media address (Linux sendto returns EINVAL).
+            // Preserve the loopback signaling listener and bind media on the
+            // matching wildcard family whenever public media is advertised.
+            if bind.ip().is_loopback() && !media_public_addr.ip().is_loopback() {
+                config.local_ip = match media_public_addr.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                };
+            }
         }
         config.stun_server.clone_from(&self.stun_server);
         if let Some(tls) = &self.secure_listener {
@@ -1784,13 +1796,16 @@ impl Config {
             let revision = rvoip_sip::SipProfileRevision::new(revision)
                 .map_err(|_| anyhow!("named SIP profile produced an invalid revision"))?;
 
-            // Clone operational tuning and NAT/media advertisement from the
-            // public stack, but bind an independent signaling endpoint and
-            // remove every inbound TLS-listener credential from the child.
+            // Clone operational tuning, the RTP bind, and NAT/media
+            // advertisement from the public stack, but bind an independent
+            // signaling endpoint and remove every inbound TLS-listener
+            // credential from the child. Config::local_ip belongs to RTP
+            // allocation, not SIP signaling: resetting it to the loopback
+            // child bind makes Linux reject sends to a public media peer with
+            // EINVAL while the SDP still advertises the public address.
             let child_name = format!("{name}-egress-{}", offset + 1);
             let isolated = rvoip_sip::Config::on(&child_name, bind.ip(), 0);
             let mut stack = base.clone();
-            stack.local_ip = isolated.local_ip;
             stack.sip_port = isolated.sip_port;
             stack.bind_addr = isolated.bind_addr;
             stack.local_uri = isolated.local_uri;
@@ -7743,6 +7758,8 @@ recipes:
             sip.contact_uri.as_deref(),
             Some("sips:bridgefu@sip.recipe.example:5061;transport=tls")
         );
+        assert_eq!(sip.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(sip.local_ip.to_string(), "0.0.0.0");
         assert!(sip.offer_srtp);
         assert!(sip.srtp_required);
         let debug = format!("{:?}", config.generic_bridge.sip);
@@ -7937,7 +7954,7 @@ recipes:
 
         // The projection assertions above prove the deployed listener remains
         // TLS-only. This local wire test swaps only the transport fixture to
-        // UDP so it can exercise the same rvoip 0.3.7 SDP policy without key
+        // UDP so it can exercise the same rvoip 0.3.8 SDP policy without key
         // material or external network dependencies.
         sip.sip_tls_mode = rvoip_sip::SipTlsMode::Disabled;
         sip.tls_bind_addr = None;
@@ -8236,6 +8253,27 @@ private_forwarding:
         assert_eq!(
             config.generic_bridge.sip.media_public_addr.as_deref(),
             Some("192.0.2.20:0")
+        );
+        let (sip, _) = config
+            .generic_sip_stack_config(
+                "webrtc-sip-public-media",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(sip.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(sip.local_ip.to_string(), "0.0.0.0");
+        let egress = config
+            .sip_egress_profile_configs(
+                "webrtc-sip-public-media",
+                config.generic_bridge.sip_bind.parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0].stack.bind_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(egress[0].stack.local_ip.to_string(), "0.0.0.0");
+        assert_eq!(
+            egress[0].stack.media_public_addr.unwrap().to_string(),
+            "192.0.2.20:0"
         );
         assert_eq!(
             config
@@ -9622,6 +9660,12 @@ generic_bridge:
             .sip_egress_profile_configs("isolated-profile-test", bind)
             .unwrap();
         assert_eq!(profiles.len(), 2);
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.stack.bind_addr.ip().is_loopback()));
+        assert!(profiles
+            .iter()
+            .all(|profile| profile.stack.local_ip == listener.local_ip));
         let pcma = profiles
             .iter()
             .find(|profile| profile.stack.offered_codecs == [8, 101])

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,7 +26,9 @@ use chrono::{DateTime, Utc};
 use rvoip_core::ids::ConnectionId;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{Executor, Row};
 
 use crate::call_engine::{
@@ -83,6 +86,16 @@ enum SqlBackend {
 struct SqlRepository {
     backend: SqlBackend,
     deployment: DeploymentId,
+    sqlite_writer: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+#[derive(Clone, Copy)]
+enum ClaimProbe {
+    ProviderEvents,
+    Outbox,
+    Deadlines,
+    RestartCalls,
+    ControlEffects,
 }
 
 #[derive(Default)]
@@ -171,6 +184,12 @@ impl SqliteRepository {
             .map_err(|_| RepositoryError::Unavailable)?
             .create_if_missing(true)
             .foreign_keys(true)
+            // WAL lets health probes and targeted execution reads proceed
+            // while the authoritative writer commits. Repository mutations
+            // are serialized by the shared async writer gate below, before
+            // they enter SQLite's busy handler.
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -191,6 +210,7 @@ impl SqliteRepository {
             inner: SqlRepository {
                 backend: SqlBackend::Sqlite(pool),
                 deployment,
+                sqlite_writer: Some(Arc::new(tokio::sync::Mutex::new(()))),
             },
         })
     }
@@ -261,6 +281,7 @@ impl PostgresRepository {
             inner: SqlRepository {
                 backend: SqlBackend::Postgres(pool),
                 deployment,
+                sqlite_writer: None,
             },
         })
     }
@@ -286,13 +307,118 @@ impl PostgresRepository {
 }
 
 impl SqlRepository {
+    /// Returns true only when a standalone SQLite claim is proven empty at a
+    /// fenced, database-authoritative instant. PostgreSQL deliberately keeps
+    /// the existing full transactional path.
+    ///
+    /// Settled call history can be large (media activity is durable), but it
+    /// cannot affect an empty claim. Avoid rebuilding that history on every
+    /// worker poll and on each startup cleanup pass. The predicates are
+    /// intentionally conservative: a false positive falls through to the
+    /// complete backend-neutral transition; only a proven empty set skips it.
+    async fn sqlite_claim_is_empty(
+        &self,
+        worker: WorkerLease,
+        at: DateTime<Utc>,
+        probe: ClaimProbe,
+    ) -> Result<bool, RepositoryError> {
+        let SqlBackend::Sqlite(pool) = &self.backend else {
+            return Ok(false);
+        };
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let result = async {
+            let authority_time = sqlite_database_time(&mut transaction).await?;
+            let worker_row = sqlx::query(
+                "SELECT fence, lease_expires_at FROM workers WHERE worker_id = ?",
+            )
+            .bind(worker.worker_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            .ok_or(RepositoryError::StaleWorkerFence)?;
+            let fence = worker_row
+                .try_get::<i64, _>("fence")
+                .map_err(database_error)?;
+            let lease_expires_at = sqlite_time(&worker_row, "lease_expires_at")?;
+            if fence != worker.fence.as_i64() || lease_expires_at <= authority_time {
+                return Err(RepositoryError::StaleWorkerFence);
+            }
+            let at = at.to_rfc3339();
+            let worker_id = worker.worker_id.to_string();
+            let fence = worker.fence.as_i64();
+            let has_possible_work = match probe {
+                ClaimProbe::ProviderEvents => sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM provider_events WHERE event_state IN ('ready', 'claimed') AND (event_state = 'claimed' OR julianday(received_at) <= julianday(?)) LIMIT 1)",
+                )
+                .bind(&at)
+                .fetch_one(&mut *transaction)
+                .await,
+                ClaimProbe::Outbox => sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE worker_id = ? AND worker_fence = ? AND outbox_state IN ('ready', 'claimed') AND (outbox_state = 'claimed' OR julianday(available_at) <= julianday(?)) LIMIT 1)",
+                )
+                .bind(&worker_id)
+                .bind(fence)
+                .bind(&at)
+                .fetch_one(&mut *transaction)
+                .await,
+                ClaimProbe::Deadlines => sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM deadlines WHERE deadline_state IN ('pending', 'claimed') AND (deadline_state = 'claimed' OR julianday(due_at) <= julianday(?)) LIMIT 1)",
+                )
+                .bind(&at)
+                .fetch_one(&mut *transaction)
+                .await,
+                ClaimProbe::RestartCalls => sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM worker_assignments AS assignment WHERE assignment.worker_id = ? AND assignment.worker_fence < ? AND (assignment.released_at IS NULL OR EXISTS(SELECT 1 FROM outbox WHERE outbox.call_id = assignment.call_id AND outbox.outbox_state IN ('ready', 'claimed')) OR EXISTS(SELECT 1 FROM control_outbox WHERE control_outbox.call_id = assignment.call_id AND control_outbox.outbox_state IN ('ready', 'claimed')) OR EXISTS(SELECT 1 FROM provider_events WHERE provider_events.event_state IN ('ready', 'claimed'))) LIMIT 1)",
+                )
+                .bind(&worker_id)
+                .bind(fence)
+                .fetch_one(&mut *transaction)
+                .await,
+                ClaimProbe::ControlEffects => sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM control_outbox WHERE worker_id = ? AND worker_fence = ? AND outbox_state IN ('ready', 'claimed') AND (outbox_state = 'claimed' OR julianday(available_at) <= julianday(?)) LIMIT 1)",
+                )
+                .bind(&worker_id)
+                .bind(fence)
+                .bind(&at)
+                .fetch_one(&mut *transaction)
+                .await,
+            }
+            .map_err(database_error)?;
+            Ok(has_possible_work == 0)
+        }
+        .await;
+        match result {
+            Ok(empty) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| RepositoryError::Unavailable)?;
+                Ok(empty)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn transaction<T, F>(&self, operation: F) -> Result<T, RepositoryError>
     where
         T: Send,
         F: for<'a> FnOnce(&'a MemoryRepository) -> RepositoryFuture<'a, T> + Send,
     {
         match &self.backend {
-            SqlBackend::Sqlite(pool) => sqlite_transaction(pool, &self.deployment, operation).await,
+            SqlBackend::Sqlite(pool) => {
+                let writer = self
+                    .sqlite_writer
+                    .as_ref()
+                    .expect("SQLite repository installs its shared writer gate");
+                let _writer = writer.lock().await;
+                sqlite_transaction(pool, &self.deployment, operation).await
+            }
             SqlBackend::Postgres(pool) => {
                 postgres_transaction(pool, &self.deployment, operation).await
             }
@@ -3995,6 +4121,14 @@ macro_rules! impl_call_repository {
                 claim_ttl: Duration,
                 limit: usize,
             ) -> Result<Vec<ClaimedProviderEvent>, RepositoryError> {
+                if limit != 0
+                    && self
+                        .inner
+                        .sqlite_claim_is_empty(worker, at, ClaimProbe::ProviderEvents)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move {
@@ -4039,6 +4173,14 @@ macro_rules! impl_call_repository {
                 claim_ttl: Duration,
                 limit: usize,
             ) -> Result<Vec<ClaimedOutbox>, RepositoryError> {
+                if limit != 0
+                    && self
+                        .inner
+                        .sqlite_claim_is_empty(worker, at, ClaimProbe::Outbox)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move {
@@ -4080,6 +4222,14 @@ macro_rules! impl_call_repository {
                 claim_ttl: Duration,
                 limit: usize,
             ) -> Result<Vec<ClaimedDeadline>, RepositoryError> {
+                if limit != 0
+                    && self
+                        .inner
+                        .sqlite_claim_is_empty(worker, at, ClaimProbe::Deadlines)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move {
@@ -4097,6 +4247,14 @@ macro_rules! impl_call_repository {
                 at: DateTime<Utc>,
                 limit: usize,
             ) -> Result<Vec<RestartClaim>, RepositoryError> {
+                if limit != 0
+                    && self
+                        .inner
+                        .sqlite_claim_is_empty(worker, at, ClaimProbe::RestartCalls)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(
@@ -4355,6 +4513,14 @@ macro_rules! impl_call_service_repository {
                 claim_ttl: Duration,
                 limit: usize,
             ) -> Result<Vec<ClaimedControlEffect>, RepositoryError> {
+                if limit != 0
+                    && self
+                        .inner
+                        .sqlite_claim_is_empty(worker, at, ClaimProbe::ControlEffects)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
                 self.inner
                     .transaction(move |repository| {
                         Box::pin(async move {

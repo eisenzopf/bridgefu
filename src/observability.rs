@@ -673,46 +673,60 @@ mod tests {
         }
     }
 
-    fn bridgefu_rust_source() -> String {
-        fn collect(directory: &std::path::Path, output: &mut String) {
+    fn bridgefu_rust_sources() -> Vec<String> {
+        fn collect(directory: &std::path::Path, output: &mut Vec<String>) {
             for entry in std::fs::read_dir(directory).expect("read Bridgefu source directory") {
                 let path = entry.expect("read Bridgefu source entry").path();
                 if path.is_dir() {
                     collect(&path, output);
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    output.push_str(&std::fs::read_to_string(path).expect("read Bridgefu source"));
-                    output.push('\n');
+                    output.push(std::fs::read_to_string(path).expect("read Bridgefu source"));
                 }
             }
         }
-        let mut source = String::new();
+        let mut sources = Vec::new();
         collect(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut source,
+            &mut sources,
         );
-        source
+        sources
     }
 
     fn emitted_bridgefu_metrics(
     ) -> std::collections::BTreeMap<String, Vec<std::collections::BTreeSet<String>>> {
-        let source = bridgefu_rust_source();
+        emitted_bridgefu_metrics_from_sources(bridgefu_rust_sources())
+    }
+
+    fn emitted_bridgefu_metrics_from_sources(
+        sources: impl IntoIterator<Item = String>,
+    ) -> std::collections::BTreeMap<String, Vec<std::collections::BTreeSet<String>>> {
         let mut metrics = std::collections::BTreeMap::<String, Vec<_>>::new();
-        for invocation in metric_macro_invocations(&source) {
-            let literals = rust_string_literals(invocation);
-            let Some(name) = literals
-                .iter()
-                .find(|(value, _)| value.starts_with("bridgefu_"))
-                .map(|(value, _)| value.clone())
-            else {
-                continue;
-            };
-            let labels = literals
-                .into_iter()
-                .filter_map(|(value, followed_by_arrow)| followed_by_arrow.then_some(value))
-                .collect();
-            metrics.entry(name).or_default().push(labels);
+        for source in sources {
+            for invocation in metric_macro_invocations(&source) {
+                let literals = rust_string_literals(invocation);
+                let Some(name) = literals
+                    .iter()
+                    .find(|(value, _)| value.starts_with("bridgefu_"))
+                    .map(|(value, _)| value.clone())
+                else {
+                    continue;
+                };
+                let labels = literals
+                    .into_iter()
+                    .filter_map(|(value, followed_by_arrow)| followed_by_arrow.then_some(value))
+                    .collect();
+                metrics.entry(name).or_default().push(labels);
+            }
         }
         metrics
+    }
+
+    #[test]
+    fn release_metric_source_scan_is_file_order_independent() {
+        let sources = bridgefu_rust_sources();
+        let forward = emitted_bridgefu_metrics_from_sources(sources.clone());
+        let reverse = emitted_bridgefu_metrics_from_sources(sources.into_iter().rev());
+        assert_eq!(forward, reverse);
     }
 
     fn metric_macro_invocations(source: &str) -> Vec<&str> {

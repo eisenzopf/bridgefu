@@ -45,7 +45,7 @@ Contact. Bridgefu does not silently downgrade signaling from TLS.
 
 ## Local development
 
-Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.7`;
+Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.8`;
 there are no Git, path, or local rvoip overrides.
 
 ```bash

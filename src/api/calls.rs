@@ -16,13 +16,14 @@ use zeroize::Zeroize;
 
 use bridgefu::api_principal::{ApiPrincipal, CallScope};
 use bridgefu::call_engine::{
-    AttachmentTransport, CallId, LegDirection, LegId, LegKind, MediaFlow, SignalingInitiator,
+    AttachmentTransport, CallId, LegDirection, LegId, LegKind, MediaFlow, RepositoryError,
+    SignalingInitiator,
 };
 use bridgefu::call_service::{
-    CallService, CallView, CreateCallInput, CreateCallView, DtmfAcceptedView, DtmfCallInput,
-    GetCallInput, IdempotencyKey, LegEndpointConfig, NamedProfileKind, NamedProfileRole,
-    NamedRouteBinding, NamedRouteCallContext, ReplaceLegInput, RequestedLeg, SipEndpointConfig,
-    SipInitialContextMode, TransferCallInput, WebRtcEndpointConfig,
+    CallService, CallServiceError, CallView, CreateCallInput, CreateCallView, DtmfAcceptedView,
+    DtmfCallInput, GetCallInput, IdempotencyKey, LegEndpointConfig, NamedProfileKind,
+    NamedProfileRole, NamedRouteBinding, NamedRouteCallContext, ReplaceLegInput, RequestedLeg,
+    SipEndpointConfig, SipInitialContextMode, TransferCallInput, WebRtcEndpointConfig,
 };
 use bridgefu::recipes::SipAdmissionMode;
 
@@ -33,6 +34,20 @@ use bridgefu::signaling_token::SIGNALING_TOKEN_USAGE;
 
 const WEBRTC_SIGNALING_SUBPROTOCOL: &str = "rvoip.webrtc.v1";
 const WEBRTC_ATTACHMENT_PREFIX: &str = "bridgefu.attach.";
+// Media activity advances the same durable aggregate version used by control
+// mutations. A replacement must therefore tolerate a bounded version-only
+// race between its authoritative load and commit. Every retry reruns the full
+// service validation with the same idempotency key; no other conflict class is
+// retried.
+const LEG_REPLACEMENT_VERSION_RACE_ATTEMPTS: usize = 32;
+
+fn retryable_leg_replacement_version_race(error: &CallServiceError, attempt: usize) -> bool {
+    attempt + 1 < LEG_REPLACEMENT_VERSION_RACE_ATTEMPTS
+        && matches!(
+            error,
+            CallServiceError::Repository(RepositoryError::VersionConflict)
+        )
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -754,17 +769,31 @@ pub(super) async fn replace_leg(
     })?;
     record_call_id(call_id);
     tracing::Span::current().record("leg_id", tracing::field::display(leg_id));
-    let result = service
-        .replace_leg(
-            &principal,
-            call_id,
-            leg_id,
-            &key,
-            input,
-            route.destination.clone(),
-            replacement_route,
-        )
-        .await?;
+    let mut accepted = None;
+    for attempt_index in 0..LEG_REPLACEMENT_VERSION_RACE_ATTEMPTS {
+        let outcome = service
+            .replace_leg(
+                &principal,
+                call_id,
+                leg_id,
+                &key,
+                input.clone(),
+                route.destination.clone(),
+                replacement_route.clone(),
+            )
+            .await;
+        match outcome {
+            Ok(result) => {
+                accepted = Some(result);
+                break;
+            }
+            Err(error) if retryable_leg_replacement_version_race(&error, attempt_index) => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let result = accepted.expect("bounded replacement loop either accepts or returns an error");
     metrics::counter!(
         "bridgefu_call_operations_total",
         "operation" => "replace_leg",
@@ -899,6 +928,29 @@ mod tests {
     use bridgefu::call_service::{
         AmazonConnectEndpointConfig, ProviderEndpointConfig, ProviderKind, WebRtcEndpointConfig,
     };
+
+    #[test]
+    fn leg_replacement_retries_only_bounded_aggregate_version_races() {
+        let version_race = CallServiceError::Repository(RepositoryError::VersionConflict);
+        assert!(retryable_leg_replacement_version_race(&version_race, 0));
+        assert!(retryable_leg_replacement_version_race(
+            &version_race,
+            LEG_REPLACEMENT_VERSION_RACE_ATTEMPTS - 2,
+        ));
+        assert!(!retryable_leg_replacement_version_race(
+            &version_race,
+            LEG_REPLACEMENT_VERSION_RACE_ATTEMPTS - 1,
+        ));
+
+        for error in [
+            CallServiceError::Repository(RepositoryError::CommandConflict),
+            CallServiceError::Repository(RepositoryError::IdempotencyConflict),
+            CallServiceError::InvalidTransition,
+            CallServiceError::DependencyUnavailable,
+        ] {
+            assert!(!retryable_leg_replacement_version_race(&error, 0));
+        }
+    }
 
     #[test]
     fn split_destination_capabilities_do_not_alias_ingress_transports() {

@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
-pub const COORDINATED_RVOIP_VERSION: &str = "0.3.7";
+pub const COORDINATED_RVOIP_VERSION: &str = "0.3.8";
 const LATENCY_MAX_US: u64 = 1_000_000;
 pub const APPROVED_RVOIP_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
@@ -406,11 +406,11 @@ mod tests {
     #[test]
     fn lock_evidence_uses_the_coordinated_crates_io_release() {
         let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert_eq!(evidence.release_version, "0.3.7");
+        assert_eq!(evidence.release_version, "0.3.8");
         assert!(evidence
             .packages
             .iter()
-            .all(|package| package.version == "0.3.7"
+            .all(|package| package.version == "0.3.8"
                 && package.source == APPROVED_RVOIP_SOURCE
                 && package.checksum.is_some()));
     }

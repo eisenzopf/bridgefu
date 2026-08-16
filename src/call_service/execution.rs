@@ -111,12 +111,21 @@ const WORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WORK_CLAIM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const WORK_BATCH_SIZE: usize = 64;
 const EXTERNAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Startup recovery is bounded independently from one new call's setup
+// deadline. A cold durable store may legitimately need to reconcile external
+// cleanup before listeners open; repeatedly killing it at the shorter call
+// boundary makes progress depend on filesystem cache warmth.
+const DURABLE_RECOVERY_TIMEOUT_FLOOR: Duration = Duration::from_secs(120);
 const AUTHORITY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDOFF_STATUS_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const TERMINAL_RETIRE_QUIET: Duration = Duration::from_secs(1);
 const MAX_WORKER_DIRECT_BROADCASTS: usize = 1_000;
 const PRIVATE_STAGED_CONTROL_CAPACITY: usize = 32;
 const PENDING_PRIVATE_OPERATIONAL_CAPACITY: usize = 16;
+
+fn durable_recovery_timeout(setup_timeout: Duration) -> Duration {
+    setup_timeout.max(DURABLE_RECOVERY_TIMEOUT_FLOOR)
+}
 
 #[derive(Clone, Copy)]
 struct OutboundProfileFailure {
@@ -178,7 +187,7 @@ pub enum CallExecutionError {
     /// Durable startup recovery failed before listeners could be opened.
     #[error("durable call execution recovery failed: {0}")]
     Repository(#[from] RepositoryError),
-    /// Durable startup recovery exceeded the configured setup boundary.
+    /// Durable startup recovery exceeded its process-start boundary.
     #[error("durable call execution recovery timed out")]
     RecoveryTimeout,
     /// The worker fence was already unavailable while installing execution.
@@ -529,8 +538,9 @@ async fn recover_before_listeners_with_health(
     setup_timeout: Duration,
     runtime_health: &mut watch::Receiver<RuntimeSupervisorHealth>,
 ) -> Result<(), CallExecutionError> {
+    let recovery_timeout = durable_recovery_timeout(setup_timeout);
     let recovery = tokio::time::timeout(
-        setup_timeout,
+        recovery_timeout,
         recover_before_listeners(
             orchestrator,
             runtime,
@@ -1685,6 +1695,9 @@ async fn run_supervisor(
                         }
                         inflight_admissions.remove(&result.connection_id);
                     }
+                    Some(Err(error)) if error.is_cancelled() => {
+                        tracing::debug!("attachment proof task cancelled during shutdown")
+                    }
                     Some(Err(error)) => tracing::error!(%error, "attachment proof task panicked"),
                     None => {}
                 }
@@ -1693,6 +1706,9 @@ async fn run_supervisor(
                 match result {
                     Some(Ok(batch)) => {
                         pending_work.extend(batch.items);
+                    }
+                    Some(Err(error)) if error.is_cancelled() => {
+                        tracing::debug!("durable work claim task cancelled during shutdown")
                     }
                     Some(Err(error)) => tracing::error!(%error, "durable work claim task panicked"),
                     None => {}
@@ -3187,6 +3203,17 @@ fn is_terminal_cleanup_effect(intent: &EffectIntent) -> bool {
         EffectIntent::StopLeg { .. }
             | EffectIntent::AbortLegReplacement { .. }
             | EffectIntent::UnbridgeMedia { .. }
+    )
+}
+
+fn is_terminal_retired_external_effect(intent: &EffectIntent) -> bool {
+    matches!(
+        intent,
+        EffectIntent::StartLeg { .. }
+            | EffectIntent::StartLegReplacement { .. }
+            | EffectIntent::ConnectProviderDestination { .. }
+            | EffectIntent::BridgeMedia { .. }
+            | EffectIntent::ExecuteTransfer { .. }
     )
 }
 
@@ -8079,7 +8106,11 @@ fn context_to_amazon_attributes(
         attributes.insert("correlation_id".into(), envelope.correlation_id.clone());
     }
     for (key, value) in &envelope.metadata {
-        if policy.allows_metadata_key(key).map_err(|_| ())? {
+        // The handoff token authenticates the temporary Vapi SIP leg. It is
+        // intentionally eligible for that SIP header projection, but it is a
+        // private control value rather than customer screen-pop data and must
+        // never become an Amazon Connect contact attribute.
+        if key != "handoff_token" && policy.allows_metadata_key(key).map_err(|_| ())? {
             attributes.insert(key.clone(), value.clone());
         }
     }
@@ -10167,13 +10198,7 @@ async fn execute_call_effect(
             && !requires_amazon_recovery
             && !is_terminal_cleanup_effect(&claim.record.intent)
         {
-            let result = if matches!(
-                claim.record.intent,
-                EffectIntent::StartLeg { .. }
-                    | EffectIntent::ConnectProviderDestination { .. }
-                    | EffectIntent::BridgeMedia { .. }
-                    | EffectIntent::ExecuteTransfer { .. }
-            ) {
+            let result = if is_terminal_retired_external_effect(&claim.record.intent) {
                 ServiceEffectResult::Failed(FailureDetails::sanitized(
                     "call_already_terminal",
                     "external work was retired after terminal call convergence",
@@ -12114,57 +12139,73 @@ async fn execute_start_leg_replacement(
     }
 
     let replacement_context = if replacement_uses_initial_context(&endpoint) {
-        match runtime
-            .service_repository()
-            .load_replacement_initial_context(ReplacementInitialContextLookup {
-                tenant_id: meta.tenant_id.clone(),
-                call_id: meta.call_id,
-                target_leg_id: leg_id,
-                previous_binding_generation,
-                pending_binding_generation,
-            })
-            .await
-        {
-            Ok(Some(context)) => {
-                let envelope = match serde_json::from_slice::<ContextEnvelope>(&context.envelope) {
-                    Ok(envelope)
-                        if envelope
-                            .validate_binding(
-                                meta.tenant_id.as_str(),
-                                &meta.call_id.to_string(),
-                                &context.source_leg_id.to_string(),
-                            )
-                            .is_ok() =>
-                    {
-                        envelope
-                    }
-                    _ => {
-                        return Ok(ReplacementStartExecution::rejected(
-                            deadline_generation,
-                            pending_binding_generation,
-                            "replacement_context_ownership_invalid",
-                            "the retained initial context no longer owns this call",
-                            false,
-                        ));
-                    }
-                };
-                metrics::counter!(
-                    "bridgefu_initial_context_total",
-                    "result" => "carried",
-                    "reason" => match &endpoint {
-                        super::LegEndpointConfig::Sip(_) => "replacement_sip",
-                        super::LegEndpointConfig::AmazonConnect(_) => "replacement_amazon",
-                        _ => "replacement_other",
-                    }
-                )
-                .increment(1);
-                Some(envelope)
+        let server_owned = match named_route_context_envelope(stored, leg_id) {
+            Ok(context) => context,
+            Err(()) => {
+                return Ok(ReplacementStartExecution::rejected(
+                    deadline_generation,
+                    pending_binding_generation,
+                    "replacement_context_ownership_invalid",
+                    "the server-owned replacement context is invalid",
+                    false,
+                ));
             }
-            Ok(None) => None,
-            Err(RepositoryError::StaleClaim | RepositoryError::NotFound) => {
-                return Err(RepositoryError::StaleClaim);
-            }
-            Err(error) => return Err(error),
+        };
+        match server_owned {
+            Some(envelope) => Some(envelope),
+            None => match runtime
+                .service_repository()
+                .load_replacement_initial_context(ReplacementInitialContextLookup {
+                    tenant_id: meta.tenant_id.clone(),
+                    call_id: meta.call_id,
+                    target_leg_id: leg_id,
+                    previous_binding_generation,
+                    pending_binding_generation,
+                })
+                .await
+            {
+                Ok(Some(context)) => {
+                    let envelope =
+                        match serde_json::from_slice::<ContextEnvelope>(&context.envelope) {
+                            Ok(envelope)
+                                if envelope
+                                    .validate_binding(
+                                        meta.tenant_id.as_str(),
+                                        &meta.call_id.to_string(),
+                                        &context.source_leg_id.to_string(),
+                                    )
+                                    .is_ok() =>
+                            {
+                                envelope
+                            }
+                            _ => {
+                                return Ok(ReplacementStartExecution::rejected(
+                                    deadline_generation,
+                                    pending_binding_generation,
+                                    "replacement_context_ownership_invalid",
+                                    "the retained initial context no longer owns this call",
+                                    false,
+                                ));
+                            }
+                        };
+                    metrics::counter!(
+                        "bridgefu_initial_context_total",
+                        "result" => "carried",
+                        "reason" => match &endpoint {
+                            super::LegEndpointConfig::Sip(_) => "replacement_sip",
+                            super::LegEndpointConfig::AmazonConnect(_) => "replacement_amazon",
+                            _ => "replacement_other",
+                        }
+                    )
+                    .increment(1);
+                    Some(envelope)
+                }
+                Ok(None) => None,
+                Err(RepositoryError::StaleClaim | RepositoryError::NotFound) => {
+                    return Err(RepositoryError::StaleClaim);
+                }
+                Err(error) => return Err(error),
+            },
         }
     } else {
         None
@@ -14717,6 +14758,31 @@ mod tests {
     use rvoip_core::config::Config as CoreConfig;
     use rvoip_core::{IdentityAssurance, Jwk, OperationalEventStreamHealth};
     use tokio::sync::Notify;
+
+    #[test]
+    fn durable_recovery_has_a_process_start_budget_independent_of_call_setup() {
+        assert_eq!(
+            durable_recovery_timeout(Duration::from_secs(15)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            durable_recovery_timeout(Duration::from_secs(180)),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn terminal_retirement_marks_unstarted_replacement_as_failed_external_work() {
+        let intent = EffectIntent::StartLegReplacement {
+            leg_id: LegId::new(),
+            previous_binding_generation: BindingGeneration::INITIAL,
+            pending_binding_generation: BindingGeneration::INITIAL.next().unwrap(),
+            kind: crate::call_engine::LegKind::AmazonConnect,
+            deadline_generation: crate::call_engine::DeadlineGeneration::default(),
+        };
+        assert!(is_terminal_retired_external_effect(&intent));
+        assert!(!is_terminal_cleanup_effect(&intent));
+    }
 
     fn named_sip_profile_route(revision: &str) -> NamedRouteBinding {
         NamedRouteBinding::new_with_profiles(
