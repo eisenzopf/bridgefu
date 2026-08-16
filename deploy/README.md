@@ -1,7 +1,7 @@
 # Deployment assets
 
 `deploy/Dockerfile` is the canonical release image definition. It resolves the
-exact crates.io `rvoip` 0.3.7 package set from the committed `Cargo.lock`; no
+exact crates.io `rvoip` 0.3.8 package set from the committed `Cargo.lock`; no
 separate rvoip checkout or named build context is required. The image runs as
 UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
 bases are pinned to multi-platform manifest digests. Builder packages come from
@@ -215,7 +215,7 @@ systemctl enable --now bridgefu
 `deploy.sh` packages Bridgefu source with `git archive`; it requires and
 verifies an exact `BRIDGEFU_REVISION`, expands it into a new remote release
 directory, and runs `cargo build --locked` inside the canonical image. The
-exact rvoip 0.3.7 inputs come from crates.io and are verified against the
+exact rvoip 0.3.8 inputs come from crates.io and are verified against the
 checksums in the committed `Cargo.lock`; `RVOIP_DIR` and `RVOIP_REVISION` are
 not deployment inputs. The Docker build captures an immutable local image ID in
 `/etc/bridgefu/image.env`, then requires `/readyz` and `/livez`; a failed check

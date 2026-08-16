@@ -302,11 +302,11 @@ if not packages:
 invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
-    if package["version"] != "0.3.7"
+    if package["version"] != "0.3.8"
     or not package.get("source", "").startswith("registry+")
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.7 rvoip packages: {invalid}")
+    raise SystemExit(f"Cargo.lock has non-registry or non-0.3.8 rvoip packages: {invalid}")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -340,7 +340,7 @@ bash -n deploy.sh deploy/scripts/*.sh
 grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
 grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
 grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
-grep -Fq 'readonly RVOIP_VERSION=0.3.7' deploy.sh
+grep -Fq 'readonly RVOIP_VERSION=0.3.8' deploy.sh
 grep -Fq -- '--iidfile' deploy.sh
 grep -Fq '/etc/bridgefu/image.env' deploy.sh
 grep -Fq '/readyz' deploy.sh

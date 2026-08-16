@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased — crates.io rvoip 0.3.7 and recipe runtime cleanup
+## Unreleased — crates.io rvoip 0.3.8 and recipe runtime cleanup
 
-- Repointed the coordinated rvoip dependency graph to exact crates.io `0.3.7`
+- Repointed the coordinated rvoip dependency graph to exact crates.io `0.3.8`
   packages and removed every Git/path override.
 - Kept the provider-neutral recipe compiler and the built-in
   `vapi-amazon-connect-screen-pop@1` runtime contract while moving its AWS
@@ -12,7 +12,7 @@
   offers and negotiates SDES-SRTP when the peer offers it, and otherwise
   accepts RTP/AVP. Strict `sips_srtp` remains the default.
 - Added an explicit DNS `sips:` Contact for secure recipe UAS responses so a
-  2xx ACK remains on the secure dialog route with rvoip 0.3.7. Bridgefu keeps
+  2xx ACK remains on the secure dialog route with rvoip 0.3.8. Bridgefu keeps
   the explicit `;transport=tls` route contract used by deployed integrations.
 - Added redacted runtime evidence for the exact media-security posture of a
   fully established SIPS ingress leg. Strict SDES-SRTP and the explicit

@@ -195,6 +195,7 @@ impl HermeticConnectStream {
                 clock_rate_hz: 48_000,
                 channels: 1,
                 fmtp: None,
+                payload_type: Some(111),
             },
             inbound: Arc::new(Mutex::new(Some(inbound))),
             source,

@@ -8,7 +8,7 @@ maintainer contact.
 ## Authoritative release inputs
 
 Bridgefu now consumes exact crates.io
-`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.7 packages. The committed
+`rvoip-webrtc`/`rvoip-webrtc-stack`/`rvoip-rtc` 0.3.8 packages. The committed
 Cargo.lock records their registry checksums and contains no Git or path package
 source. The validation runs below predate that package migration and were
 performed while both manifests temporarily used
@@ -17,7 +17,7 @@ path-resolved. Those overrides have been removed. Because the restored base
 and candidate worktrees were not the current published graph, the recorded
 RTC-dependent results remain local-composite validation rather than evidence
 for the authoritative release build. The local TURN and DTMF candidates
-described below must not be represented as qualified in 0.3.7 until their
+described below must not be represented as qualified in 0.3.8 until their
 behavior is rerun against the locked package set.
 
 ## Local candidate provenance
@@ -162,7 +162,7 @@ composite; the TypeScript SDK passes 20/20. Bridgefu library 328/328,
 16 Python tests plus production web build are also green.
 
 Those results prove only the recorded composite local checkouts. They do not
-prove that the current published rvoip 0.3.7 package graph has equivalent
+prove that the current published rvoip 0.3.8 package graph has equivalent
 behavior.
 
 Qualification now requires rerunning the focused suites, full WebRTC

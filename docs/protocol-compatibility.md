@@ -2,13 +2,13 @@
 
 | Surface | Release contract |
 |---|---|
-| rvoip packages | Exact crates.io `=0.3.7` component releases; `Cargo.lock` records every registry checksum and transitive package |
+| rvoip packages | Exact crates.io `=0.3.8` component releases; `Cargo.lock` records every registry checksum and transitive package |
 | SIP/RTP | Audio, G.711 µ-law/A-law, RFC 4733 DTMF |
 | WebRTC | Opus, WHIP/WHEP, WS/WSS signaling, arbitrary labeled DataChannels |
-| WebRTC engine | crates.io `rvoip-webrtc = 0.3.7`, backed by `rvoip-webrtc-stack = 0.3.7` and `rvoip-rtc = 0.3.7`; no Git or path override |
+| WebRTC engine | crates.io `rvoip-webrtc = 0.3.8`, backed by `rvoip-webrtc-stack = 0.3.8` and `rvoip-rtc = 0.3.8`; no Git or path override |
 | Context | `bridgefu.context.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
 | UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet; exact mono Opus/PCMU/PCMA route negotiation with canonical PT 111/0/8 |
-| MOQT wire library | crates.io `rvoip-moq = 0.3.7` with exact `rvoip-moq-transport`, `rvoip-moq-native`, and `rvoip-moq-relay` 0.3.7 packages recorded in `Cargo.lock` |
+| MOQT wire library | crates.io `rvoip-moq = 0.3.8` with exact `rvoip-moq-transport`, `rvoip-moq-native`, and `rvoip-moq-relay` 0.3.8 packages recorded in `Cargo.lock` |
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
 MOQT draft churn is isolated in the published `rvoip-moq` package family. The
@@ -34,7 +34,7 @@ datagram, FETCH, object, status, padding, and authorization encodings.
 The matching pre-publication rvoip revision was
 `7d83b66545789d55471c13a7c68eb54a9493cc0a`. It exposes only rvoip-owned
 authorization, catalog, LOC, events, compatibility, health, topology, and
-lifecycle types. Release builds now select the checksummed crates.io 0.3.7
+lifecycle types. Release builds now select the checksummed crates.io 0.3.8
 packages rather than that source revision. Its final Gate 5 matrix recorded 134
 unit, three managed relay E2E, two public API, and seven admission tests. The
 E2E matrix includes warm Relative Joining FETCH, cold live fallback, raw QUIC,
@@ -74,7 +74,7 @@ used as a broadcast fanout protocol.
 ## WebRTC alpha and TURN
 
 The authoritative alpha implementation is packaged as exact crates.io
-`rvoip-webrtc-stack` and `rvoip-rtc` 0.3.7 dependencies. It supports the
+`rvoip-webrtc-stack` and `rvoip-rtc` 0.3.8 dependencies. It supports the
 qualified WHIP/WHEP and WS/WSS signaling, ICE/DTLS, Opus, late DataChannel, and
 teardown paths. Its wrapper does not enforce relay-only gathering, so Bridgefu
 does not claim TURN relay qualification on that dependency.

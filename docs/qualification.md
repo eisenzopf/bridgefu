@@ -9,7 +9,7 @@ on the local machine; it does not satisfy a one-hour roadmap item.
 Bridgefu 0.9.0 is the first customer-preview release toward the 1.0 roadmap.
 Its Rust package, CLI, and OCI metadata use `0.9.0`; the TypeScript SDK remains
 independently versioned at `0.1.0`. The preview uses the exact crates.io
-rvoip 0.3.7 graph and discloses the generic-WSS outbound-DTMF limitation tracked
+rvoip 0.3.8 graph and discloses the generic-WSS outbound-DTMF limitation tracked
 as rvoip #54. It does not claim the still-open 1.0 TURN/public-NAT, fourth
 exact-Chromium destination, live-provider, cloud, or one-hour load gates.
 

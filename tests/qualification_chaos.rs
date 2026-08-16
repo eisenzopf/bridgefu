@@ -7,7 +7,7 @@
 //! smoke, never the one-hour release qualification.
 //!
 //! Bridgefu scenarios run under Bridgefu's Cargo.lock. rvoip source scenarios
-//! are selected from the exact checksummed crates.io 0.3.7 packages, then run
+//! are selected from the exact checksummed crates.io 0.3.8 packages, then run
 //! under each packaged crate's own Cargo.lock. The report records those as separate
 //! dependency graphs rather than attaching Bridgefu lock evidence to the
 //! independently locked upstream test commands.
@@ -431,7 +431,7 @@ fn qualifies_deterministic_chaos_matrix() {
     validate_scenarios(SCENARIOS).expect("static chaos scenario matrix must be valid");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let rvoip_manifests = resolve_rvoip_pinned_manifests(&manifest_dir, SCENARIOS)
-        .expect("resolve exact pinned rvoip 0.3.7 package manifests");
+        .expect("resolve exact pinned rvoip 0.3.8 package manifests");
     let child_target = env::var_os(CHILD_TARGET_ENVIRONMENT)
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("target/qualification/chaos-cargo-target"));

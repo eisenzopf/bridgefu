@@ -456,11 +456,18 @@ impl TestMediaStream {
 }
 
 fn codec(name: &str, clock_rate_hz: u32, channels: u8) -> CodecInfo {
+    let payload_type = match name.to_ascii_lowercase().as_str() {
+        "pcmu" | "g.711-mu" => Some(0),
+        "pcma" | "g.711-a" => Some(8),
+        "opus" => Some(111),
+        _ => None,
+    };
     CodecInfo {
         name: name.into(),
         clock_rate_hz,
         channels,
         fmtp: None,
+        payload_type,
     }
 }
 

@@ -3085,6 +3085,7 @@ async fn exact_pcmu_private_route_negotiates_and_decodes_as_pcmu() {
         clock_rate_hz: 8_000,
         channels: 1,
         fmtp: None,
+        payload_type: Some(0),
     };
     let route = gateway
         .open_route_with_codec(
@@ -3490,6 +3491,7 @@ async fn native_whip_edge_reaches_call_pinned_worker_over_mtls_uctp_and_drains_c
         clock_rate_hz: 48_000,
         channels: 1,
         fmtp: None,
+        payload_type: Some(111),
     };
     let first_stream = from_tracks(
         StreamId::new(),

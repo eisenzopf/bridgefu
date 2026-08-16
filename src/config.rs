@@ -352,10 +352,10 @@ pub struct GenericSipNetworkCfg {
     /// A route may advertise `sips:` only when this listener is configured.
     #[serde(default)]
     pub secure_listener: Option<GenericSipSecureListenerCfg>,
-    /// Runtime-only Contact owned by a compiled secure-ingress recipe. rvoip
-    /// 0.3.7 otherwise falls back to a `sip:` Contact even for an initial
-    /// SIPS dialog, which can misroute the 2xx ACK. Expert generic SIP
-    /// configurations keep rvoip's existing Contact derivation.
+    /// Runtime-only Contact owned by a compiled secure-ingress recipe. This
+    /// keeps the deployed public identity and explicit `;transport=tls`
+    /// contract stable; expert generic SIP configurations keep rvoip 0.3.8's
+    /// secure-dialog-aware Contact derivation.
     #[serde(skip)]
     recipe_contact_uri: Option<RecipeSipContactUri>,
     /// SDES-SRTP posture for the inbound/default SIP child. Named outbound
@@ -7954,7 +7954,7 @@ recipes:
 
         // The projection assertions above prove the deployed listener remains
         // TLS-only. This local wire test swaps only the transport fixture to
-        // UDP so it can exercise the same rvoip 0.3.7 SDP policy without key
+        // UDP so it can exercise the same rvoip 0.3.8 SDP policy without key
         // material or external network dependencies.
         sip.sip_tls_mode = rvoip_sip::SipTlsMode::Disabled;
         sip.tls_bind_addr = None;

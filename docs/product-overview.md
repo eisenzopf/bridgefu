@@ -40,7 +40,7 @@ workflows.
 | Vapi | Runs the voice assistant and either transfers a Vapi-managed call to Bridgefu or receives a SIP call from Bridgefu in direct-browser mode. A Vapi tool can notify the application backend that escalation is required. |
 | Bridgefu | Authenticates and binds call attachments, owns the two-leg call state, translates media and allowed context, controls replacement, and reconciles teardown. |
 | Amazon Connect | Creates the inbound WebRTC contact, runs the configured contact flow, rings the agent, and renders the screen pop from contact attributes. |
-| rvoip | Supplies Bridgefu's SIP, RTP, WebRTC, media graph, authentication, and transport implementations through exact crates.io 0.3.7 component packages recorded in `Cargo.lock`. |
+| rvoip | Supplies Bridgefu's SIP, RTP, WebRTC, media graph, authentication, and transport implementations through exact crates.io 0.3.8 component packages recorded in `Cargo.lock`. |
 
 ## Workflow 1: Vapi SIP transfer to Amazon Connect
 
@@ -97,7 +97,7 @@ evidence rather than by expecting sensitive headers in normal logs.
 The relevant implementation starts in
 [`src/main.rs`](../src/main.rs),
 [`src/config.rs`](../src/config.rs), and the crates.io
-`rvoip-amazon-connect` 0.3.7 server implementation pinned by `Cargo.lock`.
+`rvoip-amazon-connect` 0.3.8 server implementation pinned by `Cargo.lock`.
 Amazon setup is described in
 [`amazon-connect.md`](amazon-connect.md).
 
@@ -438,7 +438,7 @@ The repository distinguishes implemented behavior from release evidence.
 - live Amazon Connect and agent-screen-pop qualification for the current
   release candidate;
 - a clean rerun of the exact-Chromium handoff matrix against the published,
-  locked rvoip 0.3.7 WebRTC/RTC packages;
+  locked rvoip 0.3.8 WebRTC/RTC packages;
 - TURN-only and public-NAT qualification;
 - built-SDK split gateway/worker Amazon execution;
 - process-restart recovery during the handoff matrix;

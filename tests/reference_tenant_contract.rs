@@ -141,6 +141,7 @@ impl MediaStream for HermeticConnectStream {
             clock_rate_hz: 48_000,
             channels: 1,
             fmtp: None,
+            payload_type: Some(111),
         }
     }
 

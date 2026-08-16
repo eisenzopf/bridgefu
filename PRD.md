@@ -142,7 +142,7 @@ parse YAML → build `ScreenPopServerConfig` (`SipConfig` + `ConnectConfig` +
 alongside an axum health/metrics server.
 
 - Local development and production use the coordinated crates.io rvoip
-  component release at exact version `=0.3.7`, including
+  component release at exact version `=0.3.8`, including
   `rvoip-amazon-connect`. The committed `Cargo.lock` supplies the registry
   checksums and complete transitive dependency graph.
 

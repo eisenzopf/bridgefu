@@ -609,7 +609,7 @@ export class BridgefuWebRtcClient {
           throw new BridgefuWebRtcError("protocol-error", "invalid remote ICE candidate JSON");
         }
         let candidateInit = candidate as unknown as RTCIceCandidateInit;
-        // rvoip-rtc 0.3.7 emits an empty sdpMid together with a valid m-line
+        // rvoip-rtc 0.3.8 emits an empty sdpMid together with a valid m-line
         // index for trickled candidates. An empty MID names no media section;
         // Chromium accepts the promise but does not form a candidate pair.
         // Remove only that invalid empty selector and retain the explicit
