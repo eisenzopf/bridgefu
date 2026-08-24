@@ -1,4 +1,11 @@
+<div align="center">
+  <img src="bridgefu-banner.png" alt="Bridgefu — Connect anything." width="70%" />
+
 # Bridgefu
+
+**Connect anything.**
+
+</div>
 
 Bridgefu connects real-time voice systems without making either side understand
 the other side's signaling, media, or customer-context format.
