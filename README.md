@@ -1,4 +1,11 @@
+<div align="center">
+  <img src="bridgefu-banner.png" alt="Bridgefu — Connect anything." width="70%" />
+
 # Bridgefu
+
+**Connect anything.**
+
+</div>
 
 Bridgefu is a Rust media gateway that terminates two call legs and bridges
 audio, DTMF, and explicitly allowed context between them. It is built on
