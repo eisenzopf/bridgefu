@@ -10,7 +10,7 @@ sdk/typescript/dist/
 **/.terraform/
 **/*.tfstate
 **/*.tfstate.*
-terraform/terraform.tfvars
+**/*.tfvars
 bridgefu.yaml
 deploy/tls/
 **/.env

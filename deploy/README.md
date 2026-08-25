@@ -212,14 +212,16 @@ systemctl daemon-reload
 systemctl enable --now bridgefu
 ```
 
-`deploy.sh` packages Bridgefu source with `git archive`; it requires and
-verifies an exact `BRIDGEFU_REVISION`, expands it into a new remote release
-directory, and runs `cargo build --locked` inside the canonical image. The
-exact rvoip 0.3.8 inputs come from crates.io and are verified against the
-checksums in the committed `Cargo.lock`; `RVOIP_DIR` and `RVOIP_REVISION` are
-not deployment inputs. The Docker build captures an immutable local image ID in
-`/etc/bridgefu/image.env`, then requires `/readyz` and `/livez`; a failed check
-restores the previous config and image ID when one exists.
-`RUNTIME_ENV` is required so `env:` secret references are passed to the
-container without embedding values in the YAML or image; it is installed with
-mode 0600 and restored together with the config during rollback.
+`RUNTIME_ENV` carries `env:` secret references into the container without
+embedding values in the YAML or the image; install it mode 0600. Pin
+`BRIDGEFU_IMAGE` to an immutable digest — never a floating tag.
+
+There is no deployment driver in this repository. The legacy `deploy.sh`
+single-host path was removed; build an image from `deploy/Dockerfile` and ship
+it with whatever orchestration you already run, or use the cloud modules above.
+
+For the production-qualified Vapi -> Amazon Connect path, do not assemble this
+by hand: the customer CloudFormation template, Packer AMI build, Lambdas, Vapi
+provisioning, and live qualification harness are maintained in
+[bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect),
+which pins an immutable Bridgefu commit and builds the AMI from it.

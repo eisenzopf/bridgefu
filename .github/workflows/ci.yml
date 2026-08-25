@@ -52,7 +52,7 @@ jobs:
           python3 deploy/scripts/test_verify_multiarch_oci.py
           python3 deploy/scripts/test_select_oci_platform.py
           python3 deploy/scripts/test_verify_trivy_policy.py
-          shellcheck deploy.sh deploy/scripts/*.sh
+          shellcheck deploy/scripts/*.sh
 
   test:
     runs-on: ubuntu-24.04

@@ -7,10 +7,6 @@ test -f "$dockerfile"
 test -f Cargo.lock
 test -f .dockerignore
 test ! -e deploy/missing-rvoip-context
-if ! cmp -s Dockerfile deploy/Dockerfile; then
-  echo "root Dockerfile diverged from canonical deploy/Dockerfile" >&2
-  exit 1
-fi
 
 bridgefu_version="$(
   python3 - <<'PY'
@@ -36,7 +32,7 @@ for ignored_path in \
   '**/.terraform/' \
   '**/*.tfstate' \
   '**/*.tfstate.*' \
-  'terraform/terraform.tfvars' \
+  '**/*.tfvars' \
   'bridgefu.yaml' \
   'deploy/tls/' \
   '**/.env' \
@@ -193,9 +189,9 @@ if grep -Eq '^  multiarch-image:$' .github/workflows/ci.yml; then
 fi
 if grep -Eiq \
   'rvoip_revision|RVOIP_REVISION|RVOIP_DIR|repository:[[:space:]]*eisenzopf/rvoip|--build-context[[:space:]]+rvoip|build-contexts:[[:space:]]*rvoip|COPY --from=rvoip|FROM scratch AS rvoip|rvoip\.revision|[.][.]/rvoip' \
-  Dockerfile deploy/Dockerfile deploy/vapi-feasibility/Dockerfile \
+  deploy/Dockerfile deploy/vapi-feasibility/Dockerfile \
   compose.yaml deploy/vapi-feasibility/compose.local.yaml \
-  .github/workflows/ci.yml "$release_workflow" deploy.sh \
+  .github/workflows/ci.yml "$release_workflow" \
   deploy/scripts/runtime-smoke.py; then
   echo "build and release infrastructure still references a sibling rvoip checkout or revision" >&2
   exit 1
@@ -336,19 +332,7 @@ if grep -q 'bridgefu:latest' deploy/bridgefu.service; then
   exit 1
 fi
 
-bash -n deploy.sh deploy/scripts/*.sh
-grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
-grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
-grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
-grep -Fq 'readonly RVOIP_VERSION=0.3.8' deploy.sh
-grep -Fq -- '--iidfile' deploy.sh
-grep -Fq '/etc/bridgefu/image.env' deploy.sh
-grep -Fq '/readyz' deploy.sh
-grep -Fq '/livez' deploy.sh
-if grep -Eq -- '--delete|bridgefu:latest|/healthz' deploy.sh; then
-  echo "deploy.sh contains a destructive sync, floating image, or stale health route" >&2
-  exit 1
-fi
+bash -n deploy/scripts/*.sh
 
 while IFS= read -r image; do
   case "$image" in

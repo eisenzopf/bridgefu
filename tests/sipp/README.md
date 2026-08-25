@@ -95,7 +95,7 @@ path) so `play_pcap_audio="pcap/g711a.pcap"` resolves.
 Get the scenario onto the box (from the instance):
 
 ```bash
-# It was already rsynced with the source by deploy.sh:
+# From a checkout of the Bridgefu source on the box:
 cp /opt/build/bridgefu/tests/sipp/bridgefu_invite.xml /opt/sipp/
 ```
 

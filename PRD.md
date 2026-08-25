@@ -1,5 +1,12 @@
 # BridgeFu — Product Requirements (1.0)
 
+> **Historical document.** This is the original proof-of-concept PRD. Its
+> deployment sections (`terraform apply` + `deploy.sh`, single EC2 host) describe
+> a path that has been removed. Deployment of the Vapi -> Amazon Connect recipe
+> now lives in
+> [bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect).
+> The product requirements below are retained as a record of intent.
+
 ## 1. Problem & goal
 
 We need a small, always-on **SIP → Amazon Connect gateway** we can point a
