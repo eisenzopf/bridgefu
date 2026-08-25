@@ -705,3 +705,154 @@ fn cli_init_fail_closed_behavior_is_recorded() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Composition: recipe -> configuration -> concrete runtime transports
+// ---------------------------------------------------------------------------
+
+/// Every built-in recipe, the credential-free configuration that selects it,
+/// and the transports that configuration must project it onto.
+///
+/// This is the half of the composition the compile gate above cannot reach.
+/// Compiling a recipe standalone proves the manifest and its inputs agree; it
+/// does not prove the recipe survives being selected from a complete
+/// configuration, where the edge listener, API TLS, and admission policy all
+/// have to be present and consistent. Each fixture here is first run through
+/// `validate` -- the full runtime preflight -- and only then explained.
+///
+/// Scope, stated precisely. `recipe explain` reports the transport posture the
+/// configured inputs produce; the port numbers in its output are display
+/// constants in `explain_compiled_recipe`, keyed off `sip_security` alone, and
+/// are NOT read back from the configuration's `edge` block. So these assertions
+/// pin "the operator's values drove this posture, inside a configuration that
+/// passes preflight". They do not pin listener addresses, and they place no
+/// call. What carries real media is the hermetic transport coverage listed in
+/// the repository README.
+const PROJECTIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "vapi-amazon-connect-production.yaml",
+        "vapi-amazon-connect-screen-pop@1",
+        "source: SIP (SIPS with preferred SRTP; TCP 5061; UDP 16384-32767); \
+         admission=managed one-use attachment",
+        "destination: Amazon Connect WebRTC; instance and flow configured (redacted)",
+    ),
+    (
+        "recipe-configs/webrtc-amazon.yaml",
+        "webrtc-amazon-connect-bridge@1",
+        "source: WebRTC; signaling=configured (redacted)",
+        "destination: Amazon Connect WebRTC; instance and flow configured (redacted)",
+    ),
+    (
+        "recipe-configs/sip-webrtc.yaml",
+        "sip-webrtc-bridge@1",
+        "source: SIP (SIPS/SRTP; TCP 5061; UDP 16384-32767); \
+         admission=managed one-use attachment",
+        "destination: WebRTC; signaling=configured (redacted)",
+    ),
+    (
+        "recipe-configs/webrtc-sip.yaml",
+        "webrtc-sip-bridge@1",
+        "source: WebRTC; signaling=configured (redacted)",
+        "destination: SIP (SIPS/SRTP; TCP 5061; UDP 16384-32767); \
+         target_uri=configured (redacted)",
+    ),
+];
+
+/// Run the binary against a fixture configuration with both secrets supplied by
+/// reference, exactly as a deployment does.
+fn bridgefu_with_config(fixture: &str, args: &[&str]) -> std::process::Output {
+    let path = repo_root().join("tests").join("fixtures").join(fixture);
+    let mut argv = vec!["--config", path.to_str().expect("fixture path is UTF-8")];
+    argv.extend_from_slice(args);
+    Command::new(env!("CARGO_BIN_EXE_bridgefu"))
+        .args(&argv)
+        .current_dir(repo_root())
+        .env("BRIDGEFU_API_BEARER_TOKEN", "x".repeat(48))
+        .env("BRIDGEFU_CONTROL_HMAC_KEY", "y".repeat(48))
+        .output()
+        .expect("the bridgefu binary must be runnable")
+}
+
+#[test]
+fn every_recipe_projects_onto_its_declared_transports() {
+    for (fixture, selector, source, destination) in PROJECTIONS {
+        stdout_of(
+            &bridgefu_with_config(fixture, &["validate"]),
+            &format!("validate {fixture}"),
+        );
+
+        let explained = stdout_of(
+            &bridgefu_with_config(fixture, &["recipe", "explain", "support"]),
+            &format!("recipe explain for {fixture}"),
+        );
+
+        assert!(
+            explained.contains(selector),
+            "{fixture} did not project {selector}:\n{explained}",
+        );
+        for expected in [source, destination] {
+            assert!(
+                explained.contains(expected),
+                "{fixture} projected the wrong transport.\n  expected: {expected}\n\
+                 got:\n{explained}",
+            );
+        }
+        assert!(
+            explained.contains("projection conflicts: none"),
+            "{fixture} reported projection conflicts:\n{explained}",
+        );
+    }
+}
+
+#[test]
+fn projection_never_reveals_a_secret() {
+    for (fixture, _, _, _) in PROJECTIONS {
+        let explained = stdout_of(
+            &bridgefu_with_config(fixture, &["recipe", "explain", "support"]),
+            &format!("recipe explain for {fixture}"),
+        );
+        assert!(
+            explained.contains("secrets: redacted"),
+            "{fixture} dropped the redaction notice:\n{explained}",
+        );
+        // The configured ARN, flow id, and URIs are operator data. `explain` is
+        // what someone pastes into a ticket, so it must stay paste-safe.
+        for leaked in ["123456789012", "22222222-2222", "wss://", "sips:"] {
+            assert!(
+                !explained.contains(leaked),
+                "{fixture} leaked {leaked:?} into `recipe explain`:\n{explained}",
+            );
+        }
+    }
+}
+
+#[test]
+fn projection_fingerprint_reflects_configured_values() {
+    // The Vapi recipe's own example uses sips_srtp and one CIDR; the production
+    // fixture uses sips_optional_srtp and two. Same recipe, different inputs, so
+    // the fingerprints must differ -- otherwise the fingerprint is not actually
+    // binding the values an operator supplied.
+    let catalog = RecipeCatalog::builtin().expect("the built-in catalog must construct");
+    let standalone = catalog
+        .resolve("builtin:vapi-amazon-connect-screen-pop@1")
+        .expect("resolves")
+        .compile(&BUILTINS[0].example_values())
+        .expect("compiles")
+        .fingerprint;
+
+    let explained = stdout_of(
+        &bridgefu_with_config(
+            "vapi-amazon-connect-production.yaml",
+            &["recipe", "explain", "support"],
+        ),
+        "recipe explain for the production fixture",
+    );
+
+    assert!(
+        !explained.contains(&standalone),
+        "the configured projection reported the same fingerprint as the \
+         standalone example compile ({standalone}), even though the \
+         configuration supplies different sip_security and CIDRs. The \
+         fingerprint would not be binding operator input.",
+    );
+}

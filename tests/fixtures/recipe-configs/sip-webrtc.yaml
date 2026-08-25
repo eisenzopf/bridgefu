@@ -1,0 +1,41 @@
+# Credential-free configuration that selects one built-in recipe, used by
+# tests/recipe_matrix.rs to prove the recipe projects into concrete runtime
+# transports. Every value is a documentation placeholder.
+config_version: 1
+aws:
+  region: us-west-2
+edge:
+  public_host: edge.bridgefu.example
+  media_public_addr: 203.0.113.10:0
+  sip_tls:
+    bind: 0.0.0.0:5061
+    advertised_addr: 203.0.113.10:5061
+    certificate_chain: /etc/bridgefu/tls/fullchain.pem
+    private_key: /etc/bridgefu/tls/private-key.pem
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  tls:
+    certificate_chain: /etc/bridgefu/tls/api-fullchain.pem
+    private_key: /etc/bridgefu/tls/api-key.pem
+recipes:
+  support:
+    use: builtin:sip-webrtc-bridge@1
+    with:
+      sip_signaling_cidrs:
+        - 198.51.100.0/24
+      webrtc_signaling_uri: wss://peer.example/attach
+      sip_security: sips_srtp
+persistence:
+  backend: sqlite
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  deployment_id: bft-example
+observability:
+  log_level: info
+  log_format: json
+  http_bind: 127.0.0.1:9090
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: 100

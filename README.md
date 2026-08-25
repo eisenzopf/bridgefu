@@ -95,15 +95,57 @@ the `recipe` CLI and validates the exact production configuration the downstream
 AMI ships. It places no call, moves no media, and contacts no provider — it is a
 configuration-contract gate.
 
+**What the projection gate attests.** Each recipe is also selected from a
+complete, credential-free configuration under `tests/fixtures/recipe-configs/`,
+run through `validate` (full runtime preflight), and then through
+`recipe explain`. That pins the recipe surviving projection into a real
+configuration — where the edge listener, API TLS, and admission policy must all
+be present and consistent — and proves the operator's supplied values drive the
+resulting posture: flipping `sip_security` in a fixture fails the test. Port
+numbers in `explain` output are display constants keyed off `sip_security`, not
+listener addresses read back from config, so this gate does not pin bind
+addresses.
+
 **What the hermetic tests attest.** Real full-duplex media, SRTP, DTMF,
 transcoding, hangup in both directions, and leak-free cleanup, against in-process
 peers rather than mocks.
 
-**The gap between them.** The hermetic tests drive named low-level routes, not
-the recipe path. So "this recipe compiles to this bridge graph" and "this
-transport pair carries a real call" are each tested, but their composition is
-not tested end to end. Closing that — running a compiled recipe through a live
-call — is what moves a recipe from `preview` toward `supported`.
+**The gap that remains.** The hermetic transport tests drive named low-level
+routes rather than a compiled recipe. So three things are tested — the recipe
+compiles to a pinned graph, it projects into a configuration that passes
+preflight, and the transport pair carries a real call — while the single
+end-to-end composition, a compiled recipe carrying a live call, is tested only
+for `vapi-amazon-connect-screen-pop` and only in the downstream deployment
+repository. Closing it for the other three is what moves them from `preview`
+toward `supported`.
+
+### Reporting the evidence
+
+Each command reports one tier, strongest claim last:
+
+```bash
+cargo run -- recipe available                  # what is embedded in this build
+make recipe-matrix                             # compile, fingerprint, negatives, projection
+cargo test --locked --test qualification_generic_wss      # SIP <-> WebRTC media path
+cargo test --locked --test qualification_amazon_connect   # WebRTC -> Amazon Connect media path
+cargo test --locked --test generic_sip_reference          # SIP packet path: SRTP, DTMF, transcode
+cargo test --locked --test reference_tenant_contract      # the production handoff contract
+```
+
+To see what a recipe projects to under a given configuration — the paste-safe
+summary an operator can attach to a ticket, with every secret and identifier
+redacted:
+
+```bash
+cargo run -- --config tests/fixtures/recipe-configs/webrtc-sip.yaml \
+  recipe explain support
+```
+
+Opt-in tiers not in the default suite: the `built_typescript_sdk_*` tests need a
+pinned Chromium, and the `#[ignore]`d Gate 11 tests (UCTP fanout, MOQT relay,
+chaos, load) are manual. Live-call evidence for the production recipe lives in
+[bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect),
+not here.
 
 ## Local development
 
