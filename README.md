@@ -69,6 +69,21 @@ cargo run -- recipe validate builtin:vapi-amazon-connect-screen-pop@1 \
   --values recipes/vapi-amazon-connect-screen-pop/values.example.yaml
 ```
 
+Every built-in recipe is compiled, fingerprinted, and negative-tested by
+`tests/recipe_matrix.rs`, which also validates the exact production
+configuration shape that the downstream AMI ships:
+
+```bash
+make recipe-matrix
+```
+
+`sdk/typescript` (`@bridgefu/webrtc-browser`) is the reference browser client
+for the WebRTC leg of any recipe. It is a generic rvoip signaling client with
+no deployment-specific coupling, so it doubles as the test client for the
+`webrtc-sip-bridge` and `sip-webrtc-bridge` recipes. See
+[docs/recipes.md](docs/recipes.md) for what each recipe still needs before it
+can be promoted past `preview`.
+
 Low-level configuration remains available for custom integrations. Start with
 [the product overview](docs/product-overview.md), [architecture](docs/architecture.md),
 [configuration schema](config/schema.json), and [security model](docs/security.md).

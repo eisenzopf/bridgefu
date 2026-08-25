@@ -1,0 +1,67 @@
+# Credential-free rendering of the production configuration that
+# bridgefu-vapi-awsconnect bakes into its customer AMI
+# (image/runtime/bridgefu.yaml.tmpl, rendered by image/runtime/render.py).
+#
+# This fixture exists so a change to Bridgefu's configuration schema that would
+# break the shipped customer AMI fails here, in this repository's CI, before the
+# downstream commit pin is ever bumped. Keep it in sync with that template.
+#
+# Every value below is a documentation placeholder. No secret, real account,
+# real Connect instance, or real hostname appears here.
+config_version: 1
+
+aws:
+  region: us-west-2
+
+edge:
+  public_host: sip.bridgefu.example
+  media_public_addr: 203.0.113.10:0
+  sip_tls:
+    bind: 0.0.0.0:5061
+    advertised_addr: 203.0.113.10:5061
+    certificate_chain: /etc/bridgefu/tls/fullchain.pem
+    private_key: /etc/bridgefu/tls/private-key.pem
+
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  static_tenant: support
+  rate_limit:
+    enabled: true
+    control_requests_per_second: 20
+    control_burst: 40
+    diagnostics_requests_per_second: 5
+    diagnostics_burst: 10
+    webhook_requests_per_second: 5
+    webhook_burst: 10
+    max_tracked_identities: 1024
+    identity_idle_ttl_secs: 300
+
+recipes:
+  support:
+    use: builtin:vapi-amazon-connect-screen-pop@1
+    with:
+      vapi_signaling_cidrs:
+        - 198.51.100.0/24
+        - 203.0.113.0/24
+      connect_instance_arn: arn:aws:connect:us-west-2:123456789012:instance/11111111-1111-1111-1111-111111111111
+      connect_entry_contact_flow_id: 22222222-2222-2222-2222-222222222222
+      sip_security: sips_optional_srtp
+
+persistence:
+  backend: sqlite
+  database_url: sqlite:///var/lib/bridgefu/bridgefu.db
+  deployment_id: bft-example
+
+observability:
+  log_level: info
+  log_format: json
+  http_bind: 127.0.0.1:9090
+
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: 100
+  setup_timeout_secs: 15
+  media_idle_timeout_secs: 120
+  drain_timeout_secs: 60

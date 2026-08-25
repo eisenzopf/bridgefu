@@ -21,18 +21,37 @@ failure cases, operations, teardown, latency, capacity, and retained test gate.
 
 ## Catalog
 
-| Recipe or capability | Source | Destination | Tier |
-|---|---|---|---|
-| [`vapi-amazon-connect-screen-pop@1`](https://github.com/eisenzopf/bridgefu-vapi-awsconnect) | Vapi SIP transfer | Amazon Connect WebRTC | Preview; customer CloudFormation and live qualification are maintained externally |
-| [`webrtc-amazon-connect-bridge@1`](../recipes/webrtc-amazon-connect-bridge/recipe.yaml) | Interactive WebRTC/WSS | Amazon Connect WebRTC | Preview |
-| `browser-vapi-to-contact-center` | Vapi-managed browser WebRTC | SIP/RTP, SIPS/SRTP, or Amazon Connect WebRTC | Development recipe work |
-| [`sip-webrtc-bridge@1`](../recipes/sip-webrtc-bridge/README.md) | SIP/RTP or SIPS/SRTP | Interactive WebRTC/WSS | Preview |
-| [`webrtc-sip-bridge@1`](../recipes/webrtc-sip-bridge/README.md) | Interactive WebRTC/WSS | SIP/RTP or SIPS/SRTP | Preview |
-| `genesys-webrtc-bridge` | SIP/RTP or SIPS/SRTP | Genesys WebRTC | Roadmap |
+Every built-in is compiled, fingerprinted, and negative-tested on each CI run by
+[`tests/recipe_matrix.rs`](../tests/recipe_matrix.rs). That gate proves a recipe
+still *compiles* to the bridge graph it claims. It does not prove a live call
+works, which is what the promotion blocker column below tracks.
+
+| Recipe or capability | Source | Destination | Tier | What blocks promotion to `supported` |
+|---|---|---|---|---|
+| [`vapi-amazon-connect-screen-pop@1`](https://github.com/eisenzopf/bridgefu-vapi-awsconnect) | Vapi SIP transfer | Amazon Connect WebRTC | Preview | Nothing technical. Dual-region live evidence exists; customer CloudFormation and qualification are maintained externally, so promotion is a release-process step, not an engineering one. |
+| [`webrtc-amazon-connect-bridge@1`](../recipes/webrtc-amazon-connect-bridge/recipe.yaml) | Interactive WebRTC/WSS | Amazon Connect WebRTC | Preview | Needs a live browser-to-Connect call: a Connect instance, a published entry flow, and a browser client driving the Bridgefu Web SDK. No live evidence retained yet. |
+| [`sip-webrtc-bridge@1`](../recipes/sip-webrtc-bridge/README.md) | SIP/RTP or SIPS/SRTP | Interactive WebRTC/WSS | Preview | Needs a live SIP peer that will originate into Bridgefu, plus a browser answering over WSS. Testable locally with the `generic` Compose profile and the SDK; no retained evidence yet. |
+| [`webrtc-sip-bridge@1`](../recipes/webrtc-sip-bridge/README.md) | Interactive WebRTC/WSS | SIP/RTP or SIPS/SRTP | Preview | Needs a fixed SIP destination that accepts Bridgefu's From URI, plus TLS roots for `sips_srtp`. The `generic` Compose profile plus coturn covers the browser half; the SIP half needs a real contact-center endpoint. |
+| `browser-vapi-to-contact-center` | Vapi-managed browser WebRTC | SIP/RTP, SIPS/SRTP, or Amazon Connect WebRTC | Development | Not yet an embedded recipe. Needs a manifest before it can be compiled or tested at all. |
+| `genesys-webrtc-bridge` | SIP/RTP or SIPS/SRTP | Genesys WebRTC | Roadmap | Not implemented. Needs a Genesys destination adapter in the call engine first. |
 
 Telnyx, WHIP/WHEP, UCTP, MOQT, and generic WSS capabilities remain available
 through expert configuration at their published development/preview status.
 They are not part of the first promoted recipe matrix.
+
+### Testing a recipe locally
+
+The three non-Vapi recipes all have a browser leg, and
+[`sdk/typescript`](../sdk/typescript) is the reference client for it — a generic
+rvoip WebRTC signaling client with no deployment-specific coupling. Pair it with
+the `generic` Compose profile (which also starts coturn) to exercise the
+WebRTC half of a bridge without any cloud account:
+
+```bash
+make recipes                  # what is embedded in this build
+make recipe-matrix            # compile + fingerprint + negative cases
+docker compose --profile generic up
+```
 
 ## Why the first recipe matters
 

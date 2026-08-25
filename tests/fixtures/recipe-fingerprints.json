@@ -1,0 +1,7 @@
+{
+  "_comment": "Golden compile fingerprints for every built-in recipe against its own values.example.yaml. A change here means the compiled bridge graph a customer deploys changed. If that is intentional, update these values in the same commit that changes the manifest; if it is not, the manifest was edited by accident.",
+  "sip-webrtc-bridge@1": "31dab347d6ea6436b4a3f1b328a3749b59732e6b337cda452a17a815e3e6f827",
+  "vapi-amazon-connect-screen-pop@1": "a78f93ffa80c200779f64194ed43d87afc6ba58234e6c7ac3573363017f7196d",
+  "webrtc-amazon-connect-bridge@1": "677404d62c7b0f07213de5ca5335ce4e1d1ebf7363e1b5fd7947dd7d6fe5d459",
+  "webrtc-sip-bridge@1": "10263d1f65a1a08a0a7ab497104abd5320f1386b6744edc18d8592dda64ff76c"
+}

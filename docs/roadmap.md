@@ -4,6 +4,15 @@ This is the canonical implementation and release-gate plan for Bridgefu 1.0.
 Every gate remains incomplete until its exit criteria have executable evidence.
 Documentation, Terraform, or API scaffolding alone does not complete a gate.
 
+> **Partially superseded.** Sections describing AWS CloudFormation, AMI builds,
+> Lambda packaging, Vapi provisioning, live customer qualification, or a
+> single-host `terraform apply` deploy no longer describe this repository.
+> Deployment of the Vapi to Amazon Connect recipe moved to
+> [bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect),
+> and the legacy single-host path was removed. Bridgefu owns the runtime and the
+> declarative recipe contract; see [recipes.md](recipes.md) for the current
+> per-recipe status and what blocks each one from promotion.
+
 ## Baseline
 
 - Bridgefu starting revision: `5ed676c3f51d1b3af5bdabe504032b26a59225e0`

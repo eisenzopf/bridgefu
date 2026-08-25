@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — repository cleanup and recipe conformance gate
+
+Housekeeping only. No runtime behavior changed, and `Cargo.lock` is
+byte-identical, so the commit pin and AMI build contract that
+`bridgefu-vapi-awsconnect` depends on are unaffected.
+
+- Purged the debris left by the `bridgefu-vapi-awsconnect` split: 2.2 GB of
+  cached Terraform provider binaries and Python bytecode under
+  `recipes/vapi-amazon-connect-screen-pop/`, whose sources had already moved to
+  that repository, plus the empty `apps/`, `benchmarks/`, and `qualification/`
+  directories and 22 stale git worktrees. Working tree: 5.0 GB to 2.7 GB.
+- Retired the legacy single-host deploy path — `terraform/` (a root module whose
+  12 AWS resources were already destroyed), `deploy.sh`, and the root
+  `Dockerfile`, which was a byte-identical duplicate of `deploy/Dockerfile`.
+  The provider-neutral `deploy/terraform/{aws,gcp}` cluster modules remain.
+- Removed engagement-specific smoke, drain, and rollback tooling along with a
+  cross-repository configuration check that reached into a sibling checkout by
+  hard-coded path. Bridgefu no longer references any specific deployment.
+- **Fixed a CI gap:** `ci.yml` and `check-release-image.sh` both iterated a
+  Compose profile under its former name, which `compose.yaml` had since renamed
+  to `reference-tenant`. `docker compose --profile` succeeds on an unmatched
+  profile, so neither the profile validation nor the runtime-hardening
+  assertions (`read_only`, `no-new-privileges`, `cap_drop`) had been running
+  against that service at all. Both now resolve to a real service.
+- Corrected stale Rust test names in the documentation, which still referred to
+  tests renamed in the code some time ago.
+- Added `tests/recipe_matrix.rs`: every built-in recipe is now compiled against
+  its published example values, pinned to a golden fingerprint, checked for
+  input completeness, and negative-tested for unknown inputs, missing required
+  inputs, and out-of-enum `sip_security`. The same gate drives the `recipe`
+  CLI and validates `tests/fixtures/vapi-amazon-connect-production.yaml`, a
+  credential-free rendering of the configuration baked into the customer AMI —
+  so a schema change that would break that AMI now fails here first.
+- Documented, per recipe, what still blocks promotion from `preview` to
+  `supported`.
+
 ## Unreleased — crates.io rvoip 0.3.8 and recipe runtime cleanup
 
 - Repointed the coordinated rvoip dependency graph to exact crates.io `0.3.8`
