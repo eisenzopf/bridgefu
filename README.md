@@ -102,10 +102,13 @@ make recipe-matrix
 ```
 
 `sdk/typescript` (`@bridgefu/webrtc-browser`) is the reference browser client
-for the WebRTC leg of any recipe. It is a generic rvoip signaling client with
-no deployment-specific coupling, so it doubles as the test client for the
-`webrtc-sip-bridge` and `sip-webrtc-bridge` recipes. See
-[docs/recipes.md](docs/recipes.md) for what each recipe still needs before it
+for a WebRTC call leg. It is a generic rvoip signaling client with no
+deployment-specific coupling. `tests/qualification_browser_sdk.rs` drives the
+built SDK through Chromium against a hermetic SIPS/SRTP destination, but that
+test is opt-in rather than part of the default suite, and it uses low-level
+configuration rather than a recipe. Wiring the SDK to the `webrtc-sip-bridge`
+and `sip-webrtc-bridge` recipes is exactly the gap those recipes need closed;
+see [docs/recipes.md](docs/recipes.md) for what each one still needs before it
 can be promoted past `preview`.
 
 Low-level configuration remains available for custom integrations. Start with
