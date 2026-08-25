@@ -38,22 +38,27 @@ bash deploy/scripts/check-release-image.sh
 ```
 
 `.dockerignore` deliberately excludes local agent worktrees, SDK installs and
-browsers, Terraform caches/state, editor files, operator configuration and
-environment files, Compose-mounted `deploy/tls`, and common private-key and
-certificate formats. Docker does not honor `.gitignore`; removing these
+browsers, editor files, operator configuration and environment files,
+Compose-mounted `deploy/tls`, and common private-key and certificate formats.
+It also still excludes Terraform state and caches: no Terraform remains in this
+repository, but the guard costs nothing and a local experiment must never leak
+state into a build context. Docker does not honor `.gitignore`; removing these
 exclusions can leak local state into the builder context even when Git is clean.
 
-The protected `release-image-candidate.yml` workflow is the authoritative way
-to build the non-published `linux/amd64,linux/arm64` OCI archive with embedded
-SBOM and provenance and per-platform Trivy reports. It accepts only an exact
-clean 40-character commit, has no registry write permission, and retains the
-verified archive as a review artifact. A local host may reproduce that workflow
-with Buildx, QEMU, Python 3, and Trivy, but a native `docker build` proves only
-the host architecture.
+There is no image release pipeline. Bridgefu publishes no container image to
+any registry, and `ci.yml` is checked to make sure it never gains permission to.
+CI builds the image natively per architecture, runs its healthcheck, and retains
+an SBOM and a Trivy SARIF report; that is the extent of it.
+
+A multi-platform candidate workflow used to live here. It was dispatched twice,
+timed out at three hours both times without ever producing an archive, and has
+been removed along with its OCI verification helpers. If Bridgefu ever needs
+published images, that pipeline should be rebuilt against a build that can
+actually finish -- QEMU-emulated cross-compilation of the full rvoip graph is
+not it.
 
 Allow at least 32 GB of memory and substantial build-cache space for a cold
-compile of the complete rvoip graph. A 32-vCPU, 128-GB RAM, 1.2-TB Linux runner
-is comfortably sized for parallel native jobs and retained OCI evidence.
+compile of the complete rvoip graph.
 
 ## Local profiles
 
@@ -69,7 +74,11 @@ docker compose --profile moqt config --quiet
 ```
 
 The `cluster` profile defines PostgreSQL, TLS Redis, gateway, worker, and MOQT
-relay services. Gateway-to-worker media uses authenticated UCTP 0.2 over
+relay services. **This topology is unproven**: it has conformance tests in CI
+and no deployment evidence whatsoever. It exists so the distributed code has a
+local harness. The only configuration ever run in production is a single
+all-in-one instance on SQLite -- see the deployment status table in
+[the repository README](../README.md). Gateway-to-worker media uses authenticated UCTP 0.2 over
 mutually authenticated QUIC. Redis and that private transport require
 caller-owned certificates at `BRIDGEFU_TLS_DIR` (`ca.crt`,
 `redis.{crt,key}`, `gateway.{crt,key}`, `public-uctp.{crt,key}`,

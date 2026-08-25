@@ -587,8 +587,10 @@ load, and deployed chaos evidence remain open.
 
 Release-image evidence recorded on the same worktree:
 
-- `deploy/scripts/check-release-image.sh` and all ten OCI helper unit tests
-  pass.
+- `deploy/scripts/check-release-image.sh` passes. (The ten OCI helper unit
+  tests referenced in the original record covered a multi-platform candidate
+  pipeline that never produced an archive and has since been removed; Bridgefu
+  publishes no container image.)
 - All eight rendered Compose services pass executable configuration/role
   preflight.
 - The credential-free runtime smoke passes all nine role, lifecycle, private

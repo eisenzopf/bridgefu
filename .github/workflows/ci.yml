@@ -32,9 +32,6 @@ jobs:
         working-directory: bridgefu
         run: |
           bash deploy/scripts/check-release-image.sh
-          python3 deploy/scripts/test_verify_multiarch_oci.py
-          python3 deploy/scripts/test_select_oci_platform.py
-          python3 deploy/scripts/test_verify_trivy_policy.py
           shellcheck deploy/scripts/*.sh
 
   test:

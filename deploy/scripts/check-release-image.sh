@@ -120,15 +120,6 @@ grep -Eq 'file: bridgefu/deploy/Dockerfile' .github/workflows/ci.yml
 grep -Eq 'platform: linux/amd64' .github/workflows/ci.yml
 grep -Eq 'platform: linux/arm64' .github/workflows/ci.yml
 grep -Fq 'Verify locked rvoip crates.io graph' .github/workflows/ci.yml
-release_workflow=.github/workflows/release-image-candidate.yml
-test -f "$release_workflow"
-grep -Eq '^  workflow_dispatch:$' "$release_workflow"
-grep -Eq '^    environment: bridgefu-release-image-candidate$' "$release_workflow"
-grep -Fq 'run: bash deploy/scripts/check-release-image.sh' "$release_workflow"
-grep -Eq 'platforms: linux/amd64,linux/arm64' "$release_workflow"
-grep -Eq 'outputs: type=oci,dest=' "$release_workflow"
-grep -Eq '^          push: false$' "$release_workflow"
-grep -Eq 'provenance: mode=max' "$release_workflow"
 
 grep -Fq 'name: Verify native runtime and healthcheck execution' .github/workflows/ci.yml
 grep -Fq -- '--entrypoint /usr/local/bin/bridgefu' .github/workflows/ci.yml
@@ -144,14 +135,9 @@ grep -Fq 'test: [CMD, /usr/local/bin/bridgefu, healthcheck, --path, /readyz]' co
 # Secrets reach the process by file-backed reference, never inline.
 grep -Fq 'let path_variable = format!("{name}_FILE");' src/secret_ref.rs
 
-grep -Eq '^          sbom: true$' "$release_workflow"
-grep -Eq 'verify-multiarch-oci\.py' "$release_workflow"
-grep -Eq 'verify-trivy-policy\.py' "$release_workflow"
-grep -Eq 'select-oci-platform\.py' "$release_workflow"
-grep -Eq 'TRIVY_PLATFORM: linux/amd64' "$release_workflow"
-grep -Eq 'TRIVY_PLATFORM: linux/arm64' "$release_workflow"
-if grep -Eq 'packages: write|id-token: write|push: true' "$release_workflow"; then
-  echo "release-candidate workflow must not have registry/publication authority" >&2
+# Image CI builds and scans; it must never gain publication authority.
+if grep -Eq 'packages: write|id-token: write|push: true' .github/workflows/ci.yml; then
+  echo "image CI must not have registry/publication authority" >&2
   exit 1
 fi
 if grep -Eq '^  multiarch-image:$' .github/workflows/ci.yml; then
@@ -161,8 +147,7 @@ fi
 if grep -Eiq \
   'rvoip_revision|RVOIP_REVISION|RVOIP_DIR|repository:[[:space:]]*eisenzopf/rvoip|--build-context[[:space:]]+rvoip|build-contexts:[[:space:]]*rvoip|COPY --from=rvoip|FROM scratch AS rvoip|rvoip\.revision|[.][.]/rvoip' \
   deploy/Dockerfile compose.yaml \
-  .github/workflows/ci.yml "$release_workflow" \
-  deploy/scripts/runtime-smoke.py; then
+  .github/workflows/ci.yml deploy/scripts/runtime-smoke.py; then
   echo "build and release infrastructure still references a sibling rvoip checkout or revision" >&2
   exit 1
 fi
@@ -175,28 +160,27 @@ while IFS= read -r use; do
     echo "workflow action is not commit-pinned: $use" >&2
     exit 1
   fi
-done < <(grep -hE '^[[:space:]]+- uses:' .github/workflows/ci.yml "$release_workflow")
+done < <(grep -hE '^[[:space:]]+- uses:' .github/workflows/ci.yml)
 
 # Trivy's action and scanner are separate supply-chain inputs. Keep both
-# immutable and synchronized across ordinary image CI and the retained
-# multi-platform candidate workflow. The previous v0.28.0 action depended on a
-# removed setup-trivy tag and could not even prepare a GitHub Actions job.
+# immutable. The previous v0.28.0 action depended on a removed setup-trivy tag
+# and could not even prepare a GitHub Actions job.
 trivy_action_uses="$(awk '
   /uses: aquasecurity\/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25/ {
     count++
   }
   END { print count + 0 }
-' .github/workflows/ci.yml "$release_workflow")"
-if [ "$trivy_action_uses" -ne 3 ]; then
-  echo "all three Trivy scans must use the reviewed v0.36.0 action commit" >&2
+' .github/workflows/ci.yml)"
+if [ "$trivy_action_uses" -ne 1 ]; then
+  echo "the image Trivy scan must use the reviewed v0.36.0 action commit" >&2
   exit 1
 fi
 trivy_version_pins="$(awk '
   /^[[:space:]]+version: v0[.]70[.]0$/ { count++ }
   END { print count + 0 }
-' .github/workflows/ci.yml "$release_workflow")"
-if [ "$trivy_version_pins" -ne 3 ]; then
-  echo "all three Trivy scans must pin scanner version v0.70.0" >&2
+' .github/workflows/ci.yml)"
+if [ "$trivy_version_pins" -ne 1 ]; then
+  echo "the image Trivy scan must pin scanner version v0.70.0" >&2
   exit 1
 fi
 sarif_severity_limits=$(grep -Ec \
@@ -213,17 +197,6 @@ if [ "$ci_strict_severities" -ne 1 ] || [ "$ci_strict_exits" -ne 1 ]; then
   echo "CI image scanning must fail on every HIGH/CRITICAL finding" >&2
   exit 1
 fi
-candidate_all_severities=$(grep -Ec \
-  '^          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL$' "$release_workflow" || true)
-candidate_json_reports=$(grep -Ec '^          format: json$' "$release_workflow" || true)
-candidate_vuln_scanners=$(grep -Ec '^          scanners: vuln$' "$release_workflow" || true)
-candidate_retained_exits=$(grep -Ec '^          exit-code: "0"$' "$release_workflow" || true)
-if [ "$candidate_all_severities" -ne 2 ] || [ "$candidate_json_reports" -ne 2 ] || \
-  [ "$candidate_vuln_scanners" -ne 2 ] || [ "$candidate_retained_exits" -ne 2 ]; then
-  echo "candidate scans must retain all vulnerability severities for both platforms" >&2
-  exit 1
-fi
-
 # rvoip-amazon-connect compiles its published protobuf schema at build time.
 # The canonical builder installs protoc from its pinned Debian snapshot; the
 # distroless runtime contains neither protoc nor a package manager. The
@@ -235,9 +208,6 @@ grep -Fq 'sudo apt-get install --yes --no-install-recommends protobuf-compiler' 
   .github/workflows/ci.yml
 grep -Fq 'protoc --version' .github/workflows/ci.yml
 
-test -x deploy/scripts/verify-multiarch-oci.py
-test -x deploy/scripts/verify-trivy-policy.py
-test -x deploy/scripts/select-oci-platform.py
 test -x deploy/scripts/runtime-smoke.py
 python3 - <<'PY'
 import ast
@@ -245,12 +215,6 @@ from pathlib import Path
 
 for name in (
     "runtime-smoke.py",
-    "select-oci-platform.py",
-    "test_select_oci_platform.py",
-    "verify-multiarch-oci.py",
-    "test_verify_multiarch_oci.py",
-    "verify-trivy-policy.py",
-    "test_verify_trivy_policy.py",
 ):
     ast.parse(Path("deploy/scripts", name).read_text())
 PY
