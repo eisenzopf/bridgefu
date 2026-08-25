@@ -1,0 +1,30 @@
+# Justified, dated exceptions to the HIGH/CRITICAL image scan.
+#
+# An entry belongs here only when the vulnerability is BOTH unfixable today and
+# unreachable from Bridgefu. "Inconvenient" is not a reason. Every entry carries
+# an expiry so it is re-examined rather than inherited forever; when an entry
+# expires the scan fails again and someone has to make the call afresh.
+
+vulnerabilities:
+  - id: CVE-2026-14456
+    statement: >-
+      OpenSSL denial of service via unbounded memory growth in its QUIC server.
+      Present in libssl3t64 from the distroless cc-debian13 base image, not
+      pulled in by Bridgefu.
+
+      Unreachable: the Bridgefu binary does not link OpenSSL. Its only declared
+      shared-library dependencies are libc.so.6, libgcc_s.so.1, and libm.so.6.
+      All TLS and QUIC is rustls + ring, compiled in statically -- see the
+      rustls/quinn/reqwest/redis/sqlx feature selections in Cargo.toml, which
+      pin ring and rustls backends throughout. The only openssl-named crates in
+      Cargo.lock are openssl-probe 0.1.6 and 0.2.1, which locate CA certificate
+      paths and link nothing. Bridgefu also runs no OpenSSL QUIC server: its
+      QUIC is quinn.
+
+      Unfixable: Debian has marked this fix_deferred with no fixed version, so
+      no base image bump resolves it. Rebasing away from Debian would be a far
+      larger change than this unreachable finding justifies.
+
+      Re-check on expiry: if Debian has shipped a fix by then, drop this entry
+      and take the patched base image instead.
+    expired_at: 2026-11-24

@@ -209,6 +209,31 @@ grep -Fq 'sudo apt-get install --yes --no-install-recommends protobuf-compiler' 
 grep -Fq 'protoc --version' .github/workflows/ci.yml
 
 test -x deploy/scripts/runtime-smoke.py
+
+# A vulnerability exception must always be justified and dated. Trivy stops
+# honouring an entry once it expires, which is the point: the scan fails again
+# and someone re-examines it rather than inheriting a permanent silence.
+test -f .trivyignore.yaml
+grep -Fq 'trivyignores: bridgefu/.trivyignore.yaml' .github/workflows/ci.yml
+python3 - <<'TRIVYGUARD'
+import datetime
+
+import yaml
+
+document = yaml.safe_load(open(".trivyignore.yaml"))
+entries = (document or {}).get("vulnerabilities") or []
+for entry in entries:
+    identifier = entry.get("id", "<missing id>")
+    statement = (entry.get("statement") or "").strip()
+    if len(statement) < 120:
+        raise SystemExit(
+            f"{identifier} needs a statement explaining why it is both "
+            "unfixable and unreachable"
+        )
+    if not isinstance(entry.get("expired_at"), datetime.date):
+        raise SystemExit(f"{identifier} needs an expired_at date")
+print(f"{len(entries)} justified, dated vulnerability exception(s)")
+TRIVYGUARD
 python3 - <<'PY'
 import ast
 from pathlib import Path

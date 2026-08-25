@@ -90,6 +90,21 @@ use rvoip_webrtc::peer::{PeerRole, RvoipPeerConnection};
 use rvoip_webrtc::WebRtcConfig;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 
+/// Upper bound on waiting for an event that is already in flight.
+///
+/// These waits do not measure latency; they only stop a hung test from running
+/// forever, so a longer bound costs nothing when the test passes. Five seconds
+/// proved tight enough that
+/// `split_egress_uses_a_second_generation_bound_connection_full_duplex` failed
+/// intermittently on GitHub-hosted runners, which also host this job's
+/// PostgreSQL and Redis service containers. Reproduced locally at roughly one
+/// run in fifteen under CPU contention.
+///
+/// This deliberately does NOT apply to the `Duration::from_secs(5)` values
+/// passed into shutdown, admission, reservation, or setup APIs: those are the
+/// production semantics under test, not test-harness patience.
+const EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct TlsFixture {
     root: PathBuf,
     worker: MutualTlsFiles,
@@ -2398,7 +2413,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
                 .await
         })
     };
-    let ticket = tokio::time::timeout(Duration::from_secs(5), admissions.recv())
+    let ticket = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, admissions.recv())
         .await
         .expect("private egress admission ticket timeout")
         .expect("private egress admission receiver closed");
@@ -2467,7 +2482,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
             payload_type: Some(111),
         })
         .await;
-    let early_media = tokio::time::timeout(Duration::from_secs(5), from_gateway.recv())
+    let early_media = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, from_gateway.recv())
         .await
         .expect("pre-answer private media timeout")
         .expect("pre-answer private media stream closed");
@@ -2509,7 +2524,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
             payload_type: Some(111),
         })
         .await;
-    let reverse = tokio::time::timeout(Duration::from_secs(5), from_gateway.recv())
+    let reverse = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, from_gateway.recv())
         .await
         .expect("reverse private media timeout")
         .expect("reverse private media stream closed");
@@ -2617,7 +2632,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
                 .await
         })
     };
-    let web_ticket = tokio::time::timeout(Duration::from_secs(5), admissions.recv())
+    let web_ticket = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, admissions.recv())
         .await
         .expect("private WebRTC egress admission ticket timeout")
         .expect("private egress admission receiver closed");
@@ -2673,7 +2688,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
     assert!(web_native
         .activated
         .load(std::sync::atomic::Ordering::Acquire));
-    let post_commit_media = tokio::time::timeout(Duration::from_secs(5), web_from_gateway.recv())
+    let post_commit_media = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, web_from_gateway.recv())
         .await
         .expect("post-commit WebRTC media timeout")
         .expect("post-commit WebRTC media stream closed");
@@ -2827,7 +2842,7 @@ async fn mtls_uctp_routes_full_rtp_rtcp_and_data_with_pinning_backpressure_and_d
         route.try_send_rtp(rtp(b"queue-full", 42, 10_560, 0x1020_3040)),
         Err(GatewayForwardingError::Backpressure)
     );
-    let frame = tokio::time::timeout(Duration::from_secs(5), inbound_media.recv())
+    let frame = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, inbound_media.recv())
         .await
         .unwrap()
         .unwrap();
@@ -2854,7 +2869,7 @@ async fn mtls_uctp_routes_full_rtp_rtcp_and_data_with_pinning_backpressure_and_d
         .await
         .unwrap();
     let ForwardedPacket::Rtp(worker_rtp) =
-        tokio::time::timeout(Duration::from_secs(5), route.recv())
+        tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, route.recv())
             .await
             .unwrap()
             .unwrap()
@@ -2911,7 +2926,7 @@ async fn mtls_uctp_routes_full_rtp_rtcp_and_data_with_pinning_backpressure_and_d
     let ForwardedPacket::Dtmf {
         digits,
         duration_ms,
-    } = tokio::time::timeout(Duration::from_secs(5), route.recv())
+    } = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, route.recv())
         .await
         .unwrap()
         .unwrap()
@@ -2933,7 +2948,7 @@ async fn mtls_uctp_routes_full_rtp_rtcp_and_data_with_pinning_backpressure_and_d
         .await
         .unwrap();
     let ForwardedPacket::Data(worker_data) =
-        tokio::time::timeout(Duration::from_secs(5), route.recv())
+        tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, route.recv())
             .await
             .unwrap()
             .unwrap()
@@ -3118,7 +3133,7 @@ async fn exact_pcmu_private_route_negotiates_and_decodes_as_pcmu() {
     route
         .try_send_rtp(rtp_with_pt(&encoded, 0, 2, 320, 0x0102_0304))
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(5), received.recv())
+    let frame = tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, received.recv())
         .await
         .expect("PCMU worker media timeout")
         .expect("PCMU worker stream closed");
