@@ -345,7 +345,7 @@ while IFS= read -r image; do
 done < <(docker compose --profile cluster --profile generic config --images)
 
 # Compose must preserve the runtime hardening contract for every Bridgefu role.
-for profile in standardcharter generic telnyx uctp moqt cluster; do
+for profile in reference-tenant generic telnyx uctp moqt cluster; do
   rendered=$(docker compose --profile "$profile" config)
   if ! grep -q 'read_only: true' <<<"$rendered"; then
     echo "profile $profile lost read-only root filesystem" >&2

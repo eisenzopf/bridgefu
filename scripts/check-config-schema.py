@@ -112,7 +112,7 @@ def validate_reference_tenant_pair(
         raise AssertionError("paired Amazon rollback fixture must use SIPS")
     bearer_ref = reference_tenant.get("BRIDGEFU_API_BEARER_TOKEN_REF", "")
     if not bearer_ref.startswith("env:"):
-        raise AssertionError("StandardCharter control bearer must remain a secret reference")
+        raise AssertionError("reference-tenant control bearer must remain a secret reference")
 
     expected_destination_types = {
         "amazon-connect": ("amazon_connect", "amazon_connect"),
@@ -148,22 +148,6 @@ def validate_reference_tenant_pair(
         ("providers", "telnyx", "media_sip_password"),
     ):
         assert_env_secret(bridgefu, *path)
-
-    # A coordinated local checkout additionally catches accidental drift in
-    # StandardCharter's operator-facing example. Isolated Bridgefu CI still
-    # validates the complete canonical pair above.
-    sibling = ROOT.parent / "standardcharter" / "config" / "bridgefu-managed-ingress.env.example"
-    if sibling.is_file():
-        deployed = parse_env_fixture(sibling)
-        for key in (
-            "BRIDGEFU_ROUTE_IDS",
-            "BRIDGEFU_DEFAULT_ROUTE_ID",
-            "BRIDGEFU_LEGACY_AMAZON_ROLLBACK_ENABLED",
-        ):
-            if deployed.get(key) != reference_tenant.get(key):
-                raise AssertionError(
-                    f"StandardCharter example drifted from paired fixture key {key}"
-                )
 
 
 def main() -> None:

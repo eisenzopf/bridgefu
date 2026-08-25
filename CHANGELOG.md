@@ -24,7 +24,7 @@
 This working tree is not yet a published release. An owner-reviewed immutable
 revision and the protected two-platform OCI candidate remain 0.9.0 release
 gates. The rvoip #54 fix and fourth exact-Chromium pass, TURN/public-NAT,
-live-provider and StandardCharter checks, cloud deployment evidence, and the
+live-provider and reference-tenant checks, cloud deployment evidence, and the
 one-hour qualification profiles remain explicit 1.0 gates.
 
 ### Audit scope and review status
@@ -113,7 +113,7 @@ the PR and protected two-platform workflow pass.
   generation-fenced effect path.
 - The real generic-SIP cancellation case passes its one-second destination
   CANCEL bound. The complete six-case generic SIP reference suite, 40-case
-  call execution supervisor suite, 82-case StandardCharter contract, and two
+  call execution supervisor suite, 82-case reference-tenant contract, and two
   hermetic Amazon Connect qualification cases pass against registry-only
   rvoip `0.3.4`. The owner-gated Chromium case remains separately ignored.
 
@@ -197,7 +197,7 @@ the PR and protected two-platform workflow pass.
 
 ### Added — Vapi to Amazon Connect
 
-- Preserved the frozen StandardCharter-compatible Vapi SIP-transfer listener on
+- Preserved the frozen reference-tenant-compatible Vapi SIP-transfer listener on
   the configured legacy SIP port (default `5060`). It routes by Request-URI,
   then `To`, then optional default tenant; maps allowlisted `X-*` headers to
   Amazon attributes; starts `StartWebRTCContact`; bridges SIP G.711 to Chime
@@ -220,7 +220,7 @@ the PR and protected two-platform workflow pass.
 - Added [src/amazon_cleanup.rs](src/amazon_cleanup.rs): successful Amazon starts
   retain exact `StopContact` authority before media proceeds, and startup/drain
   reconcile unresolved cleanup records without exposing contact identifiers.
-- Added an optional, false-by-default durable StandardCharter canary on the
+- Added an optional, false-by-default durable reference-tenant canary on the
   generic listener while leaving the original listener independent.
 
 ### Added — browser WebRTC to Vapi assistant to Amazon handoff
@@ -365,7 +365,7 @@ the PR and protected two-platform workflow pass.
 - Added a hardened multi-stage, non-root, read-only-root-compatible image for
   linux/amd64 and linux/arm64 with immutable base/package inputs and explicit
   build provenance metadata.
-- Added Compose profiles for StandardCharter, generic SIP/WebRTC, Telnyx, UCTP,
+- Added Compose profiles for reference-tenant, generic SIP/WebRTC, Telnyx, UCTP,
   MOQT, PostgreSQL/Redis, Coturn, and clustered gateway/worker/relay roles.
 - Added a protected, manually dispatched release-image candidate workflow that
   builds a no-push OCI layout and verifies exact platforms, SPDX SBOMs, SLSA
@@ -373,7 +373,7 @@ the PR and protected two-platform workflow pass.
 - Added credential-free runtime/configuration smoke tooling, OCI/platform/Trivy
   policy validators, schema and Compose checkers, local Redis TLS generation,
   and a retained evidence format that records dirty tracked and untracked state.
-- Added the protected, manually dispatched StandardCharter nonproduction smoke
+- Added the protected, manually dispatched reference-tenant nonproduction smoke
   workflow, runbook, retained-artifact verifier, and bounded drain/rollback
   scripts. They do not authorize or imply a production deployment.
 - Expanded AWS Terraform to a role-separated ECS-on-EC2/NLB/RDS/ElastiCache
@@ -382,7 +382,7 @@ the PR and protected two-platform workflow pass.
   isolation. These roots are static definitions, not proof of a successful
   cloud apply.
 - Preserved the legacy single-host `deploy.sh` and systemd path as an isolated
-  StandardCharter compatibility deployment rather than the clustered reference.
+  reference-tenant compatibility deployment rather than the clustered reference.
 - Added MIT licensing and contribution/security-reporting guidance.
 
 ### Changed
@@ -439,7 +439,7 @@ the PR and protected two-platform workflow pass.
 
 ### Security notes
 
-- The legacy `:5060` StandardCharter listener remains plain SIP/RTP and relies
+- The legacy `:5060` reference-tenant listener remains plain SIP/RTP and relies
   on carrier CIDR/firewall isolation; it is not upgraded in place to SIP auth,
   TLS, or SRTP. Use the managed named-SIPS path where those controls are needed.
 - Named Vapi profiles require a real shared TLS listener and mandatory SRTP.
@@ -457,7 +457,7 @@ the PR and protected two-platform workflow pass.
 
 ### Compatibility and breaking protocol changes
 
-- The existing Vapi-to-Amazon StandardCharter listener remains the default
+- The existing Vapi-to-Amazon reference-tenant listener remains the default
   all-in-one compatibility path and is protected by frozen contract tests.
 - UCTP 0.2 datagrams contain the eight-byte UCTP header followed by a complete
   RTP packet; payload-only alpha datagrams are not wire compatible.
@@ -480,7 +480,7 @@ the PR and protected two-platform workflow pass.
 - Added repository-conformance suites across memory, SQLite, PostgreSQL, Redis
   coordination, Amazon start specs, initial contexts, private egress, and
   durable broadcast commands.
-- Added frozen StandardCharter routing/header/media/lifecycle contracts, generic
+- Added frozen reference-tenant routing/header/media/lifecycle contracts, generic
   SIP reference tests, call-directionality checks, and execution-supervisor
   recovery/teardown matrices.
 - Added hermetic all-in-one qualification for browser/Vapi-like SIPS assistant
@@ -515,7 +515,7 @@ the PR and protected two-platform workflow pass.
 - Added or expanded architecture, security, observability, provider capability,
   protocol compatibility, migration, repository, Amazon, gateway-ingress,
   qualification, benchmark, MOQT/RTC fork-review, interop, packet-capture,
-  deployment, Terraform, and StandardCharter smoke/rollback documentation.
+  deployment, Terraform, and reference-tenant smoke/rollback documentation.
 - Added a non-secret managed-route fixture and the comprehensive illustrative
   browser/Vapi/Amazon configuration. The latter contains placeholder addresses,
   UUIDs, CIDRs, certificates, and `env:` secrets and was intentionally not run
@@ -606,7 +606,7 @@ listing them here does not make them part of a Bridgefu commit.
 3. Legacy Vapi-to-Amazon path:
    [src/main.rs](src/main.rs), [src/config.rs](src/config.rs),
    [src/amazon_cleanup.rs](src/amazon_cleanup.rs), and
-   [tests/standardcharter_contract.rs](tests/standardcharter_contract.rs).
+   [tests/reference_tenant_contract.rs](tests/reference_tenant_contract.rs).
 4. Named route/API contract:
    [src/api.rs](src/api.rs), [src/api/calls.rs](src/api/calls.rs),
    [src/api_principal.rs](src/api_principal.rs), and
