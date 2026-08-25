@@ -87,6 +87,16 @@ runtime:
   media_idle_timeout_secs: 30 # refreshed only by authoritative rvoip media activity
   drain_timeout_secs: 30
 
+# ---------------------------------------------------------------------------
+# UNPROVEN. The role-separated gateway/worker topology below has never been
+# deployed. It has conformance tests against real PostgreSQL and Redis in CI,
+# and nothing more -- no live evidence, no operational runbook, no capacity or
+# failure data. The only configuration ever run in production is the
+# `mode: all-in-one` + SQLite shape above. Do not copy this block into a
+# production deployment expecting a supported path. See the deployment status
+# table in README.md.
+# ---------------------------------------------------------------------------
+#
 # Required for role-separated `gateway` and `worker` modes. The QUIC TLS
 # handshake requires a certificate from the explicitly configured peer CA;
 # short-lived UCTP JWTs additionally bind gateway, worker audience, tenant,
