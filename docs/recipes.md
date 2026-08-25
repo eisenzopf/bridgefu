@@ -23,8 +23,16 @@ failure cases, operations, teardown, latency, capacity, and retained test gate.
 
 Every built-in is compiled, fingerprinted, and negative-tested on each CI run by
 [`tests/recipe_matrix.rs`](../tests/recipe_matrix.rs). That gate proves a recipe
-still *compiles* to the bridge graph it claims. It does not prove a live call
-works, which is what the promotion blocker column below tracks.
+still *compiles* to the bridge graph it claims; it places no call, moves no
+media, and contacts no provider.
+
+Each recipe's transport pair additionally has hermetic runtime coverage that
+runs on every CI run -- real full-duplex media, SRTP, DTMF, transcoding, and
+leak-free cleanup against in-process peers. Those tests drive named low-level
+routes rather than the recipe path, so the two halves are each tested and their
+composition is not. The repository README carries the per-recipe table of what
+is code tested versus production tested. The promotion blocker column below
+tracks what each recipe still needs beyond that.
 
 | Recipe or capability | Source | Destination | Tier | What blocks promotion to `supported` |
 |---|---|---|---|---|

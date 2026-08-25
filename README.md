@@ -74,6 +74,37 @@ Multi-node operation is unproven. The `cluster` Compose profile exists so the
 gateway/worker code has a local harness, not because that topology has been
 run in anger.
 
+### Recipe matrix: code tested vs production tested
+
+All four built-in recipes are **code tested** on every CI run. Exactly one is
+**production tested**. These are different claims and the table keeps them
+apart.
+
+| Recipe | Bridge | Code tested | Production tested |
+|---|---|---|---|
+| `vapi-amazon-connect-screen-pop@1` | SIP → Amazon Connect WebRTC | Compile gate + 98 hermetic contract tests (`reference_tenant_contract.rs`) through a real localhost SIP listener, with Amazon's control plane and Chime media injected at rvoip's boundary | **Yes.** Single all-in-one EC2 instance, dual-region, signed live-call evidence |
+| `webrtc-amazon-connect-bridge@1` | Browser WebRTC → Amazon Connect WebRTC | Compile gate + `direct_browser_to_amazon_connect_is_full_duplex_context_bound_and_leak_free` and the make-before-break handoff test (`qualification_amazon_connect.rs`) | No |
+| `sip-webrtc-bridge@1` | SIP → interactive WebRTC/WSS | Compile gate + `browser_and_vapi_like_sips_to_wss_are_full_duplex_and_clean_both_hangup_directions` (`qualification_generic_wss.rs`) | No |
+| `webrtc-sip-bridge@1` | Browser WebRTC → SIP | Compile gate + `direct_browser_to_named_generic_sips_qualifies_pcmu_pcma_context_and_cleanup`, plus real SRTP/transcoding/DTMF packet-path coverage in `generic_sip_reference.rs` | No |
+
+**What "compile gate" attests.** `tests/recipe_matrix.rs` compiles each recipe
+from its own published example values into a bridge graph, pins that graph to a
+recorded fingerprint, proves the compile is deterministic, and rejects unknown
+inputs, missing required inputs, and out-of-enum `sip_security`. It also drives
+the `recipe` CLI and validates the exact production configuration the downstream
+AMI ships. It places no call, moves no media, and contacts no provider — it is a
+configuration-contract gate.
+
+**What the hermetic tests attest.** Real full-duplex media, SRTP, DTMF,
+transcoding, hangup in both directions, and leak-free cleanup, against in-process
+peers rather than mocks.
+
+**The gap between them.** The hermetic tests drive named low-level routes, not
+the recipe path. So "this recipe compiles to this bridge graph" and "this
+transport pair carries a real call" are each tested, but their composition is
+not tested end to end. Closing that — running a compiled recipe through a live
+call — is what moves a recipe from `preview` toward `supported`.
+
 ## Local development
 
 Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.8`;
