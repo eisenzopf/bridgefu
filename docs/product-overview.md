@@ -26,9 +26,12 @@ This document concentrates on Bridgefu's two intended product workflows:
    with Amazon Connect.
 
 Bridgefu also contains generic SIP/WebRTC routing, Telnyx control, UCTP and
-MOQT broadcasts, clustered process roles, and deployment work. Those are real
-capabilities, but they are not prerequisites for understanding these two
-workflows.
+MOQT broadcasts, and clustered process roles. These are implemented and
+unit-tested, but none of them has been deployed: the only configuration ever
+run in production is a single all-in-one instance on SQLite. UCTP and MOQT
+end-to-end qualification is manual-only and does not run in CI. See the
+deployment status table in the repository README before relying on any of
+them.
 
 ## The actors and their responsibilities
 
@@ -332,7 +335,7 @@ wire contract and API.
 | Hangup | Either terminal leg converges the other leg and owned external resources toward cleanup. |
 | SIP transfer | Authoritative SIP `REFER`/`NOTIFY` semantics are separate from server-controlled leg replacement. |
 | Replacement | One stable logical destination leg is rebound to a new server-owned endpoint generation. |
-| Persistence | SQLite is the normal all-in-one backend; PostgreSQL plus Redis supports role separation and clustered coordination. Memory is explicit dev/test-only state. |
+| Persistence | SQLite is the all-in-one backend and the only one ever deployed. PostgreSQL plus Redis is required for the gateway/worker split; that topology has conformance tests but no deployment evidence. Memory is explicit dev/test-only state. |
 
 ## Runtime components
 

@@ -157,71 +157,19 @@ The report deliberately sets `release_criterion_satisfied` to `false`: this
 smoke does not place a carrier call, exchange public media/context, exercise a
 deployed relay, run release-scale load, or apply cloud infrastructure.
 
-## Cloud modules
+## What is not here
 
-`terraform/aws` and `terraform/gcp` are intentionally modules: callers own
-state backends, DNS, certificate issuance, organization policies, and secret
-values. Copy each module's `terraform.tfvars.example` and replace every
-placeholder. The AWS module rejects tagged images and exposes the security
-group that must be attached to every instance in the supplied ECS capacity
-provider. The GCP module references an existing Secret Manager secret so its
-contents are not copied into Terraform state. Its init containers fetch the
-Redis URL and private CA into a memory-backed volume, build the combined trust
-bundle, and pass only file paths to the shell-free Bridgefu workload. Existing
-`env:BRIDGEFU_REDIS_URL` config references resolve through the standard
-`BRIDGEFU_REDIS_URL_FILE` fallback; a direct environment value still wins.
+There is no deployment driver, cloud module, or systemd unit in this
+repository. `deploy/` builds and verifies the container image; that is all.
 
-Static validation never applies infrastructure. Credentialed smoke tests must
-use disposable projects/accounts and run `terraform destroy` even after a
-failed assertion. Ordinary CI builds each architecture natively, generates an
-independent SPDX SBOM, and rejects HIGH or CRITICAL vulnerabilities.
+The one production-qualified deployment -- a Vapi SIP transfer into Amazon
+Connect with a correlated agent screen pop -- is maintained in
+[bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect).
+That repository pins an immutable Bridgefu commit, compiles the binary natively
+inside a Packer AMI build, and ships it with CloudFormation. It does not use
+this image, this directory, or anything else under `deploy/`.
 
-One combined digest is assembled only by the manual
-`release-image-candidate.yml` workflow. Configure required reviewers on its
-`bridgefu-release-image-candidate` environment before treating a run as
-authorized evidence. GitHub accepts `workflow_dispatch` only after the workflow
-definition exists on the default branch, so the owner-reviewed candidate must
-first land on `main`; pushing a candidate branch alone does not make this gate
-runnable. Dispatch the landed workflow with that exact 40-character candidate
-commit. The workflow builds the exact crates.io dependency graph recorded in
-its `Cargo.lock`; it has
-read-only repository permission, has no package or OIDC publication permission,
-and always uses `push: false`. It retains one OCI layout containing
-`linux/amd64` and `linux/arm64`; BuildKit embeds SPDX SBOM and SLSA provenance
-statements. The verifier accepts only the layout root or one top-level image
-index (never a reachable child manifest), verifies every blob, binds each
-statement to its exact platform manifest, and requires both predicates for
-both platforms. Trivy scans minimal exact-platform layouts derived from that
-same archive, and the retained policy report rejects HIGH or CRITICAL findings.
-These BuildKit statements are registry-compatible build evidence, not a signed
-public provenance record. Publishing the image or an external attestation
-requires separate owner authorization.
-
-## systemd host mode
-
-`bridgefu.service` retains host networking for the explicit RTP range but uses
-the same nonroot, read-only, capability-free container contract. Before
-starting it, install the configuration and an immutable image reference:
-
-```sh
-install -m 0600 bridgefu.yaml /etc/bridgefu/bridgefu.yaml
-install -m 0600 bridgefu-runtime.env /etc/bridgefu/runtime.env
-printf '%s\n' 'BRIDGEFU_IMAGE=registry.example/bridgefu@sha256:…' \
-  > /etc/bridgefu/image.env
-systemctl daemon-reload
-systemctl enable --now bridgefu
-```
-
-`RUNTIME_ENV` carries `env:` secret references into the container without
-embedding values in the YAML or the image; install it mode 0600. Pin
-`BRIDGEFU_IMAGE` to an immutable digest — never a floating tag.
-
-There is no deployment driver in this repository. The legacy `deploy.sh`
-single-host path was removed; build an image from `deploy/Dockerfile` and ship
-it with whatever orchestration you already run, or use the cloud modules above.
-
-For the production-qualified Vapi -> Amazon Connect path, do not assemble this
-by hand: the customer CloudFormation template, Packer AMI build, Lambdas, Vapi
-provisioning, and live qualification harness are maintained in
-[bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect),
-which pins an immutable Bridgefu commit and builds the AMI from it.
+If you are deploying Bridgefu yourself, build the image from
+`deploy/Dockerfile` and run it with whatever orchestration you already have.
+Bridgefu has only ever been operated as a **single all-in-one instance**; see
+[docs/recipes.md](../docs/recipes.md) for what is and is not proven.

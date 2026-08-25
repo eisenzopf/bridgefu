@@ -16,10 +16,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: bridgefu
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
-        with:
-          terraform_version: 1.15.6
-          terraform_wrapper: false
       - name: Validate versioned configuration schema and example
         working-directory: bridgefu
         run: |
@@ -32,19 +28,6 @@ jobs:
           for profile in reference-tenant generic telnyx uctp moqt cluster; do
             docker compose --profile "${profile}" config --quiet
           done
-      - name: Terraform formatting
-        working-directory: bridgefu
-        run: terraform fmt -check -recursive deploy/terraform
-      - name: Validate AWS Terraform without applying
-        working-directory: bridgefu/deploy/terraform/aws
-        run: |
-          terraform init -backend=false -input=false
-          terraform validate -no-color
-      - name: Validate GCP Terraform without applying
-        working-directory: bridgefu/deploy/terraform/gcp
-        run: |
-          terraform init -backend=false -input=false
-          terraform validate -no-color
       - name: Static release-image policy
         working-directory: bridgefu
         run: |

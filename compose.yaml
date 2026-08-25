@@ -101,7 +101,12 @@ services:
       <<: *bridgefu-environment
       BRIDGEFU__BROADCAST__DEFAULT_TRANSPORT: moqt
 
-  # Local clustered topology. TLS material is caller-owned: mount a directory
+  # Local clustered topology. UNPROVEN: this gateway/worker/moq-relay split has
+  # never been deployed. It exists so the distributed code has a local harness
+  # and so CI can validate it; the shipped product is a single all-in-one
+  # instance on SQLite. See the deployment status table in README.md.
+  #
+  # TLS material is caller-owned: mount a directory
   # containing ca.crt, redis.{crt,key}, gateway.{crt,key},
   # public-uctp.{crt,key}, public-api.{crt,key}, and worker.{crt,key} via
   # BRIDGEFU_TLS_DIR. The public-api identity also terminates WSS/WHIPS. This

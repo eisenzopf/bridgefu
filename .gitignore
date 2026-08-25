@@ -45,22 +45,18 @@ __pycache__/
 # config/bridgefu.example.yaml, not the real one.
 /bridgefu.yaml
 
-# Terraform — never commit local state (may contain sensitive values), the
-# provider plugin cache (huge), crash logs, or your real tfvars. The only
-# Terraform in this repo is the provider-neutral deploy/terraform/{aws,gcp}
-# cluster modules.
-/deploy/terraform/*/.terraform/
+# There is no Terraform in this repository any more; deployment lives in
+# eisenzopf/bridgefu-vapi-awsconnect. These stay as a guard so a local
+# experiment can never commit state or real variable values.
 .terraform/
 *.tfstate
 *.tfstate.*
 *.tfvars
 *.tfvars.json
 !*.tfvars.example
-!*.tfvars.json.example
 crash.log
 .vscode
 crash.*.log
-# Keep .terraform.lock.hcl tracked (provider pinning) and tfvars.example tracked.
 
 # Output from the repository README's recipe-init walkthrough. It contains
 # operator-filled deployment values and must never become repository source.

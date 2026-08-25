@@ -50,6 +50,30 @@ builds the customer AMIs from it.
 Every SIPS recipe uses one-use managed attachment URIs and a DNS `sips:`
 Contact. Bridgefu does not silently downgrade signaling from TLS.
 
+## Deployment status
+
+Bridgefu has been operated in production in exactly **one** configuration:
+
+- a **single all-in-one instance** (`runtime.mode: all-in-one`),
+- SQLite persistence on local disk,
+- running the `vapi-amazon-connect-screen-pop` recipe,
+- deployed by [bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect)
+  as one EC2 instance, dual-region qualified with signed live-call evidence.
+
+Everything else in this repository is implemented and unit-tested, but **has
+never been deployed**:
+
+| Capability | Status |
+|---|---|
+| Single all-in-one instance, SQLite | **Proven.** Live dual-region qualification evidence |
+| Gateway/worker split, PostgreSQL + Redis coordination, private egress | Implemented; conformance tests run against real PostgreSQL 17 and Redis 7.2 in CI. Never deployed |
+| Telnyx call control | Implemented; hermetic tests only. No live carrier evidence |
+| UCTP fanout, MOQT relay | Implemented; end-to-end qualification is **manual-only and does not run in CI**. Treat as experimental |
+
+Multi-node operation is unproven. The `cluster` Compose profile exists so the
+gateway/worker code has a local harness, not because that topology has been
+run in anger.
+
 ## Local development
 
 Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.8`;

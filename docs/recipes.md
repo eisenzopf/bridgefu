@@ -35,9 +35,11 @@ works, which is what the promotion blocker column below tracks.
 | `browser-vapi-to-contact-center` | Vapi-managed browser WebRTC | SIP/RTP, SIPS/SRTP, or Amazon Connect WebRTC | Development | Not yet an embedded recipe. Needs a manifest before it can be compiled or tested at all. |
 | `genesys-webrtc-bridge` | SIP/RTP or SIPS/SRTP | Genesys WebRTC | Roadmap | Not implemented. Needs a Genesys destination adapter in the call engine first. |
 
-Telnyx, WHIP/WHEP, UCTP, MOQT, and generic WSS capabilities remain available
-through expert configuration at their published development/preview status.
-They are not part of the first promoted recipe matrix.
+Telnyx, WHIP/WHEP, UCTP, MOQT, and generic WSS remain available through expert
+configuration, but none is part of the promoted recipe matrix and none has been
+deployed. UCTP and MOQT end-to-end qualification is manual-only and does not run
+in CI. The deployment status table in the repository README states exactly what
+has and has not been run in production.
 
 ### Testing a recipe locally
 

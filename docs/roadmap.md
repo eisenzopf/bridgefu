@@ -5,8 +5,11 @@ Every gate remains incomplete until its exit criteria have executable evidence.
 Documentation, Terraform, or API scaffolding alone does not complete a gate.
 
 > **Partially superseded.** Sections describing AWS CloudFormation, AMI builds,
-> Lambda packaging, Vapi provisioning, live customer qualification, or a
-> single-host `terraform apply` deploy no longer describe this repository.
+> Lambda packaging, Vapi provisioning, live customer qualification, a
+> single-host `terraform apply` deploy, or the `deploy/terraform` AWS/GCP cloud
+> modules no longer describe this repository. Those modules were validated but
+> never applied to anything, and have been removed; dated evidence entries below
+> that cite them are retained as a historical record, not as current state.
 > Deployment of the Vapi to Amazon Connect recipe moved to
 > [bridgefu-vapi-awsconnect](https://github.com/eisenzopf/bridgefu-vapi-awsconnect),
 > and the legacy single-host path was removed. Bridgefu owns the runtime and the

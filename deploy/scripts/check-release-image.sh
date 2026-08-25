@@ -111,11 +111,8 @@ grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" "$dockerfile"
 grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.8"' "$dockerfile"
-grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" deploy/vapi-feasibility/Dockerfile
-grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' deploy/vapi-feasibility/Dockerfile
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.3\.8"' deploy/vapi-feasibility/Dockerfile
 grep -Eq 'dockerfile: deploy/Dockerfile' compose.yaml
-if grep -Eq 'additional_contexts:' compose.yaml deploy/vapi-feasibility/compose.local.yaml; then
+if grep -Eq 'additional_contexts:' compose.yaml; then
   echo "Compose must build from the Bridgefu context alone" >&2
   exit 1
 fi
@@ -143,34 +140,8 @@ grep -Fq "docker inspect --format '{{json .Config.Healthcheck.Test}}'" \
 # directly. Shell-based startup and curl healthchecks cannot work in the final
 # stage and would make a successfully built image undeployable.
 grep -Fq 'test: [CMD, /usr/local/bin/bridgefu, healthcheck, --path, /readyz]' compose.yaml
-grep -Fq 'command     = ["CMD", "/usr/local/bin/bridgefu", "healthcheck"' \
-  deploy/terraform/aws/main.tf
 
-gcp_bridgefu_commands=$(grep -Fc 'command = ["/usr/local/bin/bridgefu"]' \
-  deploy/terraform/gcp/kubernetes.tf)
-if [ "$gcp_bridgefu_commands" -ne 3 ]; then
-  echo "every GCP Bridgefu workload must use the direct distroless entrypoint" >&2
-  exit 1
-fi
-if grep -Fq 'exec /usr/local/bin/bridgefu' deploy/terraform/gcp/kubernetes.tf; then
-  echo "GCP Bridgefu workloads must not depend on a shell wrapper" >&2
-  exit 1
-fi
-gcp_redis_file_refs=$(grep -Fc 'name  = "BRIDGEFU_REDIS_URL_FILE"' \
-  deploy/terraform/gcp/kubernetes.tf)
-gcp_ca_file_refs=$(grep -Fc 'name  = "SSL_CERT_FILE"' \
-  deploy/terraform/gcp/kubernetes.tf)
-gcp_ca_bundles=$(grep -Fc '> /run/bridgefu-secrets/ca-bundle.pem' \
-  deploy/terraform/gcp/kubernetes.tf)
-if [ "$gcp_redis_file_refs" -ne 3 ] || [ "$gcp_ca_file_refs" -ne 3 ] || \
-  [ "$gcp_ca_bundles" -ne 3 ]; then
-  echo "GCP Bridgefu workloads must receive file-backed Redis and CA secrets" >&2
-  exit 1
-fi
-# Kubernetes, not this shell, expands the worker pod-name variable.
-# shellcheck disable=SC2016
-grep -Fq 'args    = ["--config", "/run/bridgefu-secrets/$(BRIDGEFU_CONFIG_NAME).yaml", "run"]' \
-  deploy/terraform/gcp/kubernetes.tf
+# Secrets reach the process by file-backed reference, never inline.
 grep -Fq 'let path_variable = format!("{name}_FILE");' src/secret_ref.rs
 
 grep -Eq '^          sbom: true$' "$release_workflow"
@@ -189,8 +160,7 @@ if grep -Eq '^  multiarch-image:$' .github/workflows/ci.yml; then
 fi
 if grep -Eiq \
   'rvoip_revision|RVOIP_REVISION|RVOIP_DIR|repository:[[:space:]]*eisenzopf/rvoip|--build-context[[:space:]]+rvoip|build-contexts:[[:space:]]*rvoip|COPY --from=rvoip|FROM scratch AS rvoip|rvoip\.revision|[.][.]/rvoip' \
-  deploy/Dockerfile deploy/vapi-feasibility/Dockerfile \
-  compose.yaml deploy/vapi-feasibility/compose.local.yaml \
+  deploy/Dockerfile compose.yaml \
   .github/workflows/ci.yml "$release_workflow" \
   deploy/scripts/runtime-smoke.py; then
   echo "build and release infrastructure still references a sibling rvoip checkout or revision" >&2
@@ -322,16 +292,6 @@ if missing:
 PY
 grep -Eq 'runtime-smoke\.py' .github/workflows/ci.yml
 grep -Eq 'bridgefu-runtime-smoke-' .github/workflows/ci.yml
-grep -Eq '^EnvironmentFile=/etc/bridgefu/image.env$' deploy/bridgefu.service
-grep -Eq -- '--read-only' deploy/bridgefu.service
-grep -Eq -- '--user 65532:65532' deploy/bridgefu.service
-grep -Eq -- '--env-file /etc/bridgefu/runtime.env' deploy/bridgefu.service
-grep -Eq '\$\{BRIDGEFU_IMAGE\}' deploy/bridgefu.service
-if grep -q 'bridgefu:latest' deploy/bridgefu.service; then
-  echo "systemd unit must not use a floating image tag" >&2
-  exit 1
-fi
-
 bash -n deploy/scripts/*.sh
 
 while IFS= read -r image; do

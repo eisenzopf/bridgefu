@@ -57,8 +57,9 @@ media route remain alive until the worker's exact generation-bound ACK is
 durable. Source loss provides the fallback cleanup when that ACK can no longer
 arrive.
 
-Gateway and worker process roles now install this protocol for configured SIP
-and WebRTC egress. The durable call supervisor uses it for initial destinations
+Gateway and worker process roles install this protocol for configured SIP and
+WebRTC egress. This split-role topology has never been deployed; the shipped
+product runs a single all-in-one instance. The durable call supervisor uses it for initial destinations
 and generation-fenced make-before-break replacement, while clustered gateway
 state, replay, and lifecycle journals use Redis. Hermetic real-network tests
 cover authenticated WHIP ingress, SIP and WSS egress, full-duplex media and
