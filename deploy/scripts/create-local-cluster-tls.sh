@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-destination="${1:?usage: create-local-redis-tls.sh DESTINATION}"
+destination="${1:?usage: create-local-cluster-tls.sh DESTINATION}"
 mkdir -p "$destination"
 destination=$(cd "$destination" && pwd)
 work=$(mktemp -d)

@@ -92,8 +92,8 @@ cluster profile can become healthy. This profile is an integration topology,
 not a production security boundary.
 
 ```sh
-deploy/scripts/create-local-redis-tls.sh /tmp/bridgefu-redis-tls
-BRIDGEFU_TLS_DIR=/tmp/bridgefu-redis-tls \
+deploy/scripts/create-local-cluster-tls.sh /tmp/bridgefu-cluster-tls
+BRIDGEFU_TLS_DIR=/tmp/bridgefu-cluster-tls \
   docker compose --profile cluster config --quiet
 ```
 
