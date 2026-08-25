@@ -71,3 +71,12 @@ terraform/terraform.tfvars
 
 # NOTE: Cargo.lock IS committed — bridgefu is a binary and we want reproducible
 # builds (deploy.sh ships it; the Dockerfile relies on it for the MSRV-pinned tree).
+
+# Stale local caches from the pre-split layout. The Lambda, Terraform, and
+# qualification sources for vapi-amazon-connect-screen-pop now live in
+# eisenzopf/bridgefu-vapi-awsconnect. Only recipe.yaml and values.example.yaml
+# belong here — both are include_str!'d into the binary.
+/recipes/*/lambda/
+/recipes/*/runtime/
+/recipes/*/tests/
+/recipes/*/terraform/
