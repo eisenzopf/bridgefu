@@ -6,7 +6,10 @@ separate rvoip checkout or named build context is required. The image runs as
 UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
 bases are pinned to multi-platform manifest digests. Builder packages come from
 an immutable Debian snapshot with explicit top-level package versions. The
-final stage is the package-manager-free distroless Debian 13 `cc` runtime: it
+final stage uses pinned Distroless Debian 13 `base-nossl`, with only GCC/C++
+runtime libraries, package metadata, and licenses copied from a separately
+pinned `cc` image. Bridgefu uses Rustls; the unused OpenSSL, zlib, and zstd
+packages are omitted rather than exempted from vulnerability scanning. It
 contains no shell or curl, and `bridgefu healthcheck` probes `/livez` without
 loading configuration or secrets. `Cargo.lock` registry checksums, the Bridgefu
 source revision, commit-derived build date, and `SOURCE_DATE_EPOCH` complete the

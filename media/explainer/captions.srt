@@ -1,0 +1,29 @@
+1
+00:00:00,300 --> 00:00:10,200
+Voice apps speak different languages. Your browser uses WebRTC. Your
+phone system uses SIP. And your AI assistant needs to reach a human.
+
+2
+00:00:10,520 --> 00:00:21,570
+Bridgefu connects those worlds. It's a Rust media gateway built on
+rvoip. Two call legs. One bridge for bidirectional audio, keypad
+tones, and explicitly allowed context.
+
+3
+00:00:21,890 --> 00:00:28,840
+Bridgefu handles protocol boundaries and converts codecs when needed,
+so each side can keep its own stack.
+
+4
+00:00:29,160 --> 00:00:37,310
+One reference workflow connects a Vapi SIP transfer to Amazon Connect,
+carrying a correlation ID for an agent screen pop.
+
+5
+00:00:37,630 --> 00:00:45,230
+Define a route, choose a declarative recipe, and try an encrypted SIP
+to WebRTC call locally.
+
+6
+00:00:45,550 --> 00:00:50,000
+Bridgefu. Connect anything. Start with the local demos on GitHub.

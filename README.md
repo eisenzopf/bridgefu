@@ -13,6 +13,10 @@ audio, DTMF, and explicitly allowed context between them. It is built on
 SIP, WebRTC, provider call control, and contact-center systems without making
 either side understand the other.
 
+[![Watch the 51-second Bridgefu explainer](media/explainer/scene-2.png)](media/explainer/bridgefu-explainer.mp4)
+
+[Watch the explainer (MP4)](media/explainer/bridgefu-explainer.mp4) · [English captions](media/explainer/captions.srt)
+
 The first product-qualified deployment target is a Vapi SIP transfer into
 Amazon Connect with a correlated agent screen pop:
 
@@ -56,7 +60,15 @@ For complete configurable Vapi → Amazon Connect setups, see the
 
 ## Try SIP ↔ WebRTC locally
 
-Run a real encrypted call with automated peers and no cloud account:
+With [Rust 1.95+, a C/C++ toolchain, and protobuf installed](examples/native-sip-webrtc/README.md#start-with-the-local-demo), run this **one line from the repository root**:
+
+```sh
+cargo run --locked --example native-sip-webrtc -- --settings examples/sip-to-webrtc/settings.example.json
+```
+
+It makes a real encrypted SIP → WebRTC call, verifies audio both ways, prints
+**PASS**, and stops all demo endpoints. No cloud account or credentials are needed.
+The first build can take several minutes. Change settings or try the reverse direction:
 
 - [SIP caller → WebRTC service](examples/sip-to-webrtc/README.md)
 - [WebRTC caller → SIP destination](examples/webrtc-to-sip/README.md)

@@ -38,3 +38,6 @@ deploy/*.tar.gz
 **/*.tfvars
 **/*.tfvars.json
 bridgefu-vapi-connect/
+
+# Documentation video and production assets are not runtime build inputs.
+media/

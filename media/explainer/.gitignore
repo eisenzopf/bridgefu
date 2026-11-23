@@ -1,0 +1,8 @@
+# Local preview and verification outputs; the README thumbnail is versioned.
+__pycache__/
+scene-*.png
+!scene-2.png
+storyboard.jpg
+export-check.jpg
+transcript-check.json
+verification.json

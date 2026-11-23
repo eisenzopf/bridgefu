@@ -2,6 +2,13 @@
 
 ## 0.9.1 — 2026-11-23
 
+- Add a narrated developer explainer with captions and a directly runnable
+  one-line encrypted SIP-to-WebRTC demo in the README.
+
+- Refresh the pinned Distroless runtime and omit unused OpenSSL/compression
+  libraries. Preserve GCC/C++ package metadata and licenses so both native
+  image builds continue to receive complete vulnerability checks.
+
 - Add runnable native SIP → WebRTC and WebRTC → SIP examples, editable recipes,
   deployment templates, a local browser caller/backend, and an eight-call
   encrypted protocol test matrix. No customer context fields are required.

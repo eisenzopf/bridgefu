@@ -118,6 +118,16 @@ cargo test --locked --test coordination_sql --test redis_coordination \
 
 Stop the isolated instances afterward. These checks use synthetic data.
 
+## Hosted release image refresh
+
+The November 23 scan found five HIGH findings in the old pinned runtime base.
+The latest `cc` image still contained two unfixed OpenSSL QUIC findings.
+The release now uses pinned Distroless `base-nossl`, with GCC/C++ libraries,
+Debian package metadata, and licenses copied from a pinned `cc` stage.
+Bridgefu's Cargo graph uses Rustls and contains no `openssl-sys` dependency.
+The protected native build, execution, SBOM, and vulnerability checks must pass
+on both architectures; the severity threshold is unchanged.
+
 ## Live evidence and remaining release gate
 
 Both actual Vapi → Bridgefu → Connect recipes passed on November 20. See
