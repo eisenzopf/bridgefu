@@ -33,6 +33,13 @@ for ignored_path in \
   '.claude/' \
   '.vscode/' \
   '**/node_modules/' \
+  '**/.local/' \
+  '**/.venv/' \
+  '**/settings.local.json' \
+  '**/target/' \
+  '**/*.tfvars' \
+  '**/*.tfvars.json' \
+  'bridgefu-vapi-connect/' \
   '**/.terraform/' \
   '**/*.tfstate' \
   '**/*.tfstate.*' \
@@ -72,9 +79,9 @@ for ignored_path in \
 done
 
 # The canonical image must use immutable multi-platform base manifests.
-base_args=$(grep -Ec '^ARG (RUST_IMAGE|RUNTIME_IMAGE)=.+@sha256:[0-9a-f]{64}$' "$dockerfile")
-if [ "$base_args" -ne 2 ]; then
-  echo "release Dockerfile must pin both base manifest digests" >&2
+base_args=$(grep -Ec '^ARG (RUST_IMAGE|CC_IMAGE|RUNTIME_IMAGE)=.+@sha256:[0-9a-f]{64}$' "$dockerfile")
+if [ "$base_args" -ne 3 ]; then
+  echo "release Dockerfile must pin all three base manifest digests" >&2
   exit 1
 fi
 snapshot_args=$(grep -Ec '^ARG BUILDER_DEBIAN_SNAPSHOT=[0-9]{8}T[0-9]{6}Z$' "$dockerfile")
@@ -86,8 +93,14 @@ if grep -Eq '^ARG RUNTIME_DEBIAN_SNAPSHOT=' "$dockerfile"; then
   echo "distroless release runtime must not carry a Debian package snapshot" >&2
   exit 1
 fi
-grep -Eq '^ARG RUNTIME_IMAGE=gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}$' \
+grep -Eq '^ARG RUNTIME_IMAGE=gcr\.io/distroless/base-nossl-debian13:nonroot@sha256:[0-9a-f]{64}$' \
   "$dockerfile"
+grep -Eq '^ARG CC_IMAGE=gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}$' \
+  "$dockerfile"
+grep -Fq 'COPY --from=builder /out/runtime-libs/ /' "$dockerfile"
+for retained_package in libgcc-s1 libstdc++6 gcc-14-base; do
+  grep -Fq "var/lib/dpkg/status.d/${retained_package}*" "$dockerfile"
+done
 grep -Eq 'snapshot\.debian\.org/archive/debian/' "$dockerfile"
 grep -Eq 'snapshot\.debian\.org/archive/debian-security/' "$dockerfile"
 grep -Eq 'build-essential=[^ ]+' "$dockerfile"

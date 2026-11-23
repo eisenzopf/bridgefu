@@ -1,0 +1,51 @@
+config_version: 1
+# Replace documentation addresses and paths with your own deployment values.
+edge:
+  public_host: bridgefu.example.com
+  media_public_addr: 203.0.113.10:0
+  sip_tls:
+    bind: 0.0.0.0:5061
+    advertised_addr: 203.0.113.10:5061
+    certificate_chain: /run/bridgefu/tls/fullchain.pem
+    private_key: env:BRIDGEFU_TLS_PRIVATE_KEY_PATH
+api:
+  enabled: true
+  bearer_token: env:BRIDGEFU_API_BEARER_TOKEN
+  control_hmac_key: env:BRIDGEFU_CONTROL_HMAC_KEY
+  tls:
+    certificate_chain: /run/bridgefu/tls/fullchain.pem
+    private_key: env:BRIDGEFU_TLS_PRIVATE_KEY_PATH
+generic_bridge:
+  webrtc_ws_bind: 0.0.0.0:8443
+  sip:
+    rtp_port_start: 20000
+    rtp_port_end: 20199
+  webrtc:
+    udp_port_range:
+      bind_ip: 0.0.0.0
+      port_start: 20200
+      port_end: 20399
+persistence:
+  backend: sqlite
+  database_url: sqlite://examples/sip-to-webrtc/.local/bridgefu.db
+observability:
+  http_bind: 127.0.0.1:9090
+  log_level: info
+  log_format: json
+runtime:
+  mode: all-in-one
+  max_concurrent_calls: 10
+  setup_timeout_secs: 20
+  media_idle_timeout_secs: 120
+  drain_timeout_secs: 30
+recipe_catalog:
+  paths: [examples/sip-to-webrtc/recipe]
+recipes:
+  support:
+    use: external:example-sip-to-webrtc@1
+    with:
+      sip_signaling_cidrs: [198.51.100.0/24]
+      sip_security: sips_srtp
+      webrtc_signaling_uri: wss://agents.example.com/signaling
+      # Optional destination bearer; omit when the destination does not use one.
+      # webrtc_bearer_token: env:BRIDGEFU_WEBRTC_DESTINATION_TOKEN

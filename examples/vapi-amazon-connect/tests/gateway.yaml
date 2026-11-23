@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable example-test gateway and source builder; no SSH ingress.
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+  HostedZoneId: {Type: String}
+  SipHostname: {Type: String}
+  ConnectInstanceArn: {Type: String}
+  SignalingCidr1: {Type: String}
+  SignalingCidr2: {Type: String}
+Resources:
+  Artifacts:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.248.0.0/24, EnableDnsSupport: true, EnableDnsHostnames: true}
+  InternetGateway: {Type: AWS::EC2::InternetGateway}
+  Attachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.248.0.0/25, MapPublicIpOnLaunch: true}
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: Attachment
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref RouteTable, SubnetId: !Ref Subnet}
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Test TLS SIP and RTP; administration is through SSM only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref SignalingCidr1}
+        - {IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref SignalingCidr2}
+        - {IpProtocol: udp, FromPort: 16384, ToPort: 32767, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: udp, FromPort: 40000, ToPort: 40031, CidrIp: 0.0.0.0/0}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore']
+      Policies:
+        - PolicyName: TestResourcesOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: 's3:GetObject', Resource: !Sub '${Artifacts.Arn}/*'}
+              - {Effect: Allow, Action: 'connect:StartWebRTCContact', Resource: !Sub '${ConnectInstanceArn}/contact-flow/*'}
+              - {Effect: Allow, Action: 'connect:StopContact', Resource: !Sub '${ConnectInstanceArn}/contact/*'}
+              - {Effect: Allow, Action: ['route53:ChangeResourceRecordSets'], Resource: !Sub 'arn:aws:route53:::hostedzone/${HostedZoneId}'}
+              - {Effect: Allow, Action: ['route53:ListHostedZones', 'route53:ListHostedZonesByName'], Resource: '*'}
+              - {Effect: Allow, Action: 'route53:GetChange', Resource: 'arn:aws:route53:::change/*'}
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref Role]}
+  Host:
+    Type: AWS::EC2::Instance
+    DependsOn: Route
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: c7g.2xlarge
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: [!Ref SecurityGroup]
+      IamInstanceProfile: !Ref Profile
+      MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled}
+      BlockDeviceMappings: [{DeviceName: /dev/sda1, Ebs: {VolumeSize: 100, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}}]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-disposable'}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec >/var/log/bridgefu-bootstrap.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y build-essential clang cmake libclang-dev pkg-config protobuf-compiler unzip python3-boto3 certbot python3-certbot-dns-route53
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
+          mkdir -p /opt/bridgefu-src /var/lib/bridgefu /run/bridgefu/tls
+          for attempt in $(seq 1 180); do
+            if python3 -c "import boto3; boto3.client('s3').download_file('${Artifacts}', 'source.tar.gz', '/tmp/source.tar.gz')"; then break; fi
+            sleep 10
+          done
+          tar -xzf /tmp/source.tar.gz -C /opt/bridgefu-src
+          cd /opt/bridgefu-src
+          /root/.cargo/bin/cargo build --locked --release -j 4 >/var/log/bridgefu-build.log 2>&1
+          install -m755 target/release/bridgefu /usr/local/bin/bridgefu
+          certbot certonly --dns-route53 --agree-tos --register-unsafely-without-email --non-interactive -d '${SipHostname}'
+          cp '/etc/letsencrypt/live/${SipHostname}/fullchain.pem' /run/bridgefu/tls/fullchain.pem
+          cp '/etc/letsencrypt/live/${SipHostname}/privkey.pem' /run/bridgefu/tls/private-key.pem
+          chmod 600 /run/bridgefu/tls/private-key.pem
+          touch /var/lib/bridgefu/build-ready
+  Address:
+    Type: AWS::EC2::EIP
+    Properties: {Domain: vpc}
+  AddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties: {AllocationId: !GetAtt Address.AllocationId, InstanceId: !Ref Host}
+  Dns:
+    Type: AWS::Route53::RecordSet
+    Properties: {HostedZoneId: !Ref HostedZoneId, Name: !Ref SipHostname, Type: A, TTL: '60', ResourceRecords: [!Ref Address]}
+Outputs:
+  InstanceId: {Value: !Ref Host}
+  PublicIp: {Value: !Ref Address}
+  ArtifactBucket: {Value: !Ref Artifacts}
+  SipHostname: {Value: !Ref SipHostname}

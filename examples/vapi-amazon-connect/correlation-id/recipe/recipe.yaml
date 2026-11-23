@@ -1,0 +1,44 @@
+api_version: bridgefu.dev/recipe/v1
+kind: bridge_recipe
+metadata:
+  name: vapi-connect-correlation-id
+  version: 1
+  title: 'Vapi to Connect: correlation-id'
+  support: custom
+inputs:
+  signaling_cidrs:
+    type: cidr_list
+    required: true
+  connect_instance_arn:
+    type: aws_arn
+    required: true
+  contact_flow_id:
+    type: aws_connect_resource_id
+    required: true
+  sip_security:
+    type: enum
+    values:
+    - sips_srtp
+    - sips_optional_srtp
+    default: sips_srtp
+spec:
+  bridges:
+    handoff:
+      source:
+        type: sip
+        security:
+          $input: sip_security
+        admission:
+          mode: stable_uri
+          uri_user: support
+          trusted_cidrs:
+            $input: signaling_cidrs
+      destination:
+        type: amazon_connect
+        media: webrtc
+        instance_arn:
+          $input: connect_instance_arn
+        contact_flow_id:
+          $input: contact_flow_id
+        context_metadata_keys:
+        - handoff_id

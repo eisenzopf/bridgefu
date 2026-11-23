@@ -29,3 +29,15 @@ __pycache__/
 *.log
 /etc/
 deploy/*.tar.gz
+
+# Private recipe state and local tooling must never enter image layers.
+**/.local/
+**/.venv/
+**/settings.local.json
+**/target/
+**/*.tfvars
+**/*.tfvars.json
+bridgefu-vapi-connect/
+
+# Documentation video and production assets are not runtime build inputs.
+media/

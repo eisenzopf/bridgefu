@@ -1,0 +1,124 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "lookup",
+  "Metadata": {
+    "entryPointPosition": {
+      "x": 40,
+      "y": 40
+    },
+    "ActionMetadata": {}
+  },
+  "Actions": [
+    {
+      "Identifier": "lookup",
+      "Type": "InvokeLambdaFunction",
+      "Parameters": {
+        "LambdaFunctionARN": "${LookupFunction.Arn}",
+        "InvocationTimeLimitSeconds": "8",
+        "ResponseValidation": {
+          "ResponseType": "STRING_MAP"
+        }
+      },
+      "Transitions": {
+        "NextAction": "check-result",
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingError",
+            "NextAction": "missing"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "check-result",
+      "Type": "Compare",
+      "Parameters": {
+        "ComparisonValue": "$.External.handoff_status"
+      },
+      "Transitions": {
+        "NextAction": "missing",
+        "Conditions": [
+          {
+            "NextAction": "attributes",
+            "Condition": {
+              "Operator": "Equals",
+              "Operands": [
+                "found"
+              ]
+            }
+          }
+        ],
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingCondition",
+            "NextAction": "missing"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "attributes",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "TargetContact": "Current",
+        "Attributes": {
+          "customer_session": "$.External.customer_session",
+          "vapi_reference": "$.External.vapi_reference",
+          "customer_intent": "$.External.customer_intent",
+          "conversation_summary": "$.External.conversation_summary",
+          "handoff_status": "found"
+        }
+      },
+      "Transitions": {
+        "NextAction": "target",
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingError",
+            "NextAction": "target"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "missing",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "TargetContact": "Current",
+        "Attributes": {
+          "handoff_status": "unavailable"
+        }
+      },
+      "Transitions": {
+        "NextAction": "target",
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingError",
+            "NextAction": "target"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "target",
+      "Type": "TransferToFlow",
+      "Parameters": {
+        "ContactFlowId": "${TargetContactFlowArn}"
+      },
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingError",
+            "NextAction": "disconnect"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "disconnect",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}

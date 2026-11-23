@@ -70,9 +70,10 @@ SIP, interactive WebRTC, and Amazon Connect WebRTC endpoint shapes. SIP source
 admission is explicit:
 
 - `managed_attachment`: recommended; short-lived one-use URI/token.
-- `stable_uri`: fixed Request-URI user for a trusted, authenticated SIP peer.
-  This mode is available only with the explicit clear SIP/RTP compatibility
-  posture; both SIPS modes must use `managed_attachment`.
+- `stable_uri`: fixed Request-URI user with trusted signaling CIDRs. It supports
+  `sip_rtp`, `sips_srtp`, and `sips_optional_srtp`. A fixed URI and network
+  allowlist do not authenticate a particular caller account. See the
+  [configurable Vapi/Connect examples](../examples/vapi-amazon-connect/README.md).
 
 For `stable_uri`, set `uri_user` to one lowercase recipe-owned identifier and
 send the INVITE to that exact user at the configured Bridgefu edge, for
@@ -82,12 +83,17 @@ creates the same durable named-route call and internally consumes the same
 one-use proof used by managed admission. The stable URI never authorizes an
 arbitrary destination, does not bypass profile revisions, and is not returned
 by the route-call API. Repeated SIP operations are isolated with a
-tenant-, recipe-, route-, connection-, and correlation-bound idempotency
-digest.
+tenant-, recipe-, route-, and connection-bound idempotency digest, with
+correlation included when configured.
 
-Use `managed_attachment` unless the upstream SIP product cannot fetch a fresh
-URI before transfer. A minimal custom source fragment for the compatibility
-mode is:
+Use `managed_attachment` for one-use admission. Choose `stable_uri` when the
+upstream product needs a fixed address or the route ingests initial SIP headers.
+For SIP-to-Connect routes, destination `context_metadata_keys` selects the keys
+to copy from `context.allow_headers`; this direct ingestion currently requires
+`stable_uri`. Managed routes receive their initial context through route-call
+creation. A correlation header is required only when the recipe declares it.
+
+A minimal fixed source fragment using clear SIP compatibility mode is:
 
 ```yaml
 source:

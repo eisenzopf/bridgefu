@@ -1,5 +1,7 @@
 # Browser WebRTC to SIP contact center
 
+Start with the [runnable example and setup guide](../../examples/webrtc-to-sip/README.md).
+
 `webrtc-sip-bridge@1` accepts a short-lived, one-use WebRTC attachment and
 originates one fixed SIP destination. It is the starting recipe for a website
 voice experience that transfers to a SIP contact center without letting the

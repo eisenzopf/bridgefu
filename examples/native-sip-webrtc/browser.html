@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bridgefu · Browser to SIP</title>
+<style>
+body { font: 18px/1.6 system-ui, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1.5rem; color: #182331; }
+button { font: inherit; padding: .65rem 1.4rem; margin-right: .5rem; cursor: pointer; }
+#status { background: #f0f4f8; padding: 1rem; border-radius: .5rem; }
+</style>
+<h1>Browser to SIP</h1>
+<p>Press Call, allow microphone access, and answer at your configured SIP destination.</p>
+<button id="call">Call</button><button id="hangup" disabled>Hang up</button>
+<p id="status" role="status">Ready</p><audio id="audio" autoplay></audio>
+<p>The destination is selected by your local app settings. The Bridgefu control token stays in the Python backend.</p>
+<script type="module">
+import { BridgefuWebRtcClient, normalizeBridgefuRouteAttachment } from '/sdk/index.js';
+const call = document.querySelector('#call'), hangup = document.querySelector('#hangup'), status = document.querySelector('#status');
+const client = new BridgefuWebRtcClient({ remoteAudioElement: document.querySelector('#audio') });
+function ready(message) { status.textContent = message; call.disabled = false; hangup.disabled = true; }
+client.on('handoff', ({status: value}) => { status.textContent = value; });
+client.on('reconnectRequired', () => ready('Call ended. Press Call for a new connection.'));
+client.on('error', () => ready('Connection failed. Check the Bridgefu logs and endpoint settings.'));
+call.onclick = async () => {
+  call.disabled = true; status.textContent = 'Connecting…';
+  try {
+    const response = await fetch('/call', {method: 'POST'});
+    if (!response.ok) throw new Error('Call creation failed');
+    const created = await response.json();
+    const leg = created.legs.find(x => x.direction === 'inbound' && x.kind === 'webrtc');
+    const attachment = normalizeBridgefuRouteAttachment(created.attachment, {tenantId: created.tenant_id, callId: created.call_id, legId: leg.leg_id});
+    if (client.state === 'reconnect-required' || client.state === 'failed') await client.reconnect(attachment);
+    else await client.connect(attachment);
+    hangup.disabled = false; status.textContent = 'Connected';
+  } catch (_) { await client.disconnect(); ready('Unable to connect. Check API access, WSS, microphone permission, and SIP destination.'); }
+};
+hangup.onclick = async () => { await client.disconnect(); ready('Call ended'); };
+</script>
+</html>

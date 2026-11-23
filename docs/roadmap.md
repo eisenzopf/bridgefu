@@ -4550,3 +4550,23 @@ rvoip and Bridgefu revisions are release-candidate quality.
 - External provider/cloud evidence requires test credentials supplied through
   secret references; absence of credentials never converts a pending gate into
   a completed one.
+
+## Configurable fixed-SIPS context handoff (2026-11-20)
+
+Unreleased candidate: [setup and examples](../examples/vapi-amazon-connect/README.md).
+Custom recipes accept a configured stable SIPS user and map selected headers
+into the persisted Amazon Connect start specification. The direct-header route
+requires no customer correlation ID or context lookup. The optional correlation
+example stores context and resolves it with a Connect Lambda. Customer field
+names, sources, header mappings, and attributes are defined in example settings;
+the built-in correlation screen-pop recipe retains its existing contract.
+
+Hermetic gates cover strict/optional SRTP configuration projection,
+case-insensitive header mapping, duplicate/invalid/bounded values, trusted ID
+selection, Connect start attributes, audio forwarding, and exact cleanup.
+Both examples also pass a bounded real Vapi native-SIP → Bridgefu → Connect agent
+smoke with exact context, bidirectional audio, and zero retained call capacity.
+The lookup case verifies missing and expired token handling. See the
+[replication guide and results](../examples/vapi-amazon-connect/tests/E2E.md).
+This is not customer QA, strict-SRTP or mTLS qualification, load testing, or a
+published 0.9.1 release. DTMF turn suppression remains a separate Vapi change.

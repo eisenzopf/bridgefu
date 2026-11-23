@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-20",
+  "status": "passed",
+  "path": "Authenticated Vapi US SIP -> fixed Bridgefu SIPS -> Amazon Connect browser agent",
+  "bridgefu": "Unreleased working tree; published 0.9.0 image is not this candidate",
+  "runtime_source_sha256": "bf2cdd6ac6e4b5a054d508c97b6a0c3694d98f102eddfdbc6b94da19b27c0a98",
+  "runtime_source_matches_checkout": true,
+  "fresh_provisioning_passed": true,
+  "clean_python_environment_replay_passed": true,
+  "environment": {
+    "aws_region": "us-west-2",
+    "gateway_architecture": "Linux ARM64",
+    "rust": "1.95.0",
+    "rvoip": "0.3.8",
+    "python": "3.12.4",
+    "boto3": "1.44.8",
+    "pyyaml": "6.0.3",
+    "node": "26.3.0",
+    "playwright": "1.62.1"
+  },
+  "cases": [
+    {
+      "mode": "sip-headers",
+      "date": "2026-11-20",
+      "passed": true,
+      "sip_security_configured": "sips_optional_srtp",
+      "attributes": {
+        "customer_session": true,
+        "vapi_reference": true,
+        "customer_intent": true,
+        "conversation_summary": true
+      },
+      "input_variables": {
+        "customer_session": true
+      },
+      "input_variables_match": true,
+      "agent_connected": true,
+      "contact_disconnected": true,
+      "source_peer_passed": true,
+      "agent_audio": {
+        "incoming": 685,
+        "outgoing": 1049,
+        "dtmfFrames": 404
+      },
+      "source_audio": {
+        "agent_marker_frames_received": 252,
+        "caller_probe_frames_sent": 750
+      },
+      "bidirectional_audio": true,
+      "no_correlation_attribute": true,
+      "all_fields_in_initial_contact": true,
+      "gateway_cleanup": {
+        "active_calls": 0,
+        "reserved_calls": 0,
+        "unreleased_assignments": 0
+      },
+      "gateway_drained": true,
+      "duration_seconds": 44.2
+    },
+    {
+      "mode": "correlation-id",
+      "date": "2026-11-20",
+      "passed": true,
+      "sip_security_configured": "sips_optional_srtp",
+      "attributes": {
+        "customer_session": true,
+        "vapi_reference": true,
+        "customer_intent": true,
+        "conversation_summary": true
+      },
+      "input_variables": {
+        "customer_session": true
+      },
+      "input_variables_match": true,
+      "agent_connected": true,
+      "contact_disconnected": true,
+      "source_peer_passed": true,
+      "agent_audio": {
+        "incoming": 660,
+        "outgoing": 1009,
+        "dtmfFrames": 383
+      },
+      "source_audio": {
+        "agent_marker_frames_received": 251,
+        "caller_probe_frames_sent": 750
+      },
+      "bidirectional_audio": true,
+      "lookup_found": true,
+      "token_only_ingress": true,
+      "missing_token_rejected": true,
+      "expired_token_rejected": true,
+      "gateway_cleanup": {
+        "active_calls": 0,
+        "reserved_calls": 0,
+        "unreleased_assignments": 0
+      },
+      "gateway_drained": true,
+      "duration_seconds": 44.6
+    }
+  ],
+  "additional_live_checks": {
+    "sip-headers_unauthenticated_rejected": true,
+    "correlation-id_unauthenticated_rejected": true,
+    "missing_token_rejected": true
+  },
+  "limitations": [
+    "Native SIP ingress was tested; not a browser webCall transfer.",
+    "TLS signaling required; optional SRTP configured. Strict SRTP and client-certificate mTLS are not qualified.",
+    "Functional smoke only; no load, production resilience, or customer-environment qualification.",
+    "Test durations include speech, probes, and verification; they are not handoff latency measurements.",
+    "The existing Connect-to-Vapi phone/DTMF leg is outside this test."
+  ],
+  "cleanup": {
+    "verified": true,
+    "active_test_stacks": 0,
+    "remaining_test_dns_records": 0,
+    "recorded_vapi_resources_deleted": true
+  }
+}

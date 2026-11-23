@@ -1,0 +1,8 @@
+[
+  "Voice apps speak different languages. Your browser uses Web R T C. Your phone system uses S I P. And your A I assistant needs to reach a human.",
+  "Bridgefu connects those worlds. It's a Rust media gateway built on r-voip. Two call legs. One bridge for bidirectional audio, keypad tones, and explicitly allowed context.",
+  "Bridgefu handles protocol boundaries and converts codecs when needed, so each side can keep its own stack.",
+  "One reference workflow connects a Vapi S I P transfer to Amazon Connect, carrying a correlation I D for an agent screen pop.",
+  "Define a route, choose a declarative recipe, and try an encrypted S I P to Web R T C call locally.",
+  "Bridgefu. Connect anything. Start with the local demos on GitHub."
+]

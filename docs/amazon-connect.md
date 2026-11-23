@@ -1,5 +1,10 @@
 # Amazon Connect setup for bridgefu
 
+For complete, customer-configurable Vapi setups, use the
+[SIP-header and optional correlation-ID examples](../examples/vapi-amazon-connect/README.md).
+The legacy `mapping.rename` guidance below is not sufficient for durable recipe
+routes; those explicitly select keys from `context.allow_headers`.
+
 What the Connect side needs so a Vapi transfer lands on an agent with the screen
 pop populated. bridgefu calls **`StartWebRTCContact`** with the mapped attributes;
 everything below is about making your instance + contact flow consume them.

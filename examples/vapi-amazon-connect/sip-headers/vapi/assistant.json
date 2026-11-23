@@ -1,0 +1,61 @@
+{
+  "name": "Bridgefu sip-headers example",
+  "firstMessage": "Hello. How can I help you today?",
+  "model": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a concise support assistant. Help callers troubleshoot. Transfer when the caller requests a human. When transferring, call transfer_to_support once. Supply only its declared conversation fields, using short, factual, single-line text. IDs and input variables are supplied by the server. Never invent them. A successful tool result means transfer requested, not agent answered. If it fails, continue helping; do not retry automatically."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "async": false,
+        "function": {
+          "name": "transfer_to_support",
+          "description": "Transfer this caller to a human with the configured handoff context.",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "intent": {
+                "type": "string",
+                "maxLength": 128,
+                "description": "Short reason for the human handoff."
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 512,
+                "description": "Brief factual conversation summary, including troubleshooting already attempted."
+              }
+            },
+            "required": [
+              "intent",
+              "summary"
+            ]
+          }
+        },
+        "server": {
+          "url": "https://WEBHOOK_HOST/transfer",
+          "timeoutSeconds": 25,
+          "headers": {
+            "X-Bridgefu-Webhook-Secret": "REPLACE_FROM_STACK_SECRET"
+          }
+        }
+      }
+    ]
+  },
+  "voice": {
+    "provider": "vapi",
+    "voiceId": "Elliot"
+  },
+  "artifactPlan": {
+    "recordingEnabled": false
+  },
+  "keypadInputPlan": {
+    "enabled": false
+  }
+}

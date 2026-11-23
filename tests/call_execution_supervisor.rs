@@ -197,7 +197,10 @@ fn stable_recipe_principal() -> AuthenticatedPrincipal {
     }
 }
 
-fn stable_recipe_catalog(principal: AuthenticatedPrincipal) -> Arc<RecipeSipAdmissionCatalog> {
+fn stable_recipe_catalog(
+    principal: AuthenticatedPrincipal,
+    header_only: bool,
+) -> Arc<RecipeSipAdmissionCatalog> {
     let ingress = NamedProfileBinding::new(
         NamedProfileRole::Ingress,
         NamedProfileKind::SipIngress,
@@ -228,7 +231,28 @@ fn stable_recipe_catalog(principal: AuthenticatedPrincipal) -> Arc<RecipeSipAdmi
             route_id: "stable-support".into(),
             expected_principal: principal,
             profiles: vec![ingress, destination],
-            required_correlation_header: Some("X-Correlation-Id".into()),
+            required_correlation_header: (!header_only).then(|| "X-Correlation-Id".into()),
+            context_headers: if header_only {
+                [
+                    "session-id",
+                    "vapi-call-id",
+                    "intent",
+                    "summary",
+                    "language",
+                    "device",
+                    "caller-number",
+                ]
+                .into_iter()
+                .map(|name| {
+                    (
+                        format!("x-customer-{name}"),
+                        format!("customer_{}", name.replace('-', "_")),
+                    )
+                })
+                .collect()
+            } else {
+                BTreeMap::new()
+            },
             destination: RequestedLeg {
                 direction: LegDirection::Outbound,
                 signaling_initiator: Some(SignalingInitiator::Bridgefu),
@@ -2289,9 +2313,18 @@ fn build_reference_tenant_canary_amazon() -> (
 
 #[tokio::test]
 async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
+    run_stable_recipe_case(false).await;
+}
+
+#[tokio::test]
+async fn stable_recipe_headers_reach_connect_without_correlation_and_bridge_media() {
+    run_stable_recipe_case(true).await;
+}
+
+async fn run_stable_recipe_case(header_only: bool) {
     let owner = stable_recipe_principal();
     let runtime = build_stable_recipe_runtime(owner.clone()).await;
-    let catalog = stable_recipe_catalog(owner.clone());
+    let catalog = stable_recipe_catalog(owner.clone(), header_only);
     let orchestrator = Orchestrator::new(CoreConfig::default());
     let (starter, media, amazon) = build_reference_tenant_canary_amazon();
     let context_policy = ContextPolicy {
@@ -2323,7 +2356,29 @@ async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
         .unwrap();
 
     let connection_id = ConnectionId::new();
-    let metadata = vec![("X-Correlation-Id".into(), "bf1_stable-context-77".into())];
+    let metadata = if header_only {
+        vec![
+            (
+                "X-Customer-Session-Id".into(),
+                "000000000000000000000000000000000000123".into(),
+            ),
+            (
+                "x-customer-vapi-call-id".into(),
+                "11111111-2222-4333-8444-555555555555".into(),
+            ),
+            ("X-CUSTOMER-INTENT".into(), "device_offline".into()),
+            (
+                "x-customer-summary".into(),
+                "Doorbell offline; reboot attempted.".into(),
+            ),
+            ("x-customer-language".into(), "en-US".into()),
+            ("x-customer-device".into(), "doorbell".into()),
+            ("x-customer-caller-number".into(), "+12025550123".into()),
+            ("X-Unlisted".into(), "must-not-pass".into()),
+        ]
+    } else {
+        vec![("X-Correlation-Id".into(), "bf1_stable-context-77".into())]
+    };
     // Observe the deterministic durable call ID without exposing the bearer
     // to the signaling fixture. The supervisor replays this exact operation
     // from the fixed URI and consumes the internal proof itself.
@@ -2367,11 +2422,11 @@ async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
         route
             .context()
             .map(|context| context.correlation_id.as_str()),
-        Some("bf1_stable-context-77")
+        (!header_only).then_some("bf1_stable-context-77")
     );
     assert_eq!(
         route.required_sip_correlation_header(),
-        Some("X-Correlation-Id")
+        (!header_only).then_some("X-Correlation-Id")
     );
     wait_for_active_bridge_count(&orchestrator, 1).await;
 
@@ -2385,8 +2440,22 @@ async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
                 .attributes
                 .get("correlation_id")
                 .map(String::as_str),
-            Some("bf1_stable-context-77")
+            (!header_only).then_some("bf1_stable-context-77")
         );
+        if header_only {
+            assert_eq!(starts[0].attributes.len(), 8);
+            for (header, value) in &metadata[..7] {
+                let key = header
+                    .to_ascii_lowercase()
+                    .replacen("x-customer-", "customer_", 1)
+                    .replace('-', "_");
+                assert_eq!(starts[0].attributes.get(&key), Some(value));
+            }
+            assert!(!starts[0]
+                .attributes
+                .values()
+                .any(|value| value == "must-not-pass"));
+        }
         assert_eq!(
             starts[0]
                 .attributes
@@ -2409,9 +2478,14 @@ async fn stable_recipe_uri_uses_named_route_context_media_and_exact_cleanup() {
     // Duplicate correlation headers fail before a second route call can be
     // reserved or an Amazon contact can be started.
     let duplicate_connection = ConnectionId::new();
+    let duplicate_header = if header_only {
+        "X-Customer-Session-Id"
+    } else {
+        "X-Correlation-Id"
+    };
     let duplicate_metadata: Vec<(String, String)> = vec![
-        ("X-Correlation-Id".into(), "bf1_stable-context-78".into()),
-        ("x-correlation-id".into(), "bf1_stable-context-78".into()),
+        (duplicate_header.into(), "conflict-one".into()),
+        (duplicate_header.to_ascii_lowercase(), "conflict-two".into()),
     ];
     sip.prepare_inbound_with_codec_and_metadata(
         duplicate_connection.clone(),

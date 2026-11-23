@@ -1,0 +1,35 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "target",
+  "Metadata": {
+    "entryPointPosition": {
+      "x": 40,
+      "y": 40
+    },
+    "ActionMetadata": {}
+  },
+  "Actions": [
+    {
+      "Identifier": "target",
+      "Type": "TransferToFlow",
+      "Parameters": {
+        "ContactFlowId": "${TargetContactFlowArn}"
+      },
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [
+          {
+            "ErrorType": "NoMatchingError",
+            "NextAction": "disconnect"
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "disconnect",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}
