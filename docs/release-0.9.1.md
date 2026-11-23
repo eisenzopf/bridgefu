@@ -1,9 +1,9 @@
 # Bridgefu 0.9.1 release checks
 
 Local validation completed on November 23, 2026. The source is prepared for a
-release PR. Push the candidate and pass CI plus the protected image-candidate
-workflow before creating the release tag. No public image or tag is implied by
-this report.
+release PR. Push the candidate and pass all four protected CI checks before
+creating the source release tag. Container publication additionally requires the
+protected image-candidate workflow. This report records validation, not publication.
 
 ## What changed
 
@@ -127,9 +127,14 @@ That report identifies the pre-version-bump source. The final local checks above
 do not claim a new live cloud run. The calls used TLS with optional SRTP;
 strict SRTP, mTLS, load qualification, and customer QA remain outside that evidence.
 
-After pushing the final commit, run CI and dispatch
+After pushing the final commit, pass the protected test, infrastructure, AMD64
+image, and ARM64 image checks and merge the PR. Tag the resulting main commit
+`v0.9.1` for the source release. Like `v0.9.0`, this source release does not
+include a published container image.
+
+Before any separate container publication, dispatch
 [release-image-candidate.yml](../.github/workflows/release-image-candidate.yml)
-with that exact 40-character commit ID. Review the retained amd64/arm64 OCI
-artifact, SBOM, provenance, and vulnerability-policy results. Only then tag
-that same commit `v0.9.1` and publish the reviewed artifact. The candidate
-workflow builds and scans; it does not publish an image.
+with the exact 40-character release commit ID. Review the retained amd64/arm64
+OCI artifact, SBOM, provenance, and vulnerability-policy results. Publish only
+that reviewed artifact. The candidate workflow builds and scans; it does not
+publish an image.

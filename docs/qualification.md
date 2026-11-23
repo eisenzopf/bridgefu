@@ -17,10 +17,11 @@ and fixture cleanup. Its source hash identifies that tested tree, not the final
 SRTP, mTLS, load behavior, or the remaining 1.0 gates.
 
 The [0.9.1 check report](release-0.9.1.md) records local results and repeatable commands.
-Before tagging, run those checks against the final commit and retain the
-protected `linux/amd64,linux/arm64` OCI candidate and vulnerability reports.
-The candidate workflow requires a pushed commit; local checks alone cannot
-substitute for that artifact. No image publication is implied by a version bump.
+Before tagging the source release, pass the protected test, infrastructure,
+AMD64 image, and ARM64 image checks. Container publication additionally requires
+the protected `linux/amd64,linux/arm64` OCI candidate and vulnerability reports.
+Local checks alone cannot substitute for those artifacts. The source release
+does not publish a container image.
 
 ## Historical Bridgefu 0.9.0 customer-preview boundary
 

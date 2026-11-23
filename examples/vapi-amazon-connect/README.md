@@ -21,4 +21,4 @@ After setup:
 - [End-to-end test](tests/E2E.md): reproduce the disposable test and understand its results.
 - [Configuration reference](REFERENCE.md): field sources, validation limits, generated files, and deployment details.
 
-These examples target Bridgefu 0.9.1; build from this checkout until that release is published. They are not included in the published Bridgefu `0.9.0` image. The existing built-in correlation recipe remains available; these examples add two independently configurable routes.
+These examples require Bridgefu 0.9.1 or newer. They are not included in the `0.9.0` source release. The existing built-in correlation recipe remains available; these examples add two independently configurable routes.

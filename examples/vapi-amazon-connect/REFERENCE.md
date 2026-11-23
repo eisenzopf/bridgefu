@@ -13,7 +13,7 @@ These recipes cover the Vapi → Bridgefu → Connect return leg. They assume yo
 
 ## Prerequisites
 
-- Build Bridgefu from this checkout. Bridgefu 0.9.1 includes the fixed-URI TLS and configured header-ingestion changes; the published `0.9.0` image does not include them.
+- Build Bridgefu from this checkout. Bridgefu 0.9.1 includes the fixed-URI TLS and configured header-ingestion changes; the `0.9.0` source release does not include them.
 - An AWS account, an authenticated AWS CLI profile, Python 3.10+, and a Vapi private API key in `VAPI_PRIVATE_KEY`.
 - An existing Amazon Connect instance and published target contact flow in the same AWS region. The target flow handles queuing/agents. The example creates a new entry flow and transfers to your target.
 - A public Bridgefu gateway with DNS, a trusted TLS certificate, its public media IP, and an IAM role allowed to `connect:StartWebRTCContact` on the example entry flow and `connect:StopContact` on that instance's contacts. Use your deployment's normal workload credentials.

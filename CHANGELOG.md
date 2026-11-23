@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.1 — Unreleased
+## 0.9.1 — 2026-11-23
 
 - Add runnable native SIP → WebRTC and WebRTC → SIP examples, editable recipes,
   deployment templates, a local browser caller/backend, and an eight-call
@@ -21,7 +21,7 @@
 - Use generic customer field names in test fixtures and exclude private example
   state, local settings, and Terraform variable files from image build contexts.
 - Update the Rust package and OCI image metadata to 0.9.1. Publication and
-  tagging are pending; the earlier live report describes the pre-version-bump tree.
+  tagging follow the protected CI checks; the earlier live report describes the pre-version-bump tree.
 
 ## Unreleased — crates.io rvoip 0.3.8 and recipe runtime cleanup
 
