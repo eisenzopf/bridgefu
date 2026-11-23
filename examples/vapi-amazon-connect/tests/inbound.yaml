@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Test-only Vapi inbound assistant selector with configurable synthetic input variables.
+Parameters:
+  AssistantId: {Type: String}
+  VariablesJson: {Type: String}
+Resources:
+  Secret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: ReadTestSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref Secret}]
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 5
+      Role: !GetAtt Role.Arn
+      Environment:
+        Variables:
+          ASSISTANT_ID: !Ref AssistantId
+          VARIABLES: !Ref VariablesJson
+          SECRET_ARN: !Ref Secret
+      Code:
+        ZipFile: |
+          import json,os,hmac,boto3
+          cached=None
+          def handler(event,context):
+            global cached
+            if cached is None: cached=boto3.client('secretsmanager').get_secret_value(SecretId=os.environ['SECRET_ARN'])['SecretString']
+            supplied=event.get('headers',{}).get('x-test-secret','')
+            if not hmac.compare_digest(supplied,cached): return {'statusCode':401,'body':'{}'}
+            message=json.loads(event['body']).get('message',{})
+            body={'assistantId':os.environ['ASSISTANT_ID'],'assistantOverrides':{'variableValues':json.loads(os.environ['VARIABLES'])}} if message.get('type')=='assistant-request' else {}
+            return {'statusCode':200,'headers':{'content-type':'application/json'},'body':json.dumps(body)}
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: {Name: !Sub '${AWS::StackName}-input', ProtocolType: HTTP}
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref Api, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt Function.Arn, PayloadFormatVersion: '2.0'}
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: 'POST /start', Target: !Sub 'integrations/${Integration}'}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: {ApiId: !Ref Api, StageName: '$default', AutoDeploy: true}
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: 'lambda:InvokeFunction', FunctionName: !Ref Function, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/start'}
+Outputs:
+  Url: {Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/start'}
+  SecretArn: {Value: !Ref Secret}

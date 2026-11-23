@@ -71,3 +71,8 @@ terraform/terraform.tfvars
 
 # NOTE: Cargo.lock IS committed — bridgefu is a binary and we want reproducible
 # builds (deploy.sh ships it; the Dockerfile relies on it for the MSRV-pinned tree).
+
+# Private example deployment state, rendered credentials, and test captures.
+/examples/vapi-amazon-connect/.local/
+/examples/vapi-amazon-connect/**/settings.local.json
+/examples/vapi-amazon-connect/tests/sip-client/target/

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.1 — Unreleased
+
+- Allow explicitly configured stable SIP users with SIPS while retaining trusted
+  signaling-source admission and internal one-use proofs.
+- Honor SIP recipe correlation requirements rather than imposing them on every
+  SIP-to-Connect bridge. Map explicitly selected headers into the durable
+  Connect start specification, rejecting duplicates and invalid/bounded context.
+- Add complete configurable SIP-header and optional correlation-ID examples under
+  `examples/vapi-amazon-connect`, including Vapi assistants, Lambda, CloudFormation,
+  Connect flows, and a disposable live-test harness. The stock recipe stays unchanged.
+- Both examples pass a bounded real Vapi SIP → Bridgefu → Amazon Connect agent
+  test with exact context, bidirectional audio, and cleanup. See the example test
+  report for scope. The live tests used TLS with optional SRTP; strict SRTP,
+  mTLS, load qualification, and customer QA remain outside that evidence.
+- Use generic customer field names in test fixtures and exclude private example
+  state, local settings, and Terraform variable files from image build contexts.
+- Update the Rust package and OCI image metadata to 0.9.1. Publication and
+  tagging are pending; the earlier live report describes the pre-version-bump tree.
+
 ## Unreleased — crates.io rvoip 0.3.8 and recipe runtime cleanup
 
 - Repointed the coordinated rvoip dependency graph to exact crates.io `0.3.8`

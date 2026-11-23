@@ -1,0 +1,12 @@
+{
+  "assistantId": "REPLACE_WITH_NEW_ASSISTANT_ID",
+  "phoneNumberId": "REPLACE_WITH_NONPRODUCTION_PHONE_NUMBER_ID",
+  "customer": {
+    "number": "+12025550123"
+  },
+  "assistantOverrides": {
+    "variableValues": {
+      "customer_session": "synthetic-session-001"
+    }
+  }
+}

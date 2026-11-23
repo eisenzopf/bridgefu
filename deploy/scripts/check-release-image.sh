@@ -33,6 +33,13 @@ for ignored_path in \
   '.claude/' \
   '.vscode/' \
   '**/node_modules/' \
+  '**/.local/' \
+  '**/.venv/' \
+  '**/settings.local.json' \
+  '**/target/' \
+  '**/*.tfvars' \
+  '**/*.tfvars.json' \
+  'bridgefu-vapi-connect/' \
   '**/.terraform/' \
   '**/*.tfstate' \
   '**/*.tfstate.*' \

@@ -26,6 +26,13 @@ jobs:
           python3 -m pip install --disable-pip-version-check \
             'jsonschema==4.25.1' 'PyYAML==6.0.2'
           python3 scripts/check-config-schema.py
+      - name: Validate configurable Vapi and Connect examples
+        working-directory: bridgefu
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            -r examples/vapi-amazon-connect/requirements.txt
+          python3 -m unittest discover \
+            -s examples/vapi-amazon-connect/tests -p 'test_*.py'
       - name: Validate every Compose scenario
         working-directory: bridgefu
         run: |

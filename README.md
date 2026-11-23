@@ -47,8 +47,12 @@ builds the customer AMIs from it.
 - `sip_rtp` — clear SIP and RTP. This is an explicit diagnostic compatibility
   posture, not the production default.
 
-Every SIPS recipe uses one-use managed attachment URIs and a DNS `sips:`
-Contact. Bridgefu does not silently downgrade signaling from TLS.
+Managed SIPS recipes use one-use attachment URIs. Explicit external recipes can
+use a trusted-source fixed URI with configurable context headers. Both advertise
+a DNS `sips:` Contact; Bridgefu does not silently downgrade signaling from TLS.
+
+For complete configurable Vapi → Amazon Connect setups, see the
+[SIP-header and optional correlation-ID examples](examples/vapi-amazon-connect/README.md).
 
 ## Local development
 

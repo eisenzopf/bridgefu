@@ -2964,6 +2964,19 @@ impl Config {
                 expected_principal: sip_ingress_profile_principal(profile_id, profile),
                 profiles: self.named_route_profile_bindings(route)?,
                 required_correlation_header: route.required_sip_correlation_header.clone(),
+                context_headers: self
+                    .context
+                    .allow_headers
+                    .iter()
+                    .filter(|(_, key)| {
+                        route
+                            .context_metadata_allowlist
+                            .as_ref()
+                            .is_some_and(|keys| keys.contains(*key))
+                            && key.as_str() != "correlation_id"
+                    })
+                    .map(|(header, key)| (header.clone(), key.clone()))
+                    .collect(),
                 destination: route.destination.clone(),
             });
         }
@@ -4371,6 +4384,51 @@ impl Config {
         instance_arn: &str,
         contact_flow_id: &str,
     ) -> Result<()> {
+        let bridge = &recipe.spec.bridges[bridge_id];
+        let required_correlation_header = bridge
+            .context
+            .as_ref()
+            .filter(|context| context.correlation.required)
+            .map(|context| context.correlation.from_sip_header.clone());
+        let RecipeEndpointSpec::AmazonConnect {
+            context_metadata_keys,
+            ..
+        } = &bridge.destination
+        else {
+            return Err(anyhow!("SIP recipe requires an Amazon Connect destination"));
+        };
+        // The legacy screen-pop recipe still requires its opaque ID. Header-only
+        // recipes explicitly select application keys from context.allow_headers.
+        if required_correlation_header.is_some() {
+            self.ensure_recipe_correlation_mapping()?;
+        }
+        for key in context_metadata_keys {
+            if key == "correlation_id"
+                || !self
+                    .context
+                    .allow_headers
+                    .values()
+                    .any(|value| value == key)
+            {
+                return Err(anyhow!("SIP recipe context_metadata_keys must select application keys from context.allow_headers"));
+            }
+        }
+        if !context_metadata_keys.is_empty() && admission.mode != SipAdmissionMode::StableUri {
+            return Err(anyhow!(
+                "SIP recipe header context requires stable_uri admission"
+            ));
+        }
+        let mut context_keys = context_metadata_keys.clone();
+        if required_correlation_header.is_some() {
+            context_keys.insert("correlation_id".to_owned());
+        }
+        let header_mapping: BTreeMap<String, String> = self
+            .context
+            .allow_headers
+            .iter()
+            .filter(|(_, key)| context_keys.contains(*key))
+            .map(|(header, key)| (header.clone(), key.clone()))
+            .collect();
         let connect_instance_id = connect_instance_id(instance_arn, &self.aws.region)?;
         validate_recipe_public_host(&self.edge.public_host)?;
         let media_public_addr = self
@@ -4604,7 +4662,7 @@ impl Config {
                 destination,
                 vapi_ingress_profile: None,
                 sip_ingress_profile: Some(ingress_profile_id),
-                required_sip_correlation_header: Some("X-Correlation-Id".to_owned()),
+                required_sip_correlation_header: required_correlation_header,
                 recipe_sip_admission: Some(admission.clone()),
                 webrtc_ingress_profile: None,
                 destination_profile: Some(RouteDestinationProfileRef::AmazonConnect {
@@ -4612,7 +4670,11 @@ impl Config {
                 }),
                 legacy_embedded_destination: false,
                 profile_bindings: Vec::new(),
-                context_metadata_allowlist: None,
+                context_metadata_allowlist: if context_metadata_keys.is_empty() {
+                    None
+                } else {
+                    Some(context_keys)
+                },
                 context_required: false,
                 capability_policy: NamedRouteCapabilityPolicy::default(),
             },
@@ -4621,7 +4683,7 @@ impl Config {
         let mapping = MappingCfg {
             unmapped: "drop".to_owned(),
             passthrough_prefix: "X-".to_owned(),
-            rename: BTreeMap::from([("X-Correlation-Id".to_owned(), "correlation_id".to_owned())]),
+            rename: header_mapping,
         };
         self.tenants.insert(
             instance.to_owned(),
@@ -4633,17 +4695,6 @@ impl Config {
                 mapping: Some(mapping),
             },
         );
-        if let Some(existing) = self.context.allow_headers.get("X-Correlation-Id") {
-            if existing != "correlation_id" {
-                return Err(anyhow!(
-                    "recipe correlation mapping collides with context.allow_headers"
-                ));
-            }
-        } else {
-            self.context
-                .allow_headers
-                .insert("X-Correlation-Id".to_owned(), "correlation_id".to_owned());
-        }
         match &self.api.static_tenant {
             Some(existing) if existing != instance => {
                 return Err(anyhow!(
@@ -7621,7 +7672,7 @@ mod tests {
     /// The B.4 render the reconciler produces for two tenants.
     const B4_TWO_TENANTS: &str = r#"
 aws: {"region": "us-west-2"}
-sip: {"advertised_ip": "1.2.3.4", "bind_ip": "0.0.0.0", "media_public_ip": "1.2.3.4", "port": 5060}
+sip: {"advertised_ip": "203.0.113.4", "bind_ip": "0.0.0.0", "media_public_ip": "203.0.113.4", "port": 5060}
 observability: {"http_bind": "0.0.0.0:9090", "log_format": "json"}
 default_tenant: null
 tenants:
@@ -7635,7 +7686,7 @@ aws:
   region: us-west-2
   instance_id: inst-legacy
   contact_flow_id: flow-legacy
-sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
+sip: {advertised_ip: 203.0.113.4, media_public_ip: 203.0.113.4}
 mapping:
   unmapped: drop
   rename: {X-Correlation-Id: correlation_id}
@@ -8206,6 +8257,79 @@ private_forwarding:
         let mut config: Config = serde_yaml::from_str(&clear).unwrap();
         config.apply_recipes().unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn customer_examples_project_secure_fixed_uris_and_configured_attributes() {
+        for (yaml, attribute_count) in [
+            (
+                include_str!("../examples/vapi-amazon-connect/sip-headers/bridgefu.example.yaml"),
+                4,
+            ),
+            (
+                include_str!(
+                    "../examples/vapi-amazon-connect/correlation-id/bridgefu.example.yaml"
+                ),
+                1,
+            ),
+        ] {
+            let yaml = yaml
+                .replace(
+                    "env:BRIDGEFU_CONTROL_HMAC_KEY",
+                    "example-test-control-key-32-bytes-long",
+                )
+                .replace("env:BRIDGEFU_API_BEARER_TOKEN", "example-test-bearer")
+                .replace(
+                    "env:BRIDGEFU_SIP_TLS_PRIVATE_KEY_PATH",
+                    "/run/bridgefu/tls/test-only.key",
+                );
+            for security in ["sips_srtp", "sips_optional_srtp"] {
+                let mut config: Config = serde_yaml::from_str(&yaml.replace(
+                    "sip_security: sips_srtp",
+                    &format!("sip_security: {security}"),
+                ))
+                .unwrap();
+                config.apply_recipes().unwrap();
+                config.validate().unwrap();
+                assert_eq!(
+                    config
+                        .recipe_sip_admission_catalog()
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                let route = &config.api.routes["support"];
+                assert!(route.required_sip_correlation_header.is_none());
+                assert_eq!(
+                    route.context_metadata_allowlist.as_ref().unwrap().len(),
+                    attribute_count
+                );
+                assert_eq!(
+                    config.tenants["support"]
+                        .mapping
+                        .as_ref()
+                        .unwrap()
+                        .rename
+                        .len(),
+                    attribute_count
+                );
+                assert_eq!(config.generic_bridge.sip_bind, "127.0.0.1:0");
+                assert!(config.generic_bridge.sip.secure_listener.is_some());
+                assert_eq!(
+                    route
+                        .recipe_sip_admission
+                        .as_ref()
+                        .unwrap()
+                        .uri_user
+                        .as_deref(),
+                    Some("support")
+                );
+            }
+            let mut invalid: Config = serde_yaml::from_str(&yaml).unwrap();
+            invalid.context.allow_headers.clear();
+            assert!(invalid.apply_recipes().is_err());
+        }
     }
 
     #[test]
@@ -9099,7 +9223,7 @@ broadcast:
         // and the legacy aws keys; the tenants map must win.
         let yaml = r#"
 aws: {"region": "us-west-2", "instance_id": "inst-x", "contact_flow_id": "flow-x"}
-sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
+sip: {advertised_ip: 203.0.113.4, media_public_ip: 203.0.113.4}
 default_tenant: null
 contact: {"default_display_name": "Vapi caller"}
 mapping: {"rename": {"X-Correlation-Id": "correlation_id"}, "unmapped": "drop"}
@@ -9116,7 +9240,7 @@ tenants:
     fn zero_tenants_is_valid_and_rejects_everything() {
         let yaml = r#"
 aws: {"region": "us-west-2"}
-sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
+sip: {advertised_ip: 203.0.113.4, media_public_ip: 203.0.113.4}
 default_tenant: null
 tenants: {}
 "#;
@@ -9131,7 +9255,7 @@ tenants: {}
     fn bad_default_tenant_is_rejected() {
         let yaml = r#"
 aws: {"region": "us-west-2"}
-sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
+sip: {advertised_ip: 203.0.113.4, media_public_ip: 203.0.113.4}
 default_tenant: missing
 tenants:
   "banking": {"contact_flow_id": "f", "instance_id": "i"}
@@ -9144,7 +9268,7 @@ tenants:
     fn half_configured_legacy_aws_is_rejected() {
         let yaml = r#"
 aws: {"region": "us-west-2", "instance_id": "inst-only"}
-sip: {advertised_ip: 1.2.3.4, media_public_ip: 1.2.3.4}
+sip: {advertised_ip: 203.0.113.4, media_public_ip: 203.0.113.4}
 "#;
         let err = parse(yaml).resolved_tenants().unwrap_err().to_string();
         assert!(

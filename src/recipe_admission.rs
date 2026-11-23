@@ -21,9 +21,9 @@ use crate::call_engine::{
     AttachmentTransport, CallId, LegDirection, MediaFlow, SignalingInitiator, TenantId,
 };
 use crate::call_service::{
-    CallServiceError, CallServiceRuntime, CreateCallInput, IdempotencyKey, LegEndpointConfig,
-    NamedProfileBinding, NamedRouteBinding, NamedRouteCallContext, RequestedLeg, SipEndpointConfig,
-    SipInitialContextMode,
+    AmazonConnectStartSpec, CallServiceError, CallServiceRuntime, CreateCallInput, IdempotencyKey,
+    LegEndpointConfig, NamedProfileBinding, NamedRouteBinding, NamedRouteCallContext, RequestedLeg,
+    SipEndpointConfig, SipInitialContextMode,
 };
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"bridgefu.recipe-stable-sip-admission.v1\0";
@@ -41,6 +41,8 @@ pub struct RecipeSipAdmissionRoute {
     pub expected_principal: AuthenticatedPrincipal,
     pub profiles: Vec<NamedProfileBinding>,
     pub required_correlation_header: Option<String>,
+    /// Explicit SIP header -> application metadata mapping for this route.
+    pub context_headers: BTreeMap<String, String>,
     pub destination: RequestedLeg,
 }
 
@@ -57,6 +59,7 @@ impl fmt::Debug for RecipeSipAdmissionRoute {
                 "required_correlation_header",
                 &self.required_correlation_header,
             )
+            .field("context_header_count", &self.context_headers.len())
             .field("destination", &self.destination)
             .finish()
     }
@@ -179,18 +182,16 @@ impl RecipeSipAdmissionCatalog {
                 exact_header(signaling_metadata, header).ok_or(RecipeSipAdmissionError::Rejected)
             })
             .transpose()?;
-        let context = correlation
-            .map(|correlation_id| NamedRouteCallContext {
-                correlation_id: correlation_id.to_owned(),
-                metadata: BTreeMap::new(),
-            })
-            .map(|context| {
-                context
-                    .validate()
-                    .map(|_| context)
-                    .map_err(|_| RecipeSipAdmissionError::Rejected)
-            })
-            .transpose()?;
+        let destination = destination_with_headers(route, signaling_metadata)?;
+        let context = correlation.map(|correlation_id| NamedRouteCallContext {
+            correlation_id: correlation_id.to_owned(),
+            metadata: BTreeMap::new(),
+        });
+        if let Some(context) = &context {
+            context
+                .validate()
+                .map_err(|_| RecipeSipAdmissionError::Rejected)?;
+        }
         let mut binding = NamedRouteBinding::new_with_profiles(
             route.route_id.clone(),
             context,
@@ -224,7 +225,7 @@ impl RecipeSipAdmissionCatalog {
                             }),
                             amazon_connect_start: None,
                         },
-                        route.destination.clone(),
+                        destination,
                     ],
                 },
                 binding,
@@ -253,6 +254,34 @@ impl RecipeSipAdmissionCatalog {
 }
 
 fn validate_route(route: &RecipeSipAdmissionRoute) -> Result<(), RecipeSipAdmissionError> {
+    let policy = crate::context::ContextPolicy {
+        allow_headers: route.context_headers.clone(),
+        ..Default::default()
+    };
+    policy
+        .validate()
+        .map_err(|_| RecipeSipAdmissionError::InvalidConfiguration)?;
+    if !route.context_headers.is_empty() && route.destination.amazon_connect_start.is_none() {
+        return Err(RecipeSipAdmissionError::InvalidConfiguration);
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
+    for (header, key) in &route.context_headers {
+        if key == "correlation_id"
+            || key == "handoff_token"
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || !names.insert(header.to_ascii_lowercase())
+            || !keys.insert(key)
+            || route
+                .required_correlation_header
+                .as_ref()
+                .is_some_and(|required| required.eq_ignore_ascii_case(header))
+        {
+            return Err(RecipeSipAdmissionError::InvalidConfiguration);
+        }
+    }
     let tenant = TenantId::parse(&route.recipe_instance)
         .map_err(|_| RecipeSipAdmissionError::InvalidConfiguration)?;
     let valid_uri_user = !route.uri_user.is_empty()
@@ -326,6 +355,57 @@ fn authorize(
         return Err(RecipeSipAdmissionError::Rejected);
     }
     Ok(())
+}
+
+fn destination_with_headers(
+    route: &RecipeSipAdmissionRoute,
+    metadata: &[(String, String)],
+) -> Result<RequestedLeg, RecipeSipAdmissionError> {
+    let mut destination = route.destination.clone();
+    if route.context_headers.is_empty() {
+        return Ok(destination);
+    }
+    let start = destination
+        .amazon_connect_start
+        .as_ref()
+        .ok_or(RecipeSipAdmissionError::InvalidConfiguration)?;
+    let mut values = BTreeMap::new();
+    for (header, key) in &route.context_headers {
+        let mut matches = metadata
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(header));
+        if let Some((_, value)) = matches.next() {
+            // Ambiguous copies must not silently choose a session or call ID.
+            if matches.next().is_some() {
+                return Err(RecipeSipAdmissionError::Rejected);
+            }
+            values.insert(key.clone(), value.clone());
+        }
+    }
+    // Apply the context byte/count/value bounds before retaining customer data.
+    NamedRouteCallContext {
+        correlation_id: "header-validation".to_owned(),
+        metadata: values.clone(),
+    }
+    .validate()
+    .map_err(|_| RecipeSipAdmissionError::Rejected)?;
+    let mut attributes = start.attributes().clone();
+    for (key, value) in values {
+        // Server-owned attributes remain authoritative, as in other adapters.
+        attributes.entry(key).or_insert(value);
+    }
+    destination.amazon_connect_start = Some(
+        AmazonConnectStartSpec::new(
+            start.profile(),
+            start.instance_id(),
+            start.contact_flow_id(),
+            attributes,
+            start.display_name(),
+            start.description().map(str::to_owned),
+        )
+        .map_err(|_| RecipeSipAdmissionError::Rejected)?,
+    );
+    Ok(destination)
 }
 
 fn exact_header<'a>(metadata: &'a [(String, String)], expected: &str) -> Option<&'a str> {
@@ -420,6 +500,7 @@ mod tests {
             )
             .unwrap()],
             required_correlation_header: None,
+            context_headers: BTreeMap::new(),
             destination: RequestedLeg {
                 direction: LegDirection::Outbound,
                 signaling_initiator: Some(SignalingInitiator::Bridgefu),
@@ -444,6 +525,104 @@ mod tests {
         assert_eq!(
             RecipeSipAdmissionCatalog::new([route("Support")]).unwrap_err(),
             RecipeSipAdmissionError::InvalidConfiguration
+        );
+    }
+
+    fn header_route() -> RecipeSipAdmissionRoute {
+        let mut route = route("header-handoff");
+        route.context_headers = BTreeMap::from([
+            ("x-customer-session-id".into(), "customer_session_id".into()),
+            ("x-customer-summary".into(), "customer_summary".into()),
+        ]);
+        route.destination.endpoint =
+            LegEndpointConfig::AmazonConnect(crate::call_service::AmazonConnectEndpointConfig {
+                instance_id: "instance".into(),
+                contact_flow_id: "flow".into(),
+            });
+        route.destination.amazon_connect_start = Some(
+            AmazonConnectStartSpec::new(
+                "amazon",
+                "instance",
+                "flow",
+                BTreeMap::new(),
+                "Caller",
+                None,
+            )
+            .unwrap(),
+        );
+        route
+    }
+
+    #[test]
+    fn header_mapping_is_bounded_unambiguous_and_cannot_override_server_attributes() {
+        let route = header_route();
+        RecipeSipAdmissionCatalog::new([route.clone()]).unwrap();
+        for value in [
+            "x".repeat(2049),
+            "bad\r\nheader".into(),
+            "bad\tvalue".into(),
+            "bad\0value".into(),
+        ] {
+            assert_eq!(
+                destination_with_headers(&route, &[("X-Customer-Summary".into(), value)])
+                    .unwrap_err(),
+                RecipeSipAdmissionError::Rejected
+            );
+        }
+        assert_eq!(
+            destination_with_headers(
+                &route,
+                &[
+                    ("X-Customer-Session-Id".into(), "one".into()),
+                    ("x-customer-session-id".into(), "two".into()),
+                ]
+            )
+            .unwrap_err(),
+            RecipeSipAdmissionError::Rejected
+        );
+        let mut pinned = route.clone();
+        pinned.destination.amazon_connect_start = Some(
+            AmazonConnectStartSpec::new(
+                "amazon",
+                "instance",
+                "flow",
+                BTreeMap::from([("customer_session_id".into(), "server-owned".into())]),
+                "Caller",
+                None,
+            )
+            .unwrap(),
+        );
+        let mapped = destination_with_headers(
+            &pinned,
+            &[("x-customer-session-id".into(), "caller-controlled".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            mapped.amazon_connect_start.unwrap().attributes()["customer_session_id"],
+            "server-owned"
+        );
+        for (header, key) in [
+            ("X-CUSTOMER-SESSION-ID", "other"),
+            ("x-alias", "customer_session_id"),
+            ("x-id", "call_id"),
+            ("x-token", "handoff_token"),
+            ("x-corr", "correlation_id"),
+            ("x-dotted", "invalid.key"),
+        ] {
+            let mut invalid = route.clone();
+            invalid.context_headers.insert(header.into(), key.into());
+            assert!(RecipeSipAdmissionCatalog::new([invalid]).is_err());
+        }
+        let mut large = route;
+        large.context_headers = (0..9)
+            .map(|i| (format!("x-field-{i}"), format!("field_{i}")))
+            .collect();
+        let metadata = (0..9)
+            .map(|i| (format!("x-field-{i}"), "x".repeat(2048)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            destination_with_headers(&large, &metadata).unwrap_err(),
+            RecipeSipAdmissionError::Rejected
         );
     }
 

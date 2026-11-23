@@ -4,7 +4,25 @@ Bridgefu keeps short correctness checks separate from release evidence. A
 passing smoke run proves only that the harness and the current media graph work
 on the local machine; it does not satisfy a one-hour roadmap item.
 
-## Bridgefu 0.9.0 customer-preview boundary
+## Bridgefu 0.9.1 release candidate
+
+The Rust package, CLI, and OCI metadata now use `0.9.1`. This candidate adds
+customer-configurable SIP header handoff and two complete Vapi/Connect recipes.
+The TypeScript SDK remains independently versioned at `0.1.0`.
+
+The [example test report](../examples/vapi-amazon-connect/tests/results.json)
+records both real call paths passing on November 20, before the version bump
+and fixture cleanup. Its source hash identifies that tested tree, not the final
+0.9.1 tree. Those calls used TLS with optional SRTP; they do not qualify strict
+SRTP, mTLS, load behavior, or the remaining 1.0 gates.
+
+The [0.9.1 check report](release-0.9.1.md) records local results and repeatable commands.
+Before tagging, run those checks against the final commit and retain the
+protected `linux/amd64,linux/arm64` OCI candidate and vulnerability reports.
+The candidate workflow requires a pushed commit; local checks alone cannot
+substitute for that artifact. No image publication is implied by a version bump.
+
+## Historical Bridgefu 0.9.0 customer-preview boundary
 
 Bridgefu 0.9.0 is the first customer-preview release toward the 1.0 roadmap.
 Its Rust package, CLI, and OCI metadata use `0.9.0`; the TypeScript SDK remains

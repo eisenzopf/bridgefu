@@ -366,7 +366,7 @@ fn validate_spec(spec: &RecipeSpec) -> Result<(), RecipeError> {
 
 fn validate_admission(
     bridge_id: &str,
-    security: SipSecurity,
+    _security: SipSecurity,
     admission: &super::manifest::SipAdmissionSpec,
 ) -> Result<(), RecipeError> {
     if admission.trusted_cidrs.is_empty() || admission.trusted_cidrs.len() > MAX_CIDRS {
@@ -398,14 +398,6 @@ fn validate_admission(
                 ))
             })?;
             validate_identifier(uri_user, "stable SIP URI user")?;
-            if matches!(
-                security,
-                SipSecurity::SipsSrtp | SipSecurity::SipsOptionalSrtp
-            ) {
-                return invalid(format!(
-                    "bridge {bridge_id:?} secure SIP posture requires managed_attachment admission"
-                ));
-            }
             Ok(())
         }
         _ => Ok(()),

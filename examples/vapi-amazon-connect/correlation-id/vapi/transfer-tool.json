@@ -1,0 +1,35 @@
+{
+  "type": "function",
+  "async": false,
+  "function": {
+    "name": "transfer_to_support",
+    "description": "Transfer this caller to a human with the configured handoff context.",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "intent": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Short reason for the human handoff."
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Brief factual conversation summary, including troubleshooting already attempted."
+        }
+      },
+      "required": [
+        "intent",
+        "summary"
+      ]
+    }
+  },
+  "server": {
+    "url": "https://WEBHOOK_HOST/transfer",
+    "timeoutSeconds": 25,
+    "headers": {
+      "X-Bridgefu-Webhook-Secret": "REPLACE_FROM_STACK_SECRET"
+    }
+  }
+}
