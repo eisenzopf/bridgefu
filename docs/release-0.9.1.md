@@ -16,6 +16,9 @@ this report.
 - Customer-specific fixture names were replaced with generic names. Private
   example state, rendered local settings, and Terraform variables are excluded
   from Docker build contexts as well as source control.
+- Add [native SIP/WebRTC examples](../examples/native-sip-webrtc/README.md) with
+  real encrypted local calls, editable deployment recipes, and a local browser
+  application backend. No customer context fields are required by default.
 - The Cargo package, lockfile, CLI, and all three OCI labels use `0.9.1`.
 
 ## Validation results
@@ -25,7 +28,10 @@ this report.
 | Locked Rust all-target suite | 789 passed, 0 failed, 20 opt-in cases ignored |
 | Strict all-target, all-feature Clippy | Passed |
 | Rust formatting and Git whitespace | Passed |
-| Example Python tests | 8 passed |
+| Vapi/Connect example Python tests | 8 passed |
+| Native example application-client tests | 5 passed |
+| Native SIP/WebRTC protocol matrix | 8 calls passed: both directions, PCMU/PCMA, both hangup ends |
+| Native deployment template preflight | Both templates passed with temporary TLS and credentials |
 | Configuration schema and negative fixtures | Passed |
 | Credential-free runtime smoke | All 9 checks passed, including Compose preflight |
 | Database repository and coordination checks | 41 passed, including 6 opt-in cases from the all-target suite |
@@ -34,6 +40,14 @@ this report.
 | AWS/GCP Terraform formatting and validation | Passed; no infrastructure applied |
 | Recipe documentation links | Passed |
 | CLI version | `bridgefu 0.9.1` |
+
+The native matrix uses automated SIP and WebRTC peers and the production call
+runtime, with an example-only loopback target permission. It verifies encrypted
+media, two distinct decoded tones across G.711/Opus transcoding, hangup, and
+cleanup. It does not exercise the public HTTP API, browser media, public NAT/TURN,
+or a customer SIP server. A separate Chromium UI smoke checked SDK loading,
+buttons, and API-error handling; it did not place a browser media call.
+See [the native results](../examples/native-sip-webrtc/results.json).
 
 The database checks used isolated PostgreSQL 16.14 and Redis 7.2.7 processes.
 The pinned Docker image could not unpack because the local Docker daemon
@@ -67,6 +81,8 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
 cargo test --locked --all-targets
 python3 -m unittest discover -s examples/vapi-amazon-connect/tests -p 'test_*.py'
+python3 -m unittest discover -s examples/native-sip-webrtc -p 'test_*.py'
+python3 examples/native-sip-webrtc/run-e2e.py --output /tmp/bridgefu-native-results.json
 python3 scripts/check-config-schema.py
 bash deploy/scripts/check-release-image.sh
 python3 deploy/scripts/test_verify_multiarch_oci.py
@@ -76,6 +92,7 @@ shellcheck deploy.sh deploy/scripts/*.sh
 bash scripts/test-repository-backends.sh
 bash scripts/test-coordination-backends.sh
 cargo build --locked --bin bridgefu
+python3 examples/native-sip-webrtc/validate-configs.py
 python3 deploy/scripts/runtime-smoke.py --binary target/debug/bridgefu \
   --output /tmp/bridgefu-runtime-smoke.json
 terraform fmt -check -recursive deploy/terraform

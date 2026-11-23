@@ -33,6 +33,9 @@ jobs:
             -r examples/vapi-amazon-connect/requirements.txt
           python3 -m unittest discover \
             -s examples/vapi-amazon-connect/tests -p 'test_*.py'
+      - name: Validate native example application client
+        working-directory: bridgefu
+        run: python3 -m unittest discover -s examples/native-sip-webrtc -p 'test_*.py'
       - name: Validate every Compose scenario
         working-directory: bridgefu
         run: |
@@ -171,6 +174,19 @@ jobs:
           python3 deploy/scripts/runtime-smoke.py
           --binary target/debug/bridgefu
           --output runtime-smoke.json
+      - name: Native SIP and WebRTC example configuration and end-to-end checks
+        working-directory: bridgefu
+        run: |
+          python3 examples/native-sip-webrtc/validate-configs.py
+          python3 examples/native-sip-webrtc/run-e2e.py --output /tmp/bridgefu-native-results.json
+      - name: Retain native SIP and WebRTC example evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: bridgefu-native-examples-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          path: /tmp/bridgefu-native-results.json
       - name: Retain credential-free runtime-smoke evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()

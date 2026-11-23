@@ -54,6 +54,17 @@ a DNS `sips:` Contact; Bridgefu does not silently downgrade signaling from TLS.
 For complete configurable Vapi → Amazon Connect setups, see the
 [SIP-header and optional correlation-ID examples](examples/vapi-amazon-connect/README.md).
 
+## Try SIP ↔ WebRTC locally
+
+Run a real encrypted call with automated peers and no cloud account:
+
+- [SIP caller → WebRTC service](examples/sip-to-webrtc/README.md)
+- [WebRTC caller → SIP destination](examples/webrtc-to-sip/README.md)
+
+Each guide includes a one-command demo, editable endpoint configuration, and
+step-by-step setup. The [eight-case end-to-end matrix](examples/native-sip-webrtc/README.md#repeat-the-end-to-end-tests)
+checks both codecs, both hangup directions, audio, and cleanup.
+
 ## Local development
 
 Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.8`;

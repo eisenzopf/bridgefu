@@ -76,3 +76,7 @@ terraform/terraform.tfvars
 /examples/vapi-amazon-connect/.local/
 /examples/vapi-amazon-connect/**/settings.local.json
 /examples/vapi-amazon-connect/tests/sip-client/target/
+
+# Local native SIP/WebRTC example configuration and call attachments.
+/examples/sip-to-webrtc/.local/
+/examples/webrtc-to-sip/.local/

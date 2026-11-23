@@ -1,0 +1,9 @@
+{
+  "direction": "sip-to-webrtc",
+  "tenant": "demo",
+  "route_id": "support",
+  "sip_user": "demo-peer",
+  "sip_codec": "pcmu",
+  "hangup": "source",
+  "recipe_directory": "examples/sip-to-webrtc/recipe"
+}

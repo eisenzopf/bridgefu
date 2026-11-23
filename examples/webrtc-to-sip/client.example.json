@@ -1,0 +1,8 @@
+{
+  "api_url": "http://127.0.0.1:9090",
+  "route_id": "support",
+  "ingress": "webrtc",
+  "token_env": "BRIDGEFU_API_BEARER_TOKEN",
+  "context": {},
+  "browser_port": 8080
+}

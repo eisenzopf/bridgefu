@@ -2,6 +2,10 @@
 
 ## 0.9.1 — Unreleased
 
+- Add runnable native SIP → WebRTC and WebRTC → SIP examples, editable recipes,
+  deployment templates, a local browser caller/backend, and an eight-call
+  encrypted protocol test matrix. No customer context fields are required.
+
 - Allow explicitly configured stable SIP users with SIPS while retaining trusted
   signaling-source admission and internal one-use proofs.
 - Honor SIP recipe correlation requirements rather than imposing them on every

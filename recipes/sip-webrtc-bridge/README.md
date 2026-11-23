@@ -1,5 +1,7 @@
 # SIP application to interactive WebRTC
 
+Start with the [runnable example and setup guide](../../examples/sip-to-webrtc/README.md).
+
 `sip-webrtc-bridge@1` accepts a one-use SIP attachment and originates one
 fixed interactive WebRTC WSS destination. It is the starting recipe for SIP
 applications that must interoperate with a browser-shaped or CCaaS WebRTC
