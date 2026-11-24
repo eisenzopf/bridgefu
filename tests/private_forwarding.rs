@@ -1564,7 +1564,9 @@ impl DurableSplitHarness {
             Some(remote),
             Some(browser_dtmf_tx),
         );
-        let mut browser_media = browser_stream.frames_in();
+        let mut browser_media = browser_stream
+            .try_frames_in()
+            .expect("test owns inbound media receiver");
         for offset in 4..8_u32 {
             adapter
                 .send_agent_audio(MediaFrame {
@@ -2807,7 +2809,9 @@ async fn mtls_uctp_routes_full_rtp_rtcp_and_data_with_pinning_backpressure_and_d
     let stream = first_stream(&worker, connection_id.clone()).await;
     assert_eq!(stream.codec().name, "opus");
     assert_eq!(stream.codec().clock_rate_hz, 48_000);
-    let mut inbound_media = stream.frames_in();
+    let mut inbound_media = stream
+        .try_frames_in()
+        .expect("test owns inbound media receiver");
 
     assert_eq!(
         route.try_send_rtp(rtp_with_pt(b"wrong-codec", 0, 40, 8_640, 0x1020_3040,)),
@@ -3100,7 +3104,9 @@ async fn exact_pcmu_private_route_negotiates_and_decodes_as_pcmu() {
     assert_eq!(stream.codec().name, "g.711-mu");
     assert_eq!(stream.codec().clock_rate_hz, 8_000);
     assert_eq!(stream.codec().channels, 1);
-    let mut received = stream.frames_in();
+    let mut received = stream
+        .try_frames_in()
+        .expect("test owns inbound media receiver");
 
     assert_eq!(
         route.try_send_rtp(rtp_with_pt(b"not-opus", 111, 1, 160, 0x0102_0304)),
@@ -3516,8 +3522,12 @@ async fn native_whip_edge_reaches_call_pinned_worker_over_mtls_uctp_and_drains_c
         Some(second_dtmf_tx),
         [second_dtmf_codec],
     );
-    let mut first_media = first_stream.frames_in();
-    let mut second_media = second_stream.frames_in();
+    let mut first_media = first_stream
+        .try_frames_in()
+        .expect("test owns inbound media receiver");
+    let mut second_media = second_stream
+        .try_frames_in()
+        .expect("test owns inbound media receiver");
     let mut first_encoder =
         OpusCodec::new(SampleRate::Rate48000, 1, OpusConfig::default()).unwrap();
     let first_payload = Bytes::from(

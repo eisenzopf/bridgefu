@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — rvoip 0.5 upgrade
+
+- Pin the coordinated rvoip graph to the published 0.5.0 packages.
+- Adapt fallible JWT construction and extensible coordinator configuration,
+  and align the metrics recorder with rvoip’s metrics 0.24 facade.
+- Treat rvoip’s new committed-media and quality notifications as observations,
+  so they do not terminate healthy calls.
+- Keep the dependency upgrade independent of Connect TURN transport work.
+
 ## 0.9.1 — 2026-11-23
 
 - Add a narrated developer explainer with captions and a directly runnable

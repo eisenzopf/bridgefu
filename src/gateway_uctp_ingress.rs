@@ -12,6 +12,10 @@
 //! reliable DataMessage, while ordinary reliable DataMessages remain
 //! transport-neutral in both directions.
 
+// rvoip 0.5 IDs carry an atomic lifecycle fence, but Eq/Hash/Ord use only
+// their immutable string identity. Retain the fence when storing these keys.
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
@@ -772,14 +776,13 @@ impl GatewayUctpIngress {
             attachment: bearer_validator,
             broadcast: broadcast_validator,
         });
-        let caps = UctpCoordinatorCaps {
-            authentication_deadline: config.setup_timeout,
-            signaling_send_timeout: config.setup_timeout,
-            max_sessions_per_peer: 16,
-            max_connections_per_peer: 16,
-            max_streams_per_connection: 1,
-            ..UctpCoordinatorCaps::default()
-        };
+        let mut caps = UctpCoordinatorCaps::default();
+        caps.authentication_deadline = config.setup_timeout;
+        caps.signaling_send_timeout = config.setup_timeout;
+        caps.max_sessions_per_peer = 16;
+        caps.max_connections_per_peer = 16;
+        caps.max_streams_per_connection = 1;
+
         let mut adapter_config = UctpQuicConfig::new(Arc::clone(&endpoint), accept_rx, validator)
             .with_coordinator_caps(caps)
             .with_session_binding_resolver(resolver)
@@ -2292,10 +2295,9 @@ mod tests {
         let tenant_id = TenantId::parse("tenant-a").unwrap();
         let broadcast_id = uuid::Uuid::new_v4();
         let grant_generation = uuid::Uuid::new_v4();
-        let worker_orchestrator = Orchestrator::new(rvoip_core::config::Config {
-            max_direct_subscribers: 1,
-            ..rvoip_core::config::Config::default()
-        });
+        let mut worker_config = rvoip_core::config::Config::default();
+        worker_config.max_direct_subscribers = 1;
+        let worker_orchestrator = Orchestrator::new(worker_config);
         let mut coordination = CallServiceCoordinationConfig::new(
             DeploymentId::parse(format!(
                 "private-broadcast-shutdown-{}",
@@ -3391,10 +3393,9 @@ mod tests {
         let private_key =
             PrivateTokenKey::new(b"private-forwarding-test-key-32-bytes".to_vec()).unwrap();
 
-        let worker_orchestrator = Orchestrator::new(rvoip_core::config::Config {
-            max_direct_subscribers: 2,
-            ..rvoip_core::config::Config::default()
-        });
+        let mut worker_config = rvoip_core::config::Config::default();
+        worker_config.max_direct_subscribers = 2;
+        let worker_orchestrator = Orchestrator::new(worker_config);
         let mut coordination = CallServiceCoordinationConfig::new(
             DeploymentId::parse("public-broadcast-network-worker").unwrap(),
         );

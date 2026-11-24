@@ -1,5 +1,9 @@
 //! Versioned SIP header ↔ WebRTC/UCTP data contract.
 
+// rvoip 0.5 IDs carry an atomic lifecycle fence, but Eq/Hash/Ord use only
+// their immutable string identity. Retain the fence when storing these keys.
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 

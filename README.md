@@ -79,7 +79,7 @@ checks both codecs, both hangup directions, audio, and cleanup.
 
 ## Local development
 
-Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.3.8`;
+Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.5.0`;
 there are no Git, path, or local rvoip overrides.
 
 ```bash

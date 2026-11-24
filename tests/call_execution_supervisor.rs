@@ -3793,7 +3793,8 @@ async fn named_route_destination_failure_rejects_ingress_without_final_answer() 
         .any(|leg| leg.failure().is_some_and(|failure| {
             matches!(
                 failure.code(),
-                "webrtc_start_failed" | "webrtc_start_timeout"
+                // The authoritative 0.5 Failed event may precede the activation result.
+                "webrtc_start_failed" | "webrtc_start_timeout" | "transport_failed"
             )
         })));
 
@@ -4172,15 +4173,17 @@ async fn outbound_sip_activation_failure_is_not_replayed_and_cleans_the_exact_ro
             .is_some_and(|leg| leg.state() == LegState::Failed)
     })
     .await;
-    assert_eq!(
+    // rvoip 0.5 publishes the authoritative Failed event before returning
+    // activation failure. Either observation may reach the actor first.
+    assert!(matches!(
         failed
             .call
             .aggregate
             .leg(created.leg_id)
             .and_then(|leg| leg.failure())
             .map(|failure| failure.code()),
-        Some("sip_start_failed")
-    );
+        Some("sip_start_failed" | "transport_failed")
+    ));
     assert_eq!(sip.counts.originate.load(Ordering::SeqCst), 1);
     assert_eq!(sip.counts.activate.load(Ordering::SeqCst), 1);
     let connection_id = tokio::time::timeout(Duration::from_secs(5), async {

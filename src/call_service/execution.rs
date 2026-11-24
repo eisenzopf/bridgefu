@@ -5,6 +5,10 @@
 //! actors all use bounded single-consumer channels whose tasks are owned by
 //! [`CallExecutionSupervisor`].
 
+// rvoip 0.5 IDs carry an atomic lifecycle fence, but Eq/Hash/Ord use only
+// their immutable string identity. Retain the fence when storing these keys.
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2847,7 +2851,9 @@ async fn run_worker_broadcast_admission(
                 match event.kind {
                     OperationalEventKind::Connected
                     | OperationalEventKind::Progress { .. }
-                    | OperationalEventKind::MediaActivity { .. } => {}
+                    | OperationalEventKind::MediaActivity { .. }
+                    | OperationalEventKind::MediaCommitted { .. }
+                    | OperationalEventKind::Quality { .. } => {}
                     OperationalEventKind::Ended { .. } => return Ok(()),
                     OperationalEventKind::Failed { .. } => return Err(()),
                     _ => return Err(()),
@@ -14699,6 +14705,8 @@ fn classify_operational_event(
             }
         }
         OperationalEventKind::MediaActivity { .. }
+        | OperationalEventKind::MediaCommitted { .. }
+        | OperationalEventKind::Quality { .. }
         | OperationalEventKind::Progress { .. }
         | OperationalEventKind::Dtmf { .. }
         | OperationalEventKind::DataMessage { .. }
@@ -14718,6 +14726,8 @@ fn classify_operational_event(
 fn operational_kind_label(kind: &OperationalEventKind) -> &'static str {
     match kind {
         OperationalEventKind::MediaActivity { .. } => "media_activity",
+        OperationalEventKind::MediaCommitted { .. } => "media_committed",
+        OperationalEventKind::Quality { .. } => "quality",
         OperationalEventKind::Progress { .. } => "progress",
         OperationalEventKind::Dtmf { .. } => "dtmf",
         OperationalEventKind::DataMessage { .. } => "data_message",
@@ -15900,6 +15910,29 @@ mod tests {
         let observed = Utc::now();
         let received = observed + chrono::Duration::seconds(30);
         assert_eq!(bounded_provider_received_at(observed, received), received);
+    }
+
+    #[test]
+    fn committed_media_and_quality_do_not_terminate_live_calls() {
+        let events = [
+            OperationalEventKind::MediaCommitted {
+                media: rvoip_core::adapter::CommittedAudioMedia::new(1, "OPUS", 111, 48000, 2),
+            },
+            OperationalEventKind::Quality {
+                jitter_centi_ms: 100,
+                packet_loss_centi_pct: 0,
+                mos_centi: Some(400),
+            },
+        ];
+        for event in events {
+            for state in [LegState::Signaling, LegState::Connected, LegState::Held] {
+                assert!(matches!(
+                    classify_operational_event(state, &event),
+                    OperationalTransition::Ephemeral
+                ));
+            }
+            assert_ne!(operational_kind_label(&event), "other");
+        }
     }
 
     #[test]

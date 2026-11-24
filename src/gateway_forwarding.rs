@@ -1301,6 +1301,7 @@ impl WorkerForwardingRuntime {
 
         let validator: Arc<dyn BearerValidator> =
             JwtValidator::from_hmac_secret(config.token_key.as_bytes())
+                .map_err(|_| GatewayForwardingError::InvalidConfiguration)?
                 .with_issuer([TOKEN_ISSUER])
                 .with_audience([config.worker_id.to_string()])
                 .with_required_jti()
@@ -1311,14 +1312,12 @@ impl WorkerForwardingRuntime {
             broadcast_authority: broadcast_authority.clone(),
             private_egress_admissions,
         });
-        let caps = UctpCoordinatorCaps {
-            authentication_deadline: config.timeouts.connect,
-            signaling_send_timeout: config.timeouts.signaling,
-            max_sessions_per_peer: config.limits.max_routes_per_peer,
-            max_connections_per_peer: config.limits.max_routes_per_peer,
-            max_streams_per_connection: 1,
-            ..UctpCoordinatorCaps::default()
-        };
+        let mut caps = UctpCoordinatorCaps::default();
+        caps.authentication_deadline = config.timeouts.connect;
+        caps.signaling_send_timeout = config.timeouts.signaling;
+        caps.max_sessions_per_peer = config.limits.max_routes_per_peer;
+        caps.max_connections_per_peer = config.limits.max_routes_per_peer;
+        caps.max_streams_per_connection = 1;
 
         let subscription_handler = Arc::new(PrivateSubscriptionHandler {
             inner: OrchestratorSubscriptionHandler::with_accepted_codecs(
