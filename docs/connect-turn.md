@@ -138,3 +138,16 @@ does not extend the retry budget or make a blocked destination reachable.
 Allocations and permissions are refreshed by the TURN client. Fetching new
 Chime credentials during an established contact and replacing TURN servers on
 a live peer are not implemented. Create a new peer/contact for new credentials.
+
+## Upstream TURN and ICE regression checks
+
+The pinned rvoip PR includes a [runnable TURN/ICE example](https://github.com/eisenzopf/rvoip/blob/codex/connect-turn-050/docs/TURN_ICE.md).
+Its CI gate executes relay-only and direct-ICE calls, verifies exact audio
+packets in both directions, and checks local TURN allocation release. Direct
+mode uses no ICE servers. A private configuration file supports customer TURN
+URLs, credentials, bind settings, and timeouts.
+
+The dependency-pin follow-up adds these examples and CI fixes without changing
+TURN runtime behavior. The live AWS qualification remains tied to the
+exact revisions recorded in `turn-results.json`; the later CI checks do not
+represent another live AWS run.

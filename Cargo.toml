@@ -16,16 +16,16 @@ publish = false
 # TURN candidate based on rvoip 0.5.0; every component uses the same immutable
 # source revision. The preceding upgrade commit remains registry-only.
 # See docs/connect-turn.md for review and qualification status.
-rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["server", "aws-control"] }
-rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0" }
-rvoip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0" }
-rvoip-moq = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["relay-runtime"] }
-rvoip-redis = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["moq"] }
-rvoip-quic = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0" }
-rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0" }
-rvoip-sip = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["opus"] }
-rvoip-sip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0" }
-rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
+rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["server", "aws-control"] }
+rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0" }
+rvoip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0" }
+rvoip-moq = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["relay-runtime"] }
+rvoip-redis = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["moq"] }
+rvoip-quic = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0" }
+rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0" }
+rvoip-sip = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["opus"] }
+rvoip-sip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0" }
+rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
 telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -72,10 +72,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
-rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", version = "=0.5.0", features = ["opus"] }
+rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", version = "=0.5.0", features = ["opus"] }
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
-webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de", package = "rvoip-webrtc-stack", version = "=0.5.0" }
+webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "587ae8d4ef1b750e9efa26bb90facaf03fd1b031", package = "rvoip-webrtc-stack", version = "=0.5.0" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are

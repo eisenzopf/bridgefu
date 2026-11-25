@@ -4803,7 +4803,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rvoip-amazon-connect"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4839,7 +4839,7 @@ dependencies = [
 [[package]]
 name = "rvoip-audio-send-queue"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -4848,7 +4848,7 @@ dependencies = [
 [[package]]
 name = "rvoip-auth-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4880,7 +4880,7 @@ dependencies = [
 [[package]]
 name = "rvoip-codec-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "opus",
  "thiserror 2.0.20",
@@ -4891,7 +4891,7 @@ dependencies = [
 [[package]]
 name = "rvoip-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4917,7 +4917,7 @@ dependencies = [
 [[package]]
 name = "rvoip-core-traits"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4934,7 +4934,7 @@ dependencies = [
 [[package]]
 name = "rvoip-ice-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "hmac 0.13.0",
  "rand 0.10.4",
@@ -4946,7 +4946,7 @@ dependencies = [
 [[package]]
 name = "rvoip-infra-common"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4968,7 +4968,7 @@ dependencies = [
 [[package]]
 name = "rvoip-media-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "apodize",
@@ -4999,7 +4999,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5026,7 +5026,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-native"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "clap",
@@ -5052,7 +5052,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-relay"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5075,7 +5075,7 @@ dependencies = [
 [[package]]
 name = "rvoip-moq-transport"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "bytes",
  "futures",
@@ -5094,7 +5094,7 @@ dependencies = [
 [[package]]
 name = "rvoip-quic"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5119,7 +5119,7 @@ dependencies = [
 [[package]]
 name = "rvoip-redis"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5136,7 +5136,7 @@ dependencies = [
 [[package]]
 name = "rvoip-rtc"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "bytes",
  "hex",
@@ -5171,7 +5171,7 @@ dependencies = [
 [[package]]
 name = "rvoip-rtp-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm",
@@ -5209,7 +5209,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5254,7 +5254,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-core"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -5273,7 +5273,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-dialog"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5299,7 +5299,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-proxy"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5316,7 +5316,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-registrar"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5338,7 +5338,7 @@ dependencies = [
 [[package]]
 name = "rvoip-sip-transport"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5366,7 +5366,7 @@ dependencies = [
 [[package]]
 name = "rvoip-uctp"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5395,7 +5395,7 @@ dependencies = [
 [[package]]
 name = "rvoip-vcon"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5415,7 +5415,7 @@ dependencies = [
 [[package]]
 name = "rvoip-webrtc"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -5455,7 +5455,7 @@ dependencies = [
 [[package]]
 name = "rvoip-webrtc-stack"
 version = "0.5.0"
-source = "git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de"
+source = "git+https://github.com/eisenzopf/rvoip?rev=587ae8d4ef1b750e9efa26bb90facaf03fd1b031#587ae8d4ef1b750e9efa26bb90facaf03fd1b031"
 dependencies = [
  "async-trait",
  "bytes",
