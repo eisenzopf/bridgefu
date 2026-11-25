@@ -4,7 +4,17 @@ Bridgefu keeps short correctness checks separate from release evidence. A
 passing smoke run proves only that the harness and the current media graph work
 on the local machine; it does not satisfy a one-hour roadmap item.
 
-## Bridgefu 0.9.1 release candidate
+## Bridgefu 0.9.2
+
+This release adds configurable Connect UDP TURN support and pins the merged
+rvoip 0.5.0 implementation. See the [0.9.2 release report](release-0.9.2.md),
+[Connect configuration](connect-turn.md), and
+[live restricted-egress results](../examples/vapi-amazon-connect/tests/TURN.md).
+The live report identifies the exact tested revision. Version metadata and
+release documentation changes are verified separately by release CI.
+The TypeScript SDK remains independently versioned at `0.1.0`.
+
+## Historical Bridgefu 0.9.1 release candidate
 
 The Rust package, CLI, and OCI metadata now use `0.9.1`. This candidate adds
 customer-configurable SIP header handoff and two complete Vapi/Connect recipes.

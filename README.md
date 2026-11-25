@@ -58,6 +58,12 @@ a DNS `sips:` Contact; Bridgefu does not silently downgrade signaling from TLS.
 For complete configurable Vapi → Amazon Connect setups, see the
 [SIP-header and optional correlation-ID examples](examples/vapi-amazon-connect/README.md).
 
+For networks that block direct Connect media, use the
+[Connect TURN setup](docs/connect-turn.md) and
+[restricted-egress test](examples/vapi-amazon-connect/tests/TURN.md).
+Bridgefu 0.9.2 supports Connect's UDP relay with `ice_servers: []`.
+
+
 ## Try SIP ↔ WebRTC locally
 
 With [Rust 1.95+, a C/C++ toolchain, and protobuf installed](examples/native-sip-webrtc/README.md#start-with-the-local-demo), run this **one line from the repository root**:
@@ -79,7 +85,7 @@ checks both codecs, both hangup directions, audio, and cleanup.
 
 ## Local development
 
-This TURN candidate pins every rvoip component to one immutable revision based
+Bridgefu 0.9.2 pins every rvoip component to one immutable revision based
 on `0.5.0`, recorded in `config/rvoip-source.txt` and `Cargo.lock`. No sibling
 checkout is needed. See [Connect TURN setup and validation](docs/connect-turn.md).
 
