@@ -3371,7 +3371,7 @@ generic_bridge:
             gateway_sip_listener_auth(&config, "gateway-tenant", validator()).unwrap();
         assert_eq!(
             format!("{listener_policy:?}"),
-            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 0, mtls_principal_count: 0 }"
+            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 0, mtls_principal_count: 0, source_rate_limit: None, observer_configured: false }"
         );
         let denied = gateway_sip_auth_service(&config, validator())
             .unwrap()

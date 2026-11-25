@@ -6,6 +6,9 @@
 //! complete-RTP datagram boundaries. It remains ignored: a smoke proves the
 //! topology works locally, never the immutable 1,000-listener/one-hour result.
 
+// rvoip ID equality and hashing use only the immutable identity, not its lifecycle fence.
+#![allow(clippy::mutable_key_type)]
+
 #[path = "support/qualification.rs"]
 mod qualification_support;
 
@@ -470,11 +473,9 @@ async fn qualifies_authenticated_uctp_network_fanout() {
     let started_at = Utc::now();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let core_config = Config {
-        max_direct_subscribers: parameters.listeners,
-        capacity_report_interval: None,
-        ..Config::default()
-    };
+    let mut core_config = Config::default();
+    core_config.max_direct_subscribers = parameters.listeners;
+    core_config.capacity_report_interval = None;
     let orchestrator = Orchestrator::new(core_config);
     let source_connection_id = ConnectionId::new();
     let (source_stream, source_tx) = SourceStream::new();

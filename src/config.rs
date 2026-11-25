@@ -354,7 +354,7 @@ pub struct GenericSipNetworkCfg {
     pub secure_listener: Option<GenericSipSecureListenerCfg>,
     /// Runtime-only Contact owned by a compiled secure-ingress recipe. This
     /// keeps the deployed public identity and explicit `;transport=tls`
-    /// contract stable; expert generic SIP configurations keep rvoip 0.3.8's
+    /// contract stable; expert generic SIP configurations keep rvoip 0.5.0's
     /// secure-dialog-aware Contact derivation.
     #[serde(skip)]
     recipe_contact_uri: Option<RecipeSipContactUri>,
@@ -8005,7 +8005,7 @@ recipes:
 
         // The projection assertions above prove the deployed listener remains
         // TLS-only. This local wire test swaps only the transport fixture to
-        // UDP so it can exercise the same rvoip 0.3.8 SDP policy without key
+        // UDP so it can exercise the same rvoip 0.5.0 SDP policy without key
         // material or external network dependencies.
         sip.sip_tls_mode = rvoip_sip::SipTlsMode::Disabled;
         sip.tls_bind_addr = None;
@@ -9841,7 +9841,7 @@ generic_bridge:
             .unwrap();
         assert_eq!(
             format!("{policy:?}"),
-            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 0 }"
+            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 0, source_rate_limit: None, observer_configured: false }"
         );
 
         let catalog = config.resolved_named_routes().unwrap();
@@ -10007,7 +10007,7 @@ sip_profiles:
             .unwrap();
         assert_eq!(
             format!("{policy:?}"),
-            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 1 }"
+            "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 1, source_rate_limit: None, observer_configured: false }"
         );
         assert!(!format!("{policy:?}").contains(&fingerprint));
     }
