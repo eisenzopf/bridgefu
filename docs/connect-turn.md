@@ -1,8 +1,7 @@
 # Use Amazon Connect's TURN relay
 
-This change uses merged rvoip 0.5.0 TURN support. It is not part of the published
-Bridgefu 0.9.1 release. The dependency-only upgrade and this TURN change have
-separate commits. The exact TURN dependency revision is in
+Bridgefu 0.9.2 includes merged rvoip 0.5.0 TURN support. The dependency-only
+upgrade and TURN implementation have separate commits. The exact TURN dependency revision is in
 [`config/rvoip-source.txt`](../config/rvoip-source.txt).
 
 Connect gives each contact a media endpoint and temporary relay credentials.
@@ -14,6 +13,21 @@ A firewall may block the media endpoint's public address and random UDP port.
 Bridgefu can now send that contact's media through Connect's UDP TURN relay
 instead. No correlation ID, Lambda context store, or fixed customer field is
 required by this networking change.
+
+## Get the release
+
+With the [build prerequisites](../examples/native-sip-webrtc/README.md#start-with-the-local-demo) installed:
+
+```sh
+git clone --branch v0.9.2 --depth 1 https://github.com/eisenzopf/bridgefu.git bridgefu-0.9.2
+cd bridgefu-0.9.2
+cargo build --locked --release
+./target/release/bridgefu --version
+```
+
+The version must be `bridgefu 0.9.2`. Deploy that binary using your normal
+service process, preserving your existing configuration. This source release
+does not publish a container image.
 
 ## 1. Allow the relay and control traffic
 
@@ -108,6 +122,15 @@ successful Connect call records `TURN UDP allocation established` and a
 `Connect ICE selected candidate pair` event with `local_candidate_type` equal
 to `relay`. These messages contain no relay credentials or media addresses.
 Confirm audio in both directions and normal hangup, not just call admission.
+Compare each configured Connect attribute against the supplied session, actual
+Vapi call ID, and assistant tool arguments. No correlation ID is required for
+the SIP-header recipe.
+
+In a disposable QA environment, repeat with Connect TURN disabled and the
+same firewall restrictions. Direct media must fail, and the firewall must
+record rejected packets. Restore `auto` and `relay_only: true` afterward.
+The [automated runbook](../examples/vapi-amazon-connect/tests/TURN.md) performs
+these checks and restores its test firewall rules after each case.
 
 If you use the example generator, optional `connect_turn` and `webrtc` objects
 in your settings JSON are copied into `aws.turn` and `generic_bridge.webrtc`.
@@ -123,12 +146,18 @@ bounds. Local protocol tests do not prove AWS reachability.
 
 The [restricted-egress live runbook](../examples/vapi-amazon-connect/tests/TURN.md)
 repeats real Vapi-to-Connect calls with `ice_servers: []`, blocks direct Connect
-UDP traffic, and includes a relay-disabled negative control. The November 24
+UDP traffic, and includes a relay-disabled negative control. The November 25
 [recorded results](../examples/vapi-amazon-connect/tests/turn-results.json)
-pass `auto`, explicit `join_ack`, and the required relay-disabled failure.
-Both positive calls passed two-way audio, exact context mapping, selected-relay,
-and cleanup assertions. The forced legacy URL mode did not pass. These results
-are separate from the unrestricted November 20 report.
+qualify the final merged main implementation with `auto`, explicit `join_ack`,
+and the required relay-disabled failure. The optional correlation-ID recipe
+also passed with `auto`, including missing/expired lookup-token checks.
+Positive calls passed two-way audio, exact context mapping, selected-relay,
+and cleanup assertions. All disposable test resources were removed and audited.
+
+The exact tested revision still reports version `0.9.1`; the 0.9.2 release
+changes version metadata, documentation, and evidence without changing that
+production implementation or rvoip pin. The November 24 legacy URL failure
+and November 20 unrestricted tests remain separate historical evidence.
 
 Eight unanswered ICE checks followed by a later timeout are consistent with
 the current ICE core's retry budget. Candidate checks and the overall failure
@@ -147,7 +176,6 @@ packets in both directions, and checks local TURN allocation release. Direct
 mode uses no ICE servers. A private configuration file supports customer TURN
 URLs, credentials, bind settings, and timeouts.
 
-The dependency-pin follow-up adds these examples and CI fixes without changing
-TURN runtime behavior. The live AWS qualification remains tied to the
-exact revisions recorded in `turn-results.json`; the later CI checks do not
-represent another live AWS run.
+The November 25 live AWS qualification uses the merged rvoip pin above.
+The exact Bridgefu revision and binary hash are recorded in `turn-results.json`;
+release CI checks are separate from the live AWS run.

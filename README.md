@@ -58,6 +58,12 @@ a DNS `sips:` Contact; Bridgefu does not silently downgrade signaling from TLS.
 For complete configurable Vapi → Amazon Connect setups, see the
 [SIP-header and optional correlation-ID examples](examples/vapi-amazon-connect/README.md).
 
+For networks that block direct Connect media, use the
+[Connect TURN setup](docs/connect-turn.md) and
+[restricted-egress test](examples/vapi-amazon-connect/tests/TURN.md).
+Bridgefu 0.9.2 supports Connect's UDP relay with `ice_servers: []`.
+
+
 ## Try SIP ↔ WebRTC locally
 
 With [Rust 1.95+, a C/C++ toolchain, and protobuf installed](examples/native-sip-webrtc/README.md#start-with-the-local-demo), run this **one line from the repository root**:
@@ -77,9 +83,35 @@ Each guide includes a one-command demo, editable endpoint configuration, and
 step-by-step setup. The [eight-case end-to-end matrix](examples/native-sip-webrtc/README.md#repeat-the-end-to-end-tests)
 checks both codecs, both hangup directions, audio, and cleanup.
 
+## Tested recipes and how to repeat them
+
+Choose a recipe below for step-by-step setup. The test guides explain the
+prerequisites, commands, expected results, and cleanup; the reports record
+what actually passed.
+
+| Recipe or scenario | What was tested | Repeat the test | Recorded results |
+| --- | --- | --- | --- |
+| [Vapi → Connect: SIP headers](examples/vapi-amazon-connect/sip-headers/README.md) | Live calls with exact header-to-contact attribute mapping and audio both ways; Connect UDP relay with `auto` and `join_ack`, direct media blocked, and `ice_servers: []`. | [Live environment setup](examples/vapi-amazon-connect/tests/E2E.md) → [restricted-egress steps](examples/vapi-amazon-connect/tests/TURN.md) | [November 25 live results](examples/vapi-amazon-connect/tests/TURN.md#recorded-qualification-november-25-2026--merged-main) · [JSON](examples/vapi-amazon-connect/tests/turn-results.json) |
+| [Vapi → Connect: optional correlation ID](examples/vapi-amazon-connect/correlation-id/README.md) | Live context storage and Lambda lookup, exact attributes, two-way audio, missing/expired lookup-token checks, and `auto` relay with direct media blocked and `ice_servers: []`. | [Live environment setup](examples/vapi-amazon-connect/tests/E2E.md) → [correlation-ID relay test](examples/vapi-amazon-connect/tests/TURN.md) | [November 25 live results](examples/vapi-amazon-connect/tests/turn-results.json) |
+| [Connect TURN negative control](docs/connect-turn.md) | Disabling the relay makes the call fail with actual firewall rejects and no relay allocation. This checks that the successful calls depended on TURN. | [Three-case TURN test](examples/vapi-amazon-connect/tests/TURN.md#3-run-the-three-cases-sequentially) | [November 25 live results](examples/vapi-amazon-connect/tests/turn-results.json) |
+| [SIP → WebRTC](examples/sip-to-webrtc/README.md) | Local real-protocol calls with PCMU/PCMA, audio both ways, caller/destination hangup, and cleanup. | [One-command demo and eight-case matrix](examples/native-sip-webrtc/README.md) | [November 23 recorded matrix](examples/native-sip-webrtc/results.json) |
+| [WebRTC → SIP](examples/webrtc-to-sip/README.md) | The reverse direction in the same local matrix, with both codecs and both hangup directions. | [One-command demo and eight-case matrix](examples/native-sip-webrtc/README.md) | [November 23 recorded matrix](examples/native-sip-webrtc/results.json) |
+
+The November 25 live tests ran merged main `85527e2`, before the 0.9.2
+version-only runtime metadata bump. The [0.9.2 release report](docs/release-0.9.2.md)
+records the exact source, dependency pin, cleanup audit, and release checks.
+The native matrix's checked-in report is historical 0.9.1 evidence; CI reruns
+that matrix and retains fresh results with each [CI run](https://github.com/eisenzopf/bridgefu/actions/workflows/ci.yml).
+
+The Connect tests restrict **Connect UDP media sockets**, while leaving SIP
+and HTTPS/WSS control available. They qualify UDP TURN, not whole-host egress
+allowlisting or TURN over TCP/TLS. The native examples use automated local
+WebRTC peers; they do not qualify a browser, public NAT, or your carrier.
+See [qualification scope](docs/qualification.md) for older evidence and limits.
+
 ## Local development
 
-This TURN candidate pins every rvoip component to one immutable revision based
+Bridgefu 0.9.2 pins every rvoip component to one immutable revision based
 on `0.5.0`, recorded in `config/rvoip-source.txt` and `Cargo.lock`. No sibling
 checkout is needed. See [Connect TURN setup and validation](docs/connect-turn.md).
 

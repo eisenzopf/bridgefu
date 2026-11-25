@@ -21,7 +21,7 @@ All speech and context are synthetic. Raw call records, resource IDs, browser tr
 
 ## Before running
 
-Use an AWS test account/profile, a Vapi private key, and a **public Route 53 hosted zone you control**. The test creates one new subdomain within that zone. You need Python 3.10+, Node.js, npm, Git, and ripgrep locally. CloudFormation builds Bridgefu on an isolated ARM64 EC2 host using the pinned Rust toolchain; a first build can take 30–45 minutes.
+Use an AWS test account/profile, a Vapi private key, and a **public Route 53 hosted zone you control**. The test creates one new subdomain within that zone. You need Python 3.10+, Node.js, npm, Git, and ripgrep locally. CloudFormation builds Bridgefu on an isolated ARM64 EC2 host using the pinned Rust toolchain; a first build can take 30–45 minutes. The synthetic SIP caller builds afterward, so total provisioning can take longer. Wait for the final readiness message before starting calls.
 
 The AWS identity needs permission to create the resources in `aws-sandbox.yaml`, `gateway.yaml`, and the two recipe templates, plus Polly synthesis and SSM commands. Check your quotas for a Connect instance, EC2, Elastic IP, and Vapi SIP entries. This test incurs charges until cleanup completes.
 
@@ -109,6 +109,21 @@ python3 examples/vapi-amazon-connect/tests/live.py cleanup \
 ```
 
 Cleanup uses the resource journal, removes the example resources and temporary Vapi entries, empties the test artifact bucket, and removes the test gateway/DNS/Connect stacks. It checks the AWS account before deletion. Keep the journal until it reports success.
+
+For the full closeout used in the November 25 TURN test:
+
+- Before cleanup, retain the test call IDs in your private journal. After
+  retaining the redacted reports, use Vapi's [Delete Call API](https://docs.vapi.ai/api-reference/calls/delete)
+  or dashboard action for those ended calls. Verify recordings, transcripts,
+  messages, and analysis are cleared. Historical operational call metadata
+  can remain readable; a successful deletion need not make GET return 404.
+- Verify the stacks and Connect instance are deleted, the gateway is terminated,
+  and its volumes, public address, DNS records, artifact bucket, secrets,
+  assistants, and temporary SIP entries are gone. The templates manage their
+  Lambda log groups; confirm no test log groups remain.
+
+The November 25 TURN report records this audit separately. Keep raw ownership
+identifiers and API responses private.
 
 ## Recorded result — November 20, 2026
 

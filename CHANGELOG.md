@@ -1,21 +1,24 @@
 # Changelog
 
-## Unreleased — Connect TURN candidate
+## 0.9.2 — 2026-11-25
 
-- Add per-contact Connect TURN credential selection and explicit relay-only mode,
-  with empty static ICE-server lists and customer-selected timeouts.
-- Pin the UDP TURN implementation to an immutable rvoip source revision.
-- Add a reproducible restricted-Connect-egress test with a relay-disabled
-  negative control. Live results are recorded separately from local tests.
-
-## Unreleased — rvoip 0.5 upgrade
-
-- Pin the coordinated rvoip graph to the published 0.5.0 packages.
-- Adapt fallible JWT construction and extensible coordinator configuration,
-  and align the metrics recorder with rvoip’s metrics 0.24 facade.
-- Treat rvoip’s new committed-media and quality notifications as observations,
-  so they do not terminate healthy calls.
-- Keep the dependency upgrade independent of Connect TURN transport work.
+- Add per-contact Amazon Connect TURN credentials, using Chime signaling in
+  `auto` or explicit `join_ack` mode, plus configurable relay-only operation.
+  Connect can establish media through its UDP relay when direct media
+  destinations are blocked. TURN over TCP/TLS is not implemented.
+- Support `ice_servers: []` without public STUN while still installing each
+  contact's Connect relay credentials. Credential sources, timeouts, port
+  ranges, and all customer header/attribute mappings remain configurable.
+- Upgrade to rvoip 0.5.0 and pin every component to merged commit
+  `529293064953c94c0b021c43e46d03d878922d0c`. The dependency upgrade and TURN
+  implementation remain separately reviewable in PRs #8 and #9.
+- Add real TURN/ICE regression coverage upstream and a reproducible live
+  restricted-egress runbook with a relay-disabled negative control.
+  See [the live report](examples/vapi-amazon-connect/tests/TURN.md).
+- Allow the SIP timeout fixture enough startup time to reach the deferred
+  destination while retaining its cancellation and cleanup assertions.
+- Bump the Rust package, CLI, lockfile, and OCI metadata to 0.9.2. This is a
+  source release; it does not publish a container image or a new rvoip release.
 
 ## 0.9.1 — 2026-11-23
 

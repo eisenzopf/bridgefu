@@ -33,7 +33,7 @@ RUN cargo build --locked --release --example vapi_feasibility_observer \
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG RUNTIME_DEBIAN_SNAPSHOT
 LABEL org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu" \
-      org.opencontainers.image.version="0.9.1" \
+      org.opencontainers.image.version="0.9.2" \
       org.opencontainers.image.rvoip.version="0.5.0"
 RUN sed -i \
         -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${RUNTIME_DEBIAN_SNAPSHOT}|" \

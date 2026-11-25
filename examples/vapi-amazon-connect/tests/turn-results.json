@@ -1,25 +1,19 @@
 {
   "schema": "bridgefu.connect-turn.qualification.v1",
-  "date": "2026-11-24",
-  "runtime_revision": "c898c84593386cd1709cf1d2fd76b099842bd8e1",
-  "harness_revision": "b805835e557676756a331af9bb7e672f0aa70169",
-  "rvoip_revision": "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de",
+  "date": "2026-11-25",
+  "runtime_revision": "85527e2313776886e53dba606384945c9074271d",
+  "harness_revision": "85527e2313776886e53dba606384945c9074271d",
+  "runtime_version": "0.9.1",
+  "target_release": "0.9.2",
+  "rvoip_revision": "529293064953c94c0b021c43e46d03d878922d0c",
   "rvoip_version": "0.5.0",
   "gateway_platform": "Linux ARM64",
+  "region": "us-west-2",
   "scope": "Real synthetic SIP caller -> Vapi assistant -> Bridgefu -> Amazon Connect browser agent. Firewall restricts Connect UDP source ports; SIP and HTTPS/WSS control remain available.",
   "static_ice_servers": [],
-  "local_validation": {
-    "bridgefu_tests_passed": 792,
-    "bridgefu_manual_tests_ignored": 20,
-    "connect_server_tests_passed": 87,
-    "stack_tests_passed": 9,
-    "local_turn_transport_tests_passed": 5,
-    "python_example_tests_passed": 11,
-    "clippy_warnings_denied": true,
-    "formatting": true,
-    "configuration_schema": true,
-    "static_release_image_policy": true
-  },
+  "source_archive_matches_commit": true,
+  "source_archive_sha256": "a7388f491e950cc32e4a95000a5bbbebbdc414e30a4484e05cfcc3031b007042",
+  "runtime_binary_sha256": "c29a3236a98157c3f9d76678f8202bdb1f0d186e5d68672f00d25e06a50aa32f",
   "cases": {
     "auto": {
       "schema": "bridgefu.connect-turn.restricted.v1",
@@ -29,7 +23,7 @@
       "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
       "passed": true,
       "firewall": {
-        "accepted": 604,
+        "accepted": 538,
         "rejected": 0
       },
       "selected_relay": true,
@@ -37,6 +31,7 @@
       "call_passed": true,
       "test_service_stopped": true,
       "firewall_restored": true,
+      "recipe": "sip-headers",
       "call_assertions": {
         "input_variables_match": true,
         "agent_connected": true,
@@ -52,15 +47,15 @@
           "unreleased_assignments": 0
         },
         "agent_audio": {
-          "incoming": 653,
-          "outgoing": 2147,
-          "dtmfFrames": 420
+          "incoming": 606,
+          "outgoing": 2392,
+          "dtmfFrames": 298
         },
         "source_audio": {
-          "agent_marker_frames_received": 251,
+          "agent_marker_frames_received": 110,
           "caller_probe_frames_sent": 750
         },
-        "duration_seconds": 44.2,
+        "duration_seconds": 48.8,
         "all_customer_attributes_match": true
       }
     },
@@ -72,7 +67,7 @@
       "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
       "passed": true,
       "firewall": {
-        "accepted": 645,
+        "accepted": 638,
         "rejected": 0
       },
       "selected_relay": true,
@@ -80,6 +75,7 @@
       "call_passed": true,
       "test_service_stopped": true,
       "firewall_restored": true,
+      "recipe": "sip-headers",
       "call_assertions": {
         "input_variables_match": true,
         "agent_connected": true,
@@ -95,15 +91,15 @@
           "unreleased_assignments": 0
         },
         "agent_audio": {
-          "incoming": 702,
-          "outgoing": 2160,
-          "dtmfFrames": 470
+          "incoming": 694,
+          "outgoing": 2243,
+          "dtmfFrames": 379
         },
         "source_audio": {
           "agent_marker_frames_received": 250,
           "caller_probe_frames_sent": 750
         },
-        "duration_seconds": 44.1,
+        "duration_seconds": 46.4,
         "all_customer_attributes_match": true
       }
     },
@@ -123,21 +119,86 @@
       "call_passed": false,
       "runner_error_class": "RuntimeError",
       "test_service_stopped": true,
-      "firewall_restored": true
+      "firewall_restored": true,
+      "recipe": "sip-headers"
+    },
+    "correlation_id_auto": {
+      "schema": "bridgefu.connect-turn.restricted.v1",
+      "credential_source": "auto",
+      "ice_servers_empty": true,
+      "relay_only": true,
+      "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
+      "passed": true,
+      "firewall": {
+        "accepted": 844,
+        "rejected": 0
+      },
+      "selected_relay": true,
+      "turn_allocated": true,
+      "call_passed": true,
+      "test_service_stopped": true,
+      "firewall_restored": true,
+      "recipe": "correlation-id",
+      "call_assertions": {
+        "input_variables_match": true,
+        "agent_connected": true,
+        "contact_disconnected": true,
+        "source_peer_passed": true,
+        "bidirectional_audio": true,
+        "gateway_drained": true,
+        "gateway_cleanup": {
+          "active_calls": 0,
+          "reserved_calls": 0,
+          "unreleased_assignments": 0
+        },
+        "agent_audio": {
+          "incoming": 811,
+          "outgoing": 2754,
+          "dtmfFrames": 512
+        },
+        "source_audio": {
+          "agent_marker_frames_received": 260,
+          "caller_probe_frames_sent": 1000
+        },
+        "duration_seconds": 56.8,
+        "lookup_found": true,
+        "token_only_ingress": true,
+        "missing_token_rejected": true,
+        "expired_token_rejected": true,
+        "all_customer_attributes_match": true
+      }
     }
   },
-  "legacy_url_diagnostic": {
-    "qualified": false,
-    "full_call_passed": false,
-    "turn_allocated": false,
+  "cleanup_audit": {
+    "cloudformation_stacks_deleted": true,
+    "owned_lambda_log_groups_removed": true,
+    "artifact_bucket_deleted": true,
+    "connect_instance_deleted": true,
+    "gateway_terminated": true,
+    "gateway_volumes_deleted": true,
+    "gateway_public_address_released": true,
+    "test_secrets_deleted": true,
+    "vapi_assistants_and_sip_entries_deleted": true,
+    "test_calls_ended": true,
+    "test_call_recordings_transcripts_analysis_cleared": true,
+    "gateway_dns_removed": true,
+    "certificate_challenge_dns_removed": true,
     "test_service_stopped": true,
-    "firewall_restored": true,
-    "separate_pre_signaling_http_probe_status": 400,
-    "http_probe_error_type": "UnknownOperationException",
-    "old_sdk_version_query_also_rejected": true,
-    "probe_contacts_stopped": true,
-    "note": "The current Chime SDK obtains credentials from JOIN_ACK and marks TurnControlUrl unused. The forced legacy URL mode is not qualified for this deployment."
+    "ipv4_test_firewall_removed": true,
+    "ipv6_test_firewall_removed": true,
+    "synthetic_caller_stopped": true,
+    "browser_agent_stopped": true,
+    "all_passed": true
   },
   "disposable_resources_removed": true,
-  "build_provenance": "The disposable sandbox was provisioned while the patch was being implemented. Before these calls, the committed TURN candidate was built with cargo build --locked --release and installed on that gateway. The normal runbook builds the candidate checkout during provisioning."
+  "retained_provider_history": "Vapi DELETE /call clears recordings, transcripts, messages, and analysis. Historical operational call metadata remains readable; no complete deletion of provider history is claimed.",
+  "build_provenance": "Provisioned a new sandbox from clean merged main 85527e2313776886e53dba606384945c9074271d. Every archived file was tracked and matched that commit. Built with cargo build --locked --release on the disposable gateway and recorded the installed binary hash. Release 0.9.2 changes version metadata, documentation, and redacted evidence; the tested production implementation and rvoip pin are unchanged.",
+  "legacy_url_diagnostic": "Not repeated on November 25. The November 24 historical report records the rejected forced legacy HTTP credential request; current positive qualification uses auto and join_ack.",
+  "limitations": [
+    "Connect UDP media egress only, not a whole-host destination allowlist",
+    "TURN over TCP/TLS not qualified or implemented",
+    "No long-duration credential replacement or load qualification",
+    "One disposable Linux ARM64 gateway in one AWS region",
+    "Customer QA acceptance remains separate"
+  ]
 }

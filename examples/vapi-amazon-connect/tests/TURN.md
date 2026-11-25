@@ -92,7 +92,54 @@ Run cleanup even if qualification fails. Keep the private journal until it
 reports success. No live result is implied merely by the presence of this
 runbook; the candidate's result report records what actually ran.
 
-## Recorded qualification: November 24, 2026
+## Recorded qualification: November 25, 2026 — merged main
+
+A fresh disposable environment built merged main
+`85527e2313776886e53dba606384945c9074271d`, with merged rvoip
+`529293064953c94c0b021c43e46d03d878922d0c`. Every uploaded source file was
+tracked and matched that commit. The installed binary's SHA-256 and the
+[redacted machine-readable results](turn-results.json) identify this run.
+
+This main revision still reports version `0.9.1`; it contains the merged TURN
+implementation. The 0.9.2 release preparation changes version metadata,
+documentation, and evidence, with no production-code or dependency-pin change.
+It does not represent a second live run of the version-bumped binary.
+
+Every case used `ice_servers: []` with direct Connect UDP blocked. The first
+three commands are exactly the sequence above. The fourth also validated the
+optional correlation-ID recipe using the same runner with
+`--mode correlation-id --source auto`. Preserve each case's report before
+reusing a source mode, because its `restricted-<source>-report.json` filename
+is reused. The committed report combines the per-case assertion snapshots.
+
+| Recipe / credential source | Result | Allowed relay packets | Blocked direct packets |
+| --- | --- | ---: | ---: |
+| SIP headers / `auto` | Two-way audio and exact context passed | 538 | 0 |
+| SIP headers / `join_ack` | Two-way audio and exact context passed | 638 | 0 |
+| SIP headers / `disabled` | Failed as required; negative control passed | 0 | 16 |
+| Correlation ID / `auto` | Two-way audio and exact context passed | 844 | 0 |
+
+All three successful calls selected a relay, preserved the configured
+customer fields, passed generated audio probes in both directions, and ended
+with zero active calls, reserved capacity, or unreleased assignments. The
+correlation-ID case also passed deployed missing-token and expired-token checks.
+The disabled case allocated no relay and failed with observed firewall rejects.
+
+Each case stopped its test service and removed its firewall rules. The final
+cleanup audit confirmed deletion of the six disposable stacks, Connect instance,
+gateway volumes, public address, DNS records, artifact bucket, secrets, Vapi
+assistants and SIP entries, and recording/transcript/analysis data for the ended
+test calls. It also verified that no test Lambda log groups remained and the
+gateway was terminated. Vapi retains historical operational call metadata;
+this audit does not claim to erase all provider history. See the
+[complete cleanup steps](E2E.md#5-remove-the-disposable-environment).
+
+This run did not repeat the forced legacy URL diagnostic. Its earlier failed
+result remains documented below. The scope remains one Linux ARM64 gateway,
+Connect UDP media egress, and one AWS region; SIP and HTTPS/WSS control traffic
+were available throughout.
+
+## Historical qualification: November 24, 2026
 
 The sandbox was provisioned during implementation; the committed candidate
 was then built with `cargo build --locked --release` and installed before
@@ -101,7 +148,7 @@ provisioning.
 
 Both successful cases used real Vapi and Amazon Connect calls, with
 `ice_servers: []` and direct Connect UDP blocked. See the
-[redacted machine-readable results](turn-results.json).
+[historical machine-readable results](turn-results-2026-11-24.json).
 
 | Credential source | Call result | Allowed relay packets | Blocked direct packets | Qualification |
 | --- | --- | ---: | ---: | --- |
