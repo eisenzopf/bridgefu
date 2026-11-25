@@ -1,0 +1,143 @@
+{
+  "schema": "bridgefu.connect-turn.qualification.v1",
+  "date": "2026-11-24",
+  "runtime_revision": "c898c84593386cd1709cf1d2fd76b099842bd8e1",
+  "harness_revision": "b805835e557676756a331af9bb7e672f0aa70169",
+  "rvoip_revision": "f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de",
+  "rvoip_version": "0.5.0",
+  "gateway_platform": "Linux ARM64",
+  "scope": "Real synthetic SIP caller -> Vapi assistant -> Bridgefu -> Amazon Connect browser agent. Firewall restricts Connect UDP source ports; SIP and HTTPS/WSS control remain available.",
+  "static_ice_servers": [],
+  "local_validation": {
+    "bridgefu_tests_passed": 792,
+    "bridgefu_manual_tests_ignored": 20,
+    "connect_server_tests_passed": 87,
+    "stack_tests_passed": 9,
+    "local_turn_transport_tests_passed": 5,
+    "python_example_tests_passed": 11,
+    "clippy_warnings_denied": true,
+    "formatting": true,
+    "configuration_schema": true,
+    "static_release_image_policy": true
+  },
+  "cases": {
+    "auto": {
+      "schema": "bridgefu.connect-turn.restricted.v1",
+      "credential_source": "auto",
+      "ice_servers_empty": true,
+      "relay_only": true,
+      "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
+      "passed": true,
+      "firewall": {
+        "accepted": 604,
+        "rejected": 0
+      },
+      "selected_relay": true,
+      "turn_allocated": true,
+      "call_passed": true,
+      "test_service_stopped": true,
+      "firewall_restored": true,
+      "call_assertions": {
+        "input_variables_match": true,
+        "agent_connected": true,
+        "contact_disconnected": true,
+        "source_peer_passed": true,
+        "bidirectional_audio": true,
+        "no_correlation_attribute": true,
+        "all_fields_in_initial_contact": true,
+        "gateway_drained": true,
+        "gateway_cleanup": {
+          "active_calls": 0,
+          "reserved_calls": 0,
+          "unreleased_assignments": 0
+        },
+        "agent_audio": {
+          "incoming": 653,
+          "outgoing": 2147,
+          "dtmfFrames": 420
+        },
+        "source_audio": {
+          "agent_marker_frames_received": 251,
+          "caller_probe_frames_sent": 750
+        },
+        "duration_seconds": 44.2,
+        "all_customer_attributes_match": true
+      }
+    },
+    "join_ack": {
+      "schema": "bridgefu.connect-turn.restricted.v1",
+      "credential_source": "join_ack",
+      "ice_servers_empty": true,
+      "relay_only": true,
+      "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
+      "passed": true,
+      "firewall": {
+        "accepted": 645,
+        "rejected": 0
+      },
+      "selected_relay": true,
+      "turn_allocated": true,
+      "call_passed": true,
+      "test_service_stopped": true,
+      "firewall_restored": true,
+      "call_assertions": {
+        "input_variables_match": true,
+        "agent_connected": true,
+        "contact_disconnected": true,
+        "source_peer_passed": true,
+        "bidirectional_audio": true,
+        "no_correlation_attribute": true,
+        "all_fields_in_initial_contact": true,
+        "gateway_drained": true,
+        "gateway_cleanup": {
+          "active_calls": 0,
+          "reserved_calls": 0,
+          "unreleased_assignments": 0
+        },
+        "agent_audio": {
+          "incoming": 702,
+          "outgoing": 2160,
+          "dtmfFrames": 470
+        },
+        "source_audio": {
+          "agent_marker_frames_received": 250,
+          "caller_probe_frames_sent": 750
+        },
+        "duration_seconds": 44.1,
+        "all_customer_attributes_match": true
+      }
+    },
+    "disabled": {
+      "schema": "bridgefu.connect-turn.restricted.v1",
+      "credential_source": "disabled",
+      "ice_servers_empty": true,
+      "relay_only": false,
+      "firewall_scope": "Connect UDP source port range; SIP and HTTPS control unchanged",
+      "passed": true,
+      "firewall": {
+        "accepted": 0,
+        "rejected": 16
+      },
+      "selected_relay": false,
+      "turn_allocated": false,
+      "call_passed": false,
+      "runner_error_class": "RuntimeError",
+      "test_service_stopped": true,
+      "firewall_restored": true
+    }
+  },
+  "legacy_url_diagnostic": {
+    "qualified": false,
+    "full_call_passed": false,
+    "turn_allocated": false,
+    "test_service_stopped": true,
+    "firewall_restored": true,
+    "separate_pre_signaling_http_probe_status": 400,
+    "http_probe_error_type": "UnknownOperationException",
+    "old_sdk_version_query_also_rejected": true,
+    "probe_contacts_stopped": true,
+    "note": "The current Chime SDK obtains credentials from JOIN_ACK and marks TurnControlUrl unused. The forced legacy URL mode is not qualified for this deployment."
+  },
+  "disposable_resources_removed": true,
+  "build_provenance": "The disposable sandbox was provisioned while the patch was being implemented. Before these calls, the committed TURN candidate was built with cargo build --locked --release and installed on that gateway. The normal runbook builds the candidate checkout during provisioning."
+}

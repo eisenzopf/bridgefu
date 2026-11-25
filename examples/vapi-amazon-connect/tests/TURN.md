@@ -91,3 +91,37 @@ python3 examples/vapi-amazon-connect/tests/live.py cleanup \
 Run cleanup even if qualification fails. Keep the private journal until it
 reports success. No live result is implied merely by the presence of this
 runbook; the candidate's result report records what actually ran.
+
+## Recorded qualification: November 24, 2026
+
+The sandbox was provisioned during implementation; the committed candidate
+was then built with `cargo build --locked --release` and installed before
+these calls. Normal reproduction builds your candidate checkout during
+provisioning.
+
+Both successful cases used real Vapi and Amazon Connect calls, with
+`ice_servers: []` and direct Connect UDP blocked. See the
+[redacted machine-readable results](turn-results.json).
+
+| Credential source | Call result | Allowed relay packets | Blocked direct packets | Qualification |
+| --- | --- | ---: | ---: | --- |
+| `auto` | Two-way audio and context checks passed | 604 | 0 | Passed |
+| `join_ack` | Two-way audio and context checks passed | 645 | 0 | Passed |
+| `disabled` | Failed to connect, as required | 0 | 16 | Negative control passed |
+
+Both successful calls selected a relay candidate, preserved all configured
+customer attributes, disconnected normally, and left zero active calls,
+reserved capacity, or unreleased assignments. Each case stopped the test
+service and restored its firewall rules. The disposable AWS and Vapi resources
+were removed after qualification.
+
+The forced `turn_control_url` call failed and allocated no relay. Separate
+HTTP probes, including the old SDK version parameters, received HTTP 400
+`UnknownOperationException`; their contacts were stopped. This legacy option
+is not qualified for this deployment. The current SDK's JOIN_ACK path is the
+validated recipe.
+
+This is a Connect-media egress test on one disposable Linux ARM64 gateway.
+It does not qualify TURN over TCP/TLS, a whole-host HTTPS destination allowlist,
+long-duration credential replacement, or every AWS region. Packet counts and
+call durations will vary on another run.

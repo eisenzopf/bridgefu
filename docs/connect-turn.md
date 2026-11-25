@@ -123,9 +123,12 @@ bounds. Local protocol tests do not prove AWS reachability.
 
 The [restricted-egress live runbook](../examples/vapi-amazon-connect/tests/TURN.md)
 repeats real Vapi-to-Connect calls with `ice_servers: []`, blocks direct Connect
-UDP traffic, and includes a relay-disabled negative control. Its recorded
-result must be reviewed separately; do not reuse the unrestricted November 20
-report as TURN evidence.
+UDP traffic, and includes a relay-disabled negative control. The November 24
+[recorded results](../examples/vapi-amazon-connect/tests/turn-results.json)
+pass `auto`, explicit `join_ack`, and the required relay-disabled failure.
+Both positive calls passed two-way audio, exact context mapping, selected-relay,
+and cleanup assertions. The forced legacy URL mode did not pass. These results
+are separate from the unrestricted November 20 report.
 
 Eight unanswered ICE checks followed by a later timeout are consistent with
 the current ICE core's retry budget. Candidate checks and the overall failure
