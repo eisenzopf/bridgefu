@@ -6,6 +6,10 @@ separate commits. The exact TURN dependency revision is in
 [`config/rvoip-source.txt`](../config/rvoip-source.txt).
 
 Connect gives each contact a media endpoint and temporary relay credentials.
+The current Chime SDK obtains those credentials from `JOIN_ACK`, and marks
+`TurnControlUrl` as unused ([credential handling](https://github.com/aws/amazon-chime-sdk-js/blob/main/src/task/JoinAndReceiveIndexTask.ts),
+[URL definition](https://github.com/aws/amazon-chime-sdk-js/blob/main/src/meetingsession/MeetingSessionURLs.ts)).
+Bridgefu's recommended `auto` mode prefers that same signaling path.
 A firewall may block the media endpoint's public address and random UDP port.
 Bridgefu can now send that contact's media through Connect's UDP TURN relay
 instead. No correlation ID, Lambda context store, or fixed customer field is
@@ -59,8 +63,14 @@ The credential-source choices are:
 | --- | --- |
 | `auto` | Uses usable JOIN_ACK credentials, or fetches them from that contact's `TurnControlUrl`. Recommended. |
 | `join_ack` | Uses only the credentials received during Chime signaling. |
-| `turn_control_url` | Always fetches credentials from the AWS-returned URL. Useful for testing that path. |
+| `turn_control_url` | Forces the legacy HTTP credential request. Diagnostic/legacy compatibility option; not recommended for current Connect. |
 | `disabled` | Uses only the static ICE servers you configured. |
+
+The legacy URL is not proof that its HTTP operation is available. The live
+sandbox rejected the legacy request with HTTP 400 `UnknownOperationException`,
+including with the old SDK's version query parameters. Do not force that mode
+for this deployment. It fails explicitly instead of silently selecting another
+credential source; use `auto` or `join_ack` for the current signaling path.
 
 `relay_only: true` fails the call setup if a UDP relay cannot be allocated; it
 does not fall back to a forbidden direct-media destination. The default is

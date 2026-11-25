@@ -128,7 +128,14 @@ def run(args):
             error = type(exc).__name__
             call_passed = False
         report["firewall"] = counters(state)
-        journal = command(state, f"journalctl -u bridgefu --since @{started} --no-pager -o cat", timeout=30)
+        # SSM caps command output. Filter on the host so startup/call logging
+        # cannot truncate the later relay-selection evidence.
+        journal = command(
+            state,
+            f"journalctl -u bridgefu --since @{started} --no-pager -o cat "
+            "| grep -E 'TURN UDP allocation established|Connect ICE selected candidate pair' || true",
+            timeout=30,
+        )
         report["selected_relay"] = 'local_candidate_type="relay"' in journal or '"local_candidate_type":"relay"' in journal
         report["turn_allocated"] = "TURN UDP allocation established" in journal
         report["call_passed"] = call_passed

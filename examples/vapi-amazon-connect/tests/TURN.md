@@ -37,7 +37,7 @@ example uses Connect ports 42000–42031, separate from the test caller's
 Run from the repository root:
 
 ```sh
-for SOURCE in turn_control_url auto disabled; do
+for SOURCE in auto join_ack disabled; do
   python3 examples/vapi-amazon-connect/tests/restricted_egress.py \
     --state examples/vapi-amazon-connect/.local/live/state.json \
     --network-settings examples/vapi-amazon-connect/.local/live/network.json \
@@ -47,8 +47,8 @@ done
 
 Each case temporarily installs the chosen credential-source mode, explicit
 empty static ICE servers, and the firewall before making the call. The first
-case exercises `TurnControlUrl`; the second exercises normal automatic
-selection. The last disables Connect relay provisioning and **must fail to
+case exercises automatic selection; the second requires credentials from
+Chime `JOIN_ACK`, matching the current SDK. The last disables Connect relay provisioning and **must fail to
 connect while the firewall rejects direct ICE packets**. A failed call alone
 is insufficient to pass the negative control.
 
@@ -64,9 +64,18 @@ The helper restores the generated configuration, stops this test service, and
 removes only its own firewall chains after each case. It does not change
 customer resources outside the recorded disposable test host.
 
+### Optional legacy URL diagnostic
+
+`TurnControlUrl` is unused by the current Chime SDK. To check an older endpoint,
+run the same command once with `--source turn_control_url`. This forces HTTP
+credential retrieval; it never silently switches to JOIN_ACK. Our sandbox
+rejected the legacy request with HTTP 400 `UnknownOperationException`. Treat
+that result as a failed diagnostic, not a passed relay/media test. The current
+Connect recipe uses the two signaling-based modes above.
+
 ## 4. Keep only the safe report
 
-`restricted-turn_control_url-report.json`, `restricted-auto-report.json`, and
+`restricted-auto-report.json`, `restricted-join_ack-report.json`, and
 `restricted-disabled-report.json` contain booleans, counters, and the test
 scope. Inspect them before sharing. Resource IDs, credentials, raw signaling,
 contact records and browser logs remain in the private state/run directories.
