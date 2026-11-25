@@ -9,17 +9,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridgefu::api_principal::ApiPrincipal;
 use bridgefu::call_engine::{
-    CallId, CallState, LegDirection, LegState, MediaFlow, SignalingInitiator, TenantId, WorkerId,
+    CallId, CallState, LegDirection, LegState, MediaFlow, SignalingInitiator, TenantId,
+    TerminalOutcome, WorkerId,
 };
 use bridgefu::call_service::{
     build_call_service_runtime, CallExecutionSupervisor, CallRepositoryBackendConfig,
-    CallServiceCoordinationConfig, CallServiceRuntime, CallServiceRuntimeConfig, CallTimeoutPolicy,
-    ConfiguredSipOutboundProfile, ConfiguredSipProfileAuth, CreateCallInput,
+    CallServiceClock, CallServiceCoordinationConfig, CallServiceRuntime, CallServiceRuntimeConfig,
+    CallTimeoutPolicy, ConfiguredSipOutboundProfile, ConfiguredSipProfileAuth, CreateCallInput,
     DisabledProviderLegExecutor, IdempotencyKey, LegEndpointConfig, NamedProfileBinding,
     NamedProfileKind, NamedProfileRole, NamedRouteBinding, NamedRouteCallContext, RequestedLeg,
     SamePrincipalAttachmentResolver, SipEndpointConfig, SipInitialContextMode,
@@ -28,7 +29,7 @@ use bridgefu::call_service::{
 use bridgefu::context::ContextPolicy;
 use bridgefu::coordination::DeploymentId;
 use bridgefu::secret_ref::SecretRef;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rvoip_auth_core::{AuthenticatedPrincipal, AuthenticationMethod};
 use rvoip_core::adapter::ConnectionAdapter;
 use rvoip_core::config::Config as CoreConfig;
@@ -80,6 +81,13 @@ async fn runtime() -> Arc<CallServiceRuntime> {
 }
 
 async fn runtime_with_setup_timeout(setup: Duration) -> Arc<CallServiceRuntime> {
+    runtime_with_setup_clock(setup, Arc::new(SystemCallServiceClock)).await
+}
+
+async fn runtime_with_setup_clock(
+    setup: Duration,
+    clock: Arc<dyn CallServiceClock>,
+) -> Arc<CallServiceRuntime> {
     let mut coordination = CallServiceCoordinationConfig::new(
         DeploymentId::parse("generic-sip-reference").expect("deployment ID"),
     );
@@ -102,7 +110,7 @@ async fn runtime_with_setup_timeout(setup: Duration) -> Arc<CallServiceRuntime> 
                 coordination,
             },
             Arc::new(SamePrincipalAttachmentResolver),
-            Arc::new(SystemCallServiceClock),
+            clock,
         )
         .await
         .expect("reference call runtime"),
@@ -1149,6 +1157,21 @@ async fn run_proxy_auth_reference() {
     assert_eq!(orchestrator.connection_lifecycle_task_count(), 0);
 }
 
+struct SetupClock(Mutex<DateTime<Utc>>);
+
+impl SetupClock {
+    fn advance(&self, duration: Duration) {
+        let mut now = self.0.lock().expect("setup clock lock");
+        *now += chrono::Duration::from_std(duration).expect("setup clock duration");
+    }
+}
+
+impl CallServiceClock for SetupClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("setup clock lock")
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DestinationFailureMode {
     Reject,
@@ -1159,7 +1182,9 @@ impl DestinationFailureMode {
     const fn setup_timeout(self) -> Duration {
         match self {
             Self::Reject => Duration::from_secs(5),
-            Self::SetupTimeout => Duration::from_millis(750),
+            // The injected clock triggers expiry after the INVITE is observed.
+            // Leave ample real-time budget for native protocol setup on busy CI.
+            Self::SetupTimeout => Duration::from_secs(30),
         }
     }
 
@@ -1206,7 +1231,12 @@ async fn run_destination_failure_reference(mode: DestinationFailureMode) {
     let bridge_address = reserve_udp();
     let source_address = reserve_udp();
     let destination_address = reserve_udp();
-    let runtime = runtime_with_setup_timeout(mode.setup_timeout()).await;
+    let setup_clock = Arc::new(SetupClock(Mutex::new(Utc::now())));
+    let clock: Arc<dyn CallServiceClock> = match mode {
+        DestinationFailureMode::Reject => Arc::new(SystemCallServiceClock),
+        DestinationFailureMode::SetupTimeout => setup_clock.clone(),
+    };
+    let runtime = runtime_with_setup_clock(mode.setup_timeout(), clock).await;
     let orchestrator = Orchestrator::new(CoreConfig::default());
 
     let mut outbound_profiles = StaticOutboundProfileResolver::default();
@@ -1359,6 +1389,12 @@ async fn run_destination_failure_reference(mode: DestinationFailureMode) {
         .await
         .expect("destination failure INVITE deadline")
         .expect("destination failure callback remained live");
+    if matches!(mode, DestinationFailureMode::SetupTimeout) {
+        // Expire the durable deadline only after real SIP signaling reaches the
+        // destination. A 750 ms wall-clock budget could previously expire during
+        // source attachment/startup and never exercise destination CANCEL at all.
+        setup_clock.advance(mode.setup_timeout() + Duration::from_millis(1));
+    }
     assert!(
         source_handle
             .wait_for_answered(Some(Duration::from_secs(5)))
@@ -1389,6 +1425,14 @@ async fn run_destination_failure_reference(mode: DestinationFailureMode) {
         .iter()
         .all(|leg| leg.state().is_terminal()));
     wait_for_orchestrator_idle(&orchestrator).await;
+
+    if matches!(mode, DestinationFailureMode::SetupTimeout) {
+        assert!(
+            matches!(terminal.call.aggregate.terminal_outcome(),
+                Some(TerminalOutcome::Failed(failure)) if failure.code() == "setup_timeout"),
+            "the controlled service deadline must cause the failure"
+        );
+    }
 
     supervisor.shutdown(Duration::from_secs(3)).await;
     orchestrator.drain_prepared_outbound_connections().await;
