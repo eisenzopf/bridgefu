@@ -40,8 +40,8 @@ preferred IPv6 while the bounded test listener was intentionally bound to IPv4.
 ## Reproduction
 
 This is an rvoip source-level interoperability harness, not a Bridgefu build
-dependency. Bridgefu itself resolves `rvoip-moq = 0.5.0` from crates.io through
-its committed Cargo.lock. To rerun the rvoip package's internal example, start
+dependency. The TURN candidate resolves `rvoip-moq = 0.5.0` from the immutable
+rvoip workspace revision recorded in its committed Cargo.lock. To rerun the rvoip package's internal example, start
 it from a reviewed rvoip source checkout:
 
 ```bash

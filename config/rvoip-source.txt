@@ -1,0 +1,1 @@
+git+https://github.com/eisenzopf/rvoip?rev=f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de#f25667ffec43ec93bd4fe8ccbbbf4ab5b82ce6de

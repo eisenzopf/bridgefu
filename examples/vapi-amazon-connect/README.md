@@ -19,6 +19,7 @@ After setup:
 
 - [AWS runbook](AWS-RUNBOOK.md): useful commands, troubleshooting, and cleanup.
 - [End-to-end test](tests/E2E.md): reproduce the disposable test and understand its results.
+- [Restricted-egress TURN test](tests/TURN.md): validate Connect relay media with direct UDP blocked (requires the TURN candidate).
 - [Configuration reference](REFERENCE.md): field sources, validation limits, generated files, and deployment details.
 
 These examples require Bridgefu 0.9.1 or newer. They are not included in the `0.9.0` source release. The existing built-in correlation recipe remains available; these examples add two independently configurable routes.

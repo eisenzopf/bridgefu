@@ -2,13 +2,13 @@
 
 | Surface | Release contract |
 |---|---|
-| rvoip packages | Exact crates.io `=0.5.0` component releases; `Cargo.lock` records every registry checksum and transitive package |
+| rvoip packages | Exact `=0.5.0` components at the TURN revision in `config/rvoip-source.txt`; `Cargo.lock` records source and transitive packages |
 | SIP/RTP | Audio, G.711 µ-law/A-law, RFC 4733 DTMF |
 | WebRTC | Opus, WHIP/WHEP, WS/WSS signaling, arbitrary labeled DataChannels |
-| WebRTC engine | crates.io `rvoip-webrtc = 0.5.0`, backed by `rvoip-webrtc-stack = 0.5.0` and `rvoip-rtc = 0.5.0`; no Git or path override |
+| WebRTC engine | `rvoip-webrtc = 0.5.0`, backed by `rvoip-webrtc-stack = 0.5.0` and `rvoip-rtc = 0.5.0`; one immutable Git revision, with no local path overrides |
 | Context | `bridgefu.context.v1`, JSON, allowlisted `X-Bridgefu-*`/configured `X-*` only |
 | UCTP | `uctp/0.2`; 8-byte UCTP header followed by a complete RTP packet; exact mono Opus/PCMU/PCMA route negotiation with canonical PT 111/0/8 |
-| MOQT wire library | crates.io `rvoip-moq = 0.5.0` with exact `rvoip-moq-transport`, `rvoip-moq-native`, and `rvoip-moq-relay` 0.5.0 packages recorded in `Cargo.lock` |
+| MOQT wire library | `rvoip-moq = 0.5.0` with exact `rvoip-moq-transport`, `rvoip-moq-native`, and `rvoip-moq-relay` 0.5.0 packages recorded in `Cargo.lock` |
 | Bridgefu MOQT target | MOQT draft-19, MSF-01, LOC-03 |
 
 MOQT draft churn is isolated in the published `rvoip-moq` package family. The
@@ -34,8 +34,8 @@ datagram, FETCH, object, status, padding, and authorization encodings.
 The matching pre-publication rvoip revision was
 `7d83b66545789d55471c13a7c68eb54a9493cc0a`. It exposes only rvoip-owned
 authorization, catalog, LOC, events, compatibility, health, topology, and
-lifecycle types. Release builds now select the checksummed crates.io 0.5.0
-packages rather than that source revision. Its final Gate 5 matrix recorded 134
+lifecycle types. This candidate selects the 0.5.0-based TURN source revision in
+`config/rvoip-source.txt` rather than that historical source revision. Its final Gate 5 matrix recorded 134
 unit, three managed relay E2E, two public API, and seven admission tests. The
 E2E matrix includes warm Relative Joining FETCH, cold live fallback, raw QUIC,
 WebTransport, a real two-topology external mTLS relay chain, route
@@ -73,11 +73,11 @@ used as a broadcast fanout protocol.
 
 ## WebRTC alpha and TURN
 
-The authoritative alpha implementation is packaged as exact crates.io
-`rvoip-webrtc-stack` and `rvoip-rtc` 0.5.0 dependencies. It supports the
-qualified WHIP/WHEP and WS/WSS signaling, ICE/DTLS, Opus, late DataChannel, and
-teardown paths. Its wrapper does not enforce relay-only gathering, so Bridgefu
-does not claim TURN relay qualification on that dependency.
+The published 0.5.0 wrapper does not implement TURN gathering. This candidate
+pins the reviewed source inputs for a UDP TURN implementation: real relay
+allocation, relay-only ICE, and per-contact Connect credential provisioning.
+It does not implement TURN over TCP/TLS. See [Connect TURN](connect-turn.md)
+for configuration, the local test evidence, and the separate live-test status.
 
 Before publication, an owner-controlled local WebRTC/RTC candidate passed a
 real 4/4 UDP TURN suite, but that run used a dirty RTC submodule containing a

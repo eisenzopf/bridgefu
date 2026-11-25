@@ -79,8 +79,9 @@ checks both codecs, both hangup directions, audio, and cleanup.
 
 ## Local development
 
-Bridgefu pins the coordinated crates.io rvoip package graph exactly at `0.5.0`;
-there are no Git, path, or local rvoip overrides.
+This TURN candidate pins every rvoip component to one immutable revision based
+on `0.5.0`, recorded in `config/rvoip-source.txt` and `Cargo.lock`. No sibling
+checkout is needed. See [Connect TURN setup and validation](docs/connect-turn.md).
 
 ```bash
 cargo test --locked

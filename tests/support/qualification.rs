@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
 pub const COORDINATED_RVOIP_VERSION: &str = "0.5.0";
 const LATENCY_MAX_US: u64 = 1_000_000;
-pub const APPROVED_RVOIP_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub const APPROVED_RVOIP_SOURCE: &str = include_str!("../../config/rvoip-source.txt");
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -241,14 +241,13 @@ pub fn rvoip_lock_evidence(manifest_dir: &Path) -> RvoipLockEvidence {
                 "{} must resolve from its approved immutable source",
                 package.name
             );
-            let checksum = package
-                .checksum
-                .expect("crates.io rvoip packages must carry a lockfile checksum");
+            // Git source identity includes the exact reviewed commit above.
+            assert!(package.checksum.is_none());
             CargoPackageEvidence {
                 name: package.name,
                 version: package.version,
                 source: package.source.expect("validated immutable source"),
-                checksum: Some(checksum),
+                checksum: package.checksum,
             }
         })
         .collect::<Vec<_>>();
@@ -404,7 +403,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_evidence_uses_the_coordinated_crates_io_release() {
+    fn lock_evidence_uses_the_exact_coordinated_turn_candidate() {
         let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
         assert_eq!(evidence.release_version, "0.5.0");
         assert!(evidence
@@ -412,6 +411,6 @@ mod tests {
             .iter()
             .all(|package| package.version == "0.5.0"
                 && package.source == APPROVED_RVOIP_SOURCE
-                && package.checksum.is_some()));
+                && package.checksum.is_none()));
     }
 }

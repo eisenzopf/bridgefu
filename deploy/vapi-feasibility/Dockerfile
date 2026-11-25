@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# The committed Cargo.lock pins the crates.io-hosted rvoip 0.5.0 graph.
+# The committed Cargo.lock pins the revision-pinned rvoip 0.5.0 TURN candidate graph.
 # docker build -f deploy/vapi-feasibility/Dockerfile .
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818

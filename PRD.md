@@ -141,15 +141,14 @@ parse YAML → build `ScreenPopServerConfig` (`SipConfig` + `ConnectConfig` +
 `AttributeMapping` + `AwsConnectStarter`) → `serve()` under a shutdown guard,
 alongside an axum health/metrics server.
 
-- Local development and production use the coordinated crates.io rvoip
-  component release at exact version `=0.5.0`, including
-  `rvoip-amazon-connect`. The committed `Cargo.lock` supplies the registry
-  checksums and complete transitive dependency graph.
+- The TURN candidate uses the coordinated rvoip 0.5.0 workspace pinned to an
+  immutable Git revision in `config/rvoip-source.txt`, including
+  `rvoip-amazon-connect`. The committed `Cargo.lock` records the complete
+  dependency graph. The separate upgrade branch uses published 0.5.0 packages.
 
 ## 8. Deployment
 
-- **Packaging:** multi-stage Docker image (deps from crates.io, so it builds off
-  the instance), run via systemd with `--network host` + `--restart=always`.
+- **Packaging:** multi-stage Docker image (locked dependencies, built off-instance), run via systemd with `--network host` + `--restart=always`.
 - **Infra (Terraform):** VPC + public subnet + IGW, Elastic IP, security group
   (SSH/metrics from admin CIDR; SIP 5060 + RTP 16384–32767 from a configurable
   CIDR, default open for testing), IAM instance role, AL2023 arm64 `t4g.small`.

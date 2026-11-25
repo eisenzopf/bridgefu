@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Canonical Bridgefu image. The committed Cargo.lock is the complete source of
-# truth for the crates.io-hosted rvoip 0.5.0 dependency graph:
+# truth for the revision-pinned rvoip 0.5.0 TURN candidate dependency graph:
 #
 #   docker build -f deploy/Dockerfile .
 #

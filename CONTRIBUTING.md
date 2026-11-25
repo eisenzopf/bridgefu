@@ -14,7 +14,7 @@ Before proposing a change:
    not only a happy-path test.
 4. Run `cargo fmt --all -- --check`, the affected strict Clippy target, and the
    affected Bridgefu test suites with `--locked`. Bridgefu resolves exact
-   crates.io rvoip 0.5.0 packages and does not require a sibling checkout;
+   revision-pinned rvoip 0.5.0 TURN candidate packages and does not require a sibling checkout;
    reusable rvoip changes must be released and qualified in that repository
    before Bridgefu updates its exact package versions.
 5. Update `docs/roadmap.md` with exact evidence, leaving external or long-load

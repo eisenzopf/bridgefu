@@ -540,6 +540,12 @@ pub struct GenericWebRtcNetworkCfg {
     pub nat_1to1_candidate_type: GenericNatCandidateType,
     #[serde(default = "default_webrtc_gather_timeout")]
     pub gather_timeout_secs: u64,
+    #[serde(default = "default_turn_timeout")]
+    pub turn_attempt_timeout_secs: u64,
+    #[serde(default = "default_turn_timeout")]
+    pub turn_send_timeout_secs: u64,
+    #[serde(default = "default_turn_timeout")]
+    pub turn_close_timeout_secs: u64,
     #[serde(default = "default_webrtc_connection_timeout")]
     pub connection_timeout_secs: u64,
     #[serde(default = "default_true")]
@@ -957,6 +963,20 @@ impl GenericWebRtcNetworkCfg {
             GenericNatCandidateType::Host => rvoip_webrtc::Nat1To1CandidateType::Host,
             GenericNatCandidateType::Srflx => rvoip_webrtc::Nat1To1CandidateType::Srflx,
         };
+        for timeout in [
+            self.turn_attempt_timeout_secs,
+            self.turn_send_timeout_secs,
+            self.turn_close_timeout_secs,
+        ] {
+            if !(1..=60).contains(&timeout) {
+                return Err(anyhow!(
+                    "generic_bridge.webrtc TURN timeouts must be 1..=60 seconds"
+                ));
+            }
+        }
+        config.turn_attempt_timeout_secs = self.turn_attempt_timeout_secs;
+        config.turn_send_timeout_secs = self.turn_send_timeout_secs;
+        config.turn_close_timeout_secs = self.turn_close_timeout_secs;
         config.gather_timeout_secs = self.gather_timeout_secs;
         config.connection_timeout_secs = self.connection_timeout_secs;
         config.trickle_ice = self.trickle_ice;
@@ -4037,6 +4057,9 @@ pub struct MoqRelayTimeoutsCfg {
 #[derive(Debug, Default, Deserialize)]
 pub struct AwsCfg {
     pub region: String,
+    /// Per-contact Connect TURN provisioning and relay-only policy.
+    #[serde(default)]
+    pub turn: rvoip_amazon_connect::turn::ConnectTurnConfig,
     /// Legacy single-tenant Connect instance id. Ignored when `tenants:` is
     /// non-empty.
     #[serde(default)]
@@ -5414,6 +5437,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.aws
+            .turn
+            .validate()
+            .map_err(|_| anyhow!("aws.turn configuration is invalid"))?;
         if self.config_version != 1 {
             return Err(anyhow!(
                 "unsupported config_version {}",
@@ -6349,6 +6376,11 @@ impl Config {
         )
         .with_region(self.aws.region.clone())
         .with_attribute_mapping(attribute_mapping(&self.mapping)?);
+        self.aws
+            .turn
+            .validate()
+            .map_err(|_| anyhow!("aws.turn configuration is invalid"))?;
+        connect.turn = self.aws.turn.clone();
         connect.default_display_name = self.contact.default_display_name.clone();
         connect.signaling_timeout = Duration::from_secs(self.contact.signaling_timeout_secs);
         connect.media_connect_timeout =
@@ -6426,7 +6458,10 @@ impl Config {
             }
         });
 
-        Ok(ScreenPopServerConfig::new(sip, connect, starter).with_router(router))
+        let webrtc = self.generic_bridge.webrtc_stack_config()?;
+        Ok(ScreenPopServerConfig::new(sip, connect, starter)
+            .with_webrtc_config(webrtc)
+            .with_router(router))
     }
 }
 
@@ -7629,6 +7664,10 @@ impl Default for GenericSymmetricRtpCfg {
     }
 }
 
+fn default_turn_timeout() -> u64 {
+    2
+}
+
 impl Default for GenericWebRtcNetworkCfg {
     fn default() -> Self {
         Self {
@@ -7639,6 +7678,9 @@ impl Default for GenericWebRtcNetworkCfg {
             ice_transport_policy: GenericIceTransportPolicy::All,
             nat_1to1_ips: Vec::new(),
             nat_1to1_candidate_type: GenericNatCandidateType::Host,
+            turn_attempt_timeout_secs: default_turn_timeout(),
+            turn_send_timeout_secs: default_turn_timeout(),
+            turn_close_timeout_secs: default_turn_timeout(),
             gather_timeout_secs: default_webrtc_gather_timeout(),
             connection_timeout_secs: default_webrtc_connection_timeout(),
             trickle_ice: true,
@@ -10010,6 +10052,48 @@ sip_profiles:
             "SipListenerAuthPolicy { enabled: true, tenant_configured: true, auth_service_configured: true, trusted_source_count: 1, mtls_principal_count: 1, source_rate_limit: None, observer_configured: false }"
         );
         assert!(!format!("{policy:?}").contains(&fingerprint));
+    }
+
+    #[tokio::test]
+    async fn connect_turn_preserves_empty_static_ice_servers_and_customer_timeouts() {
+        let yaml = LEGACY.replace("  region: us-west-2", "  region: us-west-2\n  turn:\n    credential_source: turn_control_url\n    relay_only: true\n    request_timeout_secs: 9\n    control_allowed_hosts: [relay-control.example.test]");
+        let yaml = format!("{yaml}\ngeneric_bridge:\n  webrtc:\n    ice_servers: []\n    turn_attempt_timeout_secs: 3\n    turn_send_timeout_secs: 4\n    turn_close_timeout_secs: 5\n");
+        let config = parse(&yaml);
+        config.validate().unwrap();
+        let connect = config.build_amazon_connect_config().unwrap();
+        assert!(connect.turn.relay_only);
+        assert_eq!(
+            connect.turn.credential_source,
+            rvoip_amazon_connect::turn::TurnCredentialSource::TurnControlUrl
+        );
+        assert_eq!(connect.turn.request_timeout_secs, 9);
+        let webrtc = config.generic_bridge.webrtc_stack_config().unwrap();
+        assert!(webrtc.ice_servers.is_empty());
+        assert_eq!(webrtc.turn_attempt_timeout_secs, 3);
+        assert_eq!(webrtc.turn_send_timeout_secs, 4);
+        assert_eq!(webrtc.turn_close_timeout_secs, 5);
+        // Relay policy belongs to Connect; generic peers still require their
+        // own static relay configuration and receive no contact credentials.
+        assert_eq!(
+            webrtc.ice_transport_policy,
+            rvoip_webrtc::config::IceTransportPolicy::All
+        );
+        let legacy = config
+            .build_server_config_with_starter(Arc::new(UnusedConnectStarter))
+            .await
+            .unwrap();
+        assert!(legacy.webrtc.ice_servers.is_empty());
+        assert!(legacy.connect.turn.relay_only);
+        assert!(
+            parse(&yaml.replace("request_timeout_secs: 9", "request_timeout_secs: 0"))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(&yaml.replace("turn_send_timeout_secs: 4", "turn_send_timeout_secs: 0"))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

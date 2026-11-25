@@ -543,6 +543,10 @@ def render(c, out):
             "drain_timeout_secs": 30,
         },
     }
+    if "connect_turn" in c:
+        gateway["aws"]["turn"] = copy.deepcopy(c["connect_turn"])
+    if "webrtc" in c:
+        gateway["generic_bridge"] = {"webrtc": copy.deepcopy(c["webrtc"])}
     write(out / "bridgefu.example.yaml", yaml.safe_dump(gateway, sort_keys=False))
     args = [f for f in c["fields"] if f["source"].startswith("arguments.")]
     tool = {

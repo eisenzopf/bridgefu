@@ -112,12 +112,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends protobuf-compiler
           protoc --version
-      - name: Verify locked rvoip crates.io graph
+      - name: Verify locked rvoip source graph
         working-directory: bridgefu
         run: |
           python3 - <<'PY'
           import json
           import subprocess
+          from pathlib import Path
 
           metadata = json.loads(subprocess.check_output(
               ["cargo", "metadata", "--locked", "--format-version", "1"],
@@ -130,15 +131,16 @@ jobs:
           ]
           if not packages:
               raise SystemExit("locked graph contains no rvoip packages")
+          expected_source = Path("config/rvoip-source.txt").read_text().strip()
           invalid = [
               (package["name"], package["version"], package["source"])
               for package in packages
               if package["version"] != "0.5.0"
-              or not (package["source"] or "").startswith("registry+")
+              or package["source"] != expected_source
           ]
           if invalid:
-              raise SystemExit(f"rvoip graph is not registry-only 0.5.0: {invalid}")
-          print(f"verified {len(packages)} locked rvoip 0.5.0 registry packages")
+              raise SystemExit(f"rvoip graph is not the pinned 0.5.0 TURN candidate: {invalid}")
+          print(f"verified {len(packages)} locked rvoip 0.5.0 packages at the pinned TURN revision")
           PY
       - name: Formatting
         working-directory: bridgefu

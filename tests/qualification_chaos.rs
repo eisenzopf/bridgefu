@@ -7,8 +7,8 @@
 //! smoke, never the one-hour release qualification.
 //!
 //! Bridgefu scenarios run under Bridgefu's Cargo.lock. rvoip source scenarios
-//! are selected from the exact checksummed crates.io 0.5.0 packages, then run
-//! under each packaged crate's own Cargo.lock. The report records those as separate
+//! are selected from the exact 0.5.0 TURN source revision, then run
+//! under the pinned rvoip workspace Cargo.lock. The report records those as separate
 //! dependency graphs rather than attaching Bridgefu lock evidence to the
 //! independently locked upstream test commands.
 
@@ -61,7 +61,7 @@ enum Workspace {
 #[serde(rename_all = "snake_case")]
 enum DependencyResolution {
     BridgefuCargoLock,
-    CratesIoPackageCargoLock,
+    RvoipWorkspaceCargoLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -469,7 +469,7 @@ fn qualifies_deterministic_chaos_matrix() {
         release_criterion_satisfied: false,
         release_criterion_reason: "this finite matrix does not execute any one-hour load profile or deployed-cloud chaos campaign",
         known_limits: &[
-            "rvoip source tests use each checksummed crates.io package's Cargo.lock, not Bridgefu's Cargo.lock; that independently locked transitive graph is not application dependency evidence",
+            "rvoip source tests use the pinned rvoip workspace Cargo.lock, not Bridgefu's Cargo.lock; that independently locked transitive graph is not application dependency evidence",
             "local media impairment covers deterministic queue pressure and RTP jitter-buffer loss, not a one-hour network impairment campaign",
             "local provider outage uses Telnyx mocks and does not replace a restricted live test-account workflow",
             "local relay loss uses the rvoip relay connector seam and does not replace a separately deployed relay-tier failure test",
@@ -525,12 +525,12 @@ fn run_scenario(
         Workspace::Rvoip => {
             let package = spec
                 .package
-                .expect("crates.io rvoip scenario must identify its package");
+                .expect("pinned Git rvoip scenario must identify its package");
             let manifest = rvoip_manifests
                 .get(package)
-                .expect("validated crates.io rvoip package manifest");
+                .expect("validated pinned Git rvoip package manifest");
             let package_root =
-                crates_io_package_root(manifest).expect("validated crates.io rvoip package root");
+                rvoip_workspace_root(manifest).expect("validated pinned Git rvoip package root");
             command
                 .current_dir(package_root)
                 .args(["test", "--locked", "--quiet", "--manifest-path"])
@@ -643,7 +643,7 @@ fn resolve_rvoip_pinned_manifests(
         }
         if package.source.as_deref() != Some(APPROVED_RVOIP_SOURCE) {
             return Err(format!(
-                "{} did not resolve from the approved crates.io source: {:?}",
+                "{} did not resolve from the approved pinned Git source: {:?}",
                 package.name, package.source
             ));
         }
@@ -654,7 +654,7 @@ fn resolve_rvoip_pinned_manifests(
                 package.manifest_path.display()
             ));
         }
-        crates_io_package_root(&package.manifest_path)?;
+        rvoip_workspace_root(&package.manifest_path)?;
         if manifests
             .insert(package.name.clone(), package.manifest_path)
             .is_some()
@@ -675,21 +675,16 @@ fn resolve_rvoip_pinned_manifests(
     Ok(manifests)
 }
 
-fn crates_io_package_root(manifest: &Path) -> Result<&Path, String> {
-    let package_root = manifest.parent().ok_or_else(|| {
-        format!(
-            "crates.io rvoip manifest has no package directory: {}",
-            manifest.display()
-        )
-    })?;
-    if package_root.join("Cargo.toml").is_file() && package_root.join("Cargo.lock").is_file() {
-        Ok(package_root)
-    } else {
-        Err(format!(
-            "crates.io rvoip package has no bundled lockfile: {}",
-            manifest.display()
-        ))
+fn rvoip_workspace_root(manifest: &Path) -> Result<&Path, String> {
+    for root in manifest.ancestors().skip(1) {
+        let workspace = std::fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+        if workspace.lines().any(|line| line.trim() == "[workspace]")
+            && root.join("Cargo.lock").is_file()
+        {
+            return Ok(root);
+        }
     }
+    Err("pinned rvoip manifest has no workspace lockfile".into())
 }
 
 fn rvoip_package_source_execution_evidence(
@@ -701,19 +696,19 @@ fn rvoip_package_source_execution_evidence(
         source: APPROVED_RVOIP_SOURCE,
         source_selection: "cargo metadata --locked from the Bridgefu manifest",
         source_identity_evidence:
-            "matching name/version/crates.io source/checksum entries in bridgefu_locked_rvoip_graph",
-        child_command: "cargo test --locked --manifest-path <crates-io-package>/Cargo.toml",
-        child_lockfile: "the checksummed crates.io package Cargo.lock",
+            "matching name/version/exact Git source revision entries in bridgefu_locked_rvoip_graph",
+        child_command: "cargo test --locked --manifest-path <pinned-rvoip-package>/Cargo.toml",
+        child_lockfile: "the pinned rvoip workspace Cargo.lock",
         bridgefu_lockfile_applied_to_child_commands: false,
         dependency_graph_relation:
-            "independently locked crates.io package test graph; not Bridgefu application dependency evidence",
+            "independently locked rvoip workspace test graph; not Bridgefu application dependency evidence",
     }
 }
 
 const fn dependency_resolution(workspace: Workspace) -> DependencyResolution {
     match workspace {
         Workspace::Bridgefu => DependencyResolution::BridgefuCargoLock,
-        Workspace::Rvoip => DependencyResolution::CratesIoPackageCargoLock,
+        Workspace::Rvoip => DependencyResolution::RvoipWorkspaceCargoLock,
     }
 }
 
@@ -953,7 +948,7 @@ fn telnyx_chaos_scenarios_select_the_library_target() {
 }
 
 #[test]
-fn resolves_upstream_scenarios_from_the_locked_crates_io_release() {
+fn resolves_upstream_scenarios_from_the_locked_source_revision() {
     let manifests =
         resolve_rvoip_pinned_manifests(Path::new(env!("CARGO_MANIFEST_DIR")), SCENARIOS)
             .expect("resolve upstream chaos packages");
@@ -970,8 +965,9 @@ fn resolves_upstream_scenarios_from_the_locked_crates_io_release() {
         expected
     );
     assert!(manifests.values().all(|manifest| {
-        crates_io_package_root(manifest)
-            .is_ok_and(|root| root.join("Cargo.lock").is_file() && !root.join(".git").exists())
+        rvoip_workspace_root(manifest).is_ok_and(|root| {
+            root.join("Cargo.lock").is_file() && root.join("Cargo.toml").is_file()
+        })
     }));
 }
 
@@ -988,7 +984,7 @@ fn report_separates_bridgefu_lock_evidence_from_rvoip_source_test_resolution() {
     assert_eq!(json["bridgefu_lockfile_applied_to_child_commands"], false);
     assert_eq!(
         json["dependency_graph_relation"],
-        "independently locked crates.io package test graph; not Bridgefu application dependency evidence"
+        "independently locked rvoip workspace test graph; not Bridgefu application dependency evidence"
     );
     assert!(json["child_command"]
         .as_str()
