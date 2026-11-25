@@ -1159,7 +1159,10 @@ impl DestinationFailureMode {
     const fn setup_timeout(self) -> Duration {
         match self {
             Self::Reject => Duration::from_secs(5),
-            Self::SetupTimeout => Duration::from_millis(750),
+            // Setup includes source attachment and native SIP startup. Allow
+            // enough time to reach the deferred destination on busy runners,
+            // but expire before its 10-second deferral/source-admission timer.
+            Self::SetupTimeout => Duration::from_secs(5),
         }
     }
 
