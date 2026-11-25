@@ -1,6 +1,6 @@
 # Use Amazon Connect's TURN relay
 
-This change is a candidate based on rvoip 0.5.0. It is not part of the published
+This change uses merged rvoip 0.5.0 TURN support. It is not part of the published
 Bridgefu 0.9.1 release. The dependency-only upgrade and this TURN change have
 separate commits. The exact TURN dependency revision is in
 [`config/rvoip-source.txt`](../config/rvoip-source.txt).
@@ -141,7 +141,7 @@ a live peer are not implemented. Create a new peer/contact for new credentials.
 
 ## Upstream TURN and ICE regression checks
 
-The pinned rvoip PR includes a [runnable TURN/ICE example](https://github.com/eisenzopf/rvoip/blob/codex/connect-turn-050/docs/TURN_ICE.md).
+The pinned rvoip merge includes a [runnable TURN/ICE example](https://github.com/eisenzopf/rvoip/blob/529293064953c94c0b021c43e46d03d878922d0c/docs/TURN_ICE.md).
 Its CI gate executes relay-only and direct-ICE calls, verifies exact audio
 packets in both directions, and checks local TURN allocation release. Direct
 mode uses no ICE servers. A private configuration file supports customer TURN
