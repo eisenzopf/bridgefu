@@ -39,7 +39,7 @@ jobs:
           git -C bridgefu diff --cached --quiet
           printf 'BUILD_DATE=%s\n' "$(git -C bridgefu show -s --format=%cI)" >> "$GITHUB_ENV"
           printf 'SOURCE_DATE_EPOCH=%s\n' "$(git -C bridgefu show -s --format=%ct)" >> "$GITHUB_ENV"
-      - name: Enforce locked crates.io rvoip release policy
+      - name: Enforce locked rvoip source policy
         working-directory: bridgefu
         run: bash deploy/scripts/check-release-image.sh
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3

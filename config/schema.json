@@ -580,6 +580,9 @@
         },
         "nat_1to1_candidate_type": { "enum": ["host", "srflx"] },
         "gather_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "turn_attempt_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "turn_send_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "turn_close_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
         "connection_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120 },
         "trickle_ice": { "type": "boolean" }
       },
@@ -670,7 +673,20 @@
       "properties": {
         "region": { "type": "string", "minLength": 1 },
         "instance_id": { "type": "string" },
-        "contact_flow_id": { "type": "string" }
+        "contact_flow_id": { "type": "string" },
+        "turn": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "credential_source": { "enum": ["auto", "join_ack", "turn_control_url", "disabled"] },
+            "relay_only": { "type": "boolean" },
+            "request_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+            "control_allowed_hosts": {
+              "type": "array", "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[^/:@*]+$" }
+            }
+          }
+        }
       },
       "additionalProperties": false
     },

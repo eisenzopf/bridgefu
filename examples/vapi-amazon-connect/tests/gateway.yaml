@@ -41,6 +41,11 @@ Resources:
     Properties:
       GroupDescription: Test TLS SIP and RTP; administration is through SSM only.
       VpcId: !Ref Vpc
+      # Bootstrap/caller traffic remains open. restricted_egress.py installs
+      # an OUTPUT firewall on the Connect UDP socket range before placing calls.
+      # This template alone is not restricted-egress qualification.
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0, Description: Bootstrap and synthetic caller; Connect media restricted by test host firewall}
       SecurityGroupIngress:
         - {IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref SignalingCidr1}
         - {IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref SignalingCidr2}

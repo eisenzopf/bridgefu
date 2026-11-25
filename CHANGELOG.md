@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — Connect TURN candidate
+
+- Add per-contact Connect TURN credential selection and explicit relay-only mode,
+  with empty static ICE-server lists and customer-selected timeouts.
+- Pin the UDP TURN implementation to an immutable rvoip source revision.
+- Add a reproducible restricted-Connect-egress test with a relay-disabled
+  negative control. Live results are recorded separately from local tests.
+
 ## Unreleased — rvoip 0.5 upgrade
 
 - Pin the coordinated rvoip graph to the published 0.5.0 packages.

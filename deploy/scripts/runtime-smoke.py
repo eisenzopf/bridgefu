@@ -276,12 +276,11 @@ def locked_dependency_state(lock_path: Path) -> dict[str, object]:
         (package["name"], package["version"], package.get("source"))
         for package in packages
         if package["version"] != RVOIP_RELEASE_VERSION
-        or not package.get("source", "").startswith("registry+")
-        or len(package.get("checksum", "")) != 64
+        or package.get("source") != (ROOT / "config/rvoip-source.txt").read_text().strip()
     ]
     if invalid:
         raise SystemExit(
-            "Cargo.lock contains non-registry, non-0.5.0, or unchecked rvoip "
+            "Cargo.lock contains unpinned or non-0.5.0 rvoip "
             f"packages: {invalid}"
         )
 
@@ -301,8 +300,9 @@ def locked_dependency_state(lock_path: Path) -> dict[str, object]:
             {
                 "name": package["name"],
                 "version": package["version"],
-                "source_kind": "registry",
-                "checksum": package["checksum"],
+                "source_kind": "git",
+                "source": package["source"],
+                "checksum": package.get("checksum"),
             }
             for package in sorted(packages, key=lambda package: package["name"])
         ],

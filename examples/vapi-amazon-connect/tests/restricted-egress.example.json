@@ -1,0 +1,13 @@
+{
+  "relay_cidrs": ["99.77.128.0/18"],
+  "relay_port": 3478,
+  "udp_port_start": 42000,
+  "udp_port_end": 42031,
+  "gather_timeout_secs": 10,
+  "connection_timeout_secs": 30,
+  "turn_attempt_timeout_secs": 2,
+  "turn_send_timeout_secs": 2,
+  "turn_close_timeout_secs": 2,
+  "request_timeout_secs": 10,
+  "control_allowed_hosts": []
+}

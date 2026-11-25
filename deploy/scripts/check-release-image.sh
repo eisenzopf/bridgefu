@@ -139,7 +139,7 @@ fi
 grep -Eq 'file: bridgefu/deploy/Dockerfile' .github/workflows/ci.yml
 grep -Eq 'platform: linux/amd64' .github/workflows/ci.yml
 grep -Eq 'platform: linux/arm64' .github/workflows/ci.yml
-grep -Fq 'Verify locked rvoip crates.io graph' .github/workflows/ci.yml
+grep -Fq 'Verify locked rvoip source graph' .github/workflows/ci.yml
 release_workflow=.github/workflows/release-image-candidate.yml
 test -f "$release_workflow"
 grep -Eq '^  workflow_dispatch:$' "$release_workflow"
@@ -306,6 +306,7 @@ from pathlib import Path
 import tomllib
 
 lock = tomllib.loads(Path("Cargo.lock").read_text())
+expected_source = Path("config/rvoip-source.txt").read_text().strip()
 packages = [
     package for package in lock["package"]
     if package["name"] == "rvoip" or package["name"].startswith("rvoip-")
@@ -316,10 +317,10 @@ invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
     if package["version"] != "0.5.0"
-    or not package.get("source", "").startswith("registry+")
+    or package.get("source") != expected_source
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock has non-registry or non-0.5.0 rvoip packages: {invalid}")
+    raise SystemExit(f"Cargo.lock has unpinned or non-0.5.0 rvoip packages: {invalid}")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
