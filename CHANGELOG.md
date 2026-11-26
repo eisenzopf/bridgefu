@@ -8,6 +8,8 @@
 - Update the runnable Vapi/Connect SIP test client to the same published
   dependency version. Customer routes, headers, attributes, and TURN/ICE
   settings remain configurable.
+- Make the private-egress integration fixture await worker teardown before
+  releasing admission and starting its next destination session.
 - Keep the published 0.9.2 tag unchanged. See the
   [0.9.3 checks](docs/release-0.9.3.md) for registry validation and the separate
   provenance of the earlier live restricted-egress calls.

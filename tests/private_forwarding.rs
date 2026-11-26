@@ -393,6 +393,19 @@ async fn wait_for_bridge_count(orchestrator: &Orchestrator, expected: u64) {
     });
 }
 
+async fn wait_for_private_connection_detached(
+    orchestrator: &Orchestrator,
+    connection_id: &ConnectionId,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while orchestrator.session_of(connection_id).is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker did not detach the ended private connection");
+}
+
 async fn wait_for_call_state(
     runtime: &CallServiceRuntime,
     tenant: &TenantId,
@@ -2413,7 +2426,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
         .await
         .unwrap();
     let session = orchestrator
-        .start_session(conversation, SessionMedium::Voice, Vec::new())
+        .start_session(conversation.clone(), SessionMedium::Voice, Vec::new())
         .await
         .unwrap();
     let admitted = admit_private_egress_worker_connection(
@@ -2586,6 +2599,11 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
     assert!(native.ended.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(handler.active_routes(), 0);
     assert_eq!(service.active_routes(), 0);
+    // Sending session.end does not await its processing on the worker. Keep
+    // the admission authorized until that worker has detached the connection;
+    // revoking it earlier can fail the peer-wide authorization guard and close
+    // the shared QUIC transport underneath the next destination.
+    wait_for_private_connection_detached(&orchestrator, admitted.connection_id()).await;
     drop(admitted);
     drop(reserved);
     assert_eq!(stream_admissions.active_admissions(), 0);
@@ -2623,12 +2641,20 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
         .await
         .expect("private WebRTC egress admission ticket timeout")
         .expect("private egress admission receiver closed");
+    // This isolated fixture has no persistent source connection. Closing its
+    // sole SIP destination ends the first core session, so the WebRTC case
+    // needs a fresh session even though it exercises the same gateway peer.
+    let web_session = orchestrator
+        .start_session(conversation, SessionMedium::Voice, Vec::new())
+        .await
+        .unwrap();
+    assert_ne!(web_session, session);
     let web_admitted = admit_private_egress_worker_connection(
         web_ticket,
         Arc::clone(&orchestrator),
         Arc::clone(&worker),
         Arc::clone(&stream_admissions),
-        session,
+        web_session,
         Duration::from_secs(5),
     )
     .await
@@ -2728,6 +2754,7 @@ async fn split_egress_uses_a_second_generation_bound_connection_full_duplex() {
     assert!(web_native.ended.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(handler.active_routes(), 0);
     assert_eq!(service.active_routes(), 0);
+    wait_for_private_connection_detached(&orchestrator, web_admitted.connection_id()).await;
     drop(web_admitted);
     drop(web_reserved);
     assert_eq!(stream_admissions.active_admissions(), 0);
