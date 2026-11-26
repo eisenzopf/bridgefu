@@ -2439,9 +2439,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rvoip-audio-send-queue"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c330b470bdfbe230240b53e350bb56dd7f692741597e0a1ce1aedcc861caf67"
+checksum = "e8dc395f1e009b34ef9b130d58fc433f7e831accd076ab1ba3d8575adc4091ca"
 dependencies = [
  "thiserror",
  "tokio",
@@ -2449,9 +2449,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-auth-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fcbb33e7ba5130d51dcfd7cc1dc5f80df865b5832dd1333e3dc12dd88676db8"
+checksum = "fcbc3b6c53cda97966bf383abfd75a5bce1efb4f55192245b5ece9a65184fd44"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2482,9 +2482,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-codec-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54d8e9a88cf68060d6acd49dae55fdeebce48f7a5765083a1805cba4d78cd988"
+checksum = "226f6c750d058b3f9b00269e0395950353a69e06e0eddb8c34ca53845d7170bc"
 dependencies = [
  "thiserror",
  "tracing",
@@ -2493,9 +2493,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "314ef54fc6da67d3c035249b9706b64f67e5e0c1df6defe3505d48c7e8f61ed4"
+checksum = "3b42e8eb9b5280b0b06fba6c06be202f85ab8da51eb7158e5e3217e053bb2528"
 dependencies = [
  "async-trait",
  "base64",
@@ -2520,9 +2520,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-core-traits"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91849d0fab76b42adfaf2bbff7e95055f30dff622672a6b1c1b1fd6326e1101"
+checksum = "4d2c60e194a38e4e66458202464282681990e0652e080be426ea1e04ca47006a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2538,9 +2538,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-ice-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4738d93cfbe368874a2218ab9d33ae31a1765df8fa53592594cf96d8cb3dd31"
+checksum = "eda93b15491d5176a9d6e0faf19900424d5373d2fe482c6f752cbd9f88afad44"
 dependencies = [
  "hmac",
  "rand 0.10.4",
@@ -2551,9 +2551,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-infra-common"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e97d6b30b8eaf858bb07bd0d6d1ff1828ef112ed635a77e86fc9f41742f2b59"
+checksum = "786c27866565dbf7ff1aae2320d5ab82a75a1cfe2c3cc739c57df16c94cca02c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2574,9 +2574,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-media-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca71fa174d7ab3cab8cee8ff653f6ee6187907edffec3af166269a6a2b088038"
+checksum = "13e04909063313d3f4c91d737dd941e22a7a80be7018cf43da369d25cf8c7d19"
 dependencies = [
  "anyhow",
  "apodize",
@@ -2606,9 +2606,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-rtp-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e42f93373b945442e9254a1a42f07fc93b9a0e1f1fcaeb76997e64bf3003a1"
+checksum = "264bca63ea57535b917ec596d1356925f2b3d2246abecb1ac0fd21bebd0a3f53"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2645,9 +2645,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3ff5359524716db26da4cdabf2dce9a8649a335b1160783f0b6eca356d9df1b"
+checksum = "ec0cd3ff90edb81555ef70a22910bcc347c818bff2cbec5130a7bde4a07bfaab"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2691,9 +2691,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "162ab8364395c9dd8f42a8ef2b845ece37880ef41201e1d7f08ab1382911d48a"
+checksum = "446504fd7978531a847075def1f1dd51d205a1feb1be5b914fd4dff000c54bfa"
 dependencies = [
  "base64",
  "bytes",
@@ -2711,9 +2711,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-dialog"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65910786abdab7611b78ce2ca52a7cd347a9a572c68ab1503135fb3773d277b5"
+checksum = "0fa970b741b69d28c99a00156f45a80faa6d68e972c820b962e187e7f370f0f8"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2738,9 +2738,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-proxy"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7068cdb3f72650e0810841632c2333041850e1664e273101e6447c620ce4dbe2"
+checksum = "abdc12a9a61fbb8ac44e64fc1374d381ab66c090fe4281d79f51b8b651c956c0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2756,9 +2756,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-registrar"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960b74de74a869c59fc24b81ffe93f83a44dc886d9feb45700fc48d7243b13de"
+checksum = "9a9ea3be5ba47ad493f82deaebd791bf7d16a29e0a6f5748e3a7527241414c3b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2779,9 +2779,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-sip-transport"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a66231018d67e66a351f1c9b4030b8dd0ca5715258a5eb9bc24c842a58f589d"
+checksum = "d42653009eb8530603ca15703ee4e846d071f36460aa0135cb41d4f399b1f352"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2808,9 +2808,9 @@ dependencies = [
 
 [[package]]
 name = "rvoip-vcon"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d912abac72901e09c1465c1d2b279d8b7ab87763e12f39a544fc94e2d7b32ac0"
+checksum = "1edc0c7f9c164585c56ffb416e9b3ef500e0b46926c3b3be348f3be54ae3fcde"
 dependencies = [
  "async-trait",
  "base64",

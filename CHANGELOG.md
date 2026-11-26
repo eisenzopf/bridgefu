@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.3 — 2026-11-25
+
+- Replace the rvoip Git revision with exact crates.io `=0.5.1` dependencies.
+  Registry checksums identify the resolved packages; release checks reject
+  Git/path dependencies and mismatched rvoip versions.
+- Update the runnable Vapi/Connect SIP test client to the same published
+  dependency version. Customer routes, headers, attributes, and TURN/ICE
+  settings remain configurable.
+- Keep the published 0.9.2 tag unchanged. See the
+  [0.9.3 checks](docs/release-0.9.3.md) for registry validation and the separate
+  provenance of the earlier live restricted-egress calls.
+
 ## 0.9.2 — 2026-11-25
 
 - Add per-contact Amazon Connect TURN credentials, using Chime signaling in

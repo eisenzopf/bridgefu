@@ -1,7 +1,7 @@
 # Deployment assets
 
 `deploy/Dockerfile` is the canonical release image definition. It resolves the
-exact rvoip 0.5.0 TURN source revision from the committed `Cargo.lock`; no
+exact rvoip 0.5.1 crates.io packages from the committed `Cargo.lock`; no
 separate rvoip checkout or named build context is required. The image runs as
 UID/GID 65532 and supports a read-only root filesystem. Its Rust and Debian
 bases are pinned to multi-platform manifest digests. Builder packages come from
@@ -11,7 +11,7 @@ runtime libraries, package metadata, and licenses copied from a separately
 pinned `cc` image. Bridgefu uses Rustls; the unused OpenSSL, zlib, and zstd
 packages are omitted rather than exempted from vulnerability scanning. It
 contains no shell or curl, and `bridgefu healthcheck` probes `/livez` without
-loading configuration or secrets. `Cargo.lock` Git revisions and registry checksums, the Bridgefu
+loading configuration or secrets. `Cargo.lock` registry checksums, the Bridgefu
 source revision, commit-derived build date, and `SOURCE_DATE_EPOCH` complete the
 reproducible input record. This is a reproducible-input contract, not an
 unsupported claim that rustc produces a byte-identical layer on every BuildKit
@@ -218,8 +218,9 @@ systemctl enable --now bridgefu
 `deploy.sh` packages Bridgefu source with `git archive`; it requires and
 verifies an exact `BRIDGEFU_REVISION`, expands it into a new remote release
 directory, and runs `cargo build --locked` inside the canonical image. The
-exact rvoip 0.5.0 TURN inputs come from the immutable Git revision in
-`config/rvoip-source.txt` and are verified against the committed `Cargo.lock`; `RVOIP_DIR` and `RVOIP_REVISION` are
+exact rvoip 0.5.1 inputs come from crates.io, the approved registry declared in
+`config/rvoip-source.txt`, and are verified against the committed `Cargo.lock`
+checksums. `RVOIP_DIR` and `RVOIP_REVISION` are
 not deployment inputs. The Docker build captures an immutable local image ID in
 `/etc/bridgefu/image.env`, then requires `/readyz` and `/livez`; a failed check
 restores the previous config and image ID when one exists.

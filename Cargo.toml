@@ -1,6 +1,6 @@
 [package]
 name = "bridgefu"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 rust-version = "1.95"
 description = "Programmable SIP/RTP, WebRTC/RTP, provider-control, and QUIC audio bridge"
@@ -13,19 +13,18 @@ categories = ["network-programming", "multimedia::audio"]
 publish = false
 
 [dependencies]
-# Merged TURN support based on rvoip 0.5.0; every component uses the same immutable
-# source revision. The preceding upgrade commit remains registry-only.
-# See docs/connect-turn.md for review and qualification status.
-rvoip-amazon-connect = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["server", "aws-control"] }
-rvoip-auth-core = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0" }
-rvoip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0" }
-rvoip-moq = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["relay-runtime"] }
-rvoip-redis = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["moq"] }
-rvoip-quic = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0" }
-rvoip-uctp = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0" }
-rvoip-sip = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["opus"] }
-rvoip-sip-core = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0" }
-rvoip-webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
+# Published rvoip 0.5.1 TURN support. Every component resolves from crates.io;
+# Cargo.lock retains the exact registry checksums. See docs/connect-turn.md.
+rvoip-amazon-connect = { version = "=0.5.1", features = ["server", "aws-control"] }
+rvoip-auth-core = { version = "=0.5.1" }
+rvoip-core = { version = "=0.5.1" }
+rvoip-moq = { version = "=0.5.1", features = ["relay-runtime"] }
+rvoip-redis = { version = "=0.5.1", features = ["moq"] }
+rvoip-quic = { version = "=0.5.1" }
+rvoip-uctp = { version = "=0.5.1" }
+rvoip-sip = { version = "=0.5.1", features = ["opus"] }
+rvoip-sip-core = { version = "=0.5.1" }
+rvoip-webrtc = { version = "=0.5.1", features = ["signaling-whip", "signaling-ws", "tls-rustls"] }
 telnyx = { version = "=0.1.0", default-features = false, features = ["calls", "webhooks", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -72,10 +71,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
-rvoip-media-core = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", version = "=0.5.0", features = ["opus"] }
+rvoip-media-core = { version = "=0.5.1", features = ["opus"] }
 rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }
-webrtc = { git = "https://github.com/eisenzopf/rvoip", rev = "529293064953c94c0b021c43e46d03d878922d0c", package = "rvoip-webrtc-stack", version = "=0.5.0" }
+webrtc = { package = "rvoip-webrtc-stack", version = "=0.5.1" }
 
 # bridgefu is the build root, so this profile governs the WHOLE dependency tree
 # (it overrides the rvoip workspace's `lto = true, codegen-units = 1`, which are

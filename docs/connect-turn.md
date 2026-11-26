@@ -1,8 +1,9 @@
 # Use Amazon Connect's TURN relay
 
-Bridgefu 0.9.2 includes merged rvoip 0.5.0 TURN support. The dependency-only
-upgrade and TURN implementation have separate commits. The exact TURN dependency revision is in
-[`config/rvoip-source.txt`](../config/rvoip-source.txt).
+Bridgefu 0.9.3 uses published rvoip 0.5.1 crates for TURN support. All
+dependencies resolve from crates.io, with package checksums in `Cargo.lock`.
+The earlier 0.9.2 release used an immutable Git revision; its tag is unchanged.
+The original upgrade and TURN implementation remain separately reviewable.
 
 Connect gives each contact a media endpoint and temporary relay credentials.
 The current Chime SDK obtains those credentials from `JOIN_ACK`, and marks
@@ -19,13 +20,13 @@ required by this networking change.
 With the [build prerequisites](../examples/native-sip-webrtc/README.md#start-with-the-local-demo) installed:
 
 ```sh
-git clone --branch v0.9.2 --depth 1 https://github.com/eisenzopf/bridgefu.git bridgefu-0.9.2
-cd bridgefu-0.9.2
+git clone --branch v0.9.3 --depth 1 https://github.com/eisenzopf/bridgefu.git bridgefu-0.9.3
+cd bridgefu-0.9.3
 cargo build --locked --release
 ./target/release/bridgefu --version
 ```
 
-The version must be `bridgefu 0.9.2`. Deploy that binary using your normal
+The version must be `bridgefu 0.9.3`. Deploy that binary using your normal
 service process, preserving your existing configuration. This source release
 does not publish a container image.
 
@@ -170,7 +171,7 @@ a live peer are not implemented. Create a new peer/contact for new credentials.
 
 ## Upstream TURN and ICE regression checks
 
-The pinned rvoip merge includes a [runnable TURN/ICE example](https://github.com/eisenzopf/rvoip/blob/529293064953c94c0b021c43e46d03d878922d0c/docs/TURN_ICE.md).
+rvoip 0.5.1 includes a [runnable TURN/ICE example](https://github.com/eisenzopf/rvoip/blob/v0.5.1/docs/TURN_ICE.md).
 Its CI gate executes relay-only and direct-ICE calls, verifies exact audio
 packets in both directions, and checks local TURN allocation release. Direct
 mode uses no ICE servers. A private configuration file supports customer TURN

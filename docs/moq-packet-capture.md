@@ -14,8 +14,8 @@ RVOIP_REVIEWED_REVISION=8dab9d14a49178fa5f9a3e48ed6c1388272bfe58 \
 ```
 
 This command is a source-level rvoip protocol-qualification tool, not a
-Bridgefu build input. The TURN candidate resolves `rvoip-moq = 0.5.0`
-from the same immutable rvoip workspace revision recorded in Cargo.lock. Release-quality capture is the
+Bridgefu build input. Bridgefu resolves `rvoip-moq = 0.5.1` from crates.io,
+with its registry checksum recorded in Cargo.lock. Release-quality capture is the
 default and requires `RVOIP_REVIEWED_REVISION` to be an exact 40-character
 commit matching `HEAD`. The rvoip worktree must be clean and remain at the same
 revision and tree state for the entire run. Choose the revision only after

@@ -25,7 +25,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TIMEOUT_SECONDS = 600
 OUTPUT_LIMIT = 2 * 1024 * 1024
-RVOIP_RELEASE_VERSION = "0.5.0"
+RVOIP_RELEASE_VERSION = "0.5.1"
 REQUIRED_RVOIP_PACKAGES = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -264,6 +264,9 @@ def repository_state(path: Path, *, required: bool) -> dict[str, object]:
 
 def locked_dependency_state(lock_path: Path) -> dict[str, object]:
     lock = tomllib.loads(lock_path.read_text())
+    expected_source = (ROOT / "config/rvoip-source.txt").read_text().strip()
+    if expected_source != "registry+https://github.com/rust-lang/crates.io-index":
+        raise SystemExit("rvoip release dependencies must come from crates.io")
     packages = [
         package
         for package in lock["package"]
@@ -276,11 +279,13 @@ def locked_dependency_state(lock_path: Path) -> dict[str, object]:
         (package["name"], package["version"], package.get("source"))
         for package in packages
         if package["version"] != RVOIP_RELEASE_VERSION
-        or package.get("source") != (ROOT / "config/rvoip-source.txt").read_text().strip()
+        or package.get("source") != expected_source
+        or len(package.get("checksum", "")) != 64
+        or any(c not in "0123456789abcdef" for c in package.get("checksum", ""))
     ]
     if invalid:
         raise SystemExit(
-            "Cargo.lock contains unpinned or non-0.5.0 rvoip "
+            "Cargo.lock contains unpinned or non-0.5.1 rvoip "
             f"packages: {invalid}"
         )
 
@@ -300,7 +305,7 @@ def locked_dependency_state(lock_path: Path) -> dict[str, object]:
             {
                 "name": package["name"],
                 "version": package["version"],
-                "source_kind": "git",
+                "source_kind": "registry",
                 "source": package["source"],
                 "checksum": package.get("checksum"),
             }
