@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKET_WIDTH_US: u64 = 100;
-pub const COORDINATED_RVOIP_VERSION: &str = "0.5.0";
+pub const COORDINATED_RVOIP_VERSION: &str = "0.5.1";
 const LATENCY_MAX_US: u64 = 1_000_000;
 pub const APPROVED_RVOIP_SOURCE: &str = include_str!("../../config/rvoip-source.txt");
 const REQUIRED_RVOIP_PACKAGES: &[&str] = &[
@@ -241,8 +241,13 @@ pub fn rvoip_lock_evidence(manifest_dir: &Path) -> RvoipLockEvidence {
                 "{} must resolve from its approved immutable source",
                 package.name
             );
-            // Git source identity includes the exact reviewed commit above.
-            assert!(package.checksum.is_none());
+            assert_eq!(
+                APPROVED_RVOIP_SOURCE,
+                "registry+https://github.com/rust-lang/crates.io-index"
+            );
+            assert!(package.checksum.as_deref().is_some_and(
+                |value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ));
             CargoPackageEvidence {
                 name: package.name,
                 version: package.version,
@@ -403,14 +408,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_evidence_uses_the_exact_coordinated_turn_candidate() {
+    fn lock_evidence_uses_checksummed_published_rvoip_crates() {
         let evidence = rvoip_lock_evidence(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert_eq!(evidence.release_version, "0.5.0");
+        assert_eq!(evidence.release_version, "0.5.1");
         assert!(evidence
             .packages
             .iter()
-            .all(|package| package.version == "0.5.0"
+            .all(|package| package.version == "0.5.1"
                 && package.source == APPROVED_RVOIP_SOURCE
-                && package.checksum.is_none()));
+                && package
+                    .checksum
+                    .as_deref()
+                    .is_some_and(|value| value.len() == 64
+                        && value.bytes().all(|byte| byte.is_ascii_hexdigit()))));
     }
 }

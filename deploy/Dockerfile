@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Canonical Bridgefu image. The committed Cargo.lock is the complete source of
-# truth for the revision-pinned rvoip 0.5.0 TURN candidate dependency graph:
+# truth for the checksummed crates.io rvoip 0.5.1 dependency graph:
 #
 #   docker build -f deploy/Dockerfile .
 #
@@ -71,9 +71,9 @@ LABEL org.opencontainers.image.title="Bridgefu" \
       org.opencontainers.image.description="Programmable SIP, WebRTC, and QUIC audio bridge" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu" \
-      org.opencontainers.image.version="0.9.2" \
+      org.opencontainers.image.version="0.9.3" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.rvoip.version="0.5.0" \
+      org.opencontainers.image.rvoip.version="0.5.1" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 COPY --from=builder /out/runtime-libs/ /

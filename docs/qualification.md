@@ -4,6 +4,13 @@ Bridgefu keeps short correctness checks separate from release evidence. A
 passing smoke run proves only that the harness and the current media graph work
 on the local machine; it does not satisfy a one-hour roadmap item.
 
+## Bridgefu 0.9.3
+
+This release uses exact crates.io rvoip 0.5.1 packages. See the
+[0.9.3 release checks](release-0.9.3.md) for dependency verification,
+reproduction steps, and the separate provenance of earlier live calls.
+The published 0.9.2 tag remains unchanged.
+
 ## Bridgefu 0.9.2
 
 This release adds configurable Connect UDP TURN support and pins the merged

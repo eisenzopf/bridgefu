@@ -62,6 +62,7 @@ jobs:
           python3 deploy/scripts/test_verify_multiarch_oci.py
           python3 deploy/scripts/test_select_oci_platform.py
           python3 deploy/scripts/test_verify_trivy_policy.py
+          python3 deploy/scripts/test_runtime_smoke_dependencies.py
           shellcheck deploy.sh deploy/scripts/*.sh
 
   test:
@@ -118,6 +119,7 @@ jobs:
           python3 - <<'PY'
           import json
           import subprocess
+          import tomllib
           from pathlib import Path
 
           metadata = json.loads(subprocess.check_output(
@@ -132,16 +134,45 @@ jobs:
           if not packages:
               raise SystemExit("locked graph contains no rvoip packages")
           expected_source = Path("config/rvoip-source.txt").read_text().strip()
+          if expected_source != "registry+https://github.com/rust-lang/crates.io-index":
+              raise SystemExit("release dependencies must come from crates.io")
+          for root in (Path("."), Path("examples/vapi-amazon-connect/tests/sip-client")):
+              lock = tomllib.loads((root / "Cargo.lock").read_text())
+              root_package = tomllib.loads((root / "Cargo.toml").read_text())["package"]
+              non_registry = [
+                  package["name"] for package in lock["package"]
+                  if not (
+                      package["name"] == root_package["name"]
+                      and package["version"] == root_package["version"]
+                      and package.get("source") is None
+                  ) and (
+                      package.get("source") != expected_source
+                      or len(package.get("checksum", "")) != 64
+                      or any(c not in "0123456789abcdef" for c in package.get("checksum", ""))
+                  )
+              ]
+              if non_registry:
+                  raise SystemExit(f"{root}: dependencies lack crates.io checksums: {non_registry}")
+              rvoip = [package for package in lock["package"]
+                       if package["name"] == "rvoip" or package["name"].startswith("rvoip-")]
+              if not rvoip or any(package["version"] != "0.5.1" for package in rvoip):
+                  raise SystemExit(f"{root}: expected only rvoip 0.5.1 components")
+              print(f"{root}: verified registry checksums and {len(rvoip)} rvoip 0.5.1 packages")
           invalid = [
               (package["name"], package["version"], package["source"])
               for package in packages
-              if package["version"] != "0.5.0"
+              if package["version"] != "0.5.1"
               or package["source"] != expected_source
           ]
           if invalid:
-              raise SystemExit(f"rvoip graph is not the pinned 0.5.0 TURN candidate: {invalid}")
-          print(f"verified {len(packages)} locked rvoip 0.5.0 packages at the pinned TURN revision")
+              raise SystemExit(f"rvoip graph is not the published 0.5.1 registry release: {invalid}")
+          print(f"verified {len(packages)} locked rvoip 0.5.1 packages from crates.io")
           PY
+      - name: Check the Vapi and Connect SIP test client
+        working-directory: bridgefu
+        run: >-
+          CARGO_TARGET_DIR=target cargo check --locked
+          --manifest-path examples/vapi-amazon-connect/tests/sip-client/Cargo.toml
       - name: Formatting
         working-directory: bridgefu
         run: cargo fmt --all -- --check

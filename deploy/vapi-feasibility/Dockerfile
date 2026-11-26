@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# The committed Cargo.lock pins the revision-pinned rvoip 0.5.0 TURN candidate graph.
+# The committed Cargo.lock pins the checksummed crates.io rvoip 0.5.1 graph.
 # docker build -f deploy/vapi-feasibility/Dockerfile .
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
@@ -33,8 +33,8 @@ RUN cargo build --locked --release --example vapi_feasibility_observer \
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG RUNTIME_DEBIAN_SNAPSHOT
 LABEL org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu" \
-      org.opencontainers.image.version="0.9.2" \
-      org.opencontainers.image.rvoip.version="0.5.0"
+      org.opencontainers.image.version="0.9.3" \
+      org.opencontainers.image.rvoip.version="0.5.1"
 RUN sed -i \
         -e "s|URIs: http://deb.debian.org/debian-security|URIs: http://snapshot.debian.org/archive/debian-security/${RUNTIME_DEBIAN_SNAPSHOT}|" \
         -e "s|URIs: http://deb.debian.org/debian|URIs: http://snapshot.debian.org/archive/debian/${RUNTIME_DEBIAN_SNAPSHOT}|" \

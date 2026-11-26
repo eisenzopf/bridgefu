@@ -127,10 +127,10 @@ grep -Eq '^STOPSIGNAL SIGTERM$' "$dockerfile"
 grep -Eq '^ENV SOURCE_DATE_EPOCH=' "$dockerfile"
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" "$dockerfile"
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.5\.0"' "$dockerfile"
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.5\.1"' "$dockerfile"
 grep -Fq "org.opencontainers.image.version=\"$bridgefu_version\"" deploy/vapi-feasibility/Dockerfile
 grep -Fq 'org.opencontainers.image.source="https://github.com/eisenzopf/bridgefu"' deploy/vapi-feasibility/Dockerfile
-grep -Eq 'org.opencontainers.image.rvoip.version="0\.5\.0"' deploy/vapi-feasibility/Dockerfile
+grep -Eq 'org.opencontainers.image.rvoip.version="0\.5\.1"' deploy/vapi-feasibility/Dockerfile
 grep -Eq 'dockerfile: deploy/Dockerfile' compose.yaml
 if grep -Eq 'additional_contexts:' compose.yaml deploy/vapi-feasibility/compose.local.yaml; then
   echo "Compose must build from the Bridgefu context alone" >&2
@@ -307,6 +307,8 @@ import tomllib
 
 lock = tomllib.loads(Path("Cargo.lock").read_text())
 expected_source = Path("config/rvoip-source.txt").read_text().strip()
+if expected_source != "registry+https://github.com/rust-lang/crates.io-index":
+    raise SystemExit("rvoip release dependencies must come from crates.io")
 packages = [
     package for package in lock["package"]
     if package["name"] == "rvoip" or package["name"].startswith("rvoip-")
@@ -316,11 +318,13 @@ if not packages:
 invalid = [
     (package["name"], package["version"], package.get("source"))
     for package in packages
-    if package["version"] != "0.5.0"
+    if package["version"] != "0.5.1"
     or package.get("source") != expected_source
+    or len(package.get("checksum", "")) != 64
+    or any(c not in "0123456789abcdef" for c in package.get("checksum", ""))
 ]
 if invalid:
-    raise SystemExit(f"Cargo.lock has unpinned or non-0.5.0 rvoip packages: {invalid}")
+    raise SystemExit(f"Cargo.lock has unpinned or non-0.5.1 rvoip packages: {invalid}")
 required = {
     "rvoip-amazon-connect",
     "rvoip-auth-core",
@@ -354,7 +358,7 @@ bash -n deploy.sh deploy/scripts/*.sh
 grep -Fq ": \"\${BRIDGEFU_REVISION:?" deploy.sh
 grep -Fq ": \"\${RUNTIME_ENV:?" deploy.sh
 grep -Fq "git -C \"\$REPO_ROOT\" archive" deploy.sh
-grep -Fq 'readonly RVOIP_VERSION=0.5.0' deploy.sh
+grep -Fq 'readonly RVOIP_VERSION=0.5.1' deploy.sh
 grep -Fq -- '--iidfile' deploy.sh
 grep -Fq '/etc/bridgefu/image.env' deploy.sh
 grep -Fq '/readyz' deploy.sh

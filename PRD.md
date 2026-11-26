@@ -141,10 +141,10 @@ parse YAML → build `ScreenPopServerConfig` (`SipConfig` + `ConnectConfig` +
 `AttributeMapping` + `AwsConnectStarter`) → `serve()` under a shutdown guard,
 alongside an axum health/metrics server.
 
-- The TURN candidate uses the coordinated rvoip 0.5.0 workspace pinned to an
-  immutable Git revision in `config/rvoip-source.txt`, including
+- Bridgefu uses exact `=0.5.1` rvoip packages from crates.io, including
   `rvoip-amazon-connect`. The committed `Cargo.lock` records the complete
-  dependency graph. The separate upgrade branch uses published 0.5.0 packages.
+  dependency graph and registry checksums; `config/rvoip-source.txt` records
+  the registry source.
 
 ## 8. Deployment
 
